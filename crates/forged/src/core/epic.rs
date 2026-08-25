@@ -63,6 +63,9 @@ struct FrozenChild {
     frozen_fields_sha256: Option<String>,
     frozen_revision: Option<String>,
     blockers: Vec<String>,
+    /// Frozen compatibility membership for dependency-linked children which
+    /// predate native Beads parent edges.
+    legacy_non_parent: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -79,6 +82,13 @@ struct EpicConfig {
     max_active_children: u32,
     execution_package: ExecutionPackageV1,
     planning_package: Option<ExecutionPackageV1>,
+    /// Explicit operator authorization. Missing on old start events and
+    /// therefore false rather than inferred from an incomplete child.
+    rolling_authorized: bool,
+    /// Whether the start event explicitly classified legacy non-parent
+    /// members. Old events did not; their exact frozen inventory is the only
+    /// bounded compatibility candidate set available.
+    legacy_membership_recorded: bool,
     root_fields: Option<NativeBeadSpecV1>,
     children: Vec<FrozenChild>,
 }
@@ -95,6 +105,14 @@ struct ChildState {
 struct PlanningState {
     run_id: String,
     pre_digest: String,
+    generation: u32,
+    observed_revision: Option<String>,
+    integration_sha: Option<String>,
+    inventory: Option<Value>,
+    completed_evidence: Option<Value>,
+    root_snapshot: Option<Value>,
+    target_snapshot: Option<Value>,
+    input_body: Option<String>,
     applied: Option<Value>,
 }
 
@@ -128,11 +146,47 @@ fn string(value: &Value, key: &str) -> Result<String, Failure> {
         .ok_or_else(|| Failure::internal(format!("epic event has no {key:?}")))
 }
 
+fn rolling_authorized(value: &Value) -> bool {
+    value
+        .get("rollingAuthorized")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn planning_state(event: &Value, generation: u32) -> Result<PlanningState, Failure> {
+    Ok(PlanningState {
+        run_id: string(event, "runId")?,
+        pre_digest: string(event, "preDigest")?,
+        generation,
+        observed_revision: event
+            .get("observedRevision")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        integration_sha: event
+            .get("integrationSha")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        inventory: event.get("frozenInventory").cloned(),
+        completed_evidence: event.get("completedChildEvidence").cloned(),
+        root_snapshot: event.get("rootSnapshot").cloned(),
+        target_snapshot: event.get("targetSnapshot").cloned(),
+        input_body: event
+            .get("planningInputBody")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        applied: None,
+    })
+}
+
 fn parse_config(value: &Value, migration: Option<&Value>) -> Result<EpicConfig, Failure> {
-    let children = value
+    let child_values = value
         .get("children")
         .and_then(Value::as_array)
-        .ok_or_else(|| Failure::internal("epic start event has no children"))?
+        .ok_or_else(|| Failure::internal("epic start event has no children"))?;
+    let legacy_membership_recorded = child_values
+        .iter()
+        .all(|child| child.get("legacyNonParent").is_some_and(Value::is_boolean));
+    let children = child_values
         .iter()
         .map(|child| {
             Ok(FrozenChild {
@@ -183,6 +237,10 @@ fn parse_config(value: &Value, migration: Option<&Value>) -> Result<EpicConfig, 
                             .collect()
                     })
                     .unwrap_or_default(),
+                legacy_non_parent: child
+                    .get("legacyNonParent")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
             })
         })
         .collect::<Result<Vec<_>, Failure>>()?;
@@ -223,6 +281,8 @@ fn parse_config(value: &Value, migration: Option<&Value>) -> Result<EpicConfig, 
             .map_err(|error| {
                 Failure::internal(format!("epic planning package is invalid: {error}"))
             })?,
+        rolling_authorized: rolling_authorized(value),
+        legacy_membership_recorded,
         root_fields: value
             .get("rootFields")
             .filter(|value| !value.is_null())
@@ -386,6 +446,26 @@ async fn epic_events(ctx: &Ctx, epic: &str) -> Result<Vec<forged_ledger::EventRo
     .await
 }
 
+/// Return the exact durable integration SHA for an internal planning run.
+/// Old planning events intentionally return `None` and preserve their legacy
+/// worktree behavior; new cycles never consult the current remote here.
+pub(super) async fn planning_base_sha(ctx: &Ctx, run_id: &str) -> Result<Option<String>, Failure> {
+    let rows = on_ledger(&ctx.ledger, |ledger| {
+        ledger.list_events_by_kind(PLAN_STARTED)
+    })
+    .await?;
+    for row in rows.iter().rev() {
+        let event = payload(row)?;
+        if event.get("runId").and_then(Value::as_str) == Some(run_id) {
+            return Ok(event
+                .get("integrationSha")
+                .and_then(Value::as_str)
+                .map(str::to_owned));
+        }
+    }
+    Ok(None)
+}
+
 async fn project(ctx: &Ctx, epic: &str) -> Result<EpicView, Failure> {
     let events = epic_events(ctx, epic).await?;
     let started = events
@@ -468,14 +548,9 @@ async fn project(ctx: &Ctx, epic: &str) -> Result<EpicView, Failure> {
                             .saturating_add(1)
                     });
                 view.planning_generations.insert(child.clone(), generation);
-                view.planning.insert(
-                    child,
-                    PlanningState {
-                        run_id: string(&event, "runId")?,
-                        pre_digest: string(&event, "preDigest")?,
-                        applied: None,
-                    },
-                );
+                view.planning_guidance.remove(&child);
+                view.planning
+                    .insert(child, planning_state(&event, generation)?);
             }
             PLAN_APPLIED => {
                 let event = payload(&row)?;
@@ -1028,7 +1103,8 @@ pub async fn epic_start(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespo
                 }
                 let epic_spec = super::spec::resolve_issue(&issue)?;
                 let root_fields = native_fields(&issue);
-                let inventory = forged_beads::epic_children(&ctx.config.bd_config(), &epic).await?;
+                let (inventory, legacy_non_parent) =
+                    forged_beads::epic_children_with_legacy(&ctx.config.bd_config(), &epic).await?;
                 if inventory.is_empty() {
                     return Err(Failure::invalid(format!(
                         "epic {epic} has no Beads children"
@@ -1106,6 +1182,7 @@ pub async fn epic_start(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespo
                         "frozenFieldsSha256": frozen_fields_sha256,
                         "frozenRevision": planning_stub.then_some(child.revision).flatten(),
                         "blockers": blockers,
+                        "legacyNonParent": legacy_non_parent.contains(&child.id),
                     }));
                 }
                 let planning_package = if rolling {
@@ -1247,14 +1324,21 @@ fn child_json(
         "pr": pr,
         "merged": state.and_then(|value| value.merged.as_ref()),
         "planning": planning.map(|value| json!({
-            "cycle": planning_generation,
+            "cycle": planning_generation.unwrap_or(value.generation),
             "target": child.id,
             "runId": value.run_id,
             "preDigest": value.pre_digest,
             "applied": value.applied.is_some(),
-            "observedRevision": value.applied.as_ref().and_then(|event| event.get("observedRevision")),
+            "observedRevision": value.observed_revision.as_deref().map(Value::from)
+                .or_else(|| value.applied.as_ref().and_then(|event| event.get("observedRevision").cloned())),
+            "integrationSha": value.integration_sha,
+            "frozenInventory": value.inventory,
+            "completedChildEvidence": value.completed_evidence,
+            "rootSnapshot": value.root_snapshot,
+            "targetSnapshot": value.target_snapshot,
             "postRevision": value.applied.as_ref().and_then(|event| event.get("postRevision")),
             "postDigest": value.applied.as_ref().and_then(|event| event.get("postDigest")),
+            "postReadback": value.applied.as_ref().and_then(|event| event.get("postReadback")),
             "result": value.applied.as_ref().and_then(|event| event.get("result")),
             "blocker": planning_blocker,
         })),
@@ -1884,74 +1968,39 @@ fn planning_run_id(child: &str, generation: u32) -> String {
     }
 }
 
-async fn start_planning(
+#[derive(Debug, Clone)]
+struct PlanningCheckpoint {
+    observed_revision: Option<String>,
+    integration_sha: String,
+    frozen_inventory: Value,
+    completed_child_evidence: Value,
+    root_snapshot: Value,
+    target_snapshot: Value,
+}
+
+async fn ensure_planning_run(
     ctx: &Ctx,
     config: &EpicConfig,
-    child: &FrozenChild,
-    generation: u32,
-    guidance: Option<&str>,
+    state: &PlanningState,
 ) -> Result<Value, Failure> {
-    let package = config
-        .planning_package
-        .clone()
-        .ok_or_else(|| Failure::internal("rolling epic has no frozen planning package"))?;
-    let compiled = crate::config::compile_frozen_package(package).map_err(|errors| {
+    let input = state.input_body.as_deref().ok_or_else(|| {
         Failure::internal(format!(
-            "frozen epic planning package is invalid: {}",
-            serde_json::to_string(&errors).unwrap_or_default()
+            "new planning cycle {:?} has no durable input body",
+            state.run_id
         ))
     })?;
-    let frozen_fields = child.frozen_fields.as_ref().ok_or_else(|| {
-        Failure::internal(format!("planning stub {:?} has no frozen fields", child.id))
-    })?;
-    let pre_digest = child.frozen_fields_sha256.clone().ok_or_else(|| {
-        Failure::internal(format!("planning stub {:?} has no frozen digest", child.id))
-    })?;
-    let current =
-        forged_beads::plan_issues(&ctx.config.bd_config(), std::slice::from_ref(&child.id))
-            .await?
-            .into_iter()
-            .next()
-            .ok_or_else(|| Failure::invalid(format!("planning stub {:?} is missing", child.id)))?;
-    let observed_revision = current.issue.revision.clone();
-    if fields_digest(&native_fields(&current.issue))? != pre_digest
-        || current.issue.status != "blocked"
-        || current.issue.assignee.is_some()
-    {
-        return Err(Failure::invalid(format!(
-            "planning stub {:?} changed before cycle start",
-            child.id
-        )));
-    }
-    let run_id = planning_run_id(&child.id, generation);
-    let input_path = ctx.config.run_dir(&run_id).join("planning-input.md");
+    let input_path = ctx.config.run_dir(&state.run_id).join("planning-input.md");
     std::fs::create_dir_all(
         input_path
             .parent()
             .ok_or_else(|| Failure::internal("planning input has no parent"))?,
     )
     .map_err(|error| Failure::internal(format!("creating planning input directory: {error}")))?;
-    let input = format!(
-        "# Frozen epic outcome\n\n```json\n{}\n```\n\n# Designated child stub\n\n```json\n{}\n```\n\n# Frozen blockers\n\n```json\n{}\n```\n\n# Operator resolution\n\n{}\n",
-        serde_json::to_string_pretty(&config.root_fields)
-            .map_err(|error| Failure::internal(error.to_string()))?,
-        serde_json::to_string_pretty(&json!({
-            "childId": child.id,
-            "fields": frozen_fields,
-            "preDigest": pre_digest,
-            "frozenRevision": child.frozen_revision,
-            "observedRevision": observed_revision,
-        }))
-            .map_err(|error| Failure::internal(error.to_string()))?,
-        serde_json::to_string_pretty(&child.blockers)
-            .map_err(|error| Failure::internal(error.to_string()))?,
-        guidance.unwrap_or("No prior operator resolution."),
-    );
     match std::fs::read_to_string(&input_path) {
         Ok(existing) if existing == input => {}
         Ok(_) => {
             return Err(Failure::invalid(format!(
-                "planning input {} differs from its frozen replay",
+                "planning input {} differs from its durable checkpoint",
                 input_path.display()
             )))
         }
@@ -1966,13 +2015,23 @@ async fn start_planning(
             )))
         }
     }
+    let package = config
+        .planning_package
+        .clone()
+        .ok_or_else(|| Failure::internal("rolling epic has no frozen planning package"))?;
+    let compiled = crate::config::compile_frozen_package(package).map_err(|errors| {
+        Failure::internal(format!(
+            "frozen epic planning package is invalid: {}",
+            serde_json::to_string(&errors).unwrap_or_default()
+        ))
+    })?;
     let mut request = OperationRequest {
         schema_version: 1,
-        idempotency_key: derive_key("run_start", Some(&run_id), None, None),
-        run_id: Some(run_id.clone()),
+        idempotency_key: derive_key("run_start", Some(&state.run_id), None, None),
+        run_id: Some(state.run_id.clone()),
         params: match json!({
             "bead": config.epic_id,
-            "run": run_id,
+            "run": state.run_id,
             "repo": config.repo,
             "internalSpec": input_path.to_string_lossy(),
             "baseRef": config.integration_branch,
@@ -1983,33 +2042,424 @@ async fn start_planning(
             _ => Map::new(),
         },
     };
-    let started =
-        response(super::ops::run_start_with_definition(ctx, &mut request, compiled).await)?;
+    response(super::ops::run_start_with_definition(ctx, &mut request, compiled).await)
+}
+
+fn issue_checkpoint(row: &forged_beads::PlanIssue, dependency_status: bool) -> Value {
+    let mut blockers = row
+        .dependencies
+        .iter()
+        .filter(|dependency| dependency.dependency_type.blocks_readiness())
+        .map(|dependency| {
+            json!({
+                "id": dependency.id,
+                "type": dependency.dependency_type.as_str(),
+                "status": dependency_status
+                    .then(|| dependency.status.map(|status| status.as_str())),
+            })
+        })
+        .collect::<Vec<_>>();
+    blockers.sort_by(|left, right| {
+        left.get("id")
+            .and_then(Value::as_str)
+            .cmp(&right.get("id").and_then(Value::as_str))
+    });
+    json!({
+        "id": row.issue.id,
+        "title": row.issue.title,
+        "issueType": row.issue.issue_type,
+        "parent": row.parent,
+        "blockingDependencies": blockers,
+        "metadata": row.issue.metadata,
+        "priority": row.issue.priority,
+        "status": row.issue.status,
+        "assignee": row.issue.assignee,
+        "revision": row.issue.revision,
+        "fields": native_fields(&row.issue),
+    })
+}
+
+async fn capture_planning_checkpoint(
+    ctx: &Ctx,
+    view: &EpicView,
+    child: &FrozenChild,
+) -> Result<PlanningCheckpoint, Failure> {
+    if !view.config.rolling_authorized {
+        return Err(Failure::invalid(format!(
+            "epic {:?} has no durable rolling authorization",
+            view.config.epic_id
+        )));
+    }
+    let integration_sha = forged_git::remote_branch_sha(
+        Path::new(&view.config.repo),
+        &view.config.integration_branch,
+    )
+    .await?;
+    let (live, live_legacy) =
+        forged_beads::epic_children_with_legacy(&ctx.config.bd_config(), &view.config.epic_id)
+            .await?;
+    let live = live
+        .into_iter()
+        .map(|issue| (issue.id.clone(), issue))
+        .collect::<BTreeMap<_, _>>();
+    let frozen_ids = view
+        .config
+        .children
+        .iter()
+        .map(|child| child.id.clone())
+        .collect::<BTreeSet<_>>();
+    let live_ids = live.keys().cloned().collect::<BTreeSet<_>>();
+    let frozen_legacy = if view.config.legacy_membership_recorded {
+        view.config
+            .children
+            .iter()
+            .filter(|child| child.legacy_non_parent)
+            .map(|child| child.id.clone())
+            .collect::<BTreeSet<_>>()
+    } else {
+        // The old event omitted source classification. Its child IDs are
+        // still the immutable bound; classify only those current members at
+        // the first new rolling checkpoint and persist the result there.
+        live_legacy.clone()
+    };
+    if live_ids != frozen_ids || live_legacy != frozen_legacy {
+        return Err(Failure::invalid(format!(
+            "epic inventory changed at rolling boundary: frozen {frozen_ids:?} with legacy {frozen_legacy:?}, live {live_ids:?} with legacy {live_legacy:?}"
+        )));
+    }
+    let mut exact_ids = vec![view.config.epic_id.clone(), child.id.clone()];
+    exact_ids.sort();
+    exact_ids.dedup();
+    let exact = forged_beads::plan_issues(&ctx.config.bd_config(), &exact_ids)
+        .await?
+        .into_iter()
+        .map(|row| (row.issue.id.clone(), row))
+        .collect::<BTreeMap<_, _>>();
+    let root = exact.get(&view.config.epic_id).ok_or_else(|| {
+        Failure::invalid(format!(
+            "rolling epic root {:?} is missing",
+            view.config.epic_id
+        ))
+    })?;
+    let target = exact
+        .get(&child.id)
+        .ok_or_else(|| Failure::invalid(format!("planning stub {:?} is missing", child.id)))?;
+    let mut members = view
+        .config
+        .children
+        .iter()
+        .map(|member| {
+            json!({
+                "id": member.id,
+                "title": member.title,
+                "issueType": member.issue_type,
+                "initiallyClosed": member.initially_closed,
+                "planningStub": member.planning_stub,
+                "legacyNonParent": frozen_legacy.contains(&member.id),
+                "blockers": member.blockers,
+            })
+        })
+        .collect::<Vec<_>>();
+    members.sort_by(|left, right| {
+        left.get("id")
+            .and_then(Value::as_str)
+            .cmp(&right.get("id").and_then(Value::as_str))
+    });
+    let frozen_inventory = json!({
+        "epicId": view.config.epic_id,
+        "members": members,
+    });
+    let mut completed = view
+        .config
+        .children
+        .iter()
+        .filter_map(|member| {
+            let issue = live.get(&member.id)?;
+            let merged = view
+                .children
+                .get(&member.id)
+                .and_then(|state| state.merged.clone());
+            (member.initially_closed || issue.status == "closed" || merged.is_some()).then(|| {
+                json!({
+                    "id": member.id,
+                    "initiallyClosed": member.initially_closed,
+                    "status": issue.status,
+                    "revision": issue.revision,
+                    "merged": merged,
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    completed.sort_by(|left, right| {
+        left.get("id")
+            .and_then(Value::as_str)
+            .cmp(&right.get("id").and_then(Value::as_str))
+    });
+    Ok(PlanningCheckpoint {
+        observed_revision: target.issue.revision.clone(),
+        integration_sha,
+        frozen_inventory,
+        completed_child_evidence: Value::Array(completed),
+        // Root dependency status is completion evidence, not root
+        // structure. Persisting it here would make our own target blocked ->
+        // open write look like root drift during post-image recovery.
+        root_snapshot: issue_checkpoint(root, false),
+        target_snapshot: issue_checkpoint(target, true),
+    })
+}
+
+async fn start_planning(
+    ctx: &Ctx,
+    view: &EpicView,
+    child: &FrozenChild,
+    generation: u32,
+    guidance: Option<&str>,
+) -> Result<Value, Failure> {
+    let config = &view.config;
+    let frozen_fields = child.frozen_fields.as_ref().ok_or_else(|| {
+        Failure::internal(format!("planning stub {:?} has no frozen fields", child.id))
+    })?;
+    let pre_digest = child.frozen_fields_sha256.clone().ok_or_else(|| {
+        Failure::internal(format!("planning stub {:?} has no frozen digest", child.id))
+    })?;
+    let checkpoint = capture_planning_checkpoint(ctx, view, child).await?;
+    let target = checkpoint
+        .target_snapshot
+        .as_object()
+        .ok_or_else(|| Failure::internal("planning target checkpoint is not an object"))?;
+    if target
+        .get("fields")
+        .cloned()
+        .map(serde_json::from_value::<NativeBeadSpecV1>)
+        .transpose()
+        .map_err(|error| Failure::internal(format!("invalid target checkpoint fields: {error}")))?
+        .as_ref()
+        .map(fields_digest)
+        .transpose()?
+        .as_deref()
+        != Some(pre_digest.as_str())
+        || target.get("status").and_then(Value::as_str) != Some("blocked")
+        || !target.get("assignee").is_none_or(Value::is_null)
+    {
+        return Err(Failure::invalid(format!(
+            "planning stub {:?} changed before cycle start",
+            child.id
+        )));
+    }
+    let run_id = planning_run_id(&child.id, generation);
+    let input_path = ctx.config.run_dir(&run_id).join("planning-input.md");
+    let input = format!(
+        "# Frozen epic outcome\n\n```json\n{}\n```\n\n# Durable rolling checkpoint\n\n```json\n{}\n```\n\n# Designated child stub\n\n```json\n{}\n```\n\n# Frozen blockers\n\n```json\n{}\n```\n\n# Operator resolution\n\n{}\n",
+        serde_json::to_string_pretty(&config.root_fields)
+            .map_err(|error| Failure::internal(error.to_string()))?,
+        serde_json::to_string_pretty(&json!({
+            "generation": generation,
+            "integrationSha": checkpoint.integration_sha,
+            "frozenInventory": checkpoint.frozen_inventory,
+            "completedChildEvidence": checkpoint.completed_child_evidence,
+            "rootSnapshot": checkpoint.root_snapshot,
+            "targetSnapshot": checkpoint.target_snapshot,
+        }))
+            .map_err(|error| Failure::internal(error.to_string()))?,
+        serde_json::to_string_pretty(&json!({
+            "childId": child.id,
+            "fields": frozen_fields,
+            "preDigest": pre_digest,
+            "frozenRevision": child.frozen_revision,
+            "observedRevision": checkpoint.observed_revision,
+        }))
+            .map_err(|error| Failure::internal(error.to_string()))?,
+        serde_json::to_string_pretty(&child.blockers)
+            .map_err(|error| Failure::internal(error.to_string()))?,
+        guidance.unwrap_or("No prior operator resolution."),
+    );
     let event = json!({
         "childId": child.id,
         "runId": run_id,
         "generation": generation,
         "preDigest": pre_digest,
-        "observedRevision": observed_revision,
+        "observedRevision": checkpoint.observed_revision,
+        "integrationSha": checkpoint.integration_sha,
+        "frozenInventory": checkpoint.frozen_inventory,
+        "completedChildEvidence": checkpoint.completed_child_evidence,
+        "rootSnapshot": checkpoint.root_snapshot,
+        "targetSnapshot": checkpoint.target_snapshot,
         "planningInput": input_path,
-        "started": started,
+        "planningInputBody": input,
     });
     append(ctx, &config.epic_id, PLAN_STARTED, event.clone()).await?;
-    Ok(json!({"planning": event}))
+    let state = planning_state(&event, generation)?;
+    let started = ensure_planning_run(ctx, config, &state).await?;
+    Ok(json!({"planning": event, "started": started}))
+}
+
+fn target_structure(snapshot: &Value) -> Value {
+    let mut value = snapshot.clone();
+    if let Some(object) = value.as_object_mut() {
+        for key in ["status", "assignee", "revision", "fields"] {
+            object.remove(key);
+        }
+    }
+    value
+}
+
+fn checkpoint_drift(
+    state: &PlanningState,
+    current: &PlanningCheckpoint,
+    post_digest: &str,
+) -> Result<(), String> {
+    // Old PLAN_STARTED events carry none of these fields. Preserve their
+    // exact legacy apply behavior instead of inventing a current checkpoint.
+    let Some(expected_sha) = state.integration_sha.as_deref() else {
+        return Ok(());
+    };
+    let expected_inventory = state
+        .inventory
+        .as_ref()
+        .ok_or_else(|| "durable planning checkpoint has no frozen inventory".to_owned())?;
+    let expected_completed = state
+        .completed_evidence
+        .as_ref()
+        .ok_or_else(|| "durable planning checkpoint has no completed-child evidence".to_owned())?;
+    let expected_root = state
+        .root_snapshot
+        .as_ref()
+        .ok_or_else(|| "durable planning checkpoint has no root snapshot".to_owned())?;
+    let expected_target = state
+        .target_snapshot
+        .as_ref()
+        .ok_or_else(|| "durable planning checkpoint has no target snapshot".to_owned())?;
+    if current.integration_sha != expected_sha {
+        return Err(format!(
+            "integration SHA changed: frozen {expected_sha}, live {}",
+            current.integration_sha
+        ));
+    }
+    if &current.frozen_inventory != expected_inventory {
+        return Err("frozen epic inventory no longer matches its live membership".to_owned());
+    }
+    if &current.completed_child_evidence != expected_completed {
+        return Err("completed-child evidence changed during planning".to_owned());
+    }
+    if &current.root_snapshot != expected_root {
+        return Err("epic root authority or structure changed during planning".to_owned());
+    }
+    let current_fields = current
+        .target_snapshot
+        .get("fields")
+        .cloned()
+        .ok_or_else(|| "live target snapshot has no fields".to_owned())?;
+    let current_fields: NativeBeadSpecV1 = serde_json::from_value(current_fields)
+        .map_err(|error| format!("live target fields are invalid: {error}"))?;
+    let current_digest = fields_digest(&current_fields).map_err(|error| error.message)?;
+    let recovered_post = current_digest == post_digest
+        && current
+            .target_snapshot
+            .get("status")
+            .and_then(Value::as_str)
+            == Some("open")
+        && current
+            .target_snapshot
+            .get("assignee")
+            .is_none_or(Value::is_null);
+    if recovered_post {
+        if target_structure(&current.target_snapshot) != target_structure(expected_target) {
+            return Err("planning target structure changed before post-image recovery".to_owned());
+        }
+        return Ok(());
+    }
+    if &current.target_snapshot != expected_target {
+        return Err("planning target authority, structure, custody, or fields changed".to_owned());
+    }
+    if state.observed_revision != current.observed_revision {
+        return Err(format!(
+            "planning target revision changed: frozen {:?}, live {:?}",
+            state.observed_revision, current.observed_revision
+        ));
+    }
+    Ok(())
 }
 
 async fn apply_planning_result(
     ctx: &Ctx,
-    config: &EpicConfig,
+    view: &EpicView,
     child: &FrozenChild,
     state: &PlanningState,
     candidate: crate::adapters::execute::PlanCandidate,
 ) -> Result<Step, Failure> {
+    let config = &view.config;
     let post_fields = candidate.spec;
     let traceability = candidate.traceability;
     let post_digest = fields_digest(&post_fields)?;
+    let initial_issue = forged_beads::show_issue(&ctx.config.bd_config(), &child.id).await?;
+    let initial_digest = fields_digest(&native_fields(&initial_issue))?;
+    if initial_digest == state.pre_digest
+        && (initial_issue.status != "blocked" || initial_issue.assignee.is_some())
+    {
+        let input = require_input(
+            ctx,
+            &config.epic_id,
+            "planning-stub-custody-changed",
+            Some(&child.id),
+            format!(
+                "stub is {:?} under assignee {:?}; expected blocked and unassigned",
+                initial_issue.status, initial_issue.assignee
+            ),
+        )
+        .await?;
+        return Ok(Step::Stop(input));
+    }
+    if state.integration_sha.is_some() {
+        let checkpoint = match capture_planning_checkpoint(ctx, view, child).await {
+            Ok(checkpoint) => checkpoint,
+            Err(error) => {
+                let input = require_input_with_evidence(
+                    ctx,
+                    &config.epic_id,
+                    "planning-checkpoint-unavailable",
+                    Some(&child.id),
+                    error.message.clone(),
+                    Some(json!({"error": error.message})),
+                )
+                .await?;
+                return Ok(Step::Stop(input));
+            }
+        };
+        if let Err(detail) = checkpoint_drift(state, &checkpoint, &post_digest) {
+            let input = require_input_with_evidence(
+                ctx,
+                &config.epic_id,
+                "planning-checkpoint-drift",
+                Some(&child.id),
+                detail.clone(),
+                Some(json!({
+                    "detail": detail,
+                    "generation": state.generation,
+                    "expected": {
+                        "integrationSha": state.integration_sha,
+                        "frozenInventory": state.inventory,
+                        "completedChildEvidence": state.completed_evidence,
+                        "rootSnapshot": state.root_snapshot,
+                        "targetSnapshot": state.target_snapshot,
+                    },
+                    "observed": {
+                        "integrationSha": checkpoint.integration_sha,
+                        "frozenInventory": checkpoint.frozen_inventory,
+                        "completedChildEvidence": checkpoint.completed_child_evidence,
+                        "rootSnapshot": checkpoint.root_snapshot,
+                        "targetSnapshot": checkpoint.target_snapshot,
+                    },
+                })),
+            )
+            .await?;
+            return Ok(Step::Stop(input));
+        }
+    }
     let issue = forged_beads::show_issue(&ctx.config.bd_config(), &child.id).await?;
-    let observed_revision = issue.revision.clone();
+    let observed_revision = state
+        .observed_revision
+        .clone()
+        .or_else(|| issue.revision.clone());
     let current_digest = fields_digest(&native_fields(&issue))?;
     if current_digest != state.pre_digest && current_digest != post_digest {
         let input = require_input(
@@ -2067,7 +2517,7 @@ async fn apply_planning_result(
         "epic_plan_apply",
         Some(&config.epic_id),
         Some(&child.id),
-        None,
+        Some(i64::from(state.generation)),
     );
     let epic_id = config.epic_id.clone();
     let effect_epic_id = epic_id.clone();
@@ -2075,6 +2525,7 @@ async fn apply_planning_result(
     let pre_digest = state.pre_digest.clone();
     let post_for_effect = post_fields.clone();
     let post_digest_for_effect = post_digest.clone();
+    let checkpoint_state = state.clone();
     let applied = safe_effect(
         ctx,
         "epic_plan_apply",
@@ -2089,6 +2540,22 @@ async fn apply_planning_result(
             "traceability": traceability,
         }),
         move |_operation| async move {
+            if checkpoint_state.integration_sha.is_some() {
+                let live_view = project(ctx, &effect_epic_id).await?;
+                let live_child = live_view
+                    .config
+                    .children
+                    .iter()
+                    .find(|candidate| candidate.id == child_id)
+                    .ok_or_else(|| {
+                        Failure::invalid(format!(
+                            "planning stub {child_id:?} left the frozen inventory"
+                        ))
+                    })?;
+                let checkpoint = capture_planning_checkpoint(ctx, &live_view, live_child).await?;
+                checkpoint_drift(&checkpoint_state, &checkpoint, &post_digest_for_effect)
+                    .map_err(Failure::invalid)?;
+            }
             let current = forged_beads::show_issue(&ctx.config.bd_config(), &child_id).await?;
             let digest = fields_digest(&native_fields(&current))?;
             if digest == post_digest_for_effect
@@ -2125,9 +2592,31 @@ async fn apply_planning_result(
             let current = forged_beads::show_issue(&ctx.config.bd_config(), &child.id).await?;
             let digest = fields_digest(&native_fields(&current))?;
             if digest != post_digest || current.status != "open" || current.assignee.is_some() {
-                return Err(error);
+                let input = require_input_with_evidence(
+                    ctx,
+                    &config.epic_id,
+                    "planning-guarded-apply-refused",
+                    Some(&child.id),
+                    error.message.clone(),
+                    Some(json!({
+                        "error": error.message,
+                        "generation": state.generation,
+                        "observedRevision": current.revision,
+                        "observedDigest": digest,
+                        "observedStatus": current.status,
+                        "observedAssignee": current.assignee,
+                    })),
+                )
+                .await?;
+                return Ok(Step::Stop(input));
             }
-            json!({"id": current.id, "status": current.status, "recovered": true})
+            json!({
+                "id": current.id,
+                "status": current.status,
+                "revision": current.revision,
+                "readback": current,
+                "recovered": true,
+            })
         }
     };
     forged_git::retire_worktree(
@@ -2155,6 +2644,7 @@ async fn apply_planning_result(
         "runId": state.run_id,
         "observedRevision": observed_revision,
         "postRevision": post_image.revision,
+        "postReadback": post_image,
         "preDigest": state.pre_digest,
         "postDigest": post_digest,
         "result": {
@@ -2511,7 +3001,7 @@ async fn planning_after_completed_wave(
     Ok(Some(Step::Progress(
         start_planning(
             ctx,
-            &view.config,
+            view,
             child,
             view.planning_generations
                 .get(&child.id)
@@ -2539,7 +3029,8 @@ async fn advance_once(ctx: &Ctx, epic: &str) -> Result<Step, Failure> {
         return Ok(Step::Progress(ensure_integration(ctx, &view.config).await?));
     }
 
-    let live = forged_beads::epic_children(&ctx.config.bd_config(), epic).await?;
+    let (live, live_legacy_non_parent) =
+        forged_beads::epic_children_with_legacy(&ctx.config.bd_config(), epic).await?;
     let issues = live
         .into_iter()
         .map(|issue| (issue.id.clone(), issue))
@@ -2563,6 +3054,9 @@ async fn advance_once(ctx: &Ctx, epic: &str) -> Result<Step, Failure> {
         else {
             continue;
         };
+        if planning.integration_sha.is_some() {
+            ensure_planning_run(ctx, &view.config, planning).await?;
+        }
         let run = super::drive::project(ctx, &planning.run_id).await?;
         if run.run.state == RunState::Stopped {
             if run.run.terminal_outcome == Some(RunOutcome::Clean) {
@@ -2577,7 +3071,7 @@ async fn advance_once(ctx: &Ctx, epic: &str) -> Result<Step, Failure> {
                     .await?;
                     return Ok(Step::Stop(input));
                 };
-                return apply_planning_result(ctx, &view.config, child, planning, candidate).await;
+                return apply_planning_result(ctx, &view, child, planning, candidate).await;
             }
             let terminal = planning_protocol_terminal(ctx, &planning.run_id).await?;
             let amendment = terminal
@@ -2831,11 +3325,36 @@ async fn advance_once(ctx: &Ctx, epic: &str) -> Result<Step, Failure> {
             if let Some(step) = planning_after_completed_wave(ctx, &view, &statuses).await? {
                 return Ok(step);
             }
-            let ready = forged_beads::ready_epic_children(&ctx.config.bd_config(), epic)
-                .await?
-                .into_iter()
-                .map(|issue| (issue.id.clone(), issue))
-                .collect::<BTreeMap<_, _>>();
+            let frozen_ids = view
+                .config
+                .children
+                .iter()
+                .map(|child| child.id.clone())
+                .collect::<BTreeSet<_>>();
+            let legacy_non_parent = if view.config.legacy_membership_recorded {
+                view.config
+                    .children
+                    .iter()
+                    .filter(|child| child.legacy_non_parent)
+                    .map(|child| child.id.clone())
+                    .filter(|id| live_legacy_non_parent.contains(id))
+                    .collect::<Vec<_>>()
+            } else {
+                live_legacy_non_parent
+                    .iter()
+                    .filter(|id| frozen_ids.contains(*id))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            };
+            let ready = forged_beads::ready_frozen_epic_children(
+                &ctx.config.bd_config(),
+                epic,
+                &legacy_non_parent,
+            )
+            .await?
+            .into_iter()
+            .map(|issue| (issue.id.clone(), issue))
+            .collect::<BTreeMap<_, _>>();
             let mut frontier = view
                 .config
                 .children
@@ -3406,5 +3925,37 @@ pub async fn epic_resolve(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
     match result {
         Ok(value) => ok_response(&key, false, value),
         Err(error) => err_response(&key, &error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_start_and_plan_events_keep_legacy_defaults() {
+        assert!(!rolling_authorized(&json!({
+            "schema": "forged.epic/1",
+            "epicId": "legacy",
+        })));
+        let state = planning_state(
+            &json!({
+                "childId": "legacy-child",
+                "runId": "legacy-child-epic-plan",
+                "preDigest": "old-digest",
+            }),
+            1,
+        )
+        .expect("old PLAN_STARTED remains readable");
+        assert_eq!(state.run_id, "legacy-child-epic-plan");
+        assert_eq!(state.pre_digest, "old-digest");
+        assert_eq!(state.generation, 1);
+        assert!(state.observed_revision.is_none());
+        assert!(state.integration_sha.is_none());
+        assert!(state.inventory.is_none());
+        assert!(state.completed_evidence.is_none());
+        assert!(state.root_snapshot.is_none());
+        assert!(state.target_snapshot.is_none());
+        assert!(state.input_body.is_none());
     }
 }

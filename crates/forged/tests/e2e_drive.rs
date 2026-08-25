@@ -553,6 +553,48 @@ fn prepare_reviewed_rolling_plan(env: &TestEnv) -> usize {
 }
 
 #[test]
+fn rolling_plan_worktree_uses_the_persisted_integration_sha() {
+    let env = TestEnv::new("forged-rolling-frozen-sha");
+    start_rolling_plan(&env);
+    let started = env
+        .ledger()
+        .list_events(Some("epic-rolling"), 0, 65_536)
+        .expect("epic events")
+        .into_iter()
+        .find(|event| event.kind == "forged.epic.plan.started")
+        .expect("planning checkpoint");
+    let checkpoint: Value =
+        serde_json::from_str(&started.payload_json).expect("planning checkpoint payload");
+    let frozen = checkpoint["integrationSha"]
+        .as_str()
+        .expect("durable integration sha")
+        .to_owned();
+    assert_eq!(
+        frozen,
+        rev_parse(&env.repos.origin, "refs/heads/forged/epic-epic-rolling")
+    );
+
+    git(&env.repos.origin, &["checkout", "forged/epic-epic-rolling"]);
+    std::fs::write(env.repos.origin.join("integration-drift.txt"), "drift\n")
+        .expect("advance integration branch");
+    git(&env.repos.origin, &["add", "integration-drift.txt"]);
+    git(&env.repos.origin, &["commit", "-m", "advance integration"]);
+    assert_ne!(
+        frozen,
+        rev_parse(&env.repos.origin, "refs/heads/forged/epic-epic-rolling")
+    );
+
+    let (code, refused) = env.forged(&["epic", "advance", "--epic", "epic-rolling"]);
+    assert_ne!(
+        code, 0,
+        "a moved integration ref must fail closed: {refused}"
+    );
+    assert!(refused["error"]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("base sha mismatch")));
+}
+
+#[test]
 fn blocking_plan_review_resolves_into_a_fresh_child_bound_cycle() {
     let env = TestEnv::new("forged-rolling-block-resolve");
     let gh_before_plan = start_rolling_plan(&env);
@@ -766,6 +808,30 @@ fn rolling_epic_plans_applies_and_opens_the_next_wave_without_manual_handoff() {
     assert!(planned["planning"]["preDigest"].is_string());
     assert!(planned["planning"]["postDigest"].is_string());
     assert!(planned["planning"]["postRevision"].is_string());
+    let events = env
+        .ledger()
+        .list_events(Some("epic-rolling"), 0, 65_536)
+        .expect("epic events");
+    let started = events
+        .iter()
+        .find(|event| event.kind == "forged.epic.plan.started")
+        .expect("planning checkpoint");
+    let started: Value = serde_json::from_str(&started.payload_json).expect("started payload");
+    assert!(started["integrationSha"].is_string());
+    assert!(started["frozenInventory"]["members"].is_array());
+    assert!(started["completedChildEvidence"].is_array());
+    assert!(started["rootSnapshot"].is_object());
+    assert!(started["targetSnapshot"].is_object());
+    let applied_event = events
+        .iter()
+        .find(|event| event.kind == "forged.epic.plan.applied")
+        .expect("applied event");
+    let applied_event: Value =
+        serde_json::from_str(&applied_event.payload_json).expect("applied payload");
+    assert_eq!(
+        applied_event["postReadback"]["revision"],
+        applied_event["postRevision"]
+    );
     assert_eq!(
         planned["planning"]["result"]["traceability"]["requirements"][0],
         json!("preserve the frozen epic outcome")
@@ -845,6 +911,33 @@ fn assigned_blocked_stub_blocks_apply_and_preserves_child_artifacts() {
             .count(),
         0,
         "custody refusal performs no guarded update"
+    );
+}
+
+#[test]
+fn structural_stub_drift_blocks_apply_with_exact_checkpoint_evidence() {
+    let env = TestEnv::new("forged-rolling-structural-drift");
+    prepare_reviewed_rolling_plan(&env);
+    env.set_bead_field("child-stub", "title", "Retitled outside the rolling cycle");
+    let worktree = env.worktree("child-stub-epic-plan");
+
+    let (code, held) = env.forged(&["epic", "advance", "--epic", "epic-rolling"]);
+    assert_eq!(code, 0, "structural drift becomes typed epic input: {held}");
+    assert_eq!(
+        held["result"]["stopped"]["code"],
+        json!("planning-checkpoint-drift")
+    );
+    assert_eq!(held["result"]["stopped"]["childId"], json!("child-stub"));
+    assert!(held["result"]["stopped"]["evidence"]["expected"]["targetSnapshot"].is_object());
+    assert!(held["result"]["stopped"]["evidence"]["observed"]["targetSnapshot"].is_object());
+    assert!(worktree.exists(), "drift preserves planning artifacts");
+    assert_eq!(
+        env.bd_calls()
+            .iter()
+            .filter(|call| call.starts_with("update child-stub "))
+            .count(),
+        0,
+        "structural drift performs no Beads write"
     );
 }
 
@@ -979,6 +1072,10 @@ fn rolling_plan_apply_recovers_exact_post_image_without_a_second_beads_write() {
     ledger.close().expect("close ledger");
     assert!(applied_payload["observedRevision"].is_string());
     assert!(applied_payload["postRevision"].is_string());
+    assert_eq!(
+        applied_payload["postReadback"]["revision"],
+        applied_payload["postRevision"]
+    );
     assert_eq!(
         applied_payload["postDigest"],
         recovered["result"]["progress"]["postDigest"]

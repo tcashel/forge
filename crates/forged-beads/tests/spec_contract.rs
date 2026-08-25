@@ -17,9 +17,9 @@ mod support;
 use std::path::Path;
 
 use forged_beads::{
-    apply_native_spec_to_blocked_stub, assign_unassigned_issue, plan_inventory,
-    ready_epic_children, show_issue, NativeSpecUpdate, PlanDependencyStatus, PlanDependencyType,
-    PlanReadiness, BLOCKED_CLAIM_REFUSAL,
+    apply_native_spec_to_blocked_stub, assign_unassigned_issue, epic_children_with_legacy,
+    plan_inventory, ready_epic_children, ready_frozen_epic_children, show_issue, NativeSpecUpdate,
+    PlanDependencyStatus, PlanDependencyType, PlanReadiness, BLOCKED_CLAIM_REFUSAL,
 };
 use serde_json::{json, Value};
 
@@ -97,6 +97,48 @@ async fn epic_ready_frontier_is_parent_scoped_and_uncapped() {
         ready.len(),
         105,
         "the bd default page must not hide children"
+    );
+}
+
+#[tokio::test]
+async fn frozen_legacy_non_parent_members_join_without_a_global_ready_scan() {
+    let _guard = support::HomeBeadsGuard::new();
+    let Some(bd) = support::require_bd() else {
+        return;
+    };
+    let s = support::scratch("ready-epic-legacy-union");
+    support::init_store(&bd, &s);
+    let epic = create_epic(&bd, &s, "legacy rolling epic");
+    let legacy = support::create_bead(&bd, &s, "legacy dependency child");
+    let unrelated = support::create_bead(&bd, &s, "unrelated ready issue");
+    let edge = support::raw_bd(
+        &bd,
+        &s,
+        &["dep", "add", &epic, &legacy, "--type", "blocks", "--json"],
+    )
+    .output()
+    .expect("spawning legacy dependency edge");
+    assert!(
+        edge.status.success(),
+        "pinned bd refused the legacy edge: {}",
+        String::from_utf8_lossy(&edge.stderr)
+    );
+
+    let (_, frozen_legacy) = epic_children_with_legacy(&support::cfg_for(&bd, &s), &epic)
+        .await
+        .expect("freeze legacy inventory");
+    assert_eq!(frozen_legacy, [legacy.clone()].into_iter().collect());
+    let ready = ready_frozen_epic_children(
+        &support::cfg_for(&bd, &s),
+        &epic,
+        &frozen_legacy.into_iter().collect::<Vec<_>>(),
+    )
+    .await
+    .expect("bounded legacy union");
+    assert!(ready.iter().any(|issue| issue.id == legacy));
+    assert!(
+        ready.iter().all(|issue| issue.id != unrelated),
+        "an operator-global ready issue must not leak into the epic frontier"
     );
 }
 

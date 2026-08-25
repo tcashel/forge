@@ -73,6 +73,23 @@ pub async fn prepare_worktree(spec: &WorktreeSpec) -> Result<PreparedWorktree, G
     let worktree = run_dir.join("worktree");
 
     if worktree.exists() || registered_worktree(&spec.repo, &worktree).await? {
+        if worktree.exists() {
+            if let Some(expected) = &spec.expected_base_sha {
+                let head = git_output(
+                    &worktree,
+                    ["rev-parse", "--verify", "--end-of-options", "HEAD"],
+                )
+                .await?;
+                require_success(&head, "git rev-parse existing worktree HEAD")?;
+                let actual = String::from_utf8_lossy(&head.stdout).trim().to_owned();
+                if *expected != actual {
+                    return Err(GitError::BaseShaMismatch {
+                        expected: expected.clone(),
+                        actual,
+                    });
+                }
+            }
+        }
         return Err(GitError::WorktreeExists {
             path: worktree.to_string_lossy().into_owned(),
         });

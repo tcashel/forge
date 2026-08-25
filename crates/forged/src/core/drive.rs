@@ -1143,13 +1143,18 @@ async fn machine_effect(
 ) -> Result<Value, Failure> {
     match step {
         MachineStage::Resolve => {
+            let expected_base_sha = if planning {
+                super::epic::planning_base_sha(ctx, &run.run_id).await?
+            } else {
+                None
+            };
             let spec = forged_git::WorktreeSpec {
                 repo: PathBuf::from(&run.repo),
                 runs_root: ctx.config.runs_root.clone(),
                 run_id: run.run_id.clone(),
                 branch: run.branch.clone(),
                 base: run.base_ref.clone(),
-                expected_base_sha: None,
+                expected_base_sha,
             };
             let prepared = match forged_git::prepare_worktree(&spec).await {
                 Ok(prepared) => Some(prepared),

@@ -1147,27 +1147,47 @@ pub async fn work_map_plan_inventory(
     })
 }
 
-/// Read an epic's inventory. Native parent/child links are preferred, with
-/// the Anvil-compatible epic-depends-on-children encoding unioned in.
-pub async fn epic_children(cfg: &BdConfig, epic: &str) -> Result<Vec<IssueSummary>, BdError> {
+/// Read an epic's frozen inventory and identify legacy dependency-linked
+/// members which have no native parent edge.
+///
+/// The returned id set is bounded by the epic's own dependency list. It is
+/// retained by the epic start event so later readiness checks never widen
+/// into an operator-global scan.
+pub async fn epic_children_with_legacy(
+    cfg: &BdConfig,
+    epic: &str,
+) -> Result<(Vec<IssueSummary>, BTreeSet<String>), BdError> {
     let native = invoke::read(cfg, &["children", epic, "--json"]).await?;
     let shown = invoke::read(cfg, &["show", epic, "--json"]).await?;
     let mut children: BTreeMap<String, IssueSummary> = list(&native)
         .into_iter()
         .map(|item| (item.id.clone(), item))
         .collect();
+    let native_ids = children.keys().cloned().collect::<BTreeSet<_>>();
+    let mut legacy = BTreeSet::new();
     if let Some(root) = envelope::first_obj(&shown) {
         if let Some(dependencies) = root.get("dependencies").and_then(Value::as_array) {
             for dependency in dependencies {
                 if let Some(item) = issue(dependency) {
                     if item.id != epic {
+                        if !native_ids.contains(&item.id) {
+                            legacy.insert(item.id.clone());
+                        }
                         children.entry(item.id.clone()).or_insert(item);
                     }
                 }
             }
         }
     }
-    Ok(children.into_values().collect())
+    Ok((children.into_values().collect(), legacy))
+}
+
+/// Read an epic's inventory. Native parent/child links are preferred, with
+/// the Anvil-compatible epic-depends-on-children encoding unioned in.
+pub async fn epic_children(cfg: &BdConfig, epic: &str) -> Result<Vec<IssueSummary>, BdError> {
+    epic_children_with_legacy(cfg, epic)
+        .await
+        .map(|(children, _)| children)
 }
 
 /// Read the current global ready frontier without claiming anything.
@@ -1180,6 +1200,28 @@ pub async fn ready_issues(cfg: &BdConfig) -> Result<Vec<IssueSummary>, BdError> 
 pub async fn ready_epic_children(cfg: &BdConfig, epic: &str) -> Result<Vec<IssueSummary>, BdError> {
     let data = invoke::read(cfg, &["ready", "--parent", epic, "--limit", "0", "--json"]).await?;
     Ok(list(&data))
+}
+
+/// Read the complete native-parent frontier and union only the exact frozen
+/// legacy dependency-linked members whose hydrated facts prove them ready.
+///
+/// This deliberately performs no global `bd ready` or capped inventory scan.
+pub async fn ready_frozen_epic_children(
+    cfg: &BdConfig,
+    epic: &str,
+    legacy_non_parent: &[String],
+) -> Result<Vec<IssueSummary>, BdError> {
+    let mut ready = ready_epic_children(cfg, epic)
+        .await?
+        .into_iter()
+        .map(|issue| (issue.id.clone(), issue))
+        .collect::<BTreeMap<_, _>>();
+    for row in plan_issues(cfg, legacy_non_parent).await? {
+        if row.parent.is_none() && row.readiness() == PlanReadiness::Ready {
+            ready.entry(row.issue.id.clone()).or_insert(row.issue);
+        }
+    }
+    Ok(ready.into_values().collect())
 }
 
 /// Persist one complete rolling-plan result and make the stub schedulable.

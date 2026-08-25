@@ -33,11 +33,12 @@ pub use config::BdConfig;
 pub use doctor::{run_doctor, DoctorConfig, ProbeResult};
 pub use graph::{
     apply_native_spec_to_blocked_stub, assign_unassigned_issue, close_held_issue, close_issue,
-    comment_once, comment_present, epic_children, list_issues, list_issues_for_repository,
-    plan_inventory, plan_issues, ready_epic_children, ready_issues, release_issue,
-    release_unresolved_issue, reopen_issue, show_issue, work_map_plan_inventory, IssueSummary,
-    NativeSpecUpdate, PlanDependency, PlanDependencyStatus, PlanDependencyType, PlanInventory,
-    PlanIssue, PlanReadiness, WorkMapPlanInventory, WorkMapPlanScope,
+    comment_once, comment_present, epic_children, epic_children_with_legacy, list_issues,
+    list_issues_for_repository, plan_inventory, plan_issues, ready_epic_children,
+    ready_frozen_epic_children, ready_issues, release_issue, release_unresolved_issue,
+    reopen_issue, show_issue, work_map_plan_inventory, IssueSummary, NativeSpecUpdate,
+    PlanDependency, PlanDependencyStatus, PlanDependencyType, PlanInventory, PlanIssue,
+    PlanReadiness, WorkMapPlanInventory, WorkMapPlanScope,
 };
 pub use guardian::{run_guardian, GuardianConfig, GuardianExit};
 pub use lease::{

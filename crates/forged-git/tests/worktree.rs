@@ -170,6 +170,35 @@ async fn second_prepare_for_same_run_id_is_refused() {
 }
 
 #[tokio::test]
+async fn reused_worktree_must_still_match_its_frozen_base_sha() {
+    let repos = setup_repos(BASE);
+    let prepared = prepare(&repos, "run-1", "feat/run-1").await;
+    let frozen = prepared.base_sha.clone();
+    let mut replay = spec(&repos, "run-1", "feat/run-1");
+    replay.expected_base_sha = Some(frozen.clone());
+    let same = prepare_worktree(&replay)
+        .await
+        .expect_err("matching replay still reports the existing worktree");
+    assert!(matches!(same, GitError::WorktreeExists { .. }));
+
+    commit_file(
+        &prepared.worktree,
+        "unexpected.txt",
+        "advanced\n",
+        "unexpected advance",
+    );
+    let advanced = rev_parse(&prepared.worktree, "HEAD");
+    let drift = prepare_worktree(&replay)
+        .await
+        .expect_err("reused worktree cannot hide base drift");
+    assert!(matches!(
+        drift,
+        GitError::BaseShaMismatch { expected, actual }
+            if expected == frozen && actual == advanced
+    ));
+}
+
+#[tokio::test]
 async fn invalid_run_id_is_refused_before_anything_runs() {
     let repos = setup_repos(BASE);
     for bad in ["../evil", "a/b", "-run", ""] {
