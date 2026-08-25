@@ -18,6 +18,8 @@ const FIX_SRC: &str = include_str!("../templates/fix.md.j2");
 const EPIC_PLAN_SRC: &str = include_str!("../templates/epic-plan.md.j2");
 const EPIC_PLAN_REVIEW_SRC: &str = include_str!("../templates/epic-plan-review.md.j2");
 const EPIC_PLAN_REVISION_SRC: &str = include_str!("../templates/epic-plan-revision.md.j2");
+const EPIC_ASSURANCE_REVIEW_SRC: &str = include_str!("../templates/epic-assurance-review.md.j2");
+const EPIC_ASSURANCE_FIX_SRC: &str = include_str!("../templates/epic-assurance-fix.md.j2");
 
 /// Which prompt template a packet renders.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,6 +36,10 @@ pub enum PromptStage {
     EpicPlanReview,
     /// Revise one exact native child spec candidate from critique findings.
     EpicPlanRevision,
+    /// Review one exact, materialized integrated-epic evidence bundle.
+    EpicAssuranceReview,
+    /// Remediate integrated-epic findings on the frozen integration branch.
+    EpicAssuranceFix,
 }
 
 impl PromptStage {
@@ -111,6 +117,33 @@ impl PromptStage {
                 "packet_id",
                 "result_schema",
             ],
+            PromptStage::EpicAssuranceReview => &[
+                "bead_id",
+                "pr_number",
+                "evidence_path",
+                "head_sha",
+                "review_evidence",
+                "risk_context",
+                "is_synthesis",
+                "packet_id",
+                "result_schema",
+            ],
+            PromptStage::EpicAssuranceFix => &[
+                "bead_id",
+                "pr_number",
+                "worktree",
+                "branch",
+                "round",
+                "total_rounds",
+                "gate_commands",
+                "push_url",
+                "evidence_path",
+                "reviewed_head_sha",
+                "findings",
+                "field_notes",
+                "packet_id",
+                "result_schema",
+            ],
         }
     }
 
@@ -124,6 +157,8 @@ impl PromptStage {
             PromptStage::Fix => "forged.result.fix/1",
             PromptStage::EpicPlan | PromptStage::EpicPlanRevision => "forged.result.epic-plan/1",
             PromptStage::EpicPlanReview => "forged.result.review/1",
+            PromptStage::EpicAssuranceReview => "forged.result.review/1",
+            PromptStage::EpicAssuranceFix => "forged.result.fix/1",
         }
     }
 
@@ -136,6 +171,8 @@ impl PromptStage {
             PromptStage::EpicPlan => "epic-plan",
             PromptStage::EpicPlanReview => "epic-plan-review",
             PromptStage::EpicPlanRevision => "epic-plan-revision",
+            PromptStage::EpicAssuranceReview => "epic-assurance-review",
+            PromptStage::EpicAssuranceFix => "epic-assurance-fix",
         }
     }
 
@@ -203,6 +240,35 @@ impl PromptStage {
                 "packet_id": "pkt-1",
                 "result_schema": self.result_schema(),
             }),
+            PromptStage::EpicAssuranceReview => json!({
+                "bead_id": "epic-1",
+                "pr_number": 7,
+                "evidence_path": "/tmp/runs/epic-1/assurance/round-0.md",
+                "head_sha": "0123456789abcdef",
+                "review_evidence": [],
+                "risk_context": "Routine change.",
+                "is_synthesis": false,
+                "packet_id": "pkt-1",
+                "result_schema": self.result_schema(),
+            }),
+            PromptStage::EpicAssuranceFix => json!({
+                "bead_id": "epic-1",
+                "pr_number": 7,
+                "worktree": "/tmp/worktrees/epic-1",
+                "branch": "forged/epic-epic-1",
+                "round": 1,
+                "total_rounds": 1,
+                "gate_commands": ["cargo test --workspace"],
+                "push_url": "https://example.invalid/repo.git",
+                "evidence_path": "/tmp/runs/epic-1/assurance/round-0.md",
+                "reviewed_head_sha": "0123456789abcdef",
+                "findings": [
+                    {"severity": "HIGH", "location": "gate:cargo test", "message": "gate failed"}
+                ],
+                "field_notes": [],
+                "packet_id": "pkt-1",
+                "result_schema": self.result_schema(),
+            }),
         }
     }
 }
@@ -267,6 +333,8 @@ impl PromptTemplates {
             (PromptStage::EpicPlan, EPIC_PLAN_SRC),
             (PromptStage::EpicPlanReview, EPIC_PLAN_REVIEW_SRC),
             (PromptStage::EpicPlanRevision, EPIC_PLAN_REVISION_SRC),
+            (PromptStage::EpicAssuranceReview, EPIC_ASSURANCE_REVIEW_SRC),
+            (PromptStage::EpicAssuranceFix, EPIC_ASSURANCE_FIX_SRC),
         ])
     }
 

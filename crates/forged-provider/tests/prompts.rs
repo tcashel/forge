@@ -62,6 +62,47 @@ fn epic_plan_context() -> Value {
     })
 }
 
+fn epic_assurance_review_context(is_synthesis: bool) -> Value {
+    json!({
+        "bead_id": "epic-1",
+        "pr_number": 73,
+        "evidence_path": "/tmp/runs/epic-1/assurance/round-0.md",
+        "head_sha": "0123456789abcdef",
+        "review_evidence": if is_synthesis {
+            vec!["seat review-1 outcome: approve"]
+        } else {
+            Vec::<&str>::new()
+        },
+        "risk_context": "High consequence integration.",
+        "is_synthesis": is_synthesis,
+        "packet_id": PACKET_ID,
+        "result_schema": PromptStage::EpicAssuranceReview.result_schema(),
+    })
+}
+
+fn epic_assurance_fix_context() -> Value {
+    json!({
+        "bead_id": "epic-1",
+        "pr_number": 73,
+        "worktree": "/tmp/worktrees/epic-1",
+        "branch": "forged/epic-epic-1",
+        "round": 1,
+        "total_rounds": 2,
+        "gate_commands": ["cargo test --workspace"],
+        "push_url": "https://example.invalid/repo.git",
+        "evidence_path": "/tmp/runs/epic-1/assurance/round-0.md",
+        "reviewed_head_sha": "0123456789abcdef",
+        "findings": [{
+            "severity": "HIGH",
+            "location": "gate:cargo test --workspace",
+            "message": "exit 101; see artifacts/gate.txt"
+        }],
+        "field_notes": [],
+        "packet_id": PACKET_ID,
+        "result_schema": PromptStage::EpicAssuranceFix.result_schema(),
+    })
+}
+
 #[test]
 fn load_succeeds() {
     PromptTemplates::load().expect("the three embedded templates load");
@@ -165,6 +206,47 @@ fn rolling_plan_templates_are_read_only_and_carry_exact_candidates() {
         .expect("revision renders");
     assert!(revised.contains("missing test"));
     assert!(revised.contains(candidate));
+}
+
+#[test]
+fn epic_assurance_review_uses_only_the_exact_materialized_evidence() {
+    let templates = PromptTemplates::load().expect("loads");
+    let independent = templates
+        .render(
+            PromptStage::EpicAssuranceReview,
+            &epic_assurance_review_context(false),
+        )
+        .expect("assurance review renders");
+    assert!(independent.contains("/tmp/runs/epic-1/assurance/round-0.md"));
+    assert!(independent.contains("0123456789abcdef"));
+    assert!(independent.contains("draft PR #73"));
+    assert!(independent.contains("Do not edit the repository"));
+    let flattened = independent.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(flattened.contains("Do not substitute live state"));
+    assert!(!independent.contains("gh pr view"));
+    assert!(!independent.contains("gh pr diff"));
+
+    let synthesis = templates
+        .render(
+            PromptStage::EpicAssuranceReview,
+            &epic_assurance_review_context(true),
+        )
+        .expect("assurance synthesis renders");
+    assert!(synthesis.contains("Do not perform a fresh independent review"));
+    assert!(synthesis.contains("seat review-1 outcome: approve"));
+}
+
+#[test]
+fn epic_assurance_fix_carries_exact_sha_and_failed_gate_evidence() {
+    let rendered = PromptTemplates::load()
+        .expect("loads")
+        .render(PromptStage::EpicAssuranceFix, &epic_assurance_fix_context())
+        .expect("assurance fix renders");
+    assert!(rendered.contains("starting head SHA 0123456789abcdef"));
+    assert!(rendered.contains("[HIGH] gate:cargo test --workspace"));
+    assert!(rendered.contains("exit 101; see artifacts/gate.txt"));
+    assert!(rendered.contains("HEAD to `forged/epic-epic-1`"));
+    assert!(rendered.contains("Do not create another PR"));
 }
 
 #[test]

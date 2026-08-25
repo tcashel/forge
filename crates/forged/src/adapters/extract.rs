@@ -128,6 +128,12 @@ pub(crate) fn validate_result_for_packet(
 ) -> Result<(), String> {
     validate_implement_gate_state(result)?;
     let planning = protocol.is_some_and(|value| value.name == "epic-plan" && value.version == 1);
+    let assurance =
+        protocol.is_some_and(|value| value.name == "epic-assurance" && value.version == 1);
+    let review_seat = matches!(
+        purpose,
+        Some(forged_types::SeatPurpose::Review | forged_types::SeatPurpose::Synthesis)
+    );
     if matches!(result.outcome, forged_types::Outcome::Plan { .. })
         && !(planning
             && matches!(
@@ -140,10 +146,7 @@ pub(crate) fn validate_result_for_packet(
         );
     }
     if planning
-        && matches!(
-            purpose,
-            Some(forged_types::SeatPurpose::Review | forged_types::SeatPurpose::Synthesis)
-        )
+        && review_seat
         && matches!(
             &result.outcome,
             forged_types::Outcome::Review {
@@ -156,10 +159,7 @@ pub(crate) fn validate_result_for_packet(
         return Err("epic-plan requestChanges requires at least one actionable finding".to_owned());
     }
     if planning
-        && matches!(
-            purpose,
-            Some(forged_types::SeatPurpose::Review | forged_types::SeatPurpose::Synthesis)
-        )
+        && review_seat
         && matches!(
             &result.outcome,
             forged_types::Outcome::Review {
@@ -172,6 +172,62 @@ pub(crate) fn validate_result_for_packet(
             "epic-plan scope or authority blockers must return typed specAmendment evidence"
                 .to_owned(),
         );
+    }
+    if assurance && review_seat {
+        match &result.outcome {
+            forged_types::Outcome::Review {
+                verdict: forged_types::Verdict::Approve,
+                findings,
+                ..
+            } if findings.iter().any(|finding| {
+                matches!(
+                    finding.severity,
+                    forged_types::Severity::Blocker | forged_types::Severity::High
+                )
+            }) =>
+            {
+                return Err(
+                    "epic-assurance approve cannot carry blocker or high findings".to_owned(),
+                );
+            }
+            forged_types::Outcome::Review {
+                verdict: forged_types::Verdict::RequestChanges,
+                findings,
+                ..
+            } if findings.is_empty()
+                || findings
+                    .iter()
+                    .any(|finding| finding.message.trim().is_empty()) =>
+            {
+                return Err(
+                    "epic-assurance requestChanges requires at least one actionable finding"
+                        .to_owned(),
+                );
+            }
+            forged_types::Outcome::Review {
+                verdict: forged_types::Verdict::Block,
+                ..
+            } => {
+                return Err(
+                    "epic-assurance scope or authority blockers must return typed specAmendment evidence"
+                        .to_owned(),
+                );
+            }
+            _ => {}
+        }
+    }
+    if assurance {
+        if let forged_types::Outcome::SpecAmendment { amendment } = &result.outcome {
+            if amendment.summary.trim().is_empty()
+                || amendment.evidence.trim().is_empty()
+                || amendment.proposed_change.trim().is_empty()
+            {
+                return Err(
+                    "epic-assurance specAmendment requires summary, evidence, and proposedChange"
+                        .to_owned(),
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -437,6 +493,13 @@ mod tests {
     fn planning_protocol() -> ProtocolRef {
         ProtocolRef {
             name: "epic-plan".to_owned(),
+            version: 1,
+        }
+    }
+
+    fn assurance_protocol() -> ProtocolRef {
+        ProtocolRef {
+            name: "epic-assurance".to_owned(),
             version: 1,
         }
     }
@@ -844,6 +907,142 @@ mod tests {
         });
         assert!(validate_result_for_packet(
             &amendment,
+            Some(&protocol),
+            Some(forged_types::SeatPurpose::Review)
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn assurance_approve_rejects_blocker_and_high_findings() {
+        let protocol = assurance_protocol();
+        for severity in [Severity::Blocker, Severity::High] {
+            let result = packet_result(Outcome::Review {
+                verdict: Verdict::Approve,
+                summary: "looks good".to_owned(),
+                findings: vec![Finding {
+                    severity,
+                    file: Some("src/lib.rs".to_owned()),
+                    line: Some(42),
+                    message: "unresolved defect".to_owned(),
+                }],
+                available: true,
+            });
+            assert!(validate_result_for_packet(
+                &result,
+                Some(&protocol),
+                Some(forged_types::SeatPurpose::Review)
+            )
+            .expect_err("approve must not conceal severe findings")
+            .contains("cannot carry blocker or high"));
+        }
+
+        let low = packet_result(Outcome::Review {
+            verdict: Verdict::Approve,
+            summary: "safe to land".to_owned(),
+            findings: vec![Finding {
+                severity: Severity::Low,
+                file: None,
+                line: None,
+                message: "non-blocking cleanup".to_owned(),
+            }],
+            available: true,
+        });
+        assert!(validate_result_for_packet(
+            &low,
+            Some(&protocol),
+            Some(forged_types::SeatPurpose::Synthesis)
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn assurance_request_changes_requires_actionable_findings() {
+        let protocol = assurance_protocol();
+        for findings in [
+            Vec::new(),
+            vec![Finding {
+                severity: Severity::High,
+                file: None,
+                line: None,
+                message: "  ".to_owned(),
+            }],
+        ] {
+            let result = packet_result(Outcome::Review {
+                verdict: Verdict::RequestChanges,
+                summary: "needs work".to_owned(),
+                findings,
+                available: true,
+            });
+            assert!(validate_result_for_packet(
+                &result,
+                Some(&protocol),
+                Some(forged_types::SeatPurpose::Review)
+            )
+            .expect_err("empty findings are not actionable")
+            .contains("actionable finding"));
+        }
+
+        let actionable = packet_result(Outcome::Review {
+            verdict: Verdict::RequestChanges,
+            summary: "gate evidence exposes a failure".to_owned(),
+            findings: vec![Finding {
+                severity: Severity::High,
+                file: Some("gate:cargo test --workspace".to_owned()),
+                line: None,
+                message: "command exited 101; fix the failing assertion".to_owned(),
+            }],
+            available: true,
+        });
+        assert!(validate_result_for_packet(
+            &actionable,
+            Some(&protocol),
+            Some(forged_types::SeatPurpose::Synthesis)
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn assurance_block_requires_a_complete_typed_spec_amendment() {
+        let protocol = assurance_protocol();
+        let block = packet_result(Outcome::Review {
+            verdict: Verdict::Block,
+            summary: "root authority conflicts".to_owned(),
+            findings: Vec::new(),
+            available: true,
+        });
+        assert!(validate_result_for_packet(
+            &block,
+            Some(&protocol),
+            Some(forged_types::SeatPurpose::Review)
+        )
+        .expect_err("block is not a typed input stop")
+        .contains("typed specAmendment"));
+
+        let incomplete = packet_result(Outcome::SpecAmendment {
+            amendment: SpecAmendment {
+                summary: "root authority conflicts".to_owned(),
+                evidence: " ".to_owned(),
+                proposed_change: "authorize the mutation".to_owned(),
+            },
+        });
+        assert!(validate_result_for_packet(
+            &incomplete,
+            Some(&protocol),
+            Some(forged_types::SeatPurpose::Synthesis)
+        )
+        .expect_err("an empty amendment field must fail")
+        .contains("summary, evidence, and proposedChange"));
+
+        let complete = packet_result(Outcome::SpecAmendment {
+            amendment: SpecAmendment {
+                summary: "root authority conflicts".to_owned(),
+                evidence: "the frozen root excludes dependency mutation".to_owned(),
+                proposed_change: "authorize dependency mutation or drop the criterion".to_owned(),
+            },
+        });
+        assert!(validate_result_for_packet(
+            &complete,
             Some(&protocol),
             Some(forged_types::SeatPurpose::Review)
         )

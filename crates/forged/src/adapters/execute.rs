@@ -4,7 +4,7 @@
 //! the result, and land or fail it. The section-(d) order is load-bearing.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -37,6 +37,22 @@ pub struct PlanCandidate {
     pub traceability: forged_types::PlanTraceabilityV1,
 }
 
+/// Immutable, orchestrator-materialized evidence for one integrated-assurance
+/// round. The provider reads `path`; the typed hashes let the adapter refuse
+/// changed evidence or an unbound repository head before rendering.
+#[derive(Debug, Clone)]
+pub struct AssuranceEvidence {
+    /// Read-only bundle containing the frozen root spec, PR identity, complete
+    /// diff, exact head SHA, and gate rows for that SHA.
+    pub path: PathBuf,
+    /// SHA-256 of the evidence file bytes at durable materialization.
+    pub sha256: String,
+    /// Exact integration HEAD reviewed and gated by this bundle.
+    pub head_sha: String,
+    /// Deterministic actionable findings synthesized from failed gate rows.
+    pub failed_gate_findings: Vec<forged_types::Finding>,
+}
+
 /// Everything packet execution needs beyond the packet itself.
 pub struct ExecutionContext {
     /// Frozen protocol selected by the run's immutable execution package.
@@ -49,6 +65,8 @@ pub struct ExecutionContext {
     pub review_evidence: Vec<String>,
     /// Latest complete rolling-plan candidate, when this is `epic-plan/v1`.
     pub plan_candidate: Option<PlanCandidate>,
+    /// Exact integrated-assurance evidence, only for `epic-assurance/v1`.
+    pub assurance_evidence: Option<AssuranceEvidence>,
     /// Frozen consequence context used to classify review severity.
     pub risk_context: String,
     /// Frozen maximum number of remediation attempts.
@@ -255,6 +273,8 @@ pub fn build_packet(
 ) -> Result<WorkPacket, Failure> {
     let stage = intent.stage;
     let planning = protocol.is_some_and(|value| value.name == "epic-plan" && value.version == 1);
+    let assurance =
+        protocol.is_some_and(|value| value.name == "epic-assurance" && value.version == 1);
     let prompt_stage = if planning {
         match intent.execution.as_ref().map(|value| value.purpose) {
             Some(forged_types::SeatPurpose::Implement) => PromptStage::EpicPlan,
@@ -263,6 +283,18 @@ pub fn build_packet(
             }
             Some(forged_types::SeatPurpose::Fix) => PromptStage::EpicPlanRevision,
             None => PromptStage::for_stage(stage),
+        }
+    } else if assurance {
+        match intent.execution.as_ref().map(|value| value.purpose) {
+            Some(forged_types::SeatPurpose::Review | forged_types::SeatPurpose::Synthesis) => {
+                PromptStage::EpicAssuranceReview
+            }
+            Some(forged_types::SeatPurpose::Fix) => PromptStage::EpicAssuranceFix,
+            _ => {
+                return Err(Failure::internal(
+                    "epic-assurance/v1 cannot build an implement or legacy packet",
+                ))
+            }
         }
     } else {
         PromptStage::for_stage(stage)
@@ -273,6 +305,12 @@ pub fn build_packet(
         .unwrap_or_else(|| format!("{}/{}/{}", run.run_id, stage_str(stage), intent.seq));
     let deliverable = if planning && matches!(stage, Stage::Implement | Stage::Fix) {
         Deliverable::NativeBeadSpec
+    } else if assurance {
+        match prompt_stage {
+            PromptStage::EpicAssuranceReview => Deliverable::ReviewBlock,
+            PromptStage::EpicAssuranceFix => Deliverable::FixCommitsPushed,
+            _ => unreachable!("assurance packet has an assurance prompt"),
+        }
     } else {
         match stage {
             Stage::Implement => Deliverable::CommitsInWorktree,
@@ -286,6 +324,16 @@ pub fn build_packet(
             PromptStage::EpicPlanReview => "critique the exact native specification candidate",
             PromptStage::EpicPlanRevision => "revise the exact candidate from bounded critique",
             _ => unreachable!("planning packet has a planning prompt"),
+        }
+    } else if assurance {
+        match prompt_stage {
+            PromptStage::EpicAssuranceReview => {
+                "review the exact materialized integrated-assurance evidence"
+            }
+            PromptStage::EpicAssuranceFix => {
+                "remediate blocker, high, and failed-gate evidence on the integration branch"
+            }
+            _ => unreachable!("assurance packet has an assurance prompt"),
         }
     } else {
         match stage {
@@ -474,19 +522,164 @@ fn apply_open(
 fn prompt_stage_of(
     packet: &WorkPacket,
     protocol: Option<&forged_types::ProtocolRef>,
-) -> PromptStage {
+) -> Result<PromptStage, Failure> {
     let planning = protocol.is_some_and(|value| value.name == "epic-plan" && value.version == 1);
-    if !planning {
-        return PromptStage::for_stage(packet.stage);
+    if planning {
+        return Ok(match packet.execution.as_ref().map(|value| value.purpose) {
+            Some(forged_types::SeatPurpose::Implement) => PromptStage::EpicPlan,
+            Some(forged_types::SeatPurpose::Review | forged_types::SeatPurpose::Synthesis) => {
+                PromptStage::EpicPlanReview
+            }
+            Some(forged_types::SeatPurpose::Fix) => PromptStage::EpicPlanRevision,
+            None => PromptStage::for_stage(packet.stage),
+        });
     }
-    match packet.execution.as_ref().map(|value| value.purpose) {
-        Some(forged_types::SeatPurpose::Implement) => PromptStage::EpicPlan,
-        Some(forged_types::SeatPurpose::Review | forged_types::SeatPurpose::Synthesis) => {
-            PromptStage::EpicPlanReview
-        }
-        Some(forged_types::SeatPurpose::Fix) => PromptStage::EpicPlanRevision,
-        None => PromptStage::for_stage(packet.stage),
+    let assurance =
+        protocol.is_some_and(|value| value.name == "epic-assurance" && value.version == 1);
+    if assurance {
+        return match packet.execution.as_ref().map(|value| value.purpose) {
+            Some(forged_types::SeatPurpose::Review | forged_types::SeatPurpose::Synthesis) => {
+                Ok(PromptStage::EpicAssuranceReview)
+            }
+            Some(forged_types::SeatPurpose::Fix) => Ok(PromptStage::EpicAssuranceFix),
+            _ => Err(Failure::internal(
+                "epic-assurance/v1 packet has an implement or legacy purpose",
+            )),
+        };
     }
+    Ok(PromptStage::for_stage(packet.stage))
+}
+
+fn assurance_evidence(exec: &ExecutionContext) -> Result<&AssuranceEvidence, Failure> {
+    let evidence = exec
+        .assurance_evidence
+        .as_ref()
+        .ok_or_else(|| Failure::internal("epic-assurance/v1 packet has no frozen evidence"))?;
+    if exec.pr_number.is_none_or(|number| number == 0) {
+        return Err(Failure::internal(
+            "epic-assurance/v1 evidence has no draft PR number",
+        ));
+    }
+    if evidence.head_sha.trim().is_empty() {
+        return Err(Failure::internal(
+            "epic-assurance/v1 evidence has no exact head SHA",
+        ));
+    }
+    let metadata = std::fs::metadata(&evidence.path).map_err(|error| {
+        Failure::invalid(format!(
+            "cannot inspect assurance evidence {}: {error}",
+            evidence.path.display()
+        ))
+    })?;
+    if !metadata.permissions().readonly() {
+        return Err(Failure::invalid(format!(
+            "epic-assurance/v1 evidence is not read-only: {}",
+            evidence.path.display()
+        )));
+    }
+    let actual = sha256_file(&evidence.path)?;
+    if actual != evidence.sha256 {
+        return Err(Failure::invalid(format!(
+            "epic-assurance/v1 evidence digest changed: expected {}, got {actual}",
+            evidence.sha256
+        )));
+    }
+    if evidence.failed_gate_findings.iter().any(|finding| {
+        !matches!(
+            finding.severity,
+            forged_types::Severity::Blocker | forged_types::Severity::High
+        ) || finding.message.trim().is_empty()
+            || !finding
+                .file
+                .as_deref()
+                .is_some_and(|location| location.trim().starts_with("gate:"))
+    }) {
+        return Err(Failure::internal(
+            "epic-assurance/v1 failed gate findings must be blocker/high with a gate: location and actionable message",
+        ));
+    }
+    Ok(evidence)
+}
+
+fn assurance_fix_findings(exec: &ExecutionContext) -> Vec<forged_types::Finding> {
+    let mut findings = exec.findings.clone();
+    if let Some(evidence) = &exec.assurance_evidence {
+        findings.extend(evidence.failed_gate_findings.iter().cloned());
+    }
+    findings.sort_by(|left, right| {
+        let severity = |value| match value {
+            forged_types::Severity::Blocker => 0,
+            forged_types::Severity::High => 1,
+            forged_types::Severity::Medium => 2,
+            forged_types::Severity::Low => 3,
+        };
+        severity(left.severity)
+            .cmp(&severity(right.severity))
+            .then_with(|| left.file.cmp(&right.file))
+            .then_with(|| left.line.cmp(&right.line))
+            .then_with(|| left.message.cmp(&right.message))
+    });
+    findings.dedup_by(|left, right| {
+        left.severity == right.severity
+            && left.file == right.file
+            && left.line == right.line
+            && left.message == right.message
+    });
+    findings
+}
+
+fn assurance_is_synthesis(packet: &WorkPacket) -> bool {
+    packet
+        .execution
+        .as_ref()
+        .is_some_and(|value| value.purpose == forged_types::SeatPurpose::Synthesis)
+}
+
+fn assurance_review_context(
+    exec: &ExecutionContext,
+    packet: &WorkPacket,
+) -> Result<Value, Failure> {
+    let evidence = assurance_evidence(exec)?;
+    let is_synthesis = assurance_is_synthesis(packet);
+    Ok(json!({
+        "bead_id": packet.bead_id,
+        "pr_number": exec.pr_number.unwrap_or(0),
+        "evidence_path": evidence.path.to_string_lossy(),
+        "head_sha": evidence.head_sha,
+        "review_evidence": if is_synthesis {
+            exec.review_evidence.clone()
+        } else {
+            Vec::new()
+        },
+        "risk_context": exec.risk_context,
+        "is_synthesis": is_synthesis,
+        "packet_id": packet.packet_id,
+        "result_schema": packet.result_schema,
+    }))
+}
+
+fn assurance_fix_context(
+    exec: &ExecutionContext,
+    packet: &WorkPacket,
+    fix_round: i64,
+) -> Result<Value, Failure> {
+    let evidence = assurance_evidence(exec)?;
+    Ok(json!({
+        "bead_id": packet.bead_id,
+        "pr_number": exec.pr_number.unwrap_or(0),
+        "worktree": packet.worktree.to_string_lossy(),
+        "branch": packet.branch,
+        "round": fix_round + 1,
+        "total_rounds": i64::from(exec.fix_round_budget),
+        "gate_commands": packet.contract.gate_commands,
+        "push_url": exec.push_url,
+        "evidence_path": evidence.path.to_string_lossy(),
+        "reviewed_head_sha": evidence.head_sha,
+        "findings": forged_provider::normalize_findings(&assurance_fix_findings(exec)),
+        "field_notes": packet.field_notes,
+        "packet_id": packet.packet_id,
+        "result_schema": packet.result_schema,
+    }))
 }
 
 fn render_context(
@@ -495,7 +688,7 @@ fn render_context(
     fix_round: i64,
 ) -> Result<Value, Failure> {
     let worktree = packet.worktree.to_string_lossy().into_owned();
-    let stage = prompt_stage_of(packet, exec.protocol.as_ref());
+    let stage = prompt_stage_of(packet, exec.protocol.as_ref())?;
     let value = match stage {
         PromptStage::Implement => json!({
             "bead_id": packet.bead_id,
@@ -569,6 +762,8 @@ fn render_context(
             "packet_id": packet.packet_id,
             "result_schema": packet.result_schema,
         }),
+        PromptStage::EpicAssuranceReview => return assurance_review_context(exec, packet),
+        PromptStage::EpicAssuranceFix => return assurance_fix_context(exec, packet, fix_round),
     };
     Ok(value)
 }
@@ -1088,7 +1283,7 @@ async fn run_attempt(
         crate::core::spec::materialize(spec, Path::new(&packet.spec.path))?;
         let templates = PromptTemplates::load()?;
         let context = render_context(exec, &packet, seq)?;
-        let prompt_stage = prompt_stage_of(&packet, exec.protocol.as_ref());
+        let prompt_stage = prompt_stage_of(&packet, exec.protocol.as_ref())?;
         let prompt = templates.render(prompt_stage, &context)?;
         crate::core::artifacts::materialize_prompt(&run_root, &dirs, prompt.as_bytes())?;
         Ok::<_, Failure>((packet, interventions, holder, packet_dir))
@@ -2164,7 +2359,105 @@ pub(crate) async fn fail_and_grant_retry(
 
 #[cfg(test)]
 mod tests {
-    use super::workspace_label_for_repo;
+    use std::collections::HashMap;
+
+    use forged_types::{
+        Deliverable, Finding, HostPolicyV1, ProtocolRef, ProviderHints, RoleId, Sandbox,
+        SeatExecutionV1, SeatId, SeatPurpose, Severity, SpecRef, Stage, StageContract, WorkPacket,
+    };
+
+    use super::*;
+
+    fn assurance_packet(purpose: SeatPurpose) -> WorkPacket {
+        let stage = match purpose {
+            SeatPurpose::Review | SeatPurpose::Synthesis => Stage::ReviewClaude,
+            SeatPurpose::Fix => Stage::Fix,
+            SeatPurpose::Implement => Stage::Implement,
+        };
+        WorkPacket {
+            schema: "forged.packet/1".to_owned(),
+            packet_id: format!("run-1/assurance-{purpose:?}/0"),
+            run_id: "run-1".to_owned(),
+            bead_id: "epic-1".to_owned(),
+            stage,
+            execution: Some(SeatExecutionV1 {
+                stage_id: "assurance-review".to_owned(),
+                seat_id: SeatId::new("assurance-seat").expect("seat"),
+                role_id: RoleId::new("reviewer").expect("role"),
+                purpose,
+                round: 0,
+            }),
+            lane_seq: Some(1),
+            spec: SpecRef {
+                path: "beads://epic-1".to_owned(),
+                sha256: "a".repeat(64),
+                revision: Some("root-revision".to_owned()),
+            },
+            worktree: PathBuf::from("/tmp/worktrees/epic-1"),
+            branch: "forged/epic-epic-1".to_owned(),
+            base_ref: "main".to_owned(),
+            contract: StageContract {
+                instructions: "assure".to_owned(),
+                gate_commands: vec!["cargo test --workspace".to_owned()],
+                deliverable: if purpose == SeatPurpose::Fix {
+                    Deliverable::FixCommitsPushed
+                } else {
+                    Deliverable::ReviewBlock
+                },
+                budget_s: 600,
+            },
+            result_schema: if purpose == SeatPurpose::Fix {
+                "forged.result.fix/1".to_owned()
+            } else {
+                "forged.result.review/1".to_owned()
+            },
+            provider_hints: ProviderHints {
+                provider: "claude".to_owned(),
+                model: "fixture".to_owned(),
+                effort: None,
+                sandbox: if purpose == SeatPurpose::Fix {
+                    Sandbox::WorkspaceWrite
+                } else {
+                    Sandbox::ReadOnly
+                },
+            },
+            field_notes: Vec::new(),
+        }
+    }
+
+    fn assurance_context(path: &Path) -> ExecutionContext {
+        ExecutionContext {
+            protocol: Some(ProtocolRef {
+                name: "epic-assurance".to_owned(),
+                version: 1,
+            }),
+            pr_number: Some(73),
+            findings: Vec::new(),
+            review_evidence: Vec::new(),
+            plan_candidate: None,
+            assurance_evidence: Some(AssuranceEvidence {
+                path: path.to_path_buf(),
+                sha256: sha256_file(path).expect("evidence digest"),
+                head_sha: "0123456789abcdef".to_owned(),
+                failed_gate_findings: Vec::new(),
+            }),
+            risk_context: "High consequence integration.".to_owned(),
+            fix_round_budget: 2,
+            push_url: "https://example.invalid/repo.git".to_owned(),
+            host_policy: HostPolicyV1::Off,
+            herdr_socket: None,
+            stage_budget_s: HashMap::new(),
+            termination_grace_s: 5,
+        }
+    }
+
+    fn freeze_evidence(path: &Path) {
+        let mut permissions = std::fs::metadata(path)
+            .expect("evidence metadata")
+            .permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(path, permissions).expect("freeze evidence");
+    }
 
     #[test]
     fn the_label_namespaces_the_repo_name_under_forged() {
@@ -2212,6 +2505,126 @@ mod tests {
         assert_eq!(workspace_label_for_repo("/"), None);
         assert_eq!(workspace_label_for_repo(""), None);
         assert_eq!(workspace_label_for_repo(".."), None);
+    }
+
+    #[test]
+    fn assurance_review_and_synthesis_bind_the_exact_evidence() {
+        let evidence = tempfile::NamedTempFile::new().expect("evidence file");
+        std::fs::write(evidence.path(), "root spec\nfull diff\ngates\n").expect("evidence");
+        freeze_evidence(evidence.path());
+        let mut exec = assurance_context(evidence.path());
+
+        let review = assurance_packet(SeatPurpose::Review);
+        assert_eq!(
+            prompt_stage_of(&review, exec.protocol.as_ref()).expect("review stage"),
+            PromptStage::EpicAssuranceReview
+        );
+        let review_context = render_context(&exec, &review, 0).expect("review context");
+        assert_eq!(
+            review_context.get("evidence_path").and_then(Value::as_str),
+            evidence.path().to_str()
+        );
+        assert_eq!(
+            review_context.get("head_sha").and_then(Value::as_str),
+            Some("0123456789abcdef")
+        );
+        assert_eq!(
+            review_context.get("is_synthesis").and_then(Value::as_bool),
+            Some(false)
+        );
+
+        exec.review_evidence = vec!["review-1: approve".to_owned()];
+        let synthesis = assurance_packet(SeatPurpose::Synthesis);
+        let synthesis_context = render_context(&exec, &synthesis, 0).expect("synthesis context");
+        assert_eq!(
+            synthesis_context
+                .pointer("/review_evidence/0")
+                .and_then(Value::as_str),
+            Some("review-1: approve")
+        );
+        assert_eq!(
+            synthesis_context
+                .get("is_synthesis")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn assurance_fix_merges_and_orders_review_and_failed_gate_findings() {
+        let evidence = tempfile::NamedTempFile::new().expect("evidence file");
+        std::fs::write(evidence.path(), "root spec\nfull diff\nfailed gate\n").expect("evidence");
+        freeze_evidence(evidence.path());
+        let mut exec = assurance_context(evidence.path());
+        exec.findings = vec![Finding {
+            severity: Severity::High,
+            file: Some("src/lib.rs".to_owned()),
+            line: Some(42),
+            message: "review failure".to_owned(),
+        }];
+        exec.assurance_evidence
+            .as_mut()
+            .expect("assurance evidence")
+            .failed_gate_findings = vec![Finding {
+            severity: Severity::Blocker,
+            file: Some("gate:cargo test --workspace".to_owned()),
+            line: None,
+            message: "exit 101; fix the failing assertion".to_owned(),
+        }];
+
+        let packet = assurance_packet(SeatPurpose::Fix);
+        let context = render_context(&exec, &packet, 0).expect("fix context");
+        assert_eq!(
+            context
+                .pointer("/findings/0/location")
+                .and_then(Value::as_str),
+            Some("gate:cargo test --workspace")
+        );
+        assert_eq!(
+            context
+                .pointer("/findings/1/location")
+                .and_then(Value::as_str),
+            Some("src/lib.rs:42")
+        );
+        assert_eq!(
+            context.get("reviewed_head_sha").and_then(Value::as_str),
+            Some("0123456789abcdef")
+        );
+
+        exec.assurance_evidence
+            .as_mut()
+            .expect("assurance evidence")
+            .failed_gate_findings[0]
+            .message = " ".to_owned();
+        assert!(render_context(&exec, &packet, 0)
+            .expect_err("failed gate evidence must be actionable")
+            .message
+            .contains("failed gate findings must be blocker/high"));
+    }
+
+    #[test]
+    fn assurance_refuses_changed_evidence_and_implement_purposes() {
+        let evidence = tempfile::NamedTempFile::new().expect("evidence file");
+        std::fs::write(evidence.path(), "frozen evidence\n").expect("evidence");
+        let exec = assurance_context(evidence.path());
+        let review = assurance_packet(SeatPurpose::Review);
+        assert!(render_context(&exec, &review, 0)
+            .expect_err("writable evidence must fail")
+            .message
+            .contains("evidence is not read-only"));
+
+        std::fs::write(evidence.path(), "changed evidence\n").expect("tamper evidence");
+        freeze_evidence(evidence.path());
+        assert!(render_context(&exec, &review, 0)
+            .expect_err("changed evidence must fail")
+            .message
+            .contains("evidence digest changed"));
+
+        let implement = assurance_packet(SeatPurpose::Implement);
+        assert!(prompt_stage_of(&implement, exec.protocol.as_ref())
+            .expect_err("assurance has no implement seat")
+            .message
+            .contains("implement or legacy"));
     }
 }
 
@@ -2528,6 +2941,7 @@ mod settle_tests {
             findings: Vec::new(),
             review_evidence: Vec::new(),
             plan_candidate: None,
+            assurance_evidence: None,
             risk_context: "routine".to_owned(),
             fix_round_budget: 1,
             push_url: String::new(),
