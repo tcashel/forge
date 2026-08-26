@@ -74,6 +74,18 @@ if (( supported == 0 )); then
   exit 1
 fi
 
+missing_capabilities=()
+for capability in heartbeat reclaim merge-slot epic; do
+  if ! "$BD_BIN" "$capability" --help >/dev/null 2>&1; then
+    missing_capabilities+=("$capability")
+  fi
+done
+if (( ${#missing_capabilities[@]} > 0 )); then
+  echo "forged setup: ERROR — bd $semver lacks required Forge commands: ${missing_capabilities[*]}" >&2
+  echo "forged setup: version order alone does not establish compatibility" >&2
+  exit 1
+fi
+
 mkdir -p "$ANVIL_HOME" "$BEADS_DIR"
 
 if [[ ! -f "$BEADS_DIR/metadata.json" ]]; then

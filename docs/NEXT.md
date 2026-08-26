@@ -55,11 +55,12 @@ codex plugin add forged@forge
 pi install "$HOME/.local/share/forge"
 ```
 
-Provide `bd` 1.2.1 or newer through `PATH` or `BD_BIN`; the Forge installer
-does not install Beads or other host dependencies. Run `/forged:setup` in
-Claude Code or Codex, or `/skill:setup` in Pi, after registration. Setup
-preserves explicit `ANVIL_HOME` and `BEADS_DIR` values and proves zero
-target-repository imposition.
+Provide `bd >=1.2.1` through `PATH` or `BD_BIN`; the Forge installer does not
+install or pin Beads or other host dependencies. Run `/forged:setup` in Claude
+Code or Codex, or `/skill:setup` in Pi, after registration. Setup requires the
+epic and lease command surface, and doctor behavior remains the compatibility
+authority. Setup preserves explicit `ANVIL_HOME` and `BEADS_DIR` values and
+proves zero target-repository imposition.
 
 ## Configure once
 

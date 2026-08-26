@@ -15,8 +15,8 @@ Forged binary.
 
 - Default `ANVIL_HOME` is `$HOME/.anvil`.
 - Default `BEADS_DIR` is `$ANVIL_HOME/beads`; an existing override wins.
-- Beads must report semver `>=1.2.1`; behavioral and schema probes remain the
-  compatibility authority.
+- Beads must report semver `>=1.2.1` and expose the required epic and lease
+  commands; behavioral and schema probes remain the compatibility authority.
 - Setup and the bundled bootstrap never install or upgrade `bd`.
 - Never initialize Beads from a target checkout or add `.beads`, hooks, agent
   files, settings, or workflow files there.
@@ -65,8 +65,9 @@ Forged resolves `bd` from an explicit absolute config `bdPath`, then a nonempty
 and healthy `BEADS_DIR`. If the operator store is missing, explain the exact
 change, obtain consent, then run the bundled
 `../../bootstrap/install-beads.sh`. The bootstrap honors the environment
-variables, validates the existing `bd >=1.2.1`, initializes only the
-out-of-repo operator store, and never installs or upgrades the binary.
+variables, validates the existing version floor and command capabilities,
+initializes only the out-of-repo operator store, and never installs or upgrades
+the binary.
 
 ## Validate Forged after consent
 

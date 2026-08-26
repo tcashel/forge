@@ -21,9 +21,10 @@ The ownership boundary does not change:
 ## Fresh team setup
 
 Provision one Dolt SQL server and one database for the team's Beads work. Use
-an existing `bd` reporting semver `>=1.2.1`; schema and behavior probes remain
-the compatibility authority. Resolve an explicit `BD_BIN` first, otherwise the
-host's `bd` on `PATH` (substitute the real endpoint and database name):
+an existing `bd` reporting semver `>=1.2.1` and exposing the required epic and
+lease commands; schema and behavior probes remain the compatibility authority.
+Resolve an explicit `BD_BIN` first, otherwise the host's `bd` on `PATH`
+(substitute the real endpoint and database name):
 
 ```sh
 export ANVIL_HOME="${ANVIL_HOME:-$HOME/.anvil}"
@@ -37,6 +38,10 @@ esac
 test -n "$BD_BIN" && test -x "$BD_BIN" \
   || { echo 'bd >=1.2.1 is required' >&2; exit 1; }
 "$BD_BIN" --version
+for capability in heartbeat reclaim merge-slot epic; do
+  "$BD_BIN" "$capability" --help >/dev/null 2>&1 \
+    || { echo "bd lacks required Forge command: $capability" >&2; exit 1; }
+done
 
 mkdir -p "$BEADS_DIR"
 (

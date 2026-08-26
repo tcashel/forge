@@ -31,9 +31,10 @@ historical TypeScript `v0.4.0` product has been replaced and is unsupported.
   work graph; Forge no longer creates a parallel repository specification.
 - Kept default-branch merge human-owned. Unattended work may prepare and review
   pull requests, but it does not merge them.
-- Treats Beads as a host dependency with a compatibility floor of `bd >=1.2.1`,
-  without installing, upgrading, downgrading, or imposing an upper pin. The
-  macOS service freezes the absolute compatible binary selected at setup.
+- Treats Beads as a host dependency with a `bd >=1.2.1` version floor and
+  required behavior probes, without installing, upgrading, downgrading, or
+  imposing an upper pin. The macOS service freezes the absolute compatible
+  binary selected at setup.
 
 ### Fixed
 

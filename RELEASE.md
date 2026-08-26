@@ -16,6 +16,22 @@ Forge follows semantic versioning while it is pre-1.0:
 The historical TypeScript `v0.4.0` tag is reserved. Never reuse, delete, or
 move a release tag.
 
+## Beads compatibility gate
+
+Forge does not pin or manage the Beads binary on an operator host. A candidate
+must clear the `bd >=1.2.1` version floor and the required epic, heartbeat,
+reclaim, merge-slot, schema, and lease-behavior probes. Version order alone is
+not compatibility evidence.
+
+Release CI downloads and checksum-verifies the current stable upstream
+artifact; it does not pin an exact Beads version. When that artifact clears the
+capability and doctor probes, the workflow uses it for every genuine Beads
+integration test. Pull requests retain a visible warning when the probe fails;
+`workflow_dispatch` fails before packaging or publication unless it passes. As
+of 2026-08-26, upstream `v1.2.2` intentionally omits the heartbeat and reclaim
+capabilities, so do not publish `v0.5.0` until a supported current stable Beads
+release clears the workflow probe.
+
 ## Prepare the release pull request
 
 1. Start from the latest `main` and choose a version whose remote tag and
@@ -133,11 +149,12 @@ curl -fsSL https://github.com/tcashel/forge/releases/latest/download/uninstall.s
 Run this uninstall command twice; the second invocation must succeed without
 changing anything outside the selected prefix.
 
-Provision `bd` 1.2.1 or newer separately through `PATH` or `BD_BIN`; the Forge
-installer does not install it. Run `forged init`, inspect every required
-`forged doctor` probe, and validate the intended profile and roster. Register
-the installed plugin explicitly in a fresh Claude Code, Codex, or Pi session
-and confirm the harness discovers it. See the
+Provision an upstream-supported `bd` separately through `PATH` or `BD_BIN`; it
+must clear Forge's version floor and capability probes, and the Forge installer
+does not install it. Run `forged init`, inspect every required `forged doctor`
+probe, and validate the intended profile and roster. Register the installed
+plugin explicitly in a fresh Claude Code, Codex, or Pi session and confirm the
+harness discovers it. See the
 [plugin installation guide](plugins/forged/README.md#install-and-register) for
 the exact registration commands.
 

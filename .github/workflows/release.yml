@@ -90,11 +90,12 @@ jobs:
       - name: Build
         run: cargo build --workspace --locked
 
-      - name: Provision current Beads for genuine contract tests
+      - name: Provision current stable Beads for the publication probe
+        id: current_beads
         shell: bash
         run: |
           set -euo pipefail
-          beads_dir="$RUNNER_TEMP/forge-beads"
+          beads_dir="$RUNNER_TEMP/forge-beads-current"
           mkdir -p "$beads_dir"
           curl -fsSL --retry 3 \
             -o "$beads_dir/checksums.txt" \
@@ -115,8 +116,27 @@ jobs:
           tar -xzf "$beads_dir/$asset" -C "$beads_dir" bd
           chmod 0755 "$beads_dir/bd"
           "$beads_dir/bd" version --json
+          printf 'path=%s\n' "$beads_dir/bd" >> "$GITHUB_OUTPUT"
+
+      - name: Probe current stable Beads capabilities
+        # Pull requests keep upstream incompatibility visible while the
+        # remaining release machinery is validated. Publication fails closed
+        # until current stable carries every required command and passes the
+        # genuine lease/doctor behavior test.
+        continue-on-error: ${{ github.event_name == 'pull_request' }}
+        env:
+          FORGED_TEST_BD: ${{ steps.current_beads.outputs.path }}
+          FORGED_REQUIRE_BD: '1'
+        shell: bash
+        run: |
+          set -euo pipefail
+          for capability in heartbeat reclaim merge-slot epic; do
+            "$FORGED_TEST_BD" "$capability" --help >/dev/null
+          done
+          cargo test -p forged-beads --test audit_doctor \
+            doctor_with_the_sandboxed_bd_probes_green -- --nocapture
           {
-            printf 'FORGED_TEST_BD=%s\n' "$beads_dir/bd"
+            printf 'FORGED_TEST_BD=%s\n' "$FORGED_TEST_BD"
             printf 'FORGED_REQUIRE_BD=1\n'
           } >> "$GITHUB_ENV"
 

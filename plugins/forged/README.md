@@ -88,9 +88,11 @@ Pi:
 pi install /absolute/prefix/share/forge
 ```
 
-Before setup, provide `bd` 1.2.1 or newer through `PATH` or the `BD_BIN`
-environment variable. Forge does not install Beads, Git, GitHub CLI, provider
-CLIs, credentials, profiles, configuration, or services.
+Before setup, provide `bd >=1.2.1` through `PATH` or `BD_BIN`. Setup requires
+the epic and lease command surface, then Forge's doctor verifies behavior;
+version order alone is not compatibility evidence. Forge does not pin or
+install Beads, Git, GitHub CLI, provider CLIs, credentials, profiles,
+configuration, or services.
 
 Use `/forge` for the native terminal cockpit. It presents work queues,
 attention, 30-day usage trends, and provider attempts directly from Forged's

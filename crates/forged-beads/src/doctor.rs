@@ -120,8 +120,10 @@ async fn bd_version(cfg: &DoctorConfig) -> Result<String, String> {
     }
 }
 
-/// Return whether `version` is valid semver at or above the supported bd
-/// minimum, `1.2.1`. Prereleases of the minimum itself are not supported.
+/// Return whether `version` is valid semver at or above the bd version floor,
+/// `1.2.1`. This predicate alone does not establish compatibility; the doctor
+/// behavior probes remain authoritative. Prereleases of the minimum itself are
+/// below the floor.
 pub fn supported_bd_version(version: &str) -> bool {
     let (without_build, build) = version
         .split_once('+')

@@ -122,7 +122,8 @@ remain awake and available while local controllers and agents run.
 
 - `x86_64` or arm64 macOS, or GNU/Linux with glibc 2.35+; musl/Alpine and
   other architectures have no prebuilt archive.
-- `git`, authenticated `gh`, and supported Beads `bd >=1.2.1`.
+- `git`, authenticated `gh`, and Beads `bd >=1.2.1` with Forge's required epic
+  and lease capabilities. Setup verifies behavior; Forge never installs or pins it.
 - Your roster's provider CLIs. The default uses Claude Code and Codex; Pi is
   opt-in.
 - Project-specific build and test commands configured before unattended work.
