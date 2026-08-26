@@ -95,6 +95,10 @@ struct EpicConfig {
     /// members. Old events did not; their exact frozen inventory is the only
     /// bounded compatibility candidate set available.
     legacy_membership_recorded: bool,
+    /// Opaque start-time root revision. Together with the native fields and
+    /// structural identity, this prevents a later planning cycle from making
+    /// an intervening root edit its new baseline.
+    root_revision: Option<String>,
     root_fields: Option<NativeBeadSpecV1>,
     children: Vec<FrozenChild>,
 }
@@ -319,6 +323,10 @@ fn parse_config(value: &Value, migration: Option<&Value>) -> Result<EpicConfig, 
             })?,
         rolling_authorized: rolling_authorized(value),
         legacy_membership_recorded,
+        root_revision: value
+            .get("specRevision")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
         root_fields: value
             .get("rootFields")
             .filter(|value| !value.is_null())
@@ -2387,6 +2395,24 @@ async fn capture_planning_checkpoint(
             view.config.epic_id
         ))
     })?;
+    let frozen_root = json!({
+        "title": view.config.title,
+        "issueType": "epic",
+        "revision": view.config.root_revision,
+        "fields": view.config.root_fields,
+    });
+    let live_root = json!({
+        "title": root.issue.title,
+        "issueType": root.issue.issue_type,
+        "revision": root.issue.revision,
+        "fields": native_fields(&root.issue),
+    });
+    if live_root != frozen_root {
+        return Err(Failure::invalid(format!(
+            "epic root {:?} changed since epic start: frozen {}, live {}",
+            view.config.epic_id, frozen_root, live_root
+        )));
+    }
     let target = exact
         .get(&child.id)
         .ok_or_else(|| Failure::invalid(format!("planning stub {:?} is missing", child.id)))?;
@@ -2468,7 +2494,23 @@ async fn start_planning(
     let pre_digest = child.frozen_fields_sha256.clone().ok_or_else(|| {
         Failure::internal(format!("planning stub {:?} has no frozen digest", child.id))
     })?;
-    let checkpoint = capture_planning_checkpoint(ctx, view, child).await?;
+    let checkpoint = match capture_planning_checkpoint(ctx, view, child).await {
+        Ok(checkpoint) => checkpoint,
+        Err(error) if error.code == ErrorCode::InvalidRequest => {
+            let detail = error.message;
+            let input = require_input_with_evidence(
+                ctx,
+                &config.epic_id,
+                "planning-checkpoint-drift",
+                Some(&child.id),
+                detail.clone(),
+                Some(json!({"error": detail})),
+            )
+            .await?;
+            return Ok(Step::Stop(input));
+        }
+        Err(error) => return Err(error),
+    };
     let target = checkpoint
         .target_snapshot
         .as_object()
@@ -2663,10 +2705,15 @@ async fn apply_planning_result(
         let checkpoint = match capture_planning_checkpoint(ctx, view, child).await {
             Ok(checkpoint) => checkpoint,
             Err(error) => {
+                let code = if error.code == ErrorCode::InvalidRequest {
+                    "planning-checkpoint-drift"
+                } else {
+                    "planning-checkpoint-unavailable"
+                };
                 let input = require_input_with_evidence(
                     ctx,
                     &config.epic_id,
-                    "planning-checkpoint-unavailable",
+                    code,
                     Some(&child.id),
                     error.message.clone(),
                     Some(json!({"error": error.message})),

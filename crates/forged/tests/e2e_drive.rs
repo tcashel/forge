@@ -2079,6 +2079,47 @@ fn structural_stub_drift_blocks_apply_with_exact_checkpoint_evidence() {
 }
 
 #[test]
+fn root_drift_before_planning_checkpoint_stops_against_frozen_contract() {
+    let env = TestEnv::new("forged-rolling-root-drift");
+    reach_rolling_planning_boundary(&env);
+    let frozen_revision = env
+        .ledger()
+        .list_events(Some("epic-rolling"), 0, 65_536)
+        .expect("epic events")
+        .into_iter()
+        .find(|event| event.kind == "forged.epic.started")
+        .and_then(|event| serde_json::from_str::<Value>(&event.payload_json).ok())
+        .and_then(|event| event["specRevision"].as_str().map(str::to_owned))
+        .expect("frozen root revision");
+    env.set_bead_field(
+        "epic-rolling",
+        "description",
+        "Changed outside the frozen epic contract",
+    );
+    // Hold the opaque token fixed so this regression proves the native root
+    // fields themselves are compared with the start contract.
+    env.set_bead_field("epic-rolling", "revision", &frozen_revision);
+    env.seed_frontier("child-next");
+
+    let (code, held) = env.forged(&["epic", "advance", "--epic", "epic-rolling"]);
+    assert_eq!(code, 0, "root drift becomes typed epic input: {held}");
+    assert_eq!(
+        held["result"]["stopped"]["code"],
+        json!("planning-checkpoint-drift")
+    );
+    assert_eq!(held["result"]["stopped"]["childId"], json!("child-stub"));
+    assert!(held["result"]["stopped"]["evidence"]["error"]
+        .as_str()
+        .is_some_and(|detail| detail.contains("changed since epic start")));
+    assert!(env
+        .ledger()
+        .list_events(Some("epic-rolling"), 0, 65_536)
+        .expect("epic events")
+        .iter()
+        .all(|event| event.kind != "forged.epic.plan.started"));
+}
+
+#[test]
 fn resolving_post_apply_implementation_failure_uses_ordinary_child_reset() {
     let env = TestEnv::new("forged-rolling-post-apply-reset");
     prepare_reviewed_rolling_plan(&env);
