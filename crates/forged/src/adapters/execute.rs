@@ -749,7 +749,13 @@ fn render_context(
             "bead_id": packet.bead_id,
             "spec_path": packet.spec.path,
             "candidate_plan": serde_json::to_string(&exec.plan_candidate).unwrap_or_default(),
-            "review_evidence": exec.review_evidence,
+            "review_evidence": if packet.execution.as_ref().is_some_and(|value|
+                value.purpose == forged_types::SeatPurpose::Synthesis
+            ) {
+                exec.review_evidence.clone()
+            } else {
+                Vec::new()
+            },
             "risk_context": exec.risk_context,
             "packet_id": packet.packet_id,
             "result_schema": packet.result_schema,
@@ -2554,6 +2560,39 @@ mod tests {
                 .get("is_synthesis")
                 .and_then(Value::as_bool),
             Some(true)
+        );
+    }
+
+    #[test]
+    fn planning_review_evidence_is_visible_only_to_synthesis() {
+        let exec = ExecutionContext {
+            protocol: Some(ProtocolRef {
+                name: "epic-plan".to_owned(),
+                version: 1,
+            }),
+            pr_number: None,
+            findings: Vec::new(),
+            review_evidence: vec!["review-1: request changes".to_owned()],
+            plan_candidate: None,
+            assurance_evidence: None,
+            risk_context: "High consequence plan.".to_owned(),
+            fix_round_budget: 1,
+            push_url: String::new(),
+            host_policy: HostPolicyV1::Off,
+            herdr_socket: None,
+            stage_budget_s: HashMap::new(),
+            termination_grace_s: 5,
+        };
+
+        let review = assurance_packet(SeatPurpose::Review);
+        let review_context = render_context(&exec, &review, 0).expect("review context");
+        assert_eq!(review_context["review_evidence"], json!([]));
+
+        let synthesis = assurance_packet(SeatPurpose::Synthesis);
+        let synthesis_context = render_context(&exec, &synthesis, 0).expect("synthesis context");
+        assert_eq!(
+            synthesis_context["review_evidence"],
+            json!(["review-1: request changes"])
         );
     }
 
