@@ -42,6 +42,7 @@ pub(super) const PAUSED: &str = "forged.epic.paused";
 pub(super) const RESUMED: &str = "forged.epic.resumed";
 pub(super) const EPIC_PR: &str = "forged.epic.pr";
 const ASSURANCE_STARTED: &str = "forged.epic.assurance.started";
+const ASSURANCE_FINALIZED: &str = "forged.epic.assurance.finalized";
 pub(super) const ASSURANCE_COMPLETED: &str = "forged.epic.assurance.completed";
 const ROSTER_REVISED: &str = "forged.epic.roster.revised";
 const PACKAGE_MIGRATED: &str = "forged.epic.execution-package.migrated";
@@ -148,6 +149,7 @@ struct EpicView {
     planning_generations: BTreeMap<String, u32>,
     planning_guidance: BTreeMap<String, String>,
     assurance: Option<AssuranceState>,
+    assurance_finalized: Option<Value>,
     assurance_completed: Option<Value>,
     child_generations: BTreeMap<String, u32>,
     input: Option<Value>,
@@ -540,6 +542,7 @@ async fn project(ctx: &Ctx, epic: &str) -> Result<EpicView, Failure> {
         planning_generations: BTreeMap::new(),
         planning_guidance: BTreeMap::new(),
         assurance: None,
+        assurance_finalized: None,
         assurance_completed: None,
         child_generations: BTreeMap::new(),
         input: None,
@@ -647,6 +650,7 @@ async fn project(ctx: &Ctx, epic: &str) -> Result<EpicView, Failure> {
                     input_body: string(&event, "assuranceInputBody")?,
                 });
             }
+            ASSURANCE_FINALIZED => view.assurance_finalized = Some(payload(&row)?),
             ASSURANCE_COMPLETED => view.assurance_completed = Some(payload(&row)?),
             ROSTER_REVISED => {
                 let revision = serde_json::from_value(payload(&row)?).map_err(|error| {
@@ -684,6 +688,40 @@ pub(super) async fn epic_submission_stop(ctx: &Ctx, epic: &str) -> Result<Option
     } else {
         view.input.map(|input| json!({"inputRequired": input}))
     })
+}
+
+async fn complete_assurance_cleanup(
+    ctx: &Ctx,
+    view: &EpicView,
+    completed: &Value,
+) -> Result<(), Failure> {
+    let state = view
+        .assurance
+        .as_ref()
+        .ok_or_else(|| Failure::internal("assurance completion has no matching assurance run"))?;
+    forged_git::retire_worktree(
+        Path::new(&view.config.repo),
+        &ctx.config.runs_root,
+        &state.run_id,
+        &forged_git::RetireOptions {
+            force: false,
+            run_state_terminal: true,
+        },
+    )
+    .await?;
+    append_stop_event(
+        ctx,
+        &view.config.epic_id,
+        ASSURANCE_COMPLETED,
+        completed.clone(),
+        EpicStopTransition {
+            state: DesiredState::Stopped,
+            outcome: DesiredReconcileOutcome::Terminal,
+            error: None,
+            identity_field: Some("transitionId"),
+        },
+    )
+    .await
 }
 
 async fn append(ctx: &Ctx, epic: &str, kind: &str, value: Value) -> Result<(), Failure> {
@@ -3713,19 +3751,6 @@ async fn complete_assurance(
                 },
                 "evidence": evidence_for_event,
             });
-            append_stop_event(
-                ctx,
-                &epic_id,
-                ASSURANCE_COMPLETED,
-                event.clone(),
-                EpicStopTransition {
-                    state: DesiredState::Stopped,
-                    outcome: DesiredReconcileOutcome::Terminal,
-                    error: None,
-                    identity_field: Some("transitionId"),
-                },
-            )
-            .await?;
             Ok(event)
         },
     )
@@ -3754,6 +3779,12 @@ async fn complete_assurance(
             return Ok(Step::Stop(stopped));
         }
     };
+    // The replayable external effect is sealed before its cleanup checkpoint.
+    // This event is nonterminal; ASSURANCE_COMPLETED lands only after the
+    // assurance worktree has been retired.
+    append(ctx, &config.epic_id, ASSURANCE_FINALIZED, value.clone()).await?;
+    crate::failpoint::hit("epic.assurance.finalized.after");
+    complete_assurance_cleanup(ctx, view, &value).await?;
     Ok(Step::Stop(json!({"finalPr": state.pr, "assurance": value})))
 }
 
@@ -3991,9 +4022,17 @@ async fn planning_after_completed_wave(
 async fn advance_once(ctx: &Ctx, epic: &str) -> Result<Step, Failure> {
     let view = project(ctx, epic).await?;
     if let Some(completed) = view.assurance_completed.as_ref() {
+        complete_assurance_cleanup(ctx, &view, completed).await?;
         return Ok(Step::Stop(json!({
             "finalPr": view.pr,
             "assurance": completed,
+        })));
+    }
+    if let Some(finalized) = view.assurance_finalized.as_ref() {
+        complete_assurance_cleanup(ctx, &view, finalized).await?;
+        return Ok(Step::Stop(json!({
+            "finalPr": view.pr,
+            "assurance": finalized,
         })));
     }
     if view.config.assurance_package.is_none() {

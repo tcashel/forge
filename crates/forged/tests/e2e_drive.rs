@@ -643,6 +643,16 @@ fn rolling_epic_assures_the_exact_draft_pr_head_before_completion() {
         .expect("integration branch");
     let remote_sha = rev_parse(&env.repos.origin, branch);
     assert_eq!(evidence["terminalSha"], json!(remote_sha));
+    let assurance_worktree = env.worktree("epic-assurance-epic-assurance");
+    assert!(
+        !assurance_worktree.exists(),
+        "terminal assurance retires its worktree"
+    );
+    assert!(
+        !git(&env.repos.repo, &["worktree", "list", "--porcelain"])
+            .contains(&assurance_worktree.to_string_lossy().into_owned()),
+        "terminal assurance removes its worktree registration"
+    );
     let (_, completed) = env.forged(&["epic", "status", "--epic", "epic-assurance"]);
     assert_eq!(completed["result"]["finalPr"]["number"], json!(7));
     assert_eq!(
@@ -979,7 +989,7 @@ fn assurance_start_crash_recovers_one_run_and_one_draft_pr() {
 
 #[cfg(feature = "failpoints")]
 #[test]
-fn assurance_pr_body_crash_replays_to_one_terminal_completion() {
+fn assurance_finalization_crashes_replay_completion_and_cleanup() {
     let env = TestEnv::new("forged-rolling-assurance-finalize-crash");
     env.enable_dynamic_gh();
     env.seed_epic(
@@ -1050,6 +1060,106 @@ fn assurance_pr_body_crash_replays_to_one_terminal_completion() {
     assert_eq!(desired.desired_state, forged_ledger::DesiredState::Running);
     ledger.close().expect("close ledger");
 
+    let mut completion_crashed = false;
+    for _ in 0..64 {
+        let status = env
+            .forged_cmd(&["epic", "advance", "--epic", "epic-assurance-finalize-crash"])
+            .env("FORGED_FAILPOINT", "epic.assurance.finalized.after")
+            .env("FORGED_FAILPOINT_MODE", "crash")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("assurance completion tick");
+        if !status.success() {
+            completion_crashed = true;
+            break;
+        }
+    }
+    assert!(
+        completion_crashed,
+        "finalization must reach the completion-before-cleanup crash seam"
+    );
+    let assurance_worktree = env.worktree("epic-assurance-finalize-crash-epic-assurance");
+    assert!(
+        assurance_worktree.exists(),
+        "the crash seam precedes assurance worktree retirement"
+    );
+    assert!(
+        git(&env.repos.repo, &["worktree", "list", "--porcelain"])
+            .contains(&assurance_worktree.to_string_lossy().into_owned()),
+        "the crash seam leaves the worktree registered for replay"
+    );
+    let ledger = env.ledger();
+    assert_eq!(
+        ledger
+            .list_events(Some("epic-assurance-finalize-crash"), 0, 65_536)
+            .expect("epic events")
+            .iter()
+            .filter(|event| event.kind == "forged.epic.assurance.finalized")
+            .count(),
+        1,
+        "final binding evidence lands once before cleanup"
+    );
+    assert_eq!(
+        ledger
+            .list_events(Some("epic-assurance-finalize-crash"), 0, 65_536)
+            .expect("epic events")
+            .iter()
+            .filter(|event| event.kind == "forged.epic.assurance.completed")
+            .count(),
+        0,
+        "cleanup has not crossed the terminal completion boundary"
+    );
+    let desired = ledger
+        .get_desired_work(
+            forged_ledger::DesiredSubjectKind::Epic,
+            "epic-assurance-finalize-crash",
+        )
+        .expect("desired query")
+        .expect("desired row");
+    assert_eq!(
+        desired.desired_state,
+        forged_ledger::DesiredState::Running,
+        "the supervisor must retry cleanup before terminal settlement"
+    );
+    ledger.close().expect("close ledger");
+    let connection = rusqlite::Connection::open(env.anvil.join("state.db"))
+        .expect("open finalization operation database");
+    let (operation_state, operation_response): (String, String) = connection
+        .query_row(
+            "SELECT state, response_json FROM operations
+             WHERE name = 'epic_pr_finalize' AND run_id = 'epic-assurance-finalize-crash'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("finalization operation");
+    assert_eq!(
+        operation_state, "terminal",
+        "cleanup cannot bypass an in-progress external effect"
+    );
+    let operation_response: Value =
+        serde_json::from_str(&operation_response).expect("finalization response JSON");
+    assert_eq!(operation_response["ok"], json!(true));
+    drop(connection);
+    let (code, status) = env.forged(&["epic", "status", "--epic", "epic-assurance-finalize-crash"]);
+    assert_eq!(code, 0, "status during cleanup gap: {status}");
+    assert!(status["result"]["finalPr"].is_null());
+    assert!(status["result"]["assurance"]["completed"].is_null());
+    let (code, detail) = env.forged(&[
+        "work",
+        "detail",
+        "--subject-kind",
+        "epic",
+        "--subject-id",
+        "epic-assurance-finalize-crash",
+    ]);
+    assert_eq!(code, 0, "Work Detail during cleanup gap: {detail}");
+    assert_ne!(
+        detail["result"]["status"]["state"],
+        json!("submitted"),
+        "no consumer may project terminal completion before cleanup: {detail}"
+    );
+
     let mut terminal = Value::Null;
     for _ in 0..8 {
         let (code, tick) =
@@ -1072,6 +1182,20 @@ fn assurance_pr_body_crash_replays_to_one_terminal_completion() {
         terminal["result"]["stopped"]["assurance"]["pr"]["url"],
         draft_pr["url"]
     );
+    assert!(!assurance_worktree.exists());
+    assert!(
+        !git(&env.repos.repo, &["worktree", "list", "--porcelain"])
+            .contains(&assurance_worktree.to_string_lossy().into_owned()),
+        "cleanup replay removes the worktree registration"
+    );
+    let (code, replayed) =
+        env.forged(&["epic", "advance", "--epic", "epic-assurance-finalize-crash"]);
+    assert_eq!(code, 0, "terminal cleanup replay: {replayed}");
+    assert_eq!(
+        replayed["result"]["stopped"]["assurance"]["pr"]["number"],
+        draft_pr["number"]
+    );
+    assert!(!assurance_worktree.exists());
 
     let ledger = env.ledger();
     assert_eq!(
