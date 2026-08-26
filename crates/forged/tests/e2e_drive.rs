@@ -2215,23 +2215,11 @@ fn structural_stub_drift_blocks_apply_with_exact_checkpoint_evidence() {
 fn root_drift_before_planning_checkpoint_stops_against_frozen_contract() {
     let env = TestEnv::new("forged-rolling-root-drift");
     reach_rolling_planning_boundary(&env);
-    let frozen_revision = env
-        .ledger()
-        .list_events(Some("epic-rolling"), 0, 65_536)
-        .expect("epic events")
-        .into_iter()
-        .find(|event| event.kind == "forged.epic.started")
-        .and_then(|event| serde_json::from_str::<Value>(&event.payload_json).ok())
-        .and_then(|event| event["specRevision"].as_str().map(str::to_owned))
-        .expect("frozen root revision");
     env.set_bead_field(
         "epic-rolling",
         "description",
         "Changed outside the frozen epic contract",
     );
-    // Hold the opaque token fixed so this regression proves the native root
-    // fields themselves are compared with the start contract.
-    env.set_bead_field("epic-rolling", "revision", &frozen_revision);
     env.seed_frontier("child-next");
 
     let (code, held) = env.forged(&["epic", "advance", "--epic", "epic-rolling"]);
@@ -2250,6 +2238,56 @@ fn root_drift_before_planning_checkpoint_stops_against_frozen_contract() {
         .expect("epic events")
         .iter()
         .all(|event| event.kind != "forged.epic.plan.started"));
+}
+
+#[test]
+fn root_revision_only_churn_does_not_hold_planning_or_apply() {
+    let env = TestEnv::new("forged-rolling-root-revision-churn");
+    reach_rolling_planning_boundary(&env);
+    let frozen_revision = env.bead_revision("epic-rolling");
+    env.set_bead_field("epic-rolling", "title", "Test epic");
+    assert_ne!(
+        env.bead_revision("epic-rolling"),
+        frozen_revision,
+        "the unchanged semantic root must still receive a new write token"
+    );
+    env.seed_frontier("child-next");
+
+    let (code, planning) = env.forged(&["epic", "advance", "--epic", "epic-rolling"]);
+    assert_eq!(
+        code, 0,
+        "revision-only churn must not hold planning: {planning}"
+    );
+    assert_eq!(
+        planning["result"]["progress"]["planning"]["childId"],
+        json!("child-stub")
+    );
+
+    let planned = drive_internal_plan_to_stop(&env, "child-stub-epic-plan");
+    assert_eq!(planned["result"]["run"]["outcome"], json!("clean"));
+    let planned_revision = env.bead_revision("epic-rolling");
+    env.set_bead_field("epic-rolling", "title", "Test epic");
+    assert_ne!(
+        env.bead_revision("epic-rolling"),
+        planned_revision,
+        "the unchanged semantic root must receive another write token before apply"
+    );
+
+    let (code, applied) = env.forged(&["epic", "advance", "--epic", "epic-rolling"]);
+    assert_eq!(
+        code, 0,
+        "revision-only churn must not hold guarded apply: {applied}"
+    );
+    assert_eq!(
+        applied["result"]["progress"]["childId"],
+        json!("child-stub")
+    );
+    assert!(env
+        .ledger()
+        .list_events(Some("epic-rolling"), 0, 65_536)
+        .expect("epic events")
+        .iter()
+        .all(|event| event.kind != "forged.epic.input.required"));
 }
 
 #[test]

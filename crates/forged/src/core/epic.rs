@@ -2407,7 +2407,14 @@ async fn capture_planning_checkpoint(
         "revision": root.issue.revision,
         "fields": native_fields(&root.issue),
     });
-    if live_root != frozen_root {
+    // A Beads revision is an opaque per-write provenance token, not a content
+    // fence. Retain both revisions in the evidence above, but freeze only the
+    // semantic root contract that rolling planning is authorized to preserve.
+    let semantic_root_keys = ["title", "issueType", "fields"];
+    if semantic_root_keys
+        .iter()
+        .any(|key| frozen_root.get(key) != live_root.get(key))
+    {
         return Err(Failure::invalid(format!(
             "epic root {:?} changed since epic start: frozen {}, live {}",
             view.config.epic_id, frozen_root, live_root
@@ -2595,6 +2602,14 @@ fn target_structure(snapshot: &Value) -> Value {
     value
 }
 
+fn root_checkpoint_without_revision(snapshot: &Value) -> Value {
+    let mut value = snapshot.clone();
+    if let Some(object) = value.as_object_mut() {
+        object.remove("revision");
+    }
+    value
+}
+
 fn checkpoint_drift(
     state: &PlanningState,
     current: &PlanningCheckpoint,
@@ -2633,7 +2648,9 @@ fn checkpoint_drift(
     if &current.completed_child_evidence != expected_completed {
         return Err("completed-child evidence changed during planning".to_owned());
     }
-    if &current.root_snapshot != expected_root {
+    if root_checkpoint_without_revision(&current.root_snapshot)
+        != root_checkpoint_without_revision(expected_root)
+    {
         return Err("epic root authority or structure changed during planning".to_owned());
     }
     let current_fields = current
