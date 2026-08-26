@@ -657,11 +657,13 @@ async fn frozen_deadline_ignores_heartbeat_and_grants_one_retry_after_verified_k
     let mut live_config = config();
     live_config.stage_budget_s.insert(Stage::Implement, 2);
     let ports = FakePorts::new();
-    ports
-        .liveness_script
-        .lock()
-        .expect("lock")
-        .push_back(SessionLiveness::Running);
+    {
+        let mut liveness = ports.liveness_script.lock().expect("lock");
+        liveness.push_back(SessionLiveness::Running);
+        // Even a clean exit must not outrank the exact deadline boundary.
+        // Reconcile checks its captured clock before accepting liveness.
+        liveness.push_back(SessionLiveness::Exited(0));
+    }
 
     let before = reconcile(
         &ledger,
@@ -688,6 +690,11 @@ async fn frozen_deadline_ignores_heartbeat_and_grants_one_retry_after_verified_k
     .expect("deadline settlement");
     assert_eq!(expired.timed_out, vec![claim.attempt_id]);
     assert!(expired.reclaimed.is_empty());
+    assert_eq!(
+        ports.liveness_script.lock().expect("lock").len(),
+        1,
+        "terminal liveness is not consulted after the deadline is reached"
+    );
     let calls = ports.recorded();
     assert!(calls.iter().any(|call| matches!(
         call,

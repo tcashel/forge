@@ -1884,72 +1884,85 @@ async fn run_attempt(
     let mut session_scanner =
         forged_provider::ProviderSessionScanner::new(&packet.provider_hints.provider);
     let liveness = loop {
-        match host.alive(&session).await {
-            Ok(forged_host::Liveness::Running) => {
-                let as_of = now_iso();
-                if let Some(note) =
-                    deadline_reason(exec, &packet, attempt_id, &attempt_started_at, &as_of)?
-                {
-                    let marker = deadline_marker(ctx, attempt_id, &note).await?;
-                    if marker.state != AttemptState::Revoking {
-                        if let Some(handle) = guardian.take() {
-                            handle.abort();
-                        }
-                        return if marker.state == AttemptState::Failed
-                            && marker.revoke_scope == Some(RevokeScope::Deadline)
-                        {
-                            Ok(PacketOutcome::Transport(note))
-                        } else {
-                            Ok(PacketOutcome::Revoked)
-                        };
-                    }
-                    host.kill_confirmed(&session)
-                        .await
-                        .map_err(|error| Failure {
-                            code: ErrorCode::HostUnavailable,
-                            message: format!(
-                                "stage deadline expired but provider death was not confirmed: {error}"
-                            ),
-                            recoverable: true,
-                        })?;
-                    if let Some(handle) = guardian.take() {
-                        handle.abort();
-                    }
-                    crate::core::artifacts::finalize_provider_files(&run_root, &dirs)?;
-                    let out = crate::core::artifacts::read_output_text(&run_root, &dirs)?;
-                    crate::core::usage::capture_attempt(
-                        ctx,
-                        &run_id,
-                        &packet_id,
-                        Some(attempt_id),
-                        &packet.provider_hints.provider,
-                        &packet.provider_hints.model,
-                        &out,
-                    )
-                    .await;
-                    if marker.revoke_scope != Some(RevokeScope::Deadline) {
-                        crate::core::artifacts::materialize_and_join(
-                            ctx,
-                            &packet,
-                            attempt_id,
-                            "revoked",
-                            &json!({"note": "attempt was revoked while its deadline expired"}),
-                            &session_evidence,
-                        )
-                        .await?;
-                        return Ok(PacketOutcome::Revoked);
-                    }
-                    crate::core::artifacts::materialize_and_join(
-                        ctx,
-                        &packet,
-                        attempt_id,
-                        "deadline",
-                        &json!({"reason": &note}),
-                        &session_evidence,
-                    )
-                    .await?;
-                    return settle_deadline_retry(ctx, &run_id, &packet_id, attempt_id, note).await;
+        let observed = match host.alive(&session).await {
+            Ok(observed) => observed,
+            Err(e) => {
+                if let Some(handle) = guardian.take() {
+                    handle.abort();
                 }
+                return Err(e.into());
+            }
+        };
+        // `alive` is an observation, not a timestamp of when the provider
+        // exited. Check the immutable deadline after every observation and
+        // before accepting even a terminal sentinel; otherwise a provider
+        // that exits between polls can cross its deadline and still have
+        // late output harvested as success.
+        let as_of = now_iso();
+        if let Some(note) = deadline_reason(exec, &packet, attempt_id, &attempt_started_at, &as_of)?
+        {
+            let marker = deadline_marker(ctx, attempt_id, &note).await?;
+            if marker.state != AttemptState::Revoking {
+                if let Some(handle) = guardian.take() {
+                    handle.abort();
+                }
+                return if marker.state == AttemptState::Failed
+                    && marker.revoke_scope == Some(RevokeScope::Deadline)
+                {
+                    Ok(PacketOutcome::Transport(note))
+                } else {
+                    Ok(PacketOutcome::Revoked)
+                };
+            }
+            host.kill_confirmed(&session)
+                .await
+                .map_err(|error| Failure {
+                    code: ErrorCode::HostUnavailable,
+                    message: format!(
+                        "stage deadline expired but provider death was not confirmed: {error}"
+                    ),
+                    recoverable: true,
+                })?;
+            if let Some(handle) = guardian.take() {
+                handle.abort();
+            }
+            crate::core::artifacts::finalize_provider_files(&run_root, &dirs)?;
+            let out = crate::core::artifacts::read_output_text(&run_root, &dirs)?;
+            crate::core::usage::capture_attempt(
+                ctx,
+                &run_id,
+                &packet_id,
+                Some(attempt_id),
+                &packet.provider_hints.provider,
+                &packet.provider_hints.model,
+                &out,
+            )
+            .await;
+            if marker.revoke_scope != Some(RevokeScope::Deadline) {
+                crate::core::artifacts::materialize_and_join(
+                    ctx,
+                    &packet,
+                    attempt_id,
+                    "revoked",
+                    &json!({"note": "attempt was revoked while its deadline expired"}),
+                    &session_evidence,
+                )
+                .await?;
+                return Ok(PacketOutcome::Revoked);
+            }
+            crate::core::artifacts::materialize_and_join(
+                ctx,
+                &packet,
+                attempt_id,
+                "deadline",
+                &json!({"reason": &note}),
+                &session_evidence,
+            )
+            .await?;
+            return settle_deadline_retry(ctx, &run_id, &packet_id, attempt_id, note).await;
+        }
+        match observed {
+            forged_host::Liveness::Running => {
                 beats += 1;
                 if beats.is_multiple_of(25) {
                     // Heartbeats prove liveness but never renew the frozen
@@ -2004,13 +2017,7 @@ async fn run_attempt(
                 }
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
-            Ok(other) => break other,
-            Err(e) => {
-                if let Some(handle) = guardian.take() {
-                    handle.abort();
-                }
-                return Err(e.into());
-            }
+            other => break other,
         }
     };
     if let Some(handle) = guardian.take() {
@@ -2654,6 +2661,7 @@ mod settle_tests {
 
     #[derive(Clone, Copy)]
     enum MockBehavior {
+        Normal,
         RefuseClose,
         LoseSendResponse,
     }
@@ -2816,7 +2824,12 @@ mod settle_tests {
     /// sentinel that settles the session. The status dir the host reserves
     /// during spawn is the start signal — writing the pid before that would
     /// race the removal of the previous attempt's file.
-    async fn play_provider(packet_dir: PathBuf, status_base: PathBuf, capture: String) {
+    async fn play_provider_after(
+        packet_dir: PathBuf,
+        status_base: PathBuf,
+        capture: String,
+        delay: Duration,
+    ) {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         let session_dir = loop {
             if let Some(entry) = std::fs::read_dir(&status_base)
@@ -2832,6 +2845,7 @@ mod settle_tests {
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         };
+        tokio::time::sleep(delay).await;
         let request: Value = serde_json::from_slice(
             &std::fs::read(packet_dir.join(".provider-stream-request.json"))
                 .expect("private runner request"),
@@ -2871,6 +2885,10 @@ mod settle_tests {
         )
         .expect("pid file");
         std::fs::write(session_dir.join("status"), "0\n").expect("sentinel");
+    }
+
+    async fn play_provider(packet_dir: PathBuf, status_base: PathBuf, capture: String) {
+        play_provider_after(packet_dir, status_base, capture, Duration::ZERO).await;
     }
 
     fn config_for(root: &Path, socket: &Path) -> ForgedConfig {
@@ -3093,6 +3111,95 @@ mod settle_tests {
         )
         .expect("session JSON");
         assert_eq!(session["metadata"]["phase"], "deadline-before-spawn");
+    }
+
+    #[tokio::test]
+    async fn execution_deadline_uses_the_exact_nanosecond_boundary() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let socket = root.path().join("herdr.sock");
+        let mut fixture = claimed_fixture(root.path(), &socket).await;
+        fixture.exec.stage_budget_s.insert(Stage::Implement, 2);
+
+        let started = "2026-08-25T00:00:00.000000123Z";
+        assert!(deadline_reason(
+            &fixture.exec,
+            &fixture.packet,
+            fixture.attempt_id,
+            started,
+            "2026-08-25T00:00:02.000000122Z",
+        )
+        .expect("before deadline")
+        .is_none());
+        assert!(deadline_reason(
+            &fixture.exec,
+            &fixture.packet,
+            fixture.attempt_id,
+            started,
+            "2026-08-25T00:00:02.000000123Z",
+        )
+        .expect("at deadline")
+        .is_some());
+    }
+
+    #[tokio::test]
+    async fn terminal_output_observed_after_the_deadline_cannot_land() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let socket = root.path().join("herdr.sock");
+        let seen = start_mock_herdr(&socket, MockBehavior::Normal);
+        let mut fixture = claimed_fixture(root.path(), &socket).await;
+        fixture.exec.stage_budget_s.insert(Stage::Implement, 1);
+        let attempt_dirs = PacketDirs::new(&fixture.packet_dir, fixture.attempt_id);
+        tokio::spawn(play_provider_after(
+            attempt_dirs.attempt_path(),
+            attempt_dirs.status(),
+            claude_capture(&fixture.packet_id),
+            Duration::from_millis(1_100),
+        ));
+
+        let outcome = run_attempt(
+            &fixture.ctx,
+            &fixture.ports,
+            &fixture.exec,
+            &fixture.packet,
+            &fixture.resolved,
+            fixture.attempt_id,
+            &fixture.claim_token,
+        )
+        .await
+        .expect("late terminal output settles as a timeout");
+        assert!(matches!(outcome, PacketOutcome::Transport(_)));
+
+        let attempt = fixture
+            .ledger
+            .get_attempt(fixture.attempt_id)
+            .expect("attempt");
+        assert_eq!(attempt.state, AttemptState::Failed);
+        assert_eq!(attempt.revoke_scope, Some(RevokeScope::Deadline));
+        assert_eq!(
+            fixture
+                .ledger
+                .list_events(Some(RUN_ID), 0, 1_000)
+                .expect("events")
+                .iter()
+                .filter(|event| event.kind == "proto.retry")
+                .count(),
+            1,
+            "the late terminal observation earns exactly one retry"
+        );
+        let methods = seen.lock().expect("method log").clone();
+        assert_eq!(
+            methods
+                .iter()
+                .filter(|method| method.as_str() == "pane.close")
+                .count(),
+            1,
+            "verified terminal cleanup is performed exactly once"
+        );
+        let result: Value = serde_json::from_slice(
+            &std::fs::read(attempt_dirs.result()).expect("deadline evidence"),
+        )
+        .expect("deadline evidence JSON");
+        assert_eq!(result["outcome"], "deadline");
     }
 
     #[tokio::test]
