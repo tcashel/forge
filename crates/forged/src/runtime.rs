@@ -2117,10 +2117,22 @@ fn new_manifest(
     config: &ForgedConfig,
     mut binary: BinaryIdentity,
 ) -> Result<RuntimeManifest, Failure> {
-    if !config.bd_path.is_absolute() {
-        return Err(Failure::invalid(format!(
-            "service installation requires bd to resolve to an absolute path, got {}",
+    let bd_path = config.bd_path.canonicalize().map_err(|error| {
+        Failure::invalid(format!(
+            "service installation requires an existing bd executable at {}: {error}",
             config.bd_path.display()
+        ))
+    })?;
+    let bd_metadata = bd_path.metadata().map_err(|error| {
+        Failure::invalid(format!(
+            "service installation cannot inspect bd executable {}: {error}",
+            bd_path.display()
+        ))
+    })?;
+    if !bd_metadata.is_file() || bd_metadata.permissions().mode() & 0o111 == 0 {
+        return Err(Failure::invalid(format!(
+            "service installation requires an executable bd file, got {}",
+            bd_path.display()
         )));
     }
     let generation = Uuid::now_v7().to_string();
@@ -2140,7 +2152,7 @@ fn new_manifest(
             .into_owned(),
         config_path: config.config_path.to_string_lossy().into_owned(),
         beads_dir: config.beads_dir.to_string_lossy().into_owned(),
-        bd_bin: Some(config.bd_path.to_string_lossy().into_owned()),
+        bd_bin: Some(bd_path.to_string_lossy().into_owned()),
         plist_path: paths.plist.to_string_lossy().into_owned(),
         installed_at: now_iso(),
     };
@@ -3334,6 +3346,10 @@ mod tests {
         fs::create_dir_all(&config.anvil_home).expect("anvil home");
         fs::create_dir_all(&config.runs_root).expect("runs root");
         fs::create_dir_all(&config.beads_dir).expect("beads dir");
+        fs::create_dir_all(config.bd_path.parent().expect("bd parent")).expect("bd tools dir");
+        fs::write(&config.bd_path, b"#!/bin/sh\nexit 0\n").expect("bd fixture");
+        fs::set_permissions(&config.bd_path, fs::Permissions::from_mode(0o700))
+            .expect("bd fixture mode");
         fs::create_dir_all(&home).expect("home");
         let paths = RuntimePaths::new(&config.anvil_home, &home, 501).expect("runtime paths");
         (root, config, paths)

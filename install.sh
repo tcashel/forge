@@ -39,6 +39,19 @@ warn() {
     printf '%s: warning: %s\n' "$PROGRAM" "$*" >&2
 }
 
+reject_symlinked_prefix() {
+    remaining=${1#/}
+    current=
+    while [ -n "$remaining" ]; do
+        case "$remaining" in
+            */*) component=${remaining%%/*}; remaining=${remaining#*/} ;;
+            *) component=$remaining; remaining= ;;
+        esac
+        current=$current/$component
+        [ ! -L "$current" ] || die "prefix contains a symlinked path component: $current"
+    done
+}
+
 cleanup() {
     if [ -n "$STAGE_PARENT" ] && [ -d "$STAGE_PARENT" ]; then
         rm -rf "$STAGE_PARENT"
@@ -115,6 +128,7 @@ case "$PREFIX" in
     *'
 '*) die "prefix must not contain a newline" ;;
 esac
+reject_symlinked_prefix "$PREFIX"
 
 case "$REQUESTED_VERSION" in
     latest) EXPECTED_VERSION= ; RELEASE_PATH=latest/download ;;

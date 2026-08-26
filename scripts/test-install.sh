@@ -146,6 +146,16 @@ do
 done
 pass "install and uninstall reject non-normalized prefixes before mutation"
 
+SYMLINK_TARGET=$TMP_ROOT/symlink-target
+SYMLINK_PREFIX=$TMP_ROOT/symlink-prefix
+mkdir "$SYMLINK_TARGET"
+ln -s "$SYMLINK_TARGET" "$SYMLINK_PREFIX"
+expect_failure run_install "$ANVIL" --archive "$TMP_ROOT/not-an-archive" \
+    --prefix "$SYMLINK_PREFIX/redirected"
+expect_failure run_uninstall "$ANVIL" --prefix "$SYMLINK_PREFIX/redirected"
+assert_absent "$SYMLINK_TARGET/redirected"
+pass "install and uninstall reject symlinked prefix ancestors before mutation"
+
 RELEASE_ONE=$TMP_ROOT/release-one
 ARCHIVE_ONE=$(make_release "$RELEASE_ONE" 9.8.7 "$TARGET")
 PREFIX=$TMP_ROOT/missing/'parent with spaces'/prefix

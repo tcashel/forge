@@ -392,14 +392,15 @@ fn resolve_bd_path(
     search_path: Option<std::ffi::OsString>,
 ) -> PathBuf {
     if let Some(configured) = configured {
-        return PathBuf::from(configured);
+        let path = PathBuf::from(configured);
+        return path.canonicalize().unwrap_or(path);
     }
     let requested = environment
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| std::ffi::OsString::from("bd"));
     let unresolved = PathBuf::from(&requested);
     if unresolved.components().count() != 1 {
-        return unresolved;
+        return unresolved.canonicalize().unwrap_or(unresolved);
     }
     let Some(search_path) = search_path.filter(|value| !value.is_empty()) else {
         return unresolved;
@@ -1269,6 +1270,25 @@ mod tests {
         permissions.set_mode(0o755);
         std::fs::set_permissions(&path_bd, permissions).expect("executable fixture");
         let search_path = Some(directory.path().as_os_str().to_os_string());
+        let linked_bd = directory.path().join("linked-bd");
+        std::os::unix::fs::symlink(&path_bd, &linked_bd).expect("linked bd fixture");
+
+        assert_eq!(
+            resolve_bd_path(
+                Some(linked_bd.to_string_lossy().into_owned()),
+                Some(std::ffi::OsString::from("/environment/bd")),
+                search_path.clone(),
+            ),
+            path_bd.canonicalize().expect("canonical configured bd")
+        );
+        assert_eq!(
+            resolve_bd_path(
+                None,
+                Some(linked_bd.as_os_str().to_os_string()),
+                search_path.clone(),
+            ),
+            path_bd.canonicalize().expect("canonical environment bd")
+        );
 
         assert_eq!(
             resolve_bd_path(

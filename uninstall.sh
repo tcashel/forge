@@ -27,6 +27,19 @@ die() {
     exit 1
 }
 
+reject_symlinked_prefix() {
+    remaining=${1#/}
+    current=
+    while [ -n "$remaining" ]; do
+        case "$remaining" in
+            */*) component=${remaining%%/*}; remaining=${remaining#*/} ;;
+            *) component=$remaining; remaining= ;;
+        esac
+        current=$current/$component
+        [ ! -L "$current" ] || die "prefix contains a symlinked path component: $current"
+    done
+}
+
 on_signal() {
     trap - HUP INT TERM
     exit 130
@@ -83,6 +96,7 @@ case "$PREFIX" in
     *'
 '*) die "prefix must not contain a newline" ;;
 esac
+reject_symlinked_prefix "$PREFIX"
 
 ANVIL_ROOT=${ANVIL_HOME:-${HOME:+$HOME/.anvil}}
 if [ -n "$ANVIL_ROOT" ]; then
