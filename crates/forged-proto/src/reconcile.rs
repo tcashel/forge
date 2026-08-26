@@ -223,6 +223,33 @@ pub async fn reconcile(
     config: &ReconcileConfig,
     now: &str,
 ) -> Result<ReconcileReport, ProtoError> {
+    reconcile_inner(ledger, run_id, ports, config, now, true).await
+}
+
+/// Reconcile only the run's attempts, leaving operation recovery and
+/// harvest-and-verify to the outer operation that owns them.
+///
+/// Whole-run settlement uses this narrower entrypoint while its own
+/// `SafeRetry` operation is in progress; releasing that operation from
+/// inside itself would strand successful settlement at response commit.
+pub async fn reconcile_attempts(
+    ledger: &Ledger,
+    run_id: &str,
+    ports: &dyn ReconcilePorts,
+    config: &ReconcileConfig,
+    now: &str,
+) -> Result<ReconcileReport, ProtoError> {
+    reconcile_inner(ledger, run_id, ports, config, now, false).await
+}
+
+async fn reconcile_inner(
+    ledger: &Ledger,
+    run_id: &str,
+    ports: &dyn ReconcilePorts,
+    config: &ReconcileConfig,
+    now: &str,
+    include_run_aftermath: bool,
+) -> Result<ReconcileReport, ProtoError> {
     let mut report = ReconcileReport::default();
     parse_stamp(now)?;
     let run: RunRow = {
@@ -416,14 +443,16 @@ pub async fn reconcile(
     report.stopped.sort_unstable();
     report.stopped.dedup();
 
-    let events = {
-        let run_id = run_id.to_owned();
-        on_ledger(ledger, move |l| fetch_all_events(l, &run_id)).await?
-    };
-    let proto_events = parse_proto_events(&events)?;
+    if include_run_aftermath {
+        let events = {
+            let run_id = run_id.to_owned();
+            on_ledger(ledger, move |l| fetch_all_events(l, &run_id)).await?
+        };
+        let proto_events = parse_proto_events(&events)?;
 
-    settle_operations(ledger, ports, &run, &proto_events, &mut report).await?;
-    harvest_and_verify(ports, run_id, config, &proto_events, &mut report).await?;
+        settle_operations(ledger, ports, &run, &proto_events, &mut report).await?;
+        harvest_and_verify(ports, run_id, config, &proto_events, &mut report).await?;
+    }
 
     Ok(report)
 }

@@ -4,7 +4,8 @@
 use std::path::Path;
 
 use forged_ledger::{
-    EffectClass, OperationState, RevokeScope, RunOutcome, RunRow, RunSettlement, RunState,
+    AttemptState, EffectClass, OperationState, RevokeScope, RunOutcome, RunRow, RunSettlement,
+    RunState,
 };
 use forged_types::{ErrorCode, OperationRequest, OperationResponse};
 use serde_json::{json, Value};
@@ -101,18 +102,39 @@ async fn stop_live_attempts(ctx: &Ctx, run_id: &str, reason: &str) -> Result<Vec
             gate_commands: view.policy.gate_commands,
         };
         let ports = ForgedPorts::new(ctx.ledger.clone(), ctx.config.clone());
-        for attempt in live {
-            let attempt_id = attempt.attempt_id;
-            if attempt.revoke_scope == Some(RevokeScope::Deadline) {
-                forged_proto::reconcile(&ctx.ledger, run_id, &ports, &config, &now_iso()).await?;
+        for observed in live {
+            let attempt_id = observed.attempt_id;
+            let reason = reason.to_owned();
+            let marker = on_ledger(&ctx.ledger, move |ledger| {
+                ledger.revoke_attempt_scoped(attempt_id, &reason, RevokeScope::Attempt)
+            })
+            .await;
+            if let Err(error) = marker {
+                // A run-scoped deadline reconcile (or another settlement)
+                // may have made this snapshot row terminal. Re-read that
+                // durable result; only an unrelated refusal still fails.
+                if error.code != ErrorCode::InvalidRequest {
+                    return Err(error);
+                }
+            }
+            // `revoke_attempt_scoped` is first-writer-wins. Read its durable
+            // row before choosing the matching terminal order so an older
+            // snapshot can never replace a sibling's Deadline scope.
+            let attempt =
+                on_ledger(&ctx.ledger, move |ledger| ledger.get_attempt(attempt_id)).await?;
+            if !matches!(
+                attempt.state,
+                AttemptState::Running | AttemptState::Revoking
+            ) {
                 stopped.push(attempt_id);
                 continue;
             }
-            let reason = reason.to_owned();
-            on_ledger(&ctx.ledger, move |ledger| {
-                ledger.revoke_attempt_scoped(attempt_id, &reason, RevokeScope::Attempt)
-            })
-            .await?;
+            if attempt.revoke_scope == Some(RevokeScope::Deadline) {
+                forged_proto::reconcile_attempts(&ctx.ledger, run_id, &ports, &config, &now_iso())
+                    .await?;
+                stopped.push(attempt_id);
+                continue;
+            }
             forged_proto::stop_attempt(&ctx.ledger, &ports, attempt_id, config.termination_grace_s)
                 .await?;
             stopped.push(attempt_id);
