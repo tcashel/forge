@@ -868,8 +868,8 @@ fn three_submitted_rolling_epics_converge_below_capacity_with_one_isolated_crux(
             .filter(|call| call.join(" ").contains("--method PATCH")
                 && call.join(" ").contains("/pulls/"))
             .count(),
-        2,
-        "only the two assured PRs receive terminal evidence: {gh_calls:?}"
+        4,
+        "the two assured PRs are each marked pending before terminal evidence: {gh_calls:?}"
     );
     assert!(gh_calls.iter().all(|call| {
         !call.iter().any(|arg| arg == "merge") && !call.iter().any(|arg| arg == "ready")
@@ -1115,10 +1115,199 @@ fn assurance_pr_body_crash_replays_to_one_terminal_completion() {
             .filter(|call| call.join(" ").contains("--method PATCH")
                 && call.join(" ").contains("/pulls/"))
             .count(),
-        2,
-        "the idempotent body update is replayed once after the crash: {gh_calls:?}"
+        4,
+        "each attempt clears stale approval before rechecking and publishing: {gh_calls:?}"
     );
     assert!(gh_calls.iter().all(|call| {
+        !call.iter().any(|arg| arg == "merge") && !call.iter().any(|arg| arg == "ready")
+    }));
+}
+
+#[cfg(feature = "failpoints")]
+#[test]
+fn assurance_body_crash_then_drift_clears_stale_approval_before_stop() {
+    let env = TestEnv::new("forged-rolling-assurance-finalize-crash-drift");
+    env.enable_dynamic_gh();
+    env.seed_epic(
+        "epic-assurance-finalize-crash-drift",
+        &[("child-assurance-finalize-crash-drift", &env.spec, false)],
+    );
+    env.set_bead_field("child-assurance-finalize-crash-drift", "status", "closed");
+    assert_eq!(env.forged(&["init"]).0, 0);
+    let default_sha = rev_parse(&env.repos.origin, "main");
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let (code, started) = env.forged(&[
+        "epic",
+        "start",
+        "--epic",
+        "epic-assurance-finalize-crash-drift",
+        "--repo",
+        &repo,
+        "--base-ref",
+        "main",
+        "--rolling",
+    ]);
+    assert_eq!(code, 0, "rolling start: {started}");
+    env.authorize_epic("epic-assurance-finalize-crash-drift");
+    assert_eq!(
+        env.forged(&[
+            "epic",
+            "advance",
+            "--epic",
+            "epic-assurance-finalize-crash-drift",
+        ])
+        .0,
+        0
+    );
+    let (code, draft) = env.forged(&[
+        "epic",
+        "advance",
+        "--epic",
+        "epic-assurance-finalize-crash-drift",
+    ]);
+    assert_eq!(code, 0, "draft PR: {draft}");
+    let number = draft["result"]["progress"]["draftPr"]["number"]
+        .as_u64()
+        .expect("draft PR number");
+
+    let mut crashed = false;
+    for _ in 0..64 {
+        let status = env
+            .forged_cmd(&[
+                "epic",
+                "advance",
+                "--epic",
+                "epic-assurance-finalize-crash-drift",
+            ])
+            .env("FORGED_FAILPOINT", "epic.assurance.pr-body.after")
+            .env("FORGED_FAILPOINT_MODE", "crash")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("assurance finalization tick");
+        if !status.success() {
+            crashed = true;
+            break;
+        }
+    }
+    assert!(crashed, "finalization must reach the PR-body crash seam");
+    let body_path = env.gh_dir.join(format!("pr.{number}.body"));
+    assert!(
+        std::fs::read_to_string(&body_path)
+            .expect("approved PR body")
+            .contains("executed and integrally assured by forged"),
+        "the crash seam must follow approval publication"
+    );
+
+    std::fs::write(env.gh_dir.join(format!("pr.{number}.head")), "main")
+        .expect("drift PR head before replay");
+    let (code, stopped) = env.forged(&[
+        "epic",
+        "advance",
+        "--epic",
+        "epic-assurance-finalize-crash-drift",
+    ]);
+    assert_eq!(code, 0, "crash-and-drift recovery: {stopped}");
+    assert_eq!(
+        stopped["result"]["stopped"]["code"],
+        json!("assurance-final-evidence-mismatch"),
+        "replay did not stop on final evidence drift: {stopped}"
+    );
+    let body = std::fs::read_to_string(&body_path).expect("recovered PR body");
+    assert!(body.contains("has not completed integrated assurance"));
+    assert!(body.contains("failed during crash recovery"));
+    assert!(body.contains("Do not treat this pull request as assured"));
+    assert!(!body.contains("executed and integrally assured by forged"));
+
+    let ledger = env.ledger();
+    assert_eq!(
+        ledger
+            .list_events(Some("epic-assurance-finalize-crash-drift"), 0, 65_536,)
+            .expect("epic events")
+            .iter()
+            .filter(|event| event.kind == "forged.epic.assurance.completed")
+            .count(),
+        0,
+        "drift recovery cannot record terminal assurance"
+    );
+    ledger.close().expect("close ledger");
+    assert_eq!(rev_parse(&env.repos.origin, "main"), default_sha);
+    let gh_calls = env.gh_calls();
+    assert_eq!(
+        gh_calls
+            .iter()
+            .filter(|call| call.join(" ").contains("--method POST")
+                && call.join(" ").contains("/pulls"))
+            .count(),
+        1,
+        "recovery reuses the original draft PR: {gh_calls:?}"
+    );
+    assert!(gh_calls.iter().all(|call| {
+        !call.iter().any(|arg| arg == "merge") && !call.iter().any(|arg| arg == "ready")
+    }));
+}
+
+#[test]
+fn assurance_final_binding_drift_leaves_explicit_non_assured_body() {
+    let env = TestEnv::new("forged-rolling-assurance-final-drift");
+    env.enable_dynamic_gh();
+    env.seed_epic(
+        "epic-assurance-final-drift",
+        &[("child-assurance-final-drift", &env.spec, false)],
+    );
+    env.set_bead_field("child-assurance-final-drift", "status", "closed");
+    assert_eq!(env.forged(&["init"]).0, 0);
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let (code, started) = env.forged(&[
+        "epic",
+        "start",
+        "--epic",
+        "epic-assurance-final-drift",
+        "--repo",
+        &repo,
+        "--base-ref",
+        "main",
+        "--rolling",
+    ]);
+    assert_eq!(code, 0, "rolling start: {started}");
+    env.authorize_epic("epic-assurance-final-drift");
+    assert_eq!(
+        env.forged(&["epic", "advance", "--epic", "epic-assurance-final-drift"])
+            .0,
+        0
+    );
+    let (code, draft) = env.forged(&["epic", "advance", "--epic", "epic-assurance-final-drift"]);
+    assert_eq!(code, 0, "draft PR: {draft}");
+    let number = draft["result"]["progress"]["draftPr"]["number"]
+        .as_u64()
+        .expect("draft PR number");
+
+    // The shim moves the PR head after the assured-body PATCH. The finalizer
+    // must catch that race in its post-publication readback and replace the
+    // approval claim with explicit non-assured drift evidence.
+    std::fs::write(env.gh_dir.join("drift-after-assured-update"), "main")
+        .expect("arm finalization drift");
+    let mut stopped = Value::Null;
+    for _ in 0..64 {
+        let (code, tick) = env.forged(&["epic", "advance", "--epic", "epic-assurance-final-drift"]);
+        assert_eq!(code, 0, "assurance drift tick: {tick}");
+        stopped = tick;
+        if stopped["result"]["stopped"]["inputRequired"].is_object() {
+            break;
+        }
+    }
+    assert_eq!(
+        stopped["result"]["stopped"]["inputRequired"]["code"],
+        json!("assurance-finalization-drift"),
+        "finalization did not stop on the raced binding: {stopped}"
+    );
+    let body = std::fs::read_to_string(env.gh_dir.join(format!("pr.{number}.body")))
+        .expect("durable PR body");
+    assert!(body.contains("has not completed integrated assurance"));
+    assert!(body.contains("Final binding verification failed"));
+    assert!(body.contains("Do not treat this pull request as assured"));
+    assert!(!body.contains("executed and integrally assured by forged"));
+    assert!(env.gh_calls().iter().all(|call| {
         !call.iter().any(|arg| arg == "merge") && !call.iter().any(|arg| arg == "ready")
     }));
 }

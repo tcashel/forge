@@ -389,7 +389,16 @@ if [ -f "$GH_SHIM_DIR/dynamic-prs" ]; then
       exit 0 ;;
     update_pr)
       num=""
-      for a in "$@"; do case "$a" in repos/*/pulls/*) num=${a##*/} ;; body=*) printf '%s' "${a#body=}" > "$GH_SHIM_DIR/pr.$num.body" ;; esac; done
+      body_value=""
+      for a in "$@"; do case "$a" in repos/*/pulls/*) num=${a##*/} ;; body=*) body_value=${a#body=}; printf '%s' "$body_value" > "$GH_SHIM_DIR/pr.$num.body" ;; esac; done
+      case "$body_value" in
+        *"executed and integrally assured by forged"*)
+          if [ -f "$GH_SHIM_DIR/drift-after-assured-update" ]; then
+            drift_head=$(cat "$GH_SHIM_DIR/drift-after-assured-update")
+            rm -f "$GH_SHIM_DIR/drift-after-assured-update"
+            printf '%s' "$drift_head" > "$GH_SHIM_DIR/pr.$num.head"
+          fi ;;
+      esac
       state=$(cat "$GH_SHIM_DIR/pr.$num.state"); draft=$(cat "$GH_SHIM_DIR/pr.$num.draft")
       base=$(cat "$GH_SHIM_DIR/pr.$num.base"); head=$(cat "$GH_SHIM_DIR/pr.$num.head")
       printf '{"number":%s,"state":"%s","draft":%s,"base":{"ref":"%s"},"head":{"ref":"%s"},"html_url":"https://example.invalid/pr/%s"}\n' "$num" "$(printf '%s' "$state" | tr '[:upper:]' '[:lower:]')" "$draft" "$base" "$head" "$num"

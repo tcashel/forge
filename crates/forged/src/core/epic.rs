@@ -3343,8 +3343,74 @@ async fn complete_assurance(
     run: &forged_proto::RunView,
 ) -> Result<Step, Failure> {
     let config = &view.config;
-    let inspected: Result<AssuranceFinalInspection, Failure> = async {
+    let prepared: Result<_, Failure> = async {
         let gate = latest_gate_evidence(run)?;
+        let expected_sha = gate
+            .get("headSha")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let number = final_pr_number(&state.pr)?;
+        let key = derive_key(
+            "epic_pr_finalize",
+            Some(&config.epic_id),
+            Some(&expected_sha),
+            Some(i64::try_from(number).unwrap_or(i64::MAX)),
+        );
+        let operation_name = "epic_pr_finalize".to_owned();
+        let operation_key = key.clone();
+        let operation = on_ledger(&ctx.ledger, move |ledger| {
+            ledger.find_operation(&operation_name, &operation_key)
+        })
+        .await?;
+        let replaying_finalization = operation.is_some_and(|operation| {
+            operation.state == OperationState::InProgress
+                && operation.run_id.as_deref() == Some(config.epic_id.as_str())
+        });
+        let pending_body = format!(
+            "Epic {} has not completed integrated assurance.\n\n## Assurance status\n\nFinal binding verification is pending. Do not treat this pull request as assured.\n\nExpected candidate SHA: `{expected_sha}`.",
+            config.epic_id,
+        );
+        if replaying_finalization {
+            let slug = repo_slug(Path::new(&config.repo))
+                .await
+                .map_err(|error| Failure::internal(error.to_string()))?;
+            forged_git::GhClient::new()
+                .update_pr_body(&slug, number, &pending_body)
+                .await?;
+        }
+        Ok((
+            gate,
+            expected_sha,
+            number,
+            key,
+            pending_body,
+            replaying_finalization,
+        ))
+    }
+    .await;
+    let (gate, gate_sha, number, key, pending_body, replaying_finalization) = match prepared {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            let stopped = require_input_with_evidence(
+                ctx,
+                &config.epic_id,
+                "assurance-final-inspection-failed",
+                None,
+                error.message.clone(),
+                Some(json!({
+                    "runId": state.run_id,
+                    "initialSha": state.integration_sha,
+                    "draftPr": state.pr,
+                    "errorCode": error.code,
+                    "recoverable": error.recoverable,
+                })),
+            )
+            .await?;
+            return Ok(Step::Stop(stopped));
+        }
+    };
+    let inspected: Result<AssuranceFinalInspection, Failure> = async {
         let local_sha = git_head(&ctx.config.worktree(&state.run_id)).await?;
         let remote_sha =
             forged_git::remote_branch_sha(Path::new(&config.repo), &config.integration_branch)
@@ -3352,12 +3418,11 @@ async fn complete_assurance(
         let slug = repo_slug(Path::new(&config.repo))
             .await
             .map_err(|error| Failure::internal(error.to_string()))?;
-        let number = final_pr_number(&state.pr)?;
         let gh = forged_git::GhClient::new();
         let pr = gh.pr_view(&slug, number).await?;
         let pr_sha = gh.pr_head_sha(&slug, number).await?;
         Ok(AssuranceFinalInspection {
-            gate,
+            gate: gate.clone(),
             local_sha,
             remote_sha,
             slug,
@@ -3400,10 +3465,6 @@ async fn complete_assurance(
     let severe = findings
         .iter()
         .any(|finding| matches!(finding.severity, Severity::Blocker | Severity::High));
-    let gate_sha = gate
-        .get("headSha")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
     let exact = local_sha == remote_sha && remote_sha == pr_sha && pr_sha == gate_sha;
     let pr_exact = pr.state == "OPEN"
         && pr.is_draft
@@ -3423,31 +3484,43 @@ async fn complete_assurance(
     let fix_changed_sha = fix_packets == 0 || local_sha != state.integration_sha;
     let gate_passed = gate.get("passed").and_then(Value::as_bool).unwrap_or(false);
     if !exact || !pr_exact || !fix_changed_sha || !gate_passed || severe {
+        let mismatch_evidence = json!({
+            "runId": state.run_id,
+            "initialSha": state.integration_sha,
+            "localSha": local_sha,
+            "remoteSha": remote_sha,
+            "prSha": pr_sha,
+            "gate": gate,
+            "pr": {
+                "number": pr.number,
+                "state": pr.state,
+                "isDraft": pr.is_draft,
+                "head": pr.head_ref_name,
+                "base": pr.base_ref_name,
+                "url": pr.url,
+            },
+            "fixPackets": fix_packets,
+            "fixChangedSha": fix_changed_sha,
+            "findings": findings,
+        });
+        if replaying_finalization {
+            let drift_body = format!(
+                "Epic {} has not completed integrated assurance.\n\n## Assurance drift\n\nFinal binding verification failed during crash recovery. Do not treat this pull request as assured.\n\n```json\n{}\n```",
+                config.epic_id,
+                serde_json::to_string_pretty(&mismatch_evidence)
+                    .map_err(|error| Failure::internal(error.to_string()))?,
+            );
+            forged_git::GhClient::new()
+                .update_pr_body(&slug, number, &drift_body)
+                .await?;
+        }
         let stopped = require_input_with_evidence(
             ctx,
             &config.epic_id,
             "assurance-final-evidence-mismatch",
             None,
             "integrated assurance did not bind one clean exact draft PR head",
-            Some(json!({
-                "runId": state.run_id,
-                "initialSha": state.integration_sha,
-                "localSha": local_sha,
-                "remoteSha": remote_sha,
-                "prSha": pr_sha,
-                "gate": gate,
-                "pr": {
-                    "number": pr.number,
-                    "state": pr.state,
-                    "isDraft": pr.is_draft,
-                    "head": pr.head_ref_name,
-                    "base": pr.base_ref_name,
-                    "url": pr.url,
-                },
-                "fixPackets": fix_packets,
-                "fixChangedSha": fix_changed_sha,
-                "findings": findings,
-            })),
+            Some(mismatch_evidence),
         )
         .await?;
         return Ok(Step::Stop(stopped));
@@ -3512,12 +3585,6 @@ async fn complete_assurance(
         serde_json::to_string_pretty(&evidence)
             .map_err(|error| Failure::internal(error.to_string()))?,
     );
-    let key = derive_key(
-        "epic_pr_finalize",
-        Some(&config.epic_id),
-        Some(&local_sha),
-        Some(i64::try_from(number).unwrap_or(i64::MAX)),
-    );
     let epic_id = config.epic_id.clone();
     let slug_for_effect = slug.clone();
     let evidence_for_event = evidence.clone();
@@ -3534,29 +3601,56 @@ async fn complete_assurance(
         json!({"pr": number, "headSha": local_sha, "bodySha256": bytes_digest(body.as_bytes())}),
         move |operation| async move {
             let gh = forged_git::GhClient::new();
-            let updated = gh.update_pr_body(&slug_for_effect, number, &body).await?;
-            crate::failpoint::hit("epic.assurance.pr-body.after");
-            let final_remote_sha =
-                forged_git::remote_branch_sha(Path::new(&repo_for_effect), &branch_for_effect)
+            // A prior process may have crashed after publishing approval but
+            // before sealing ASSURANCE_COMPLETED. Clear that claim before
+            // every replayable binding check so drift can never strand stale
+            // approval text on the durable external PR.
+            if !replaying_finalization {
+                gh.update_pr_body(&slug_for_effect, number, &pending_body)
                     .await?;
-            let final_pr = gh.pr_view(&slug_for_effect, number).await?;
-            let final_pr_sha = gh.pr_head_sha(&slug_for_effect, number).await?;
-            let final_local_sha = git_head(&worktree_for_effect).await?;
-            if final_local_sha != expected_sha
-                || final_remote_sha != expected_sha
-                || final_pr_sha != expected_sha
-                || final_pr.state != "OPEN"
-                || !final_pr.is_draft
-                || final_pr.head_ref_name != branch_for_effect
-                || final_pr.base_ref_name != base_for_effect
-            {
-                let stopped = require_input_with_evidence(
-                    ctx,
-                    &epic_id,
-                    "assurance-finalization-drift",
-                    None,
-                    "draft PR or integration branch moved during assurance finalization",
-                    Some(json!({
+            }
+            let mut approval_published = false;
+            let verified_pr = loop {
+                let inspected: Result<_, Failure> = async {
+                    let final_remote_sha = forged_git::remote_branch_sha(
+                        Path::new(&repo_for_effect),
+                        &branch_for_effect,
+                    )
+                    .await?;
+                    let final_pr = gh.pr_view(&slug_for_effect, number).await?;
+                    let final_pr_sha = gh.pr_head_sha(&slug_for_effect, number).await?;
+                    let final_local_sha = git_head(&worktree_for_effect).await?;
+                    Ok((
+                        final_local_sha,
+                        final_remote_sha,
+                        final_pr,
+                        final_pr_sha,
+                    ))
+                }
+                .await;
+                let (final_local_sha, final_remote_sha, final_pr, final_pr_sha) = match inspected {
+                    Ok(inspected) => inspected,
+                    Err(error) => {
+                        if approval_published {
+                            let failed_body = format!(
+                                "Epic {epic_id} has not completed integrated assurance.\n\n## Assurance inspection failed\n\nFinal binding verification failed after approval publication. Do not treat this pull request as assured.\n\nError: `{}`",
+                                error.message,
+                            );
+                            gh.update_pr_body(&slug_for_effect, number, &failed_body)
+                                .await?;
+                        }
+                        return Err(error);
+                    }
+                };
+                if final_local_sha != expected_sha
+                    || final_remote_sha != expected_sha
+                    || final_pr_sha != expected_sha
+                    || final_pr.state != "OPEN"
+                    || !final_pr.is_draft
+                    || final_pr.head_ref_name != branch_for_effect
+                    || final_pr.base_ref_name != base_for_effect
+                {
+                    let drift_evidence = json!({
                         "runId": evidence_for_event["runId"],
                         "expectedSha": expected_sha,
                         "localSha": final_local_sha,
@@ -3570,19 +3664,52 @@ async fn complete_assurance(
                             "base": final_pr.base_ref_name,
                             "url": final_pr.url,
                         },
-                    })),
-                )
-                .await?;
-                return Ok(json!({"inputRequired": stopped}));
-            }
+                    });
+                    let drift_body = format!(
+                        "Epic {epic_id} has not completed integrated assurance.\n\n## Assurance drift\n\nFinal binding verification failed. Do not treat this pull request as assured.\n\n```json\n{}\n```",
+                        serde_json::to_string_pretty(&drift_evidence)
+                            .map_err(|error| Failure::internal(error.to_string()))?,
+                    );
+                    gh.update_pr_body(&slug_for_effect, number, &drift_body)
+                        .await?;
+                    let stopped = require_input_with_evidence(
+                        ctx,
+                        &epic_id,
+                        "assurance-finalization-drift",
+                        None,
+                        "draft PR or integration branch moved during assurance finalization",
+                        Some(drift_evidence),
+                    )
+                    .await?;
+                    return Ok(json!({"inputRequired": stopped}));
+                }
+                if approval_published {
+                    break final_pr;
+                }
+                let published: Result<_, Failure> = gh
+                    .update_pr_body(&slug_for_effect, number, &body)
+                    .await
+                    .map_err(Into::into);
+                if let Err(error) = published {
+                    let failed_body = format!(
+                        "Epic {epic_id} has not completed integrated assurance.\n\n## Assurance publication failed\n\nThe approval body could not be durably verified. Do not treat this pull request as assured.\n\nError: `{}`",
+                        error.message,
+                    );
+                    gh.update_pr_body(&slug_for_effect, number, &failed_body)
+                        .await?;
+                    return Err(error);
+                }
+                approval_published = true;
+            };
+            crate::failpoint::hit("epic.assurance.pr-body.after");
             let event = json!({
                 "transitionId": operation,
                 "pr": {
-                    "number": updated.number,
-                    "url": updated.url,
-                    "head": updated.head_ref_name,
-                    "base": updated.base_ref_name,
-                    "isDraft": updated.is_draft,
+                    "number": verified_pr.number,
+                    "url": verified_pr.url,
+                    "head": verified_pr.head_ref_name,
+                    "base": verified_pr.base_ref_name,
+                    "isDraft": verified_pr.is_draft,
                 },
                 "evidence": evidence_for_event,
             });
