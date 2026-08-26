@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use forged_host::{ProcessHost, SessionHost};
+use forged_host::{PreparedSession, ProcessHost, SessionHost};
 use forged_ledger::{AttemptRow, AttemptState, EffectClass, RevokeScope, RunRow};
 use forged_proto::{LandOutcome, PacketIntent};
 use forged_provider::{
@@ -187,21 +187,120 @@ async fn settle_pre_spawn_deadline(
     let Some(note) = deadline_reason(exec, packet, attempt_id, &attempt.started_at, &as_of)? else {
         return Ok(None);
     };
+    settle_known_pre_spawn_deadline(ctx, packet, attempt_id, note, "deadline-before-spawn")
+        .await
+        .map(Some)
+}
+
+async fn settle_known_pre_spawn_deadline(
+    ctx: &Ctx,
+    packet: &WorkPacket,
+    attempt_id: i64,
+    note: String,
+    phase: &str,
+) -> Result<PacketOutcome, Failure> {
     let marker = deadline_marker(ctx, attempt_id, &note).await?;
     if marker.state != AttemptState::Revoking || marker.revoke_scope != Some(RevokeScope::Deadline)
     {
         return if marker.state == AttemptState::Failed
             && marker.revoke_scope == Some(RevokeScope::Deadline)
         {
-            Ok(Some(PacketOutcome::Transport(note)))
+            Ok(PacketOutcome::Transport(note))
         } else {
-            Ok(Some(PacketOutcome::Revoked))
+            Ok(PacketOutcome::Revoked)
         };
     }
-    preserve_pre_spawn_failure(ctx, packet, attempt_id, &note, "deadline-before-spawn").await?;
-    settle_deadline_retry(ctx, &packet.run_id, &packet.packet_id, attempt_id, note)
+    preserve_pre_spawn_failure(ctx, packet, attempt_id, &note, phase).await?;
+    settle_deadline_retry(ctx, &packet.run_id, &packet.packet_id, attempt_id, note).await
+}
+
+async fn settle_prepared_deadline(
+    ctx: &Ctx,
+    host: &Arc<dyn SessionHost>,
+    prepared: PreparedSession,
+    packet: &WorkPacket,
+    attempt_id: i64,
+    note: String,
+) -> Result<PacketOutcome, Failure> {
+    let marker = deadline_marker(ctx, attempt_id, &note).await?;
+    host.rollback_prepared(prepared).await;
+    if marker.state != AttemptState::Revoking || marker.revoke_scope != Some(RevokeScope::Deadline)
+    {
+        return if marker.state == AttemptState::Failed
+            && marker.revoke_scope == Some(RevokeScope::Deadline)
+        {
+            Ok(PacketOutcome::Transport(note))
+        } else {
+            Ok(PacketOutcome::Revoked)
+        };
+    }
+    preserve_pre_spawn_failure(ctx, packet, attempt_id, &note, "deadline-before-start").await?;
+    settle_deadline_retry(ctx, &packet.run_id, &packet.packet_id, attempt_id, note).await
+}
+
+async fn settle_started_deadline(
+    ctx: &Ctx,
+    host: &Arc<dyn SessionHost>,
+    session: &forged_host::HostSessionId,
+    packet: &WorkPacket,
+    attempt_id: i64,
+    session_evidence: &Value,
+    note: String,
+) -> Result<PacketOutcome, Failure> {
+    let (run_id, stage, seq) = crate::core::split_packet_key(&packet.packet_id)?;
+    let run_root = ctx.config.run_dir(&run_id);
+    let packet_dir = ctx.config.packet_dir_key(&run_id, &stage, seq);
+    let dirs = PacketDirs::new(&packet_dir, attempt_id);
+    let marker = deadline_marker(ctx, attempt_id, &note).await?;
+    host.kill_confirmed(session)
         .await
-        .map(Some)
+        .map_err(|error| Failure {
+            code: ErrorCode::HostUnavailable,
+            message: format!(
+                "stage deadline expired but provider death was not confirmed: {error}"
+            ),
+            recoverable: true,
+        })?;
+    crate::core::artifacts::finalize_provider_files(&run_root, &dirs)?;
+    let out = crate::core::artifacts::read_output_text(&run_root, &dirs)?;
+    crate::core::usage::capture_attempt(
+        ctx,
+        &packet.run_id,
+        &packet.packet_id,
+        Some(attempt_id),
+        &packet.provider_hints.provider,
+        &packet.provider_hints.model,
+        &out,
+    )
+    .await;
+    if marker.state != AttemptState::Revoking || marker.revoke_scope != Some(RevokeScope::Deadline)
+    {
+        if marker.state == AttemptState::Failed
+            && marker.revoke_scope == Some(RevokeScope::Deadline)
+        {
+            return Ok(PacketOutcome::Transport(note));
+        }
+        crate::core::artifacts::materialize_and_join(
+            ctx,
+            packet,
+            attempt_id,
+            "revoked",
+            &json!({"note": "attempt was revoked while its deadline expired"}),
+            session_evidence,
+        )
+        .await?;
+        return Ok(PacketOutcome::Revoked);
+    }
+    crate::core::artifacts::materialize_and_join(
+        ctx,
+        packet,
+        attempt_id,
+        "deadline",
+        &json!({"reason": &note}),
+        session_evidence,
+    )
+    .await?;
+    settle_deadline_retry(ctx, &packet.run_id, &packet.packet_id, attempt_id, note).await
 }
 
 /// SHA-256 hex over a file's bytes.
@@ -785,31 +884,139 @@ fn driver_for(provider: &str) -> Result<Box<dyn ProviderDriver>, Failure> {
     }
 }
 
-/// Poll `<attempt_dir>/provider.pid` until the spawned shell writes it.
-async fn await_pid(attempt_dir: &Path) -> Option<u32> {
+enum PidObservation {
+    Ready(u32),
+    Deadline(String),
+    Missing,
+}
+
+enum ProviderIdentityObservation {
+    Ready(String),
+    Deadline(String),
+    Missing,
+}
+
+/// Poll `<attempt_dir>/provider.pid` until the spawned shell writes it, the
+/// bounded identity window closes, or the attempt's earlier stage deadline
+/// wins. A pid observed at the exact deadline is late.
+async fn await_pid(
+    attempt_dir: &Path,
+    exec: &ExecutionContext,
+    packet: &WorkPacket,
+    attempt_id: i64,
+    started_at: &str,
+) -> Result<PidObservation, Failure> {
+    let budget_s = exec
+        .stage_budget_s
+        .get(&packet.stage)
+        .copied()
+        .ok_or_else(|| Failure::internal("frozen policy has no stage budget"))?;
+    let deadline: jiff::Timestamp = forged_proto::stage_deadline_at(started_at, budget_s)
+        .map_err(|error| Failure::internal(error.to_string()))?
+        .parse()
+        .map_err(|error| Failure::internal(format!("invalid stage deadline: {error}")))?;
     for _ in 0..50 {
+        let as_of = now_iso();
+        if let Some(note) = deadline_reason(exec, packet, attempt_id, started_at, &as_of)? {
+            return Ok(PidObservation::Deadline(note));
+        }
         if let Ok(text) = std::fs::read_to_string(attempt_dir.join("provider.pid")) {
             if let Ok(pid) = text.trim().parse::<u32>() {
-                return Some(pid);
+                let as_of = now_iso();
+                return Ok(
+                    match deadline_reason(exec, packet, attempt_id, started_at, &as_of)? {
+                        Some(note) => PidObservation::Deadline(note),
+                        None => PidObservation::Ready(pid),
+                    },
+                );
             }
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        let now: jiff::Timestamp = as_of
+            .parse()
+            .map_err(|error| Failure::internal(format!("invalid current timestamp: {error}")))?;
+        let remaining_ns = deadline.as_nanosecond() - now.as_nanosecond();
+        let remaining_ns = u64::try_from(remaining_ns)
+            .map_err(|_| Failure::internal("stage deadline duration does not fit u64"))?;
+        tokio::time::sleep(Duration::from_nanos(remaining_ns).min(Duration::from_millis(100)))
+            .await;
     }
-    None
+    let as_of = now_iso();
+    Ok(
+        match deadline_reason(exec, packet, attempt_id, started_at, &as_of)? {
+            Some(note) => PidObservation::Deadline(note),
+            None => PidObservation::Missing,
+        },
+    )
 }
 
 /// A provider pid is not safely recoverable cross-process until its start
 /// stamp is durable. `ps` can briefly miss a just-spawned process under host
 /// load, so use the same bounded identity window as detached controllers.
-async fn await_provider_lstart(pid: u32) -> Option<String> {
-    let pid = i32::try_from(pid).ok()?;
+async fn await_provider_lstart<F, Fut>(
+    pid: u32,
+    exec: &ExecutionContext,
+    packet: &WorkPacket,
+    attempt_id: i64,
+    started_at: &str,
+    lstart_of: F,
+) -> Result<ProviderIdentityObservation, Failure>
+where
+    F: Fn(i32) -> Fut,
+    Fut: std::future::Future<Output = Option<String>>,
+{
+    let Ok(pid) = i32::try_from(pid) else {
+        return Ok(ProviderIdentityObservation::Missing);
+    };
+    let budget_s = exec
+        .stage_budget_s
+        .get(&packet.stage)
+        .copied()
+        .ok_or_else(|| Failure::internal("frozen policy has no stage budget"))?;
+    let deadline: jiff::Timestamp = forged_proto::stage_deadline_at(started_at, budget_s)
+        .map_err(|error| Failure::internal(error.to_string()))?
+        .parse()
+        .map_err(|error| Failure::internal(format!("invalid stage deadline: {error}")))?;
     for _ in 0..20 {
-        if let Some(lstart) = crate::adapters::ports::lstart_of(pid).await {
-            return Some(lstart);
+        let as_of = now_iso();
+        if let Some(note) = deadline_reason(exec, packet, attempt_id, started_at, &as_of)? {
+            return Ok(ProviderIdentityObservation::Deadline(note));
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        let now: jiff::Timestamp = as_of
+            .parse()
+            .map_err(|error| Failure::internal(format!("invalid current timestamp: {error}")))?;
+        let remaining_ns = deadline.as_nanosecond() - now.as_nanosecond();
+        let remaining_ns = u64::try_from(remaining_ns)
+            .map_err(|_| Failure::internal("stage deadline duration does not fit u64"))?;
+        if let Ok(Some(lstart)) =
+            tokio::time::timeout(Duration::from_nanos(remaining_ns), lstart_of(pid)).await
+        {
+            let as_of = now_iso();
+            return Ok(
+                match deadline_reason(exec, packet, attempt_id, started_at, &as_of)? {
+                    Some(note) => ProviderIdentityObservation::Deadline(note),
+                    None => ProviderIdentityObservation::Ready(lstart),
+                },
+            );
+        }
+        let as_of = now_iso();
+        if let Some(note) = deadline_reason(exec, packet, attempt_id, started_at, &as_of)? {
+            return Ok(ProviderIdentityObservation::Deadline(note));
+        }
+        let now: jiff::Timestamp = as_of
+            .parse()
+            .map_err(|error| Failure::internal(format!("invalid current timestamp: {error}")))?;
+        let remaining_ns = deadline.as_nanosecond() - now.as_nanosecond();
+        let remaining_ns = u64::try_from(remaining_ns)
+            .map_err(|_| Failure::internal("stage deadline duration does not fit u64"))?;
+        tokio::time::sleep(Duration::from_nanos(remaining_ns).min(Duration::from_millis(50))).await;
     }
-    None
+    let as_of = now_iso();
+    Ok(
+        match deadline_reason(exec, packet, attempt_id, started_at, &as_of)? {
+            Some(note) => ProviderIdentityObservation::Deadline(note),
+            None => ProviderIdentityObservation::Missing,
+        },
+    )
 }
 
 /// Execute one open packet end to end: re-pin, claim, render, spawn, await,
@@ -1245,6 +1452,17 @@ async fn run_attempt(
     let attempt_started_at = on_ledger(&ctx.ledger, move |ledger| ledger.get_attempt(attempt_id))
         .await?
         .started_at;
+    let as_of = now_iso();
+    if let Some(note) = deadline_reason(exec, packet, attempt_id, &attempt_started_at, &as_of)? {
+        return settle_known_pre_spawn_deadline(
+            ctx,
+            packet,
+            attempt_id,
+            note,
+            "deadline-before-preparation",
+        )
+        .await;
+    }
 
     // 1. Everything between the claim and the spawn. The attempt is already
     // `running` with no process behind it, so NOTHING in here may propagate
@@ -1298,6 +1516,23 @@ async fn run_attempt(
     let (packet, interventions, holder, packet_dir) = match prepared {
         Ok(prepared) => prepared,
         Err(failure) => {
+            let as_of = now_iso();
+            if let Some(note) = deadline_reason(
+                exec,
+                &unprepared_packet,
+                attempt_id,
+                &attempt_started_at,
+                &as_of,
+            )? {
+                return settle_known_pre_spawn_deadline(
+                    ctx,
+                    &unprepared_packet,
+                    attempt_id,
+                    note,
+                    "deadline-during-preparation",
+                )
+                .await;
+            }
             let transport = format!("transport: the attempt could not be prepared: {failure}");
             let refusal = format!("unspawned: attempt refused before spawn: {failure}");
             return settle_unspawned(
@@ -1316,6 +1551,17 @@ async fn run_attempt(
         }
     };
     let dirs = PacketDirs::new(&packet_dir, attempt_id);
+    let as_of = now_iso();
+    if let Some(note) = deadline_reason(exec, &packet, attempt_id, &attempt_started_at, &as_of)? {
+        return settle_known_pre_spawn_deadline(
+            ctx,
+            &packet,
+            attempt_id,
+            note,
+            "deadline-during-preparation",
+        )
+        .await;
+    }
 
     // 2. The sentinel-free shell line.
     let driver = match driver_for(&packet.provider_hints.provider) {
@@ -1382,6 +1628,17 @@ async fn run_attempt(
             ledger.assert_admitted_attempt_live(&claim_token)
         })
         .await?;
+    }
+    let as_of = now_iso();
+    if let Some(note) = deadline_reason(exec, &packet, attempt_id, &attempt_started_at, &as_of)? {
+        return settle_known_pre_spawn_deadline(
+            ctx,
+            &packet,
+            attempt_id,
+            note,
+            "deadline-before-host-selection",
+        )
+        .await;
     }
     let (owned_subject, _) = crate::core::herdr_ownership::attempt_subject(&run_id)?;
     let layout_subject = forged_types::HerdrLayoutSubjectV1 {
@@ -1498,6 +1755,19 @@ async fn run_attempt(
                     )
                 }
                 Err(error) => {
+                    let as_of = now_iso();
+                    if let Some(note) =
+                        deadline_reason(exec, &packet, attempt_id, &attempt_started_at, &as_of)?
+                    {
+                        return settle_known_pre_spawn_deadline(
+                            ctx,
+                            &packet,
+                            attempt_id,
+                            note,
+                            "deadline-during-host-selection",
+                        )
+                        .await;
+                    }
                     return fail_pre_spawn_transport(
                         ctx,
                         &packet,
@@ -1514,6 +1784,19 @@ async fn run_attempt(
     let attach_hint =
         (host_kind == "herdr").then(|| format!("forged session read --attempt {attempt_id}"));
     let mut layout_mutation = layout_mutation;
+    let as_of = now_iso();
+    if let Some(note) = deadline_reason(exec, &packet, attempt_id, &attempt_started_at, &as_of)? {
+        crate::core::herdr_layout::finish_mutation(ctx, layout_mutation.take(), None, Some(&note))
+            .await;
+        return settle_known_pre_spawn_deadline(
+            ctx,
+            &packet,
+            attempt_id,
+            note,
+            "deadline-during-host-setup",
+        )
+        .await;
+    }
     let render_mode = if host_kind == "herdr" {
         ProviderStreamRenderModeV1::OwnedHerdrPane
     } else {
@@ -1634,6 +1917,26 @@ async fn run_attempt(
     let prepared = match host.prepare(&packet.worktree, &shell_line, &env).await {
         Ok(prepared) => prepared,
         Err(error) => {
+            let as_of = now_iso();
+            if let Some(note) =
+                deadline_reason(exec, &packet, attempt_id, &attempt_started_at, &as_of)?
+            {
+                crate::core::herdr_layout::finish_mutation(
+                    ctx,
+                    layout_mutation.take(),
+                    None,
+                    Some(&note),
+                )
+                .await;
+                return settle_known_pre_spawn_deadline(
+                    ctx,
+                    &packet,
+                    attempt_id,
+                    note,
+                    "deadline-during-host-prepare",
+                )
+                .await;
+            }
             crate::core::herdr_layout::finish_mutation(
                 ctx,
                 layout_mutation.take(),
@@ -1653,6 +1956,12 @@ async fn run_attempt(
             .await;
         }
     };
+    let as_of = now_iso();
+    if let Some(note) = deadline_reason(exec, &packet, attempt_id, &attempt_started_at, &as_of)? {
+        crate::core::herdr_layout::finish_mutation(ctx, layout_mutation.take(), None, Some(&note))
+            .await;
+        return settle_prepared_deadline(ctx, &host, prepared, &packet, attempt_id, note).await;
+    }
     let status_path = prepared.sentinel_path().to_string_lossy().into_owned();
     let (ownership, controller_generation) = crate::core::herdr_ownership::attempt_identity(
         &prepared,
@@ -1663,6 +1972,20 @@ async fn run_attempt(
     )?;
     if let Some(identity) = ownership.as_ref() {
         if let Err(failure) = crate::core::herdr_ownership::register(ctx, identity.clone()).await {
+            let as_of = now_iso();
+            if let Some(note) =
+                deadline_reason(exec, &packet, attempt_id, &attempt_started_at, &as_of)?
+            {
+                crate::core::herdr_layout::finish_mutation(
+                    ctx,
+                    layout_mutation.take(),
+                    Some(&prepared),
+                    Some(&note),
+                )
+                .await;
+                return settle_prepared_deadline(ctx, &host, prepared, &packet, attempt_id, note)
+                    .await;
+            }
             crate::core::herdr_layout::finish_mutation(
                 ctx,
                 layout_mutation.take(),
@@ -1700,8 +2023,15 @@ async fn run_attempt(
     crate::core::herdr_layout::finish_mutation(ctx, layout_mutation.take(), Some(&prepared), None)
         .await;
     failpoint::hit("provider.ownership.register.after");
+    let as_of = now_iso();
+    if let Some(note) = deadline_reason(exec, &packet, attempt_id, &attempt_started_at, &as_of)? {
+        return settle_prepared_deadline(ctx, &host, prepared, &packet, attempt_id, note).await;
+    }
     let spawned = host.start(prepared).await;
     failpoint::hit("provider.spawn.after");
+    let as_of = now_iso();
+    let start_deadline_note =
+        deadline_reason(exec, &packet, attempt_id, &attempt_started_at, &as_of)?;
     let session = match spawned {
         Ok(session) => session,
         Err(error) if ownership.is_some() => {
@@ -1710,6 +2040,9 @@ async fn run_attempt(
             // death proof. Keep the exact attempt, claim, admission capacity,
             // and ownership live so recovery can observe its durable sentinel
             // or provider pid; settling here could admit a duplicate effect.
+            if let Some(note) = start_deadline_note {
+                let _ = deadline_marker(ctx, attempt_id, &note).await?;
+            }
             return Err(Failure {
                 code: error.wire_code(),
                 message: format!(
@@ -1721,6 +2054,16 @@ async fn run_attempt(
         Err(e) => {
             // ProcessHost reports start failure only before it publishes a
             // child, so no provider effect can exist on this branch.
+            if let Some(note) = start_deadline_note {
+                return settle_known_pre_spawn_deadline(
+                    ctx,
+                    &packet,
+                    attempt_id,
+                    note,
+                    "deadline-during-start",
+                )
+                .await;
+            }
             let note = format!("transport: provider spawn failed: {e}");
             crate::core::artifacts::materialize_and_join(
                 ctx,
@@ -1734,10 +2077,35 @@ async fn run_attempt(
             return fail_and_grant_retry(ctx, &packet_id, &claim_token, note).await;
         }
     };
+    let mut session_evidence = json!({
+        "host": host_kind,
+        "sessionId": session.as_str(),
+        "socketPath": socket_path.clone(),
+        "statusPath": status_path.clone(),
+        "controllerGeneration": controller_generation,
+        "ownershipId": ownership.as_ref().map(|identity| &identity.ownership_id),
+        "layoutId": ownership.as_ref().and_then(|identity| identity.layout_id.as_deref()),
+        "attachHint": attach_hint.clone(),
+    });
     if let Some(identity) = ownership.as_ref() {
         if let Err(error) =
             crate::core::herdr_ownership::mark_command_started(ctx, &identity.ownership_id).await
         {
+            let as_of = now_iso();
+            if let Some(note) =
+                deadline_reason(exec, &packet, attempt_id, &attempt_started_at, &as_of)?
+            {
+                return settle_started_deadline(
+                    ctx,
+                    &host,
+                    &session,
+                    &packet,
+                    attempt_id,
+                    &session_evidence,
+                    note,
+                )
+                .await;
+            }
             // The command may be live. Never retry send_input. Contain it by
             // verified kill; if that cannot be proved, leave the running
             // attempt and durable ownership for cross-process recovery.
@@ -1752,6 +2120,19 @@ async fn run_attempt(
         let _ = crate::core::herdr_projection::refresh(ctx).await;
     }
     failpoint::hit("provider.ownership.started.after");
+    let as_of = now_iso();
+    if let Some(note) = deadline_reason(exec, &packet, attempt_id, &attempt_started_at, &as_of)? {
+        return settle_started_deadline(
+            ctx,
+            &host,
+            &session,
+            &packet,
+            attempt_id,
+            &session_evidence,
+            note,
+        )
+        .await;
+    }
     if let Err(error) = crate::core::sessions::record_session_started(
         ctx,
         crate::core::sessions::SessionStarted {
@@ -1771,6 +2152,20 @@ async fn run_attempt(
     )
     .await
     {
+        let as_of = now_iso();
+        if let Some(note) = deadline_reason(exec, &packet, attempt_id, &attempt_started_at, &as_of)?
+        {
+            return settle_started_deadline(
+                ctx,
+                &host,
+                &session,
+                &packet,
+                attempt_id,
+                &session_evidence,
+                note,
+            )
+            .await;
+        }
         if host.kill_confirmed(&session).await.is_ok() {
             let note = format!("transport: provider session record failed after start: {error}");
             return fail_and_grant_retry(ctx, &packet_id, &claim_token, note).await;
@@ -1786,16 +2181,6 @@ async fn run_attempt(
         "boundary",
     )
     .await?;
-    let mut session_evidence = json!({
-        "host": host_kind,
-        "sessionId": session.as_str(),
-        "socketPath": socket_path,
-        "statusPath": status_path,
-        "controllerGeneration": controller_generation,
-        "ownershipId": ownership.as_ref().map(|identity| &identity.ownership_id),
-        "layoutId": ownership.as_ref().and_then(|identity| identity.layout_id.as_deref()),
-        "attachHint": attach_hint,
-    });
     ports
         .adopt_session(attempt_id, Arc::clone(&host), session.clone())
         .await;
@@ -1808,47 +2193,99 @@ async fn run_attempt(
     // reclaim its apparently-expired work while it is still writing to the
     // worktree. Stop the session, record a transport failure, and let the
     // transport-retry budget decide whether to try again.
-    let Some(pid) = await_pid(dirs.path()).await else {
-        let stopped = host.kill_confirmed(&session).await;
-        drop(submit_guard);
-        stopped.map_err(|error| Failure {
-            code: ErrorCode::HostUnavailable,
-            message: format!(
-                "provider pid was not durable and its process group could not be stopped: {error}"
-            ),
-            recoverable: true,
-        })?;
-        let note = "transport: provider pid file never appeared".to_owned();
-        crate::core::artifacts::materialize_and_join(
-            ctx,
-            &packet,
-            attempt_id,
-            "transport",
-            &json!({"note": &note}),
-            &session_evidence,
-        )
-        .await?;
-        return fail_and_grant_retry(ctx, &packet_id, &claim_token, note).await;
+    let pid = match await_pid(dirs.path(), exec, &packet, attempt_id, &attempt_started_at).await? {
+        PidObservation::Ready(pid) => pid,
+        PidObservation::Deadline(note) => {
+            return settle_started_deadline(
+                ctx,
+                &host,
+                &session,
+                &packet,
+                attempt_id,
+                &session_evidence,
+                note,
+            )
+            .await;
+        }
+        PidObservation::Missing => {
+            let stopped = host.kill_confirmed(&session).await;
+            drop(submit_guard);
+            stopped.map_err(|error| Failure {
+                code: ErrorCode::HostUnavailable,
+                message: format!(
+                    "provider pid was not durable and its process group could not be stopped: {error}"
+                ),
+                recoverable: true,
+            })?;
+            let note = "transport: provider pid file never appeared".to_owned();
+            crate::core::artifacts::materialize_and_join(
+                ctx,
+                &packet,
+                attempt_id,
+                "transport",
+                &json!({"note": &note}),
+                &session_evidence,
+            )
+            .await?;
+            return fail_and_grant_retry(ctx, &packet_id, &claim_token, note).await;
+        }
     };
     // The start-time stamp beside the pid is the pid-reuse guard for every
     // process that did not spawn this attempt (see `adapters::ports`). Do not
     // let an effect-capable provider continue without that durable identity:
     // a later revoker could not safely signal it.
-    let identity_failure = match await_provider_lstart(pid).await {
-        Some(lstart) => std::fs::write(dirs.provider_lstart(), lstart)
-            .err()
-            .map(|error| format!("cannot persist provider start time: {error}")),
-        None => Some("provider start time never appeared".to_owned()),
+    let identity_failure = match await_provider_lstart(
+        pid,
+        exec,
+        &packet,
+        attempt_id,
+        &attempt_started_at,
+        crate::adapters::ports::lstart_of,
+    )
+    .await?
+    {
+        ProviderIdentityObservation::Ready(lstart) => {
+            std::fs::write(dirs.provider_lstart(), lstart)
+                .err()
+                .map(|error| format!("cannot persist provider start time: {error}"))
+        }
+        ProviderIdentityObservation::Deadline(note) => {
+            return settle_started_deadline(
+                ctx,
+                &host,
+                &session,
+                &packet,
+                attempt_id,
+                &session_evidence,
+                note,
+            )
+            .await;
+        }
+        ProviderIdentityObservation::Missing => {
+            Some("provider start time never appeared".to_owned())
+        }
     };
     if let Some(detail) = identity_failure {
         // A terminal sentinel is sufficient containment even when a very
         // short-lived process vanished before `ps` could capture its start
         // time. Otherwise the spawning host must prove the group stopped
         // before the attempt may be settled and retried.
-        if !matches!(
-            host.alive(&session).await,
-            Ok(forged_host::Liveness::Exited(_))
-        ) {
+        let observed = host.alive(&session).await;
+        let as_of = now_iso();
+        if let Some(note) = deadline_reason(exec, &packet, attempt_id, &attempt_started_at, &as_of)?
+        {
+            return settle_started_deadline(
+                ctx,
+                &host,
+                &session,
+                &packet,
+                attempt_id,
+                &session_evidence,
+                note,
+            )
+            .await;
+        }
+        if !matches!(observed, Ok(forged_host::Liveness::Exited(_))) {
             let stopped = host.kill_confirmed(&session).await;
             drop(submit_guard);
             stopped.map_err(|error| Failure {
@@ -2683,6 +3120,7 @@ mod settle_tests {
     use std::collections::BTreeMap;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;
 
     use forged_ledger::Ledger;
@@ -2694,6 +3132,7 @@ mod settle_tests {
 
     const RUN_ID: &str = "run-release";
     const PANE_ID: &str = "w1:p7";
+    const DEADLINE_CROSS_DELAY: Duration = Duration::from_millis(1_250);
 
     /// Every method the mock was asked for, in arrival order.
     type MethodLog = Arc<Mutex<Vec<String>>>;
@@ -2703,6 +3142,7 @@ mod settle_tests {
         Normal,
         RefuseClose,
         LoseSendResponse,
+        DelayPreparePastDeadline,
     }
 
     /// A protocol-19 Herdr exercising either a refused cleanup or the
@@ -2711,9 +3151,11 @@ mod settle_tests {
         let listener = UnixListener::bind(socket_path).expect("bind mock herdr socket");
         let seen: MethodLog = Arc::new(Mutex::new(Vec::new()));
         let recorded = Arc::clone(&seen);
+        let closed = Arc::new(AtomicBool::new(false));
         tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
                 let recorded = Arc::clone(&recorded);
+                let closed = Arc::clone(&closed);
                 tokio::spawn(async move {
                     let (read_half, mut write_half) = stream.into_split();
                     let mut lines = BufReader::new(read_half).lines();
@@ -2730,6 +3172,11 @@ mod settle_tests {
                             // Drop the response after observing the request:
                             // the client cannot know whether Herdr accepted it.
                             return;
+                        }
+                        if method == "pane.split"
+                            && matches!(behavior, MockBehavior::DelayPreparePastDeadline)
+                        {
+                            tokio::time::sleep(DEADLINE_CROSS_DELAY).await;
                         }
                         let frame = match method.as_str() {
                             "ping" => json!({"id": id, "result": {"type": "pong",
@@ -2759,6 +3206,9 @@ mod settle_tests {
                                 "pane": {"pane_id": PANE_ID, "workspace_id": "ws-1",
                                 "tab_id": "tab-1", "terminal_id": "term-1", "focused": false,
                                 "agent_status": "idle", "revision": 1}}}),
+                            "pane.process_info" if closed.load(Ordering::SeqCst) => json!({
+                                "id": id, "error": {
+                                    "code": "pane_not_found", "message": "pane not found"}}),
                             "pane.process_info" => json!({"id": id, "result": {
                                 "type": "pane_process_info", "process_info": {
                                 "pane_id": PANE_ID, "shell_pid": 4242,
@@ -2768,7 +3218,10 @@ mod settle_tests {
                                 json!({"id": id, "error": {
                                     "code": "INTERNAL", "message": "close refused"}})
                             }
-                            "pane.close" => json!({"id": id, "result": {"type": "ok"}}),
+                            "pane.close" => {
+                                closed.store(true, Ordering::SeqCst);
+                                json!({"id": id, "result": {"type": "ok"}})
+                            }
                             other => panic!("unexpected herdr request {other:?}"),
                         };
                         let mut bytes = frame.to_string().into_bytes();
@@ -2868,6 +3321,8 @@ mod settle_tests {
         status_base: PathBuf,
         capture: String,
         delay: Duration,
+        write_pid: bool,
+        pid_before_delay: bool,
     ) {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         let session_dir = loop {
@@ -2884,6 +3339,13 @@ mod settle_tests {
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         };
+        if write_pid && pid_before_delay {
+            std::fs::write(
+                packet_dir.join("provider.pid"),
+                exited_provider_pid().to_string(),
+            )
+            .expect("pid file");
+        }
         tokio::time::sleep(delay).await;
         let request: Value = serde_json::from_slice(
             &std::fs::read(packet_dir.join(".provider-stream-request.json"))
@@ -2918,16 +3380,26 @@ mod settle_tests {
             .expect("runner status json"),
         )
         .expect("runner status");
-        std::fs::write(
-            packet_dir.join("provider.pid"),
-            exited_provider_pid().to_string(),
-        )
-        .expect("pid file");
+        if write_pid && !pid_before_delay {
+            std::fs::write(
+                packet_dir.join("provider.pid"),
+                exited_provider_pid().to_string(),
+            )
+            .expect("pid file");
+        }
         std::fs::write(session_dir.join("status"), "0\n").expect("sentinel");
     }
 
     async fn play_provider(packet_dir: PathBuf, status_base: PathBuf, capture: String) {
-        play_provider_after(packet_dir, status_base, capture, Duration::ZERO).await;
+        play_provider_after(
+            packet_dir,
+            status_base,
+            capture,
+            Duration::ZERO,
+            true,
+            false,
+        )
+        .await;
     }
 
     fn config_for(root: &Path, socket: &Path) -> ForgedConfig {
@@ -2968,7 +3440,11 @@ mod settle_tests {
         packet_dir: PathBuf,
     }
 
-    async fn claimed_fixture(root: &Path, socket: &Path) -> ClaimedFixture {
+    async fn claimed_fixture_with_budget(
+        root: &Path,
+        socket: &Path,
+        budget_s: u64,
+    ) -> ClaimedFixture {
         write_bd_stub(&root.join("bd"), root);
         std::fs::create_dir_all(root.join("beads")).expect("beads dir");
 
@@ -3004,7 +3480,7 @@ mod settle_tests {
             push_url: String::new(),
             host_policy: HostPolicy::Required,
             herdr_socket: Some(socket.to_path_buf()),
-            stage_budget_s: HashMap::from([(Stage::Implement, 600)]),
+            stage_budget_s: HashMap::from([(Stage::Implement, budget_s)]),
             termination_grace_s: 5,
         };
         let intent = PacketIntent {
@@ -3026,8 +3502,8 @@ mod settle_tests {
             fence: forged_ledger::SpecFence::Sha256(spec_sha.clone()),
             bead_context: Vec::new(),
         };
-        let packet =
-            build_packet(&ctx, &run, &intent, &source, &resolved, &[], 600, None).expect("packet");
+        let packet = build_packet(&ctx, &run, &intent, &source, &resolved, &[], budget_s, None)
+            .expect("packet");
         std::fs::create_dir_all(&packet.worktree).expect("worktree");
         let packet_id = ledger
             .open_packet(forged_ledger::NewPacket {
@@ -3073,6 +3549,10 @@ mod settle_tests {
             claim_token: claimed.claim_token,
             packet_dir,
         }
+    }
+
+    async fn claimed_fixture(root: &Path, socket: &Path) -> ClaimedFixture {
+        claimed_fixture_with_budget(root, socket, 600).await
     }
 
     #[tokio::test]
@@ -3153,6 +3633,150 @@ mod settle_tests {
     }
 
     #[tokio::test]
+    async fn preparation_that_crosses_the_deadline_never_starts_the_provider() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let socket = root.path().join("herdr.sock");
+        let seen = start_mock_herdr(&socket, MockBehavior::DelayPreparePastDeadline);
+        let fixture = claimed_fixture_with_budget(root.path(), &socket, 1).await;
+
+        let outcome = run_attempt(
+            &fixture.ctx,
+            &fixture.ports,
+            &fixture.exec,
+            &fixture.packet,
+            &fixture.resolved,
+            fixture.attempt_id,
+            &fixture.claim_token,
+        )
+        .await
+        .expect("expired preparation settles through the deadline path");
+
+        assert!(matches!(outcome, PacketOutcome::Transport(_)));
+        let methods = seen.lock().expect("method log").clone();
+        assert!(
+            !methods.iter().any(|method| method == "pane.send_input"),
+            "no provider command may cross the deadline fence: {methods:?}"
+        );
+        assert!(
+            methods.iter().any(|method| method == "pane.close"),
+            "the prepared pane must be rolled back: {methods:?}"
+        );
+        let attempt = fixture
+            .ledger
+            .get_attempt(fixture.attempt_id)
+            .expect("attempt");
+        assert_eq!(attempt.state, AttemptState::Failed);
+        assert_eq!(attempt.revoke_scope, Some(RevokeScope::Deadline));
+        assert!(attempt
+            .fail_note
+            .as_deref()
+            .is_some_and(|note| note.starts_with("transport: stage deadline exceeded")));
+        let dirs = PacketDirs::new(&fixture.packet_dir, fixture.attempt_id);
+        let session: Value = serde_json::from_slice(
+            &std::fs::read(dirs.session()).expect("deadline session evidence"),
+        )
+        .expect("session JSON");
+        assert_eq!(session["metadata"]["phase"], "deadline-before-start");
+    }
+
+    #[tokio::test]
+    async fn pid_acquisition_uses_the_stage_deadline_not_the_identity_window() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let socket = root.path().join("herdr.sock");
+        let seen = start_mock_herdr(&socket, MockBehavior::Normal);
+        let fixture = claimed_fixture_with_budget(root.path(), &socket, 1).await;
+        let attempt_dirs = PacketDirs::new(&fixture.packet_dir, fixture.attempt_id);
+        tokio::spawn(play_provider_after(
+            attempt_dirs.attempt_path(),
+            attempt_dirs.status(),
+            claude_capture(&fixture.packet_id),
+            Duration::from_millis(100),
+            false,
+            false,
+        ));
+        let started = std::time::Instant::now();
+
+        let outcome = run_attempt(
+            &fixture.ctx,
+            &fixture.ports,
+            &fixture.exec,
+            &fixture.packet,
+            &fixture.resolved,
+            fixture.attempt_id,
+            &fixture.claim_token,
+        )
+        .await
+        .expect("missing pid settles at the earlier stage deadline");
+
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "the five-second pid identity window outlived the stage budget"
+        );
+        let PacketOutcome::Transport(note) = outcome else {
+            panic!("deadline must settle as transport")
+        };
+        assert!(note.starts_with("transport: stage deadline exceeded"));
+        assert!(!note.contains("pid file never appeared"));
+        let attempt = fixture
+            .ledger
+            .get_attempt(fixture.attempt_id)
+            .expect("attempt");
+        assert_eq!(attempt.state, AttemptState::Failed);
+        assert_eq!(attempt.revoke_scope, Some(RevokeScope::Deadline));
+        let result: Value = serde_json::from_slice(
+            &std::fs::read(attempt_dirs.result()).expect("deadline result evidence"),
+        )
+        .expect("result JSON");
+        assert_eq!(result["outcome"], "deadline");
+        assert!(
+            seen.lock()
+                .expect("method log")
+                .iter()
+                .any(|method| method == "pane.close"),
+            "deadline containment must close the started provider pane"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_identity_acquisition_uses_the_stage_deadline() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let socket = root.path().join("herdr.sock");
+        let fixture = claimed_fixture_with_budget(root.path(), &socket, 1).await;
+        let entered = Arc::new(AtomicBool::new(false));
+        let probe_entered = Arc::clone(&entered);
+        let started_at = now_iso();
+        let started = std::time::Instant::now();
+
+        let observation = await_provider_lstart(
+            1,
+            &fixture.exec,
+            &fixture.packet,
+            fixture.attempt_id,
+            &started_at,
+            move |_| {
+                let probe_entered = Arc::clone(&probe_entered);
+                async move {
+                    probe_entered.store(true, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    None
+                }
+            },
+        )
+        .await
+        .expect("provider identity acquisition");
+
+        assert!(entered.load(Ordering::SeqCst), "the lstart probe must run");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the five-second lstart probe outlived the one-second stage budget"
+        );
+        assert!(
+            matches!(observation, ProviderIdentityObservation::Deadline(_)),
+            "the stage deadline must win over missing provider identity"
+        );
+    }
+
+    #[tokio::test]
     async fn execution_deadline_uses_the_exact_nanosecond_boundary() {
         let root = tempfile::tempdir().expect("tempdir");
         let socket = root.path().join("herdr.sock");
@@ -3193,6 +3817,8 @@ mod settle_tests {
             attempt_dirs.status(),
             claude_capture(&fixture.packet_id),
             Duration::from_millis(1_100),
+            true,
+            true,
         ));
 
         let outcome = run_attempt(
