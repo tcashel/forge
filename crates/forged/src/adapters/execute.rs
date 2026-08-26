@@ -222,8 +222,8 @@ async fn settle_prepared_deadline(
     attempt_id: i64,
     note: String,
 ) -> Result<PacketOutcome, Failure> {
-    let marker = deadline_marker(ctx, attempt_id, &note).await?;
     host.rollback_prepared(prepared).await;
+    let marker = deadline_marker(ctx, attempt_id, &note).await?;
     if marker.state != AttemptState::Revoking || marker.revoke_scope != Some(RevokeScope::Deadline)
     {
         return if marker.state == AttemptState::Failed
