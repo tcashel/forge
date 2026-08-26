@@ -2,8 +2,15 @@
 
 ## Supported versions
 
-forged is pre-release (v0, pre-falsifier). Only the latest `main` is
-supported — security fixes land there. There are no backported releases.
+The current provider-neutral Rust release and the current `main` branch receive
+security fixes. Before 1.0, fixes are not backported to older releases; they
+ship in the next release.
+
+Until 0.5.0 appears in
+[GitHub Releases](https://github.com/tcashel/forge/releases), no
+provider-neutral Rust release is supported. A version becomes supported only
+when it is published there. The historical TypeScript `v0.4.0` and
+`pre-rip-v0.3.0` tags are unsupported.
 
 ## Reporting a vulnerability
 

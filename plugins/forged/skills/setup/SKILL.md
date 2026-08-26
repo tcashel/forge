@@ -15,7 +15,9 @@ Forged binary.
 
 - Default `ANVIL_HOME` is `$HOME/.anvil`.
 - Default `BEADS_DIR` is `$ANVIL_HOME/beads`; an existing override wins.
-- The supported Beads version is pinned by the bundled bootstrap.
+- Beads must report semver `>=1.2.1` and expose the required epic and lease
+  commands; behavioral and schema probes remain the compatibility authority.
+- Setup and the bundled bootstrap never install or upgrade `bd`.
 - Never initialize Beads from a target checkout or add `.beads`, hooks, agent
   files, settings, or workflow files there.
 - Never install or modify shell profiles without explicit operator consent.
@@ -44,23 +46,34 @@ manifests.
 ```bash
 export ANVIL_HOME="${ANVIL_HOME:-$HOME/.anvil}"
 export BEADS_DIR="${BEADS_DIR:-$ANVIL_HOME/beads}"
-printf 'ANVIL_HOME=%s\nBEADS_DIR=%s\n' "$ANVIL_HOME" "$BEADS_DIR"
-command -v bd
-bd --version
+BD_REQUEST="${BD_BIN:-bd}"
+case "$BD_REQUEST" in
+  /*) export BD_BIN="$BD_REQUEST" ;;
+  */*) echo 'BD_BIN must be absolute or a command on PATH' >&2; exit 1 ;;
+  *) export BD_BIN="$(command -v "$BD_REQUEST" || true)" ;;
+esac
+printf 'ANVIL_HOME=%s\nBEADS_DIR=%s\nBD_BIN=%s\n' "$ANVIL_HOME" "$BEADS_DIR" "$BD_BIN"
+test -n "$BD_BIN" && test -x "$BD_BIN"
+"$BD_BIN" --version
 command -v forged
 forged --version
 git status --short
 ```
 
-If Beads is already pinned and `BEADS_DIR` is healthy, preserve it. If Beads or
-the operator store is missing, explain the exact change, obtain consent, then
-run the bundled `../../bootstrap/install-beads.sh`. The bootstrap honors both
-environment variables, initializes only the out-of-repo operator store, and
-fails closed on a version mismatch.
+Forged resolves `bd` from an explicit absolute config `bdPath`, then a nonempty
+`BD_BIN`, then the bare `bd` command on `PATH`. Preserve an existing compatible binary
+and healthy `BEADS_DIR`. If the operator store is missing, explain the exact
+change, obtain consent, then run the bundled
+`../../bootstrap/install-beads.sh`. The bootstrap honors the environment
+variables, validates the existing version floor and command capabilities,
+initializes only the out-of-repo operator store, and never installs or upgrades
+the binary.
 
-## Validate Forged
+## Validate Forged after consent
 
-Run the installed CLI's current non-mutating probes:
+Before the first run, explain that these commands may create or migrate
+`$ANVIL_HOME/state.db`; `forged doctor` also creates and removes an isolated
+temporary Beads store. Obtain operator consent, then run:
 
 ```bash
 forged doctor
@@ -86,6 +99,12 @@ Validate configured provider adapters and optional durable supervision with the
 commands reported by `forged doctor`. Distinguish source/config evidence from a
 live runtime proof. Do not install a provider, alter credentials, or launch a
 test run without explicit authorization.
+
+On macOS, the installed supervisor includes `$HOME/.local/bin` and
+`$HOME/.cargo/bin` in its deterministic `PATH` when those directories exist,
+ahead of the available system binary directories. The service manifest freezes
+the absolute `BD_BIN` that setup resolved. After intentionally changing that
+binary, reinstall the service configuration before relying on the new path.
 
 ## Prove zero repository imposition
 

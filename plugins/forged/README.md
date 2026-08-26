@@ -38,34 +38,61 @@ Every `bd` command uses the explicitly resolved `$BEADS_DIR`. The plugin never
 passes repository-routing options to Bead creation, initializes Beads in a
 target repository, or creates a repository-local `.beads` directory.
 
-## Setup and use
+## Install and register
 
-Register the Forge checkout as a marketplace and install the same plugin from
-either supported host.
+Starting with the published `v0.5.0` release, the installer verifies the
+selected archive against `SHA256SUMS` and installs into a user-owned prefix.
+The default is `$HOME/.local`, with the binary at
+`$HOME/.local/bin/forged` and the Forge release package at
+`$HOME/.local/share/forge`. It does not use `sudo` or edit shell profiles.
+
+```sh
+curl -fsSL https://github.com/tcashel/forge/releases/latest/download/install.sh \
+  | sh
+```
+
+If `$HOME/.local/bin` is not already on `PATH`, add it in your shell
+configuration before starting an agent harness. To select an exact release or
+another user-owned prefix:
+
+```sh
+curl -fsSL https://github.com/tcashel/forge/releases/latest/download/install.sh \
+  | sh -s -- --version 0.5.0 --prefix /absolute/prefix
+```
+
+Reinstalling the same verified release succeeds without changing it. The
+installer refuses modified or foreign destination paths; pass `--force` only
+when you intend to replace those exact install paths. It never uses force to
+change services or operator state.
+
+The installer does not register plugins. Register the installed package
+explicitly from `$PREFIX/share/forge`.
 
 Claude Code:
 
 ```text
-/plugin marketplace add /absolute/path/to/forge
+/plugin marketplace add /absolute/prefix/share/forge
 /plugin install forged@forge
 ```
 
 Codex:
 
-```bash
-codex plugin marketplace add /absolute/path/to/forge
+```sh
+codex plugin marketplace add /absolute/prefix/share/forge
 codex plugin add forged@forge
 ```
 
-Pi installs the whole Forge checkout as one package while loading only the
-resources named by the root manifest. The Forged binary remains a separate
-operator installation:
+Pi:
 
-```bash
-pi install git:github.com/tcashel/forge@<release-tag>
-# or, while developing a checkout
-pi install /absolute/path/to/forge
+```sh
+pi install /absolute/prefix/share/forge
 ```
+
+Before setup, provide `bd >=1.2.1` through `PATH` or `BD_BIN`. Setup requires
+the epic and lease command surface, then Forge's doctor verifies behavior;
+version order alone is not compatibility evidence. Forge does not pin or
+install Beads, Git, GitHub CLI, provider CLIs, credentials, profiles,
+configuration, or services.
 
 Use `/forge` for the native terminal cockpit. It presents work queues,
 attention, 30-day usage trends, and provider attempts directly from Forged's
@@ -116,7 +143,7 @@ pi-standard`. Rolling epics additionally require this dedicated read-only
 workers keep repository skills and context enabled but
 disable extension code; direct Claude and Codex rosters remain available.
 The Claude manifest registers the `forged mcp` server over stdio, resolving
-the operator-installed `forged` binary from PATH (the host silently skips a
+the operator-installed `forged` binary from `PATH` (the host silently skips a
 missing binary; the plugin never installs software). Migration: operators
 with a prior user-scope entry first confirm in a fresh session that the
 plugin-mounted forged tools appear — a bare name the host cannot resolve is
@@ -130,18 +157,40 @@ read path. Pi likewise has no MCP connector: its extension registers a small
 native tool set and executes the independently installed `forged` binary with
 argument arrays.
 
-After installation, run `/forged:setup`. Then talk normally: ask the lead agent
-to explore an idea, plan or revise work, critique or adjudicate a Bead, ask
-what needs attention, explain one run's blocker or spend, reprioritize a Bead,
-or safely pause, resume, or cancel exact existing work. It can also prepare one
-ready subject for explicit execution approval. The shared `manage-work` skill
-routes that intent without requiring a command name or machine id.
+After installation, run `/forged:setup` in Claude Code or Codex, or
+`/skill:setup` in Pi. On macOS, `forged service install` optionally installs the
+per-user supervisor after setup; rerun it after a CLI upgrade so the service
+uses the new immutable binary generation. Managed service lifecycle commands
+are unsupported on Linux.
+
+Then talk normally. Ask the lead agent to explore an idea, plan or revise work,
+critique or adjudicate a Bead, identify what needs attention, explain one run's
+blocker or spend, reprioritize a Bead, or safely pause, resume, or cancel exact
+existing work. It can also prepare one ready subject for explicit execution
+approval. The shared `manage-work` skill routes that intent without requiring a
+command name or machine id.
 
 Portfolio answers come from headless Operations Overview and exact Work Detail
 projections. Their Apps are optional views over the same data. Every mutation
 uses a canonical id, one bounded authority decision, one typed operation, and
 a durable readback; titles, panes, processes, and visible App state are never
 mutation selectors.
+
+To remove the installed files, first uninstall the optional macOS supervisor,
+then run the release uninstaller:
+
+```sh
+forged service uninstall # macOS only, when installed
+curl -fsSL https://github.com/tcashel/forge/releases/latest/download/uninstall.sh \
+  | sh
+```
+
+Pass the same `--prefix` used during installation after `sh -s --` when it was
+not `$HOME/.local`.
+
+The uninstaller removes only installer-owned files and the exact `forged`
+symlink. It does not unregister harness plugins or remove `ANVIL_HOME`,
+`BEADS_DIR`, configuration, credentials, run history, or target repositories.
 
 Named skills remain available as explicit power-user and debugging surfaces:
 

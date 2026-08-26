@@ -25,26 +25,42 @@ only: the lead agent still performs cognition, native Bead fields remain the
 editable specification, and Forged remains the durable execution control
 plane.
 
-## Install the lead-agent plugin
+## Install a release
 
-From a Forge checkout, validate first with `bash scripts/validate-plugin.sh`.
-Then register the checkout as the `forge` marketplace and install `forged`:
+Starting with the published `v0.5.0` release, the installer verifies the
+platform archive against `SHA256SUMS` and installs into `$HOME/.local` by
+default. It does not use `sudo`, edit shell profiles, register an agent
+harness, install services, or initialize operator state.
+
+```sh
+curl -fsSL https://github.com/tcashel/forge/releases/latest/download/install.sh \
+  | sh
+```
+
+Ensure `$HOME/.local/bin` is on `PATH`, then register the installed package
+explicitly from `$HOME/.local/share/forge`:
 
 ```text
 # Claude Code
-/plugin marketplace add /absolute/path/to/forge
+/plugin marketplace add /absolute/prefix/share/forge
 /plugin install forged@forge
 ```
 
 ```sh
 # Codex
-codex plugin marketplace add /absolute/path/to/forge
+codex plugin marketplace add "$HOME/.local/share/forge"
 codex plugin add forged@forge
+
+# Pi
+pi install "$HOME/.local/share/forge"
 ```
 
-Run `/forged:setup` after installation. Setup preserves `ANVIL_HOME` and
-`BEADS_DIR`, and its before/after cleanliness check proves zero target-repo
-imposition. Validation and CI do not install or configure the plugin.
+Provide `bd >=1.2.1` through `PATH` or `BD_BIN`; the Forge installer does not
+install or pin Beads or other host dependencies. Run `/forged:setup` in Claude
+Code or Codex, or `/skill:setup` in Pi, after registration. Setup requires the
+epic and lease command surface, and doctor behavior remains the compatibility
+authority. Setup preserves explicit `ANVIL_HOME` and `BEADS_DIR` values and
+proves zero target-repository imposition.
 
 ## Configure once
 
@@ -69,6 +85,9 @@ forged service start
 forged service restart
 forged service uninstall
 ```
+
+Rerun `forged service install` after upgrading the CLI so launchd uses the new
+immutable binary generation.
 
 `install` copies the exact running executable to
 `$ANVIL_HOME/runtime/bin/<sha256>/forged`; launchd invokes that immutable path

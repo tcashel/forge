@@ -1,0 +1,385 @@
+name: release
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - Cargo.lock
+      - Cargo.toml
+      - CHANGELOG.md
+      - LICENSE
+      - .agents/**
+      - .claude-plugin/**
+      - install.sh
+      - package.json
+      - plugins/forged/**
+      - crates/*/Cargo.toml
+      - rust-toolchain.toml
+      - scripts/package-release.sh
+      - scripts/test-install.sh
+      - scripts/validate-plugin.sh
+      - uninstall.sh
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  validate:
+    runs-on: ubuntu-22.04
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
+
+      - name: Install pinned Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          toolchain="$(sed -n 's/^channel = "\([^"]*\)"$/\1/p' rust-toolchain.toml)"
+          test -n "$toolchain"
+          rustup toolchain install "$toolchain" \
+            --profile minimal \
+            --component rustfmt \
+            --component clippy
+
+      - name: Resolve and validate release version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$({
+            sed -n '/^\[workspace\.package\]$/,/^\[/ {
+              s/^version = "\([^"]*\)"$/\1/p
+            }' Cargo.toml
+          } | head -n 1)"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "invalid workspace release version: $version" >&2
+            exit 1
+          fi
+          if ! grep -Eq "^## \\[$version\\] - [0-9]{4}-[0-9]{2}-[0-9]{2}$" CHANGELOG.md; then
+            echo "CHANGELOG.md has no dated $version release section" >&2
+            exit 1
+          fi
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+          printf 'tag=v%s\n' "$version" >> "$GITHUB_OUTPUT"
+
+      - name: Validate shared plugin and version parity
+        run: bash scripts/validate-plugin.sh
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Build
+        run: cargo build --workspace --locked
+
+      - name: Provision current stable Beads for the publication probe
+        id: current_beads
+        shell: bash
+        run: |
+          set -euo pipefail
+          beads_dir="$RUNNER_TEMP/forge-beads-current"
+          mkdir -p "$beads_dir"
+          curl -fsSL --retry 3 \
+            -o "$beads_dir/checksums.txt" \
+            https://github.com/gastownhall/beads/releases/latest/download/checksums.txt
+          mapfile -t rows < <(
+            awk '$2 ~ /^beads_[0-9]+\.[0-9]+\.[0-9]+_linux_amd64\.tar\.gz$/ { print }' \
+              "$beads_dir/checksums.txt"
+          )
+          if [[ "${#rows[@]}" -ne 1 ]]; then
+            echo "expected exactly one stable Linux amd64 Beads asset" >&2
+            exit 1
+          fi
+          read -r digest asset <<<"${rows[0]}"
+          curl -fsSL --retry 3 \
+            -o "$beads_dir/$asset" \
+            "https://github.com/gastownhall/beads/releases/latest/download/$asset"
+          printf '%s  %s\n' "$digest" "$beads_dir/$asset" | sha256sum -c -
+          tar -xzf "$beads_dir/$asset" -C "$beads_dir" bd
+          chmod 0755 "$beads_dir/bd"
+          "$beads_dir/bd" version --json
+          printf 'path=%s\n' "$beads_dir/bd" >> "$GITHUB_OUTPUT"
+
+      - name: Probe current stable Beads capabilities
+        # Pull requests keep upstream incompatibility visible while the
+        # remaining release machinery is validated. Publication fails closed
+        # until current stable carries every required command and passes the
+        # genuine lease/doctor behavior test.
+        continue-on-error: ${{ github.event_name == 'pull_request' }}
+        env:
+          FORGED_TEST_BD: ${{ steps.current_beads.outputs.path }}
+          FORGED_REQUIRE_BD: '1'
+        shell: bash
+        run: |
+          set -euo pipefail
+          for capability in heartbeat reclaim merge-slot epic; do
+            "$FORGED_TEST_BD" "$capability" --help >/dev/null
+          done
+          cargo test -p forged-beads --test audit_doctor \
+            doctor_with_the_sandboxed_bd_probes_green -- --nocapture
+          {
+            printf 'FORGED_TEST_BD=%s\n' "$FORGED_TEST_BD"
+            printf 'FORGED_REQUIRE_BD=1\n'
+          } >> "$GITHUB_ENV"
+
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Failpoint matrix
+        run: cargo test -p forged --features failpoints
+
+      - name: Verify binary version
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: test "$(target/debug/forged --version)" = "forged $VERSION"
+
+  package:
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: macos-15
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          toolchain="$(sed -n 's/^channel = "\([^"]*\)"$/\1/p' rust-toolchain.toml)"
+          test -n "$toolchain"
+          rustup toolchain install "$toolchain" --profile minimal
+
+      - name: Build native release binary
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo build --release --locked -p forged --target "$TARGET"
+
+      - name: Package release bundle
+        env:
+          TARGET: ${{ matrix.target }}
+        run: bash scripts/package-release.sh "$TARGET" dist
+
+      - name: Create local checksum
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          asset="forge-$TARGET.tar.gz"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$asset" > SHA256SUMS
+          else
+            shasum -a 256 "$asset" > SHA256SUMS
+          fi
+
+      - name: Smoke install and uninstall
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: bash scripts/test-install.sh "dist/forge-$TARGET.tar.gz" "$VERSION" "$TARGET"
+
+      - name: Smoke isolated managed service
+        if: runner.os == 'macOS'
+        env:
+          BD_BIN: /usr/bin/true
+          FORGED_SERVICE_SMOKE_TEST: '1'
+        run: cargo test --release -p forged --test service_macos_smoke -- --ignored --nocapture
+
+      - name: Upload release bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: package-${{ matrix.target }}
+          path: dist/forge-${{ matrix.target }}.tar.gz
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    if: github.event_name == 'workflow_dispatch'
+    needs: [validate, package]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ needs.validate.outputs.tag }}
+      VERSION: ${{ needs.validate.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Refuse an unsafe publication ref
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" != refs/heads/main ]]; then
+            echo "release publication is allowed only from refs/heads/main, got $GITHUB_REF" >&2
+            exit 1
+          fi
+          if [[ "$(git rev-parse HEAD)" != "$GITHUB_SHA" ]]; then
+            echo "checkout does not match the workflow SHA" >&2
+            exit 1
+          fi
+          if [[ -n "$(git ls-remote --tags origin "refs/tags/$TAG")" ]]; then
+            echo "remote tag already exists: $TAG" >&2
+            exit 1
+          fi
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "GitHub release already exists: $TAG" >&2
+            exit 1
+          fi
+          latest_tag="$(gh release view \
+            --repo "$GITHUB_REPOSITORY" \
+            --json tagName \
+            --jq .tagName)"
+          latest_version="${latest_tag#v}"
+          if [[ "$(printf '%s\n' "$latest_version" "$VERSION" | sort -V | tail -n 1)" != "$VERSION" \
+            || "$latest_version" == "$VERSION" ]]; then
+            echo "$VERSION must be newer than current release $latest_version" >&2
+            exit 1
+          fi
+          gh api --silent rate_limit >/dev/null
+
+      - name: Download release bundles
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: package-*
+          path: dist
+          merge-multiple: true
+
+      - name: Assemble release assets and notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected_archives=(
+            forge-aarch64-apple-darwin.tar.gz
+            forge-aarch64-unknown-linux-gnu.tar.gz
+            forge-x86_64-apple-darwin.tar.gz
+            forge-x86_64-unknown-linux-gnu.tar.gz
+          )
+          printf '%s\n' "${expected_archives[@]}" | sort > expected-archives.txt
+          find dist -maxdepth 1 -type f -name 'forge-*.tar.gz' -exec basename {} \; \
+            | sort > actual-archives.txt
+          diff -u expected-archives.txt actual-archives.txt
+
+          install -m 0755 install.sh dist/install.sh
+          install -m 0755 uninstall.sh dist/uninstall.sh
+          (
+            cd dist
+            sha256sum \
+              "${expected_archives[@]}" \
+              install.sh \
+              uninstall.sh > SHA256SUMS
+          )
+
+          awk -v heading="## [$VERSION] - " '
+            index($0, heading) == 1 { found = 1; print; next }
+            found && /^## \[/ { exit }
+            found && /^\[[^]]+\]:[[:space:]]/ { exit }
+            found { print }
+            END { if (!found) exit 1 }
+          ' CHANGELOG.md > release-notes.md
+          test -s release-notes.md
+
+      - name: Create and verify draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Forge $TAG" \
+            --notes-file release-notes.md \
+            --draft
+
+          gh release view "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json tagName,targetCommitish,isDraft,isPrerelease,assets > draft-release.json
+          jq -e \
+            --arg tag "$TAG" \
+            --arg sha "$GITHUB_SHA" \
+            '.tagName == $tag and .targetCommitish == $sha and .isDraft and (.isPrerelease | not)' \
+            draft-release.json >/dev/null
+          printf '%s\n' \
+            SHA256SUMS \
+            forge-aarch64-apple-darwin.tar.gz \
+            forge-aarch64-unknown-linux-gnu.tar.gz \
+            forge-x86_64-apple-darwin.tar.gz \
+            forge-x86_64-unknown-linux-gnu.tar.gz \
+            install.sh \
+            uninstall.sh | sort > expected-assets.txt
+          jq -r '.assets[].name' draft-release.json | sort > actual-assets.txt
+          diff -u expected-assets.txt actual-assets.txt
+          jq -e 'all(.assets[]; .size > 0)' draft-release.json >/dev/null
+          mkdir verified-assets
+          gh release download "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir verified-assets
+          (cd verified-assets && sha256sum -c SHA256SUMS)
+          draft_tag_sha="$(git ls-remote --tags origin "refs/tags/$TAG" | awk '{print $1}')"
+          if [[ -n "$draft_tag_sha" && "$draft_tag_sha" != "$GITHUB_SHA" ]]; then
+            echo "draft tag points to $draft_tag_sha, expected $GITHUB_SHA" >&2
+            exit 1
+          fi
+
+      - name: Publish and verify exact release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release edit "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft=false \
+            --latest
+          gh release view "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json tagName,targetCommitish,isDraft,isPrerelease,isImmutable,assets > published-release.json
+          jq -e \
+            --arg tag "$TAG" \
+            --arg sha "$GITHUB_SHA" \
+            '.tagName == $tag and .targetCommitish == $sha and (.isDraft | not) and (.isPrerelease | not) and .isImmutable' \
+            published-release.json >/dev/null
+          jq -r '.assets[].name' published-release.json | sort > published-assets.txt
+          diff -u expected-assets.txt published-assets.txt
+          remote_sha="$(git ls-remote --tags origin "refs/tags/$TAG" | awk '{print $1}')"
+          if [[ "$remote_sha" != "$GITHUB_SHA" ]]; then
+            echo "published tag points to $remote_sha, expected $GITHUB_SHA" >&2
+            exit 1
+          fi

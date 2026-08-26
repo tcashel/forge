@@ -2664,7 +2664,10 @@ fn epic_fanout_obeys_repository_write_capacity_for_detached_child_attempts() {
                 .collect::<Vec<_>>()
         };
         let mut starts = Vec::new();
-        for _ in 0..200 {
+        // A loaded CI runner can take well over ten seconds to schedule the
+        // detached child controller and its provider; bound a hang at the
+        // same 30-second window used by the other detached-provider tests.
+        for _ in 0..600 {
             starts = implementation_starts();
             let expected = if repository_limit == 2 { 2 } else { 1 };
             if starts.len() >= expected {

@@ -613,6 +613,12 @@ fn restart_recovers_a_preparing_admission_after_spawn_crash() {
     wait_until("first controller provider start", || {
         implementation_starts(&env, run) == 1
     });
+    wait_until("first provider identity", || {
+        env.latest_attempt_dir(run, "implementation", 0)
+            .is_some_and(|dir| {
+                dir.join("provider.pid").exists() && dir.join("provider.lstart").exists()
+            })
+    });
     killpg(Pid::from_raw(first_pid), Signal::SIGKILL).expect("kill first controller group");
     wait_until("first controller group death", || {
         !process_group_alive(first_pid)

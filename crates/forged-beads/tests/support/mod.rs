@@ -235,26 +235,19 @@ pub fn create_bead(bd: &Path, s: &Scratch, title: &str) -> String {
         .to_string()
 }
 
-/// The bd binary this machine offers, version UNVERIFIED: `$FORGED_TEST_BD`
-/// if set, else `~/.anvil/tools/bd-1.2.1/bin/bd` (the canonical
-/// operator-scoped location) — never the PATH bd. `None` means the machine
-/// provisioned no bd at all, which is the only skippable state.
+/// The explicitly supplied bd binary, version unverified. Never search the
+/// host `PATH` or an operator tool directory: an absent `FORGED_TEST_BD` is
+/// the only skippable state.
 pub fn bd_candidate() -> Option<PathBuf> {
-    let mut candidates = Vec::new();
-    if let Some(p) = std::env::var_os("FORGED_TEST_BD") {
-        candidates.push(PathBuf::from(p));
-    }
-    if let Some(h) = std::env::var_os("HOME") {
-        candidates.push(PathBuf::from(h).join(".anvil/tools/bd-1.2.1/bin/bd"));
-    }
-    candidates.into_iter().find(|c| c.exists())
+    std::env::var_os("FORGED_TEST_BD")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
 }
 
-/// Resolve the sandboxed bd 1.2.x binary, or `None` when the candidate is
-/// absent OR its version is not accepted. Verified once per process via
-/// `version --json` under a scratch `HOME`/`BEADS_DIR` (never the real
-/// `$HOME`, even for a version check). Callers want [`require_bd`], which
-/// tells those two `None`s apart.
+/// Resolve a sandboxed bd semver `>=1.2.1`, or `None` when the explicit
+/// candidate is absent or incompatible. Verification runs once per process
+/// under scratch `HOME`/`BEADS_DIR`; callers use [`require_bd`] so a supplied
+/// invalid binary fails rather than skipping.
 pub fn sandboxed_bd() -> Option<PathBuf> {
     static BD: OnceLock<Option<PathBuf>> = OnceLock::new();
     BD.get_or_init(|| bd_candidate().filter(|c| verify_bd_version(c)))
@@ -262,26 +255,39 @@ pub fn sandboxed_bd() -> Option<PathBuf> {
 }
 
 fn verify_bd_version(bd: &Path) -> bool {
+    reported_bd_version(bd)
+        .is_ok_and(|version| forged_beads::doctor::supported_bd_version(&version))
+}
+
+fn reported_bd_version(bd: &Path) -> Result<String, String> {
+    if !bd.is_file() {
+        return Err(format!("{} is not a file", bd.display()));
+    }
     let s = scratch("bd-version-verify");
     let out = raw_bd(bd, &s, &["version", "--json"]).output();
-    let ok = match out {
+    let result = match out {
         Ok(o) if o.status.success() => {
             let stdout = String::from_utf8_lossy(&o.stdout).into_owned();
             serde_json::from_str::<Value>(&stdout)
-                .ok()
+                .map_err(|error| format!("version output is not JSON: {error}: {stdout}"))
                 .and_then(|v| {
                     v.get("data")
                         .and_then(|d| d.get("version"))
                         .or_else(|| v.get("version"))
                         .and_then(Value::as_str)
-                        .map(|ver| ver.starts_with("1.2."))
+                        .map(str::to_owned)
+                        .ok_or_else(|| format!("version output has no version field: {stdout}"))
                 })
-                .unwrap_or(false)
         }
-        _ => false,
+        Ok(output) => Err(format!(
+            "version probe exited {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        )),
+        Err(error) => Err(format!("version probe could not start: {error}")),
     };
     let _ = std::fs::remove_dir_all(&s.root);
-    ok
+    result
 }
 
 /// Resolve the sandboxed bd or SKIP loudly (eprintln + `None` for the
@@ -304,15 +310,17 @@ pub fn require_bd() -> Option<PathBuf> {
         return Some(bd);
     }
     if let Some(candidate) = bd_candidate() {
+        let detail = match reported_bd_version(&candidate) {
+            Ok(version) => format!("reported unsupported version {version:?}"),
+            Err(error) => error,
+        };
         panic!(
-            "bd at {} is not an accepted 1.2.x sandboxed binary: a bd whose version \
-             moved is exactly when the pinned JSON shape must be re-checked, so this \
-             fails rather than skipping",
-            candidate.display()
+            "FORGED_TEST_BD={} is not a usable bd semver >=1.2.1: {detail}; \
+             supplied versions are exercised rather than skipped",
+            candidate.display(),
         );
     }
-    let message = "sandboxed bd 1.2.x not found (set FORGED_TEST_BD or install \
-                   ~/.anvil/tools/bd-1.2.1/bin/bd)";
+    let message = "sandboxed bd >=1.2.1 not supplied (set FORGED_TEST_BD to an explicit binary)";
     assert!(
         std::env::var_os("FORGED_REQUIRE_BD").is_none_or(|v| v != "1"),
         "FORGED_REQUIRE_BD=1 and {message}: the bd contract was not checked"

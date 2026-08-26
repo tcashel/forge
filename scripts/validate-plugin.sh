@@ -747,6 +747,22 @@ check_version_parity() {
   node - <<'NODE'
 const fs = require('fs');
 const manifest = JSON.parse(fs.readFileSync('plugins/forged/.codex-plugin/plugin.json', 'utf8'));
+const workspaceManifest = fs.readFileSync('Cargo.toml', 'utf8');
+let workspaceVersion;
+let inWorkspacePackage = false;
+for (const line of workspaceManifest.split(/\r?\n/)) {
+  if (line === '[workspace.package]') {
+    inWorkspacePackage = true;
+    continue;
+  }
+  if (line.startsWith('[')) inWorkspacePackage = false;
+  const match = inWorkspacePackage && line.match(/^version\s*=\s*"([^"]+)"$/);
+  if (match) workspaceVersion = match[1];
+}
+if (!workspaceVersion || workspaceVersion !== manifest.version) {
+  console.error(`Cargo.toml workspace version: expected ${manifest.version}, got ${workspaceVersion || 'missing'}`);
+  process.exit(1);
+}
 const piPackage = JSON.parse(fs.readFileSync('package.json', 'utf8'));
 if (piPackage.version !== manifest.version) {
   console.error(`package.json: expected ${manifest.version}, got ${piPackage.version}`);
@@ -756,10 +772,21 @@ const cargoFiles = fs.readdirSync('crates', {withFileTypes: true})
   .filter((entry) => entry.isDirectory())
   .map((entry) => `crates/${entry.name}/Cargo.toml`)
   .filter((path) => fs.existsSync(path));
+const cargoLock = fs.readFileSync('Cargo.lock', 'utf8');
 for (const path of cargoFiles) {
-  const match = fs.readFileSync(path, 'utf8').match(/^version\s*=\s*"([^"]+)"/m);
-  if (!match || match[1] !== manifest.version) {
-    console.error(`${path}: expected ${manifest.version}, got ${match?.[1] || 'missing'}`);
+  const contents = fs.readFileSync(path, 'utf8');
+  const crateName = contents.match(/^name\s*=\s*"([^"]+)"/m)?.[1];
+  const inheritsVersion = /^version\.workspace\s*=\s*true\s*$/m.test(contents);
+  const literalVersion = contents.match(/^version\s*=\s*"([^"]+)"/m)?.[1];
+  if (!crateName || !inheritsVersion || literalVersion) {
+    console.error(`${path}: version must inherit workspace ${manifest.version}`);
+    process.exit(1);
+  }
+  const lockEntry = cargoLock.match(
+    new RegExp(`\\[\\[package\\]\\]\\nname = "${crateName}"\\nversion = "([^"]+)"`),
+  );
+  if (!lockEntry || lockEntry[1] !== manifest.version) {
+    console.error(`Cargo.lock ${crateName}: expected ${manifest.version}, got ${lockEntry?.[1] || 'missing'}`);
     process.exit(1);
   }
 }

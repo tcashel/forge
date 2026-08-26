@@ -1,9 +1,9 @@
 [package]
 name = "forged-beads"
-version = "0.3.1"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
+license-file.workspace = true
 
 [lints]
 workspace = true
