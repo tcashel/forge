@@ -19,6 +19,29 @@ const WAIT: Duration = Duration::from_secs(30);
 // their OS-level fixtures disjoint while retaining production timing bounds.
 static PROCESS_FIXTURE_LOCK: Mutex<()> = Mutex::new(());
 
+struct PausedProcessGroup(Option<i32>);
+
+impl PausedProcessGroup {
+    fn pause(group: i32) -> Self {
+        killpg(Pid::from_raw(group), Signal::SIGSTOP).expect("pause controller process group");
+        Self(Some(group))
+    }
+
+    fn resume(mut self) {
+        let group = self.0.expect("paused process group");
+        killpg(Pid::from_raw(group), Signal::SIGCONT).expect("resume controller process group");
+        self.0 = None;
+    }
+}
+
+impl Drop for PausedProcessGroup {
+    fn drop(&mut self) {
+        if let Some(group) = self.0.take() {
+            let _ = killpg(Pid::from_raw(group), Signal::SIGCONT);
+        }
+    }
+}
+
 fn serialize_process_fixture() -> MutexGuard<'static, ()> {
     PROCESS_FIXTURE_LOCK
         .lock()
@@ -64,11 +87,22 @@ fn recovered_live_attempt_persists_a_wake_no_later_than_its_deadline() {
     env.set_scenario("implement", "hang", 1);
     let (code, submitted) = env.forged(&["run", "submit", "--run", "run-deadline-wake"]);
     assert_eq!(code, 0, "submit: {submitted}");
+    let controller = controller_pid(&submitted);
     wait_until("provider attempt starts", || {
         implementation_starts(&env, "run-deadline-wake") == 1
     });
-    // Capture the immutable deadline before observing it: the provider may
-    // validly time out while the supervisor tick finishes.
+    wait_until("provider submission fence release", || {
+        let ledger = env.ledger();
+        let released = ledger
+            .read_merge_slot("controller-submit:run:run-deadline-wake")
+            .expect("submit slot")
+            .is_none();
+        ledger.close().expect("close");
+        released
+    });
+    // Hold the real detached controller at a live provider attempt so this
+    // observation test cannot become a provider-timeout test on a slow host.
+    let paused = PausedProcessGroup::pause(controller);
     let ledger = env.ledger();
     let attempt = ledger
         .list_live_attempts(Some("run-deadline-wake"))
@@ -76,6 +110,7 @@ fn recovered_live_attempt_persists_a_wake_no_later_than_its_deadline() {
         .into_iter()
         .next()
         .expect("running provider attempt");
+    let attempt_id = attempt.attempt_id;
     let deadline = forged_proto::stage_deadline_at(&attempt.started_at, 3).expect("deadline");
     ledger.close().expect("close");
 
@@ -87,6 +122,14 @@ fn recovered_live_attempt_persists_a_wake_no_later_than_its_deadline() {
         .get_desired_work(DesiredSubjectKind::Run, "run-deadline-wake")
         .expect("desired query")
         .expect("desired row");
+    let live_attempts = ledger
+        .list_live_attempts(Some("run-deadline-wake"))
+        .expect("live attempts");
+    assert_eq!(live_attempts.len(), 1, "one provider attempt remains live");
+    assert_eq!(
+        live_attempts[0].attempt_id, attempt_id,
+        "supervisor observation must retain the same live attempt"
+    );
     assert!(
         desired
             .next_wake_at
@@ -96,6 +139,7 @@ fn recovered_live_attempt_persists_a_wake_no_later_than_its_deadline() {
         desired.next_wake_at
     );
     ledger.close().expect("close");
+    paused.resume();
 
     let _ = env.forged(&[
         "run",
