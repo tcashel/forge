@@ -65,6 +65,12 @@ struct RestRef {
     ref_name: String,
 }
 
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PrHeadOid {
+    head_ref_oid: String,
+}
+
 impl From<RestPr> for PrMeta {
     fn from(rest: RestPr) -> Self {
         PrMeta {
@@ -133,6 +139,45 @@ impl GhClient {
             ])
             .await?;
         parse_json(&stdout)
+    }
+
+    /// Fresh exact head commit reported by GitHub for one pull request.
+    pub async fn pr_head_sha(&self, repo: &str, number: u64) -> Result<String, GhError> {
+        let number = number.to_string();
+        let stdout = self
+            .run(&[
+                "pr",
+                "view",
+                &number,
+                "--repo",
+                repo,
+                "--json",
+                "headRefOid",
+            ])
+            .await?;
+        let head: PrHeadOid = parse_json(&stdout)?;
+        if head.head_ref_oid.trim().is_empty() {
+            return Err(GhError::Json {
+                message: "pull request headRefOid is empty".to_owned(),
+            });
+        }
+        Ok(head.head_ref_oid)
+    }
+
+    /// Idempotently replace the PR body with exact terminal evidence.
+    pub async fn update_pr_body(
+        &self,
+        repo: &str,
+        number: u64,
+        body: &str,
+    ) -> Result<PrMeta, GhError> {
+        let path = format!("repos/{repo}/pulls/{number}");
+        let body_field = format!("body={body}");
+        let stdout = self
+            .run(&["api", "--method", "PATCH", &path, "-f", &body_field])
+            .await?;
+        let rest: RestPr = parse_json(&stdout)?;
+        Ok(rest.into())
     }
 
     /// The repository default branch via exactly `gh api repos/<repo>` —

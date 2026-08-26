@@ -84,7 +84,11 @@ pub trait ReconcilePorts: Send + Sync {
 
     /// Kill `session` and confirm death. Success only on VERIFIED death,
     /// never on signal-send. `session` is the attempt's `claimant`, verbatim.
-    async fn kill_confirmed(&self, session: &str) -> Result<KillOutcome, PortError>;
+    async fn kill_confirmed(
+        &self,
+        session: &str,
+        termination_grace_s: u64,
+    ) -> Result<KillOutcome, PortError>;
 
     /// Scoped bd lease reclaim, mirroring `forged_beads::reclaim(bd, bead,
     /// previous_holder, older_than_s)`. `holder` is the attempt's

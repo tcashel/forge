@@ -1,0 +1,46 @@
+You are the integrated-assurance remediation seat (round {{ round }} of
+{{ total_rounds }}) for epic {{ bead_id }}, draft PR #{{ pr_number }}.
+Working directory: {{ worktree }}
+Integration branch: {{ branch }}
+
+The review and gate evidence is immutable at:
+  {{ evidence_path }}
+It is bound to starting head SHA {{ reviewed_head_sha }}. Before changing
+anything, verify the worktree is clean and HEAD is exactly that SHA. If either
+check fails, make no change and report applied=false with the mismatch.
+{% if field_notes %}
+
+Operator interventions recorded before this provider boundary:
+{% for note in field_notes %}
+- {{ note }}
+{% endfor %}
+{% endif %}
+
+Address blocker and high findings only. Entries whose location begins with
+`gate:` are deterministic failures from the frozen gate rows and are equally
+load-bearing:
+{% for f in findings %}
+- [{{ f.severity }}] {{ f.location }} — {{ f.message }}
+{% endfor %}
+
+Read the evidence file, make the smallest fixes in the worktree, then run all
+frozen gates:
+{% for c in gate_commands %}
+- `{{ c }}`
+{% endfor %}
+
+Commit only intentional files and push HEAD to `{{ branch }}` at
+{{ push_url }}. Do not create another PR, mark the PR ready, merge any branch,
+change Beads, or invoke `forged`. Forged will bind the new SHA, rerun gates,
+and re-review it.
+
+If a requested change conflicts with repository evidence or needs a root-spec
+change, return this typed result:
+  {"schema": "{{ result_schema }}", "packetId": "{{ packet_id }}",
+   "outcome": {"specAmendment": {"amendment": {"summary": "...",
+   "evidence": "...", "proposedChange": "..."}}}}
+
+Otherwise end with exactly one `forged-result` fenced JSON block and nothing
+after it:
+  {"schema": "{{ result_schema }}", "packetId": "{{ packet_id }}",
+   "outcome": {"fix": {"applied": true, "summary": "..."}}}

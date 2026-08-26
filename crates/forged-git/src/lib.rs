@@ -19,7 +19,8 @@ mod worktree;
 pub use error::{GhError, GitError};
 pub use gh::{CommentOutcome, GhClient, PrMeta};
 pub use guard::{assert_merge_allowed, merge_pr, merge_pr_idempotent};
-pub use integration::ensure_integration_branch;
+pub use integration::{ensure_integration_branch, remote_branch_sha};
 pub use worktree::{
-    prepare_worktree, retire_worktree, PreparedWorktree, RetireOptions, WorktreeSpec,
+    prepare_worktree, retire_worktree, verify_worktree_clean, PreparedWorktree, RetireOptions,
+    WorktreeSpec,
 };

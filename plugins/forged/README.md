@@ -96,6 +96,12 @@ rosters:
         effort: high
         sandbox: readOnly
         capabilities: [repositoryRead, structuredOutput]
+      assessment:
+      - provider: pi
+        model: anthropic/claude-sonnet-4-5
+        effort: high
+        sandbox: readOnly
+        capabilities: [repositoryRead, structuredOutput]
       remediation:
       - provider: pi
         model: anthropic/claude-sonnet-4-5
@@ -105,7 +111,9 @@ rosters:
 ```
 
 Validate it with `forged definition validate --profile standard --roster
-pi-standard`. Pi packet workers keep repository skills and context enabled but
+pi-standard`. Rolling epics additionally require this dedicated read-only
+`assessment` role and an independently selected critique candidate. Pi packet
+workers keep repository skills and context enabled but
 disable extension code; direct Claude and Codex rosters remain available.
 The Claude manifest registers the `forged mcp` server over stdio, resolving
 the operator-installed `forged` binary from PATH (the host silently skips a

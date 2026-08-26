@@ -676,12 +676,16 @@ fn provider_command(request: &ProviderStreamRequestV1, override_path: Option<&Pa
     let mut command = Command::new(program);
     match request.provider {
         ProviderKindV1::Claude => {
+            command.args(["-p", "--output-format", "stream-json", "--verbose"]);
+            match request.sandbox {
+                Sandbox::ReadOnly => {
+                    command.args(["--permission-mode", "plan", "--tools", "Read,Grep,Glob"]);
+                }
+                Sandbox::WorkspaceWrite => {
+                    command.arg("--dangerously-skip-permissions");
+                }
+            }
             command.args([
-                "-p",
-                "--output-format",
-                "stream-json",
-                "--verbose",
-                "--dangerously-skip-permissions",
                 "--session-id",
                 request
                     .session_id
@@ -735,7 +739,7 @@ fn provider_command(request: &ProviderStreamRequestV1, override_path: Option<&Pa
                 command.args(["--thinking", effort]);
             }
             if request.sandbox == Sandbox::ReadOnly {
-                command.args(["--tools", "read,bash,grep,find,ls"]);
+                command.args(["--tools", "read,grep,find,ls"]);
             }
             command.env("FORGED_PI_WORKER", "1");
         }
@@ -1700,6 +1704,49 @@ mod tests {
         assert!(command.get_envs().any(|(key, value)| {
             key == "FORGED_PI_WORKER" && value.is_some_and(|value| value == "1")
         }));
+    }
+
+    #[test]
+    fn private_runner_read_only_argv_has_no_write_capable_tool_or_bypass() {
+        let (_root, mut claude, _path) = request_fixture("claude");
+        claude.sandbox = Sandbox::ReadOnly;
+        let command = provider_command(&claude, None);
+        let args = command
+            .get_args()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--permission-mode", "plan"]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--tools", "Read,Grep,Glob"]));
+        assert!(!args
+            .iter()
+            .any(|arg| arg == "--dangerously-skip-permissions"));
+        assert!(!args.iter().any(|arg| arg.contains("Bash")));
+
+        let (_root, mut pi, _path) = request_fixture("pi");
+        pi.sandbox = Sandbox::ReadOnly;
+        let command = provider_command(&pi, None);
+        let args = command
+            .get_args()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--tools", "read,grep,find,ls"]));
+        assert!(!args.iter().any(|arg| arg.contains("bash")));
+
+        let (_root, mut codex, _path) = request_fixture("codex");
+        codex.sandbox = Sandbox::ReadOnly;
+        let args = provider_command(&codex, None)
+            .get_args()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--sandbox", "read-only"]));
     }
 
     #[test]

@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 
 use common::{commit_file, git, rev_parse, setup_repos};
 use forged_git::{
-    prepare_worktree, retire_worktree, GitError, PreparedWorktree, RetireOptions, WorktreeSpec,
+    prepare_worktree, retire_worktree, verify_worktree_clean, GitError, PreparedWorktree,
+    RetireOptions, WorktreeSpec,
 };
 use forged_types::ErrorCode;
 
@@ -169,6 +170,35 @@ async fn second_prepare_for_same_run_id_is_refused() {
 }
 
 #[tokio::test]
+async fn reused_worktree_must_still_match_its_frozen_base_sha() {
+    let repos = setup_repos(BASE);
+    let prepared = prepare(&repos, "run-1", "feat/run-1").await;
+    let frozen = prepared.base_sha.clone();
+    let mut replay = spec(&repos, "run-1", "feat/run-1");
+    replay.expected_base_sha = Some(frozen.clone());
+    let same = prepare_worktree(&replay)
+        .await
+        .expect_err("matching replay still reports the existing worktree");
+    assert!(matches!(same, GitError::WorktreeExists { .. }));
+
+    commit_file(
+        &prepared.worktree,
+        "unexpected.txt",
+        "advanced\n",
+        "unexpected advance",
+    );
+    let advanced = rev_parse(&prepared.worktree, "HEAD");
+    let drift = prepare_worktree(&replay)
+        .await
+        .expect_err("reused worktree cannot hide base drift");
+    assert!(matches!(
+        drift,
+        GitError::BaseShaMismatch { expected, actual }
+            if expected == frozen && actual == advanced
+    ));
+}
+
+#[tokio::test]
 async fn invalid_run_id_is_refused_before_anything_runs() {
     let repos = setup_repos(BASE);
     for bad in ["../evil", "a/b", "-run", ""] {
@@ -259,6 +289,32 @@ async fn dirty_worktree_is_refused_with_bare_paths() {
     }
     assert_eq!(err.code(), ErrorCode::WorktreeDirty);
     assert!(prepared.worktree.exists(), "refusal must not delete");
+}
+
+#[tokio::test]
+async fn verify_clean_never_retires_the_worktree_or_artifacts() {
+    let repos = setup_repos(BASE);
+    let prepared = prepare(&repos, "run-1", "feat/run-1").await;
+
+    verify_worktree_clean(&repos.runs_root, "run-1")
+        .await
+        .expect("clean worktree verifies");
+    assert!(prepared.worktree.exists());
+    assert!(prepared.run_dir.exists());
+
+    std::fs::write(prepared.worktree.join("junk.txt"), "junk\n").unwrap();
+    let err = verify_worktree_clean(&repos.runs_root, "run-1")
+        .await
+        .expect_err("dirty worktree refuses");
+    assert!(matches!(err, GitError::WorktreeDirty { .. }), "got {err:?}");
+    assert!(
+        prepared.worktree.exists(),
+        "refusal must not delete worktree"
+    );
+    assert!(
+        prepared.run_dir.exists(),
+        "refusal must not delete artifacts"
+    );
 }
 
 #[tokio::test]

@@ -53,7 +53,7 @@ The v0.2 ordered handoff contains no spec-file argument:
 PROFILE="${PROFILE:-standard}"
 ROSTER="${ROSTER:-default}"
 forged epic start --epic "$EPIC_ID" --repo "$TARGET_REPO" \
-  --profile "$PROFILE" --roster "$ROSTER"
+  --profile "$PROFILE" --roster "$ROSTER" --rolling
 forged epic submit --epic "$EPIC_ID"
 ```
 

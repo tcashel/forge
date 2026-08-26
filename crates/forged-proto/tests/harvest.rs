@@ -26,6 +26,7 @@ fn config() -> ReconcileConfig {
             (Stage::ReviewCodex, 1800),
             (Stage::Fix, 1800),
         ]),
+        termination_grace_s: 5,
         gate_commands: vec!["cargo test --workspace".to_owned()],
     }
 }

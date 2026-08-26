@@ -305,7 +305,8 @@ pub(crate) fn backfill_work_identities_tx(conn: &Connection) -> Result<(), Ledge
     {
         let mut statement = conn.prepare(
             "SELECT ts, run_id, kind, payload_json FROM events \
-             WHERE kind IN ('forged.epic.started','forged.epic.child.started') \
+             WHERE kind IN ('forged.epic.started','forged.epic.child.started',\
+                            'forged.epic.plan.started') \
              ORDER BY event_id",
         )?;
         let rows = statement.query_map([], |row| {

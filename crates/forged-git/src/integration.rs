@@ -35,6 +35,29 @@ async fn validate_branch(repo: &Path, branch: &str) -> Result<(), GitError> {
     stdout(&output, "git check-ref-format").map(|_| ())
 }
 
+/// Resolve one exact remote branch without fetching or mutating local refs.
+///
+/// A missing branch is an error: callers use this value as a durable
+/// execution checkpoint and must never silently substitute a local ref.
+pub async fn remote_branch_sha(repo: &Path, branch: &str) -> Result<String, GitError> {
+    validate_branch(repo, branch).await?;
+    let remote_ref = format!("refs/heads/{branch}");
+    let output = git(
+        repo,
+        &["ls-remote", "--exit-code", "--heads", "origin", &remote_ref],
+    )
+    .await?;
+    let line = stdout(&output, "git ls-remote remote branch")?;
+    line.split_whitespace()
+        .next()
+        .filter(|sha| !sha.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| GitError::Exec {
+            command: "git ls-remote remote branch".to_owned(),
+            stderr: "successful probe returned no sha".to_owned(),
+        })
+}
+
 /// Ensure `origin/<integration>` exists, cutting it from the fetched
 /// `origin/<base>` only when absent. Existing integration refs are reused.
 pub async fn ensure_integration_branch(

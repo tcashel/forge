@@ -73,6 +73,23 @@ pub async fn prepare_worktree(spec: &WorktreeSpec) -> Result<PreparedWorktree, G
     let worktree = run_dir.join("worktree");
 
     if worktree.exists() || registered_worktree(&spec.repo, &worktree).await? {
+        if worktree.exists() {
+            if let Some(expected) = &spec.expected_base_sha {
+                let head = git_output(
+                    &worktree,
+                    ["rev-parse", "--verify", "--end-of-options", "HEAD"],
+                )
+                .await?;
+                require_success(&head, "git rev-parse existing worktree HEAD")?;
+                let actual = String::from_utf8_lossy(&head.stdout).trim().to_owned();
+                if *expected != actual {
+                    return Err(GitError::BaseShaMismatch {
+                        expected: expected.clone(),
+                        actual,
+                    });
+                }
+            }
+        }
         return Err(GitError::WorktreeExists {
             path: worktree.to_string_lossy().into_owned(),
         });
@@ -191,6 +208,19 @@ pub async fn retire_worktree(
 
     prune_worktrees(repo).await?;
     remove_run_dir(&run_dir)?;
+    Ok(())
+}
+
+/// Verify that one validated run worktree is resolved and clean without
+/// pruning metadata or removing either the worktree or its artifact dir.
+/// An absent worktree is already clean for crash recovery.
+pub async fn verify_worktree_clean(runs_root: &Path, run_id: &str) -> Result<(), GitError> {
+    validate_abs_path(runs_root, "runs_root")?;
+    let run_id = RunId::new(run_id.to_owned())?;
+    let worktree = runs_root.join(run_id.as_str()).join("worktree");
+    if worktree.exists() {
+        check_clean(&worktree).await?;
+    }
     Ok(())
 }
 

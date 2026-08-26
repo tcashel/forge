@@ -565,6 +565,7 @@ fn enums_round_trip_their_ddl_strings() {
     for (scope, s) in [
         (forged_ledger::RevokeScope::Bead, "bead"),
         (forged_ledger::RevokeScope::Attempt, "attempt"),
+        (forged_ledger::RevokeScope::Deadline, "deadline"),
     ] {
         assert_eq!(scope.as_str(), s);
         assert_eq!(

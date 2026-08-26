@@ -19,6 +19,29 @@ const WAIT: Duration = Duration::from_secs(30);
 // their OS-level fixtures disjoint while retaining production timing bounds.
 static PROCESS_FIXTURE_LOCK: Mutex<()> = Mutex::new(());
 
+struct PausedProcessGroup(Option<i32>);
+
+impl PausedProcessGroup {
+    fn pause(group: i32) -> Self {
+        killpg(Pid::from_raw(group), Signal::SIGSTOP).expect("pause controller process group");
+        Self(Some(group))
+    }
+
+    fn resume(mut self) {
+        let group = self.0.expect("paused process group");
+        killpg(Pid::from_raw(group), Signal::SIGCONT).expect("resume controller process group");
+        self.0 = None;
+    }
+}
+
+impl Drop for PausedProcessGroup {
+    fn drop(&mut self) {
+        if let Some(group) = self.0.take() {
+            let _ = killpg(Pid::from_raw(group), Signal::SIGCONT);
+        }
+    }
+}
+
 fn serialize_process_fixture() -> MutexGuard<'static, ()> {
     PROCESS_FIXTURE_LOCK
         .lock()
@@ -42,6 +65,92 @@ fn start_run(env: &TestEnv, run: &str) {
         "main",
     ]);
     assert_eq!(code, 0, "run start: {response}");
+}
+
+#[test]
+fn recovered_live_attempt_persists_a_wake_no_later_than_its_deadline() {
+    let _serial = serialize_process_fixture();
+    let env = TestEnv::new("supervise-provider-deadline-wake");
+    let config_path = env.anvil.join("config.json");
+    let mut config: Value = serde_json::from_str(
+        &std::fs::read_to_string(&config_path).expect("read stage-budget config"),
+    )
+    .expect("config JSON");
+    config["stage_budget_s"]["implement"] = json!(3);
+    std::fs::write(
+        &config_path,
+        serde_json::to_vec_pretty(&config).expect("serialize stage-budget config"),
+    )
+    .expect("write stage-budget config");
+
+    start_run(&env, "run-deadline-wake");
+    env.set_scenario("implement", "hang", 1);
+    let (code, submitted) = env.forged(&["run", "submit", "--run", "run-deadline-wake"]);
+    assert_eq!(code, 0, "submit: {submitted}");
+    let controller = controller_pid(&submitted);
+    wait_until("provider attempt starts", || {
+        implementation_starts(&env, "run-deadline-wake") == 1
+    });
+    wait_until("provider submission fence release", || {
+        let ledger = env.ledger();
+        let released = ledger
+            .read_merge_slot("controller-submit:run:run-deadline-wake")
+            .expect("submit slot")
+            .is_none();
+        ledger.close().expect("close");
+        released
+    });
+    // Hold the real detached controller at a live provider attempt so this
+    // observation test cannot become a provider-timeout test on a slow host.
+    let paused = PausedProcessGroup::pause(controller);
+    let ledger = env.ledger();
+    let attempt = ledger
+        .list_live_attempts(Some("run-deadline-wake"))
+        .expect("live attempts")
+        .into_iter()
+        .next()
+        .expect("running provider attempt");
+    let attempt_id = attempt.attempt_id;
+    let deadline = forged_proto::stage_deadline_at(&attempt.started_at, 3).expect("deadline");
+    ledger.close().expect("close");
+
+    let (code, adopted) = env.forged(&["supervise", "--once"]);
+    assert_eq!(code, 0, "adopt tick: {adopted}");
+    assert_eq!(adopted["result"]["subjects"][0]["action"], json!("adopted"));
+    let ledger = env.ledger();
+    let desired = ledger
+        .get_desired_work(DesiredSubjectKind::Run, "run-deadline-wake")
+        .expect("desired query")
+        .expect("desired row");
+    let live_attempts = ledger
+        .list_live_attempts(Some("run-deadline-wake"))
+        .expect("live attempts");
+    assert_eq!(live_attempts.len(), 1, "one provider attempt remains live");
+    assert_eq!(
+        live_attempts[0].attempt_id, attempt_id,
+        "supervisor observation must retain the same live attempt"
+    );
+    assert!(
+        desired
+            .next_wake_at
+            .as_deref()
+            .is_some_and(|wake| wake <= deadline.as_str()),
+        "durable supervisor wake {:?} must not follow provider deadline {deadline}",
+        desired.next_wake_at
+    );
+    ledger.close().expect("close");
+    paused.resume();
+
+    let _ = env.forged(&[
+        "run",
+        "stop",
+        "--run",
+        "run-deadline-wake",
+        "--outcome",
+        "cancelled",
+        "--reason",
+        "test cleanup",
+    ]);
 }
 
 fn wait_until(what: &str, mut predicate: impl FnMut() -> bool) {
@@ -217,6 +326,120 @@ fn capacity_queued_submit_replays_by_key_and_fresh_key_retries_later() {
         "--reason",
         "test cleanup",
     ]);
+}
+
+#[cfg(feature = "failpoints")]
+#[test]
+fn once_reports_superseded_when_foreground_progress_clears_a_deferred_claim() {
+    let _serial = serialize_process_fixture();
+    let env = TestEnv::new("supervise-deferred-claim-superseded");
+    let config_path = env.anvil.join("config.json");
+    let mut config: Value =
+        serde_json::from_str(&std::fs::read_to_string(&config_path).expect("read config"))
+            .expect("config JSON");
+    config["admission"] = json!({
+        "totalActive": 1,
+        "providerActive": 4,
+        "repositoryWriteActive": 1,
+        "deferSeconds": 60,
+    });
+    std::fs::write(
+        &config_path,
+        serde_json::to_vec_pretty(&config).expect("serialize admission config"),
+    )
+    .expect("write admission config");
+
+    let holder = "run-supervisor-capacity-holder";
+    let target = "run-supervisor-deferred-target";
+    start_run(&env, holder);
+    start_run(&env, target);
+    env.set_scenario("implement", "hang", 1);
+    let (code, submitted) = env.forged(&["run", "submit", "--run", holder]);
+    assert_eq!(code, 0, "holder submit: {submitted}");
+    wait_until("holder consumes the only admission slot", || {
+        implementation_starts(&env, holder) == 1
+    });
+    let ledger = env.ledger();
+    ledger
+        .record_desired_outcome(
+            DesiredSubjectKind::Run,
+            holder,
+            DesiredState::Running,
+            DesiredReconcileOutcome::Adopted,
+            Some("9999-01-01T00:00:00.000000000Z".to_owned()),
+            None,
+        )
+        .expect("park capacity holder observation");
+    ledger
+        .authorize_desired_work(DesiredSubjectKind::Run, target, 1)
+        .expect("authorize due target");
+    ledger.close().expect("close ledger");
+
+    let failpoint = env.root.join("supervisor-deferred-finish-fp");
+    std::fs::create_dir_all(&failpoint).expect("failpoint dir");
+    let reached = failpoint.join("admission.batch.commit.after.reached");
+    let release = failpoint.join("admission.batch.commit.after.release");
+    let supervisor = env
+        .forged_cmd(&["supervise", "--once"])
+        .env("FORGED_FAILPOINT", "admission.batch.commit.after")
+        .env("FORGED_FAILPOINT_MODE", "pause")
+        .env("FORGED_FAILPOINT_DIR", &failpoint)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("supervisor tick spawns");
+    wait_until("supervisor commits the deferred decision", || {
+        reached.exists()
+    });
+
+    // This is the exact production race: the detached controller or an
+    // explicit control operation advances desired state after the tick's
+    // observation but before its guarded reconciliation finish.
+    let ledger = env.ledger();
+    ledger
+        .record_desired_outcome(
+            DesiredSubjectKind::Run,
+            target,
+            DesiredState::Running,
+            DesiredReconcileOutcome::Authorized,
+            Some("9999-01-01T00:00:00.000000000Z".to_owned()),
+            None,
+        )
+        .expect("foreground progress clears the tick claim");
+    ledger.close().expect("close ledger");
+    std::fs::write(&release, b"").expect("release supervisor failpoint");
+
+    let output = supervisor
+        .wait_with_output()
+        .expect("supervisor tick exits");
+    assert!(
+        output.status.success(),
+        "recoverable ownership handoff failed the tick: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: Value = serde_json::from_slice(&output.stdout).expect("supervisor response JSON");
+    let report = response["result"]["subjects"]
+        .as_array()
+        .and_then(|subjects| {
+            subjects
+                .iter()
+                .find(|subject| subject["desiredWork"]["subject"]["id"] == json!(target))
+        })
+        .expect("target subject report");
+    assert_eq!(report["action"], json!("superseded"), "{response}");
+
+    let (code, cleanup) = env.forged(&[
+        "run",
+        "stop",
+        "--run",
+        holder,
+        "--outcome",
+        "cancelled",
+        "--reason",
+        "test cleanup",
+    ]);
+    assert_eq!(code, 0, "holder cleanup: {cleanup}");
 }
 
 #[test]

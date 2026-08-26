@@ -307,6 +307,7 @@ fn roster_from_legacy(legacy: &HashMap<Stage, ProviderHints>) -> RosterDefinitio
     };
     let first_review = candidate(get(Stage::ReviewClaude));
     let second_review = candidate(get(Stage::ReviewCodex));
+    let assessment = candidate(&hints("claude", "sonnet", None, Sandbox::ReadOnly));
     RosterDefinitionV1 {
         schema: ROSTER_SCHEMA_V1.to_owned(),
         name: "default".to_owned(),
@@ -320,6 +321,7 @@ fn roster_from_legacy(legacy: &HashMap<Stage, ProviderHints>) -> RosterDefinitio
             (role("review.tertiary"), vec![first_review]),
             (role("synthesis"), vec![second_review]),
             (role("remediation"), vec![candidate(get(Stage::Fix))]),
+            (role("assessment"), vec![assessment]),
         ]),
     }
 }
@@ -394,6 +396,7 @@ impl ForgedConfig {
                 .iter()
                 .map(|(stage, budget)| (*stage, *budget))
                 .collect(),
+            termination_grace_s: forged_types::DEFAULT_TERMINATION_GRACE_S,
             transport_retry_budget: self.transport_retry_budget,
             host_policy: self.host_policy,
             herdr_socket: self.herdr_sock.clone(),
@@ -503,6 +506,18 @@ impl ForgedConfig {
                 message: format!("unknown profile {profile_name:?}"),
             }]);
         };
+        if matches!(
+            profile.protocol.name.as_str(),
+            "epic-plan" | "epic-assurance"
+        ) {
+            return Err(vec![DefinitionError {
+                path: "$.profile.protocol".to_owned(),
+                message: format!(
+                    "{}/v1 is runtime-derived and cannot be selected directly",
+                    profile.protocol.name
+                ),
+            }]);
+        }
         let Some(roster) = self.rosters.get(roster_name).cloned() else {
             return Err(vec![DefinitionError {
                 path: "$.roster".to_owned(),
@@ -738,6 +753,12 @@ pub fn compile_frozen_package(
             message: format!("unsupported schema {:?}", package.schema),
         });
     }
+    if package.protocol_ref != package.profile.protocol {
+        errors.push(DefinitionError {
+            path: "$.protocolRef".to_owned(),
+            message: "protocol ref does not match frozen profile".to_owned(),
+        });
+    }
     errors.extend(package.profile.validate());
     errors.extend(package.policy.validate());
     if package.profile_ref.name != package.profile.name || package.profile_ref.version != 1 {
@@ -814,6 +835,228 @@ pub fn compile_frozen_package(
     })
 }
 
+fn internal_role_is_read_only(roster: &ResolvedRosterV1, role: &forged_types::RoleId) -> bool {
+    roster.roles.get(role).is_some_and(|candidates| {
+        !candidates.is_empty()
+            && candidates.iter().all(|candidate| {
+                candidate.sandbox == Sandbox::ReadOnly
+                    && candidate.capabilities.contains(&Capability::RepositoryRead)
+                    && candidate
+                        .capabilities
+                        .contains(&Capability::StructuredOutput)
+                    && !candidate
+                        .capabilities
+                        .contains(&Capability::RepositoryWrite)
+            })
+    })
+}
+
+fn planning_role_uses_supported_provider(
+    roster: &ResolvedRosterV1,
+    role: &forged_types::RoleId,
+) -> bool {
+    roster.roles.get(role).is_some_and(|candidates| {
+        !candidates.is_empty()
+            && candidates
+                .iter()
+                .all(|candidate| matches!(candidate.provider.as_str(), "claude" | "codex" | "pi"))
+    })
+}
+
+/// Derive the closed `epic-plan/v1` package from one already-frozen epic
+/// package. Provider selection remains frozen; only the bounded protocol
+/// topology changes. Authoring and revision use a frozen read-only reviewer;
+/// every retained critique seat must be read-only too.
+pub(crate) fn compile_epic_plan_package(
+    base: &ExecutionPackageV1,
+) -> Result<CompiledDefinition, Vec<DefinitionError>> {
+    let assessment_role = role("assessment");
+    let Some(assessment_candidates) = base.roster.roles.get(&assessment_role) else {
+        return Err(vec![DefinitionError {
+            path: "$.roster.roles.assessment".to_owned(),
+            message: "rolling epic planning requires a dedicated assessment role".to_owned(),
+        }]);
+    };
+    let critique = base
+        .profile
+        .seats
+        .iter()
+        .filter(|seat| matches!(seat.purpose, SeatPurpose::Review | SeatPurpose::Synthesis))
+        .collect::<Vec<_>>();
+    if !critique
+        .iter()
+        .any(|seat| seat.purpose == SeatPurpose::Review)
+    {
+        return Err(vec![DefinitionError {
+            path: "$.profile.seats".to_owned(),
+            message: "rolling epic planning requires at least one review seat".to_owned(),
+        }]);
+    }
+    if let Some(seat) = critique.iter().find(|seat| {
+        !internal_role_is_read_only(&base.roster, &seat.role)
+            || !planning_role_uses_supported_provider(&base.roster, &seat.role)
+    }) {
+        return Err(vec![DefinitionError {
+            path: format!("$.roster.roles.{}", seat.role.as_str()),
+            message: "rolling epic critique candidates must all be read-only".to_owned(),
+        }]);
+    }
+    if !internal_role_is_read_only(&base.roster, &assessment_role)
+        || !planning_role_uses_supported_provider(&base.roster, &assessment_role)
+    {
+        return Err(vec![DefinitionError {
+            path: "$.roster.roles.assessment".to_owned(),
+            message: "rolling epic assessment candidates must support enforced read-only execution"
+                .to_owned(),
+        }]);
+    }
+    let overlaps_assessment = |role: &forged_types::RoleId| {
+        base.roster.roles.get(role).is_some_and(|candidates| {
+            candidates.iter().any(|critic| {
+                assessment_candidates.iter().any(|author| {
+                    critic.provider == author.provider && critic.model == author.model
+                })
+            })
+        })
+    };
+    if let Some(seat) = critique.iter().find(|seat| overlaps_assessment(&seat.role)) {
+        return Err(vec![DefinitionError {
+            path: format!("$.roster.roles.{}", seat.role.as_str()),
+            message: "rolling epic critique candidates must be distinct from assessment candidates"
+                .to_owned(),
+        }]);
+    }
+
+    let protocol = ProtocolRef {
+        name: "epic-plan".to_owned(),
+        version: 1,
+    };
+    let internal_seat = |id, role, purpose| SeatDefinitionV1 {
+        id: SeatId::new(id).expect("fixed epic-plan seat id is valid"),
+        role,
+        purpose,
+    };
+    let mut seats = vec![internal_seat(
+        "plan-author",
+        assessment_role.clone(),
+        SeatPurpose::Implement,
+    )];
+    let mut reviews = 0usize;
+    let mut syntheses = 0usize;
+    for source in critique {
+        let mut seat = source.clone();
+        let id = match seat.purpose {
+            SeatPurpose::Review => {
+                reviews = reviews.saturating_add(1);
+                format!("plan-review-{reviews}")
+            }
+            SeatPurpose::Synthesis => {
+                syntheses = syntheses.saturating_add(1);
+                format!("plan-synthesis-{syntheses}")
+            }
+            _ => unreachable!("critique seats are filtered by purpose"),
+        };
+        seat.id = SeatId::new(id).expect("bounded epic-plan seat ordinal is valid");
+        seats.push(seat);
+    }
+    seats.push(internal_seat(
+        "plan-revision",
+        assessment_role,
+        SeatPurpose::Fix,
+    ));
+    let mut package = base.clone();
+    package.protocol_ref = protocol.clone();
+    package.profile = ProfileDefinitionV1 {
+        schema: PROFILE_SCHEMA_V1.to_owned(),
+        name: "epic-plan".to_owned(),
+        protocol,
+        seats,
+        risk_context: base.profile.risk_context.clone(),
+        fix_round_budget: 1,
+        escalate_on: Vec::new(),
+        escalate_to: None,
+    };
+    package.profile_ref = ProfileRef {
+        name: package.profile.name.clone(),
+        version: 1,
+    };
+    package.profile_catalog.clear();
+    package.profile_sha256 = digest_of(&package.profile).map_err(|message| {
+        vec![DefinitionError {
+            path: "$.profile".to_owned(),
+            message,
+        }]
+    })?;
+    package.roster_sha256 = digest_of(&package.roster).map_err(|message| {
+        vec![DefinitionError {
+            path: "$.roster".to_owned(),
+            message,
+        }]
+    })?;
+    compile_frozen_package(package)
+}
+
+/// Derive the internal `epic-assurance/v1` package from an already-frozen
+/// slice package. The existing review, synthesis, and remediation topology
+/// is retained verbatim; only implementation seats are omitted because the
+/// epic integration branch already contains the work under review.
+pub(crate) fn compile_epic_assurance_package(
+    base: &ExecutionPackageV1,
+) -> Result<CompiledDefinition, Vec<DefinitionError>> {
+    if base.protocol_ref.name != "slice" || base.protocol_ref.version != 1 {
+        return Err(vec![DefinitionError {
+            path: "$.protocolRef".to_owned(),
+            message: "epic assurance must derive from a frozen slice/v1 package".to_owned(),
+        }]);
+    }
+    if let Some(seat) = std::iter::once(&base.profile)
+        .chain(base.profile_catalog.values())
+        .flat_map(|profile| profile.seats.iter())
+        .filter(|seat| matches!(seat.purpose, SeatPurpose::Review | SeatPurpose::Synthesis))
+        .find(|seat| !internal_role_is_read_only(&base.roster, &seat.role))
+    {
+        return Err(vec![DefinitionError {
+            path: format!("$.roster.roles.{}", seat.role.as_str()),
+            message: "epic assurance review and synthesis candidates must all be read-only"
+                .to_owned(),
+        }]);
+    }
+    let protocol = ProtocolRef {
+        name: "epic-assurance".to_owned(),
+        version: 1,
+    };
+    let derive_profile = |profile: &ProfileDefinitionV1| {
+        let mut profile = profile.clone();
+        profile.protocol = protocol.clone();
+        profile
+            .seats
+            .retain(|seat| seat.purpose != SeatPurpose::Implement);
+        profile
+    };
+
+    let mut package = base.clone();
+    package.protocol_ref = protocol.clone();
+    package.profile = derive_profile(&base.profile);
+    package.profile_catalog = base
+        .profile_catalog
+        .iter()
+        .map(|(name, profile)| (name.clone(), derive_profile(profile)))
+        .collect();
+    package.profile_sha256 = digest_of(&package.profile).map_err(|message| {
+        vec![DefinitionError {
+            path: "$.profile".to_owned(),
+            message,
+        }]
+    })?;
+    package.roster_sha256 = digest_of(&package.roster).map_err(|message| {
+        vec![DefinitionError {
+            path: "$.roster".to_owned(),
+            message,
+        }]
+    })?;
+    compile_frozen_package(package)
+}
+
 fn compatibility_projection(
     profile: &ProfileDefinitionV1,
     roster: &RosterDefinitionV1,
@@ -828,7 +1071,13 @@ fn compatibility_projection(
     let implement = seats(SeatPurpose::Implement);
     let reviews = seats(SeatPurpose::Review);
     let fixes = seats(SeatPurpose::Fix);
-    if implement.len() != 1 || reviews.is_empty() || fixes.len() != 1 {
+    let assurance = profile.protocol.name == "epic-assurance" && profile.protocol.version == 1;
+    let implement_valid = if assurance {
+        implement.is_empty()
+    } else {
+        implement.len() == 1
+    };
+    if !implement_valid || reviews.is_empty() || fixes.len() != 1 {
         return Err(DefinitionError {
             path: "$.profile.seats".to_owned(),
             message: "profile cannot supply the temporary slice/v1 storage lanes".to_owned(),
@@ -850,8 +1099,9 @@ fn compatibility_projection(
                 message: "compatibility projection needs a first candidate".to_owned(),
             })
     };
+    let implement_lane = if assurance { fixes[0] } else { implement[0] };
     Ok(HashMap::from([
-        (Stage::Implement, candidate(implement[0])?),
+        (Stage::Implement, candidate(implement_lane)?),
         (Stage::ReviewClaude, candidate(reviews[0])?),
         (
             Stage::ReviewCodex,
@@ -1094,6 +1344,256 @@ mod tests {
         let recompiled = compile_frozen_package(package).expect("frozen compile");
         assert_eq!(recompiled.package.profile_ref.name, "lean");
         assert_eq!(recompiled.compatibility_roster.len(), 4);
+    }
+
+    #[test]
+    fn epic_plan_package_is_read_only_and_nonpublishing() {
+        let base = config().compile_definition(None, None).expect("compile");
+        let planning = compile_epic_plan_package(&base.package).expect("planning package");
+        assert_eq!(planning.package.protocol_ref.name, "epic-plan");
+        assert_eq!(planning.package.profile.protocol.name, "epic-plan");
+        let assessment = role("assessment");
+        assert!(planning
+            .package
+            .profile
+            .seats
+            .iter()
+            .any(|seat| { seat.purpose == SeatPurpose::Implement && seat.role == assessment }));
+        assert!(planning
+            .package
+            .profile
+            .seats
+            .iter()
+            .any(|seat| { seat.purpose == SeatPurpose::Fix && seat.role == assessment }));
+        assert!(planning.package.roster.roles[&assessment]
+            .iter()
+            .all(|candidate| candidate.sandbox == Sandbox::ReadOnly));
+        assert_eq!(
+            planning.compatibility_roster[&Stage::Implement].sandbox,
+            Sandbox::ReadOnly
+        );
+        assert_eq!(
+            planning.compatibility_roster[&Stage::Fix].sandbox,
+            Sandbox::ReadOnly
+        );
+    }
+
+    #[test]
+    fn epic_assurance_omits_only_implement_and_preserves_frozen_inputs() {
+        let base = config()
+            .compile_definition(Some("lean"), None)
+            .expect("compile");
+        let assurance = compile_epic_assurance_package(&base.package).expect("assurance package");
+
+        assert_eq!(assurance.package.protocol_ref.name, "epic-assurance");
+        assert_eq!(assurance.package.protocol_ref.version, 1);
+        assert_eq!(assurance.package.policy, base.package.policy);
+        assert_eq!(assurance.package.roster, base.package.roster);
+        assert_eq!(
+            assurance.package.profile.fix_round_budget,
+            base.package.profile.fix_round_budget
+        );
+        assert_eq!(
+            assurance.package.profile.escalate_on,
+            base.package.profile.escalate_on
+        );
+        assert_eq!(
+            assurance.package.profile.escalate_to,
+            base.package.profile.escalate_to
+        );
+        let retained = base
+            .package
+            .profile
+            .seats
+            .iter()
+            .filter(|seat| seat.purpose != SeatPurpose::Implement)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(assurance.package.profile.seats, retained);
+        assert!(assurance
+            .package
+            .profile_catalog
+            .values()
+            .all(|profile| profile.protocol.name == "epic-assurance"
+                && profile
+                    .seats
+                    .iter()
+                    .all(|seat| seat.purpose != SeatPurpose::Implement)));
+        assert_eq!(
+            assurance.compatibility_roster[&Stage::Implement],
+            assurance.compatibility_roster[&Stage::Fix],
+            "the unused implementation storage lane projects from fix without adding a seat"
+        );
+    }
+
+    #[test]
+    fn epic_assurance_derivation_rejects_an_internal_base_protocol() {
+        let base = config().compile_definition(None, None).expect("compile");
+        let planning = compile_epic_plan_package(&base.package).expect("planning package");
+        let errors = compile_epic_assurance_package(&planning.package)
+            .expect_err("internal protocol cannot be composed");
+        assert!(errors
+            .iter()
+            .any(|error| { error.path == "$.protocolRef" && error.message.contains("slice/v1") }));
+    }
+
+    #[test]
+    fn epic_assurance_refuses_a_writable_review_candidate() {
+        let mut base = config()
+            .compile_definition(Some("lean"), None)
+            .expect("compile")
+            .package;
+        let review = role("review.primary");
+        let candidate = &mut base.roster.roles.get_mut(&review).expect("review")[0];
+        candidate.sandbox = Sandbox::WorkspaceWrite;
+        candidate.capabilities.insert(Capability::RepositoryWrite);
+        let errors =
+            compile_epic_assurance_package(&base).expect_err("writable assurance review refused");
+        assert!(errors.iter().any(|error| {
+            error.path == "$.roster.roles.review.primary" && error.message.contains("read-only")
+        }));
+    }
+
+    #[test]
+    fn epic_assurance_refuses_a_writable_escalation_reviewer() {
+        let mut base = config()
+            .compile_definition(Some("lean"), None)
+            .expect("compile")
+            .package;
+        let secondary = role("review.secondary");
+        base.profile_catalog
+            .get_mut("standard")
+            .expect("reachable standard profile")
+            .seats
+            .iter_mut()
+            .find(|seat| seat.purpose == SeatPurpose::Review)
+            .expect("standard review")
+            .role = secondary.clone();
+        let candidate = &mut base
+            .roster
+            .roles
+            .get_mut(&secondary)
+            .expect("secondary review")[0];
+        candidate.sandbox = Sandbox::WorkspaceWrite;
+        candidate.capabilities.insert(Capability::RepositoryWrite);
+        let errors = compile_epic_assurance_package(&base)
+            .expect_err("writable escalation reviewer refused");
+        assert!(errors.iter().any(|error| {
+            error.path == "$.roster.roles.review.secondary" && error.message.contains("read-only")
+        }));
+    }
+
+    #[test]
+    fn epic_plan_package_refuses_a_writable_critique_candidate() {
+        let mut base = config()
+            .compile_definition(None, None)
+            .expect("compile")
+            .package;
+        let critique = role("review.primary");
+        let candidate = &mut base.roster.roles.get_mut(&critique).expect("review")[0];
+        candidate.sandbox = Sandbox::WorkspaceWrite;
+        candidate.capabilities.insert(Capability::RepositoryWrite);
+        let errors = compile_epic_plan_package(&base).expect_err("writable critique refused");
+        assert!(errors.iter().any(|error| {
+            error.path == "$.roster.roles.review.primary" && error.message.contains("read-only")
+        }));
+    }
+
+    #[test]
+    fn epic_plan_package_requires_a_dedicated_read_only_assessment_role() {
+        let mut base = config()
+            .compile_definition(None, None)
+            .expect("compile")
+            .package;
+        base.roster.roles.remove(&role("assessment"));
+        let errors = compile_epic_plan_package(&base).expect_err("assessment required");
+        assert!(errors.iter().any(|error| {
+            error.path == "$.roster.roles.assessment"
+                && error.message.contains("dedicated assessment")
+        }));
+
+        let mut base = config()
+            .compile_definition(None, None)
+            .expect("compile")
+            .package;
+        let candidate = &mut base
+            .roster
+            .roles
+            .get_mut(&role("assessment"))
+            .expect("assessment")[0];
+        candidate.sandbox = Sandbox::WorkspaceWrite;
+        candidate.capabilities.insert(Capability::RepositoryWrite);
+        let errors = compile_epic_plan_package(&base).expect_err("writable assessment refused");
+        assert!(errors.iter().any(|error| {
+            error.path == "$.roster.roles.assessment" && error.message.contains("read-only")
+        }));
+    }
+
+    #[test]
+    fn epic_plan_package_requires_independent_critique_candidates() {
+        let mut base = config()
+            .compile_definition(None, None)
+            .expect("compile")
+            .package;
+        let assessment = base.roster.roles[&role("assessment")][0].clone();
+        base.roster
+            .roles
+            .insert(role("review.primary"), vec![assessment]);
+        let errors = compile_epic_plan_package(&base).expect_err("overlap refused");
+        assert!(errors
+            .iter()
+            .any(|error| error.message.contains("distinct from assessment")));
+    }
+
+    #[test]
+    fn operator_authored_epic_plan_profile_is_rejected() {
+        let mut cfg = config();
+        cfg.profiles
+            .get_mut("standard")
+            .expect("standard profile")
+            .protocol
+            .name = "epic-plan".to_owned();
+        let errors = cfg
+            .compile_definition(Some("standard"), None)
+            .expect_err("runtime-only protocol cannot be selected");
+        assert!(errors.iter().any(|error| {
+            error.path == "$.profile.protocol" && error.message.contains("runtime-derived")
+        }));
+    }
+
+    #[test]
+    fn operator_authored_epic_assurance_profile_is_rejected() {
+        let mut cfg = config();
+        let profile = cfg.profiles.get_mut("standard").expect("standard profile");
+        profile.protocol.name = "epic-assurance".to_owned();
+        profile
+            .seats
+            .retain(|seat| seat.purpose != SeatPurpose::Implement);
+        let errors = cfg
+            .compile_definition(Some("standard"), None)
+            .expect_err("runtime-only protocol cannot be selected");
+        assert!(errors.iter().any(|error| {
+            error.path == "$.profile.protocol" && error.message.contains("runtime-derived")
+        }));
+    }
+
+    #[test]
+    fn epic_plan_derivation_bounds_valid_long_authoring_names() {
+        let mut base = config()
+            .compile_definition(None, None)
+            .expect("compile")
+            .package;
+        base.profile.name = "p".repeat(64);
+        base.profile_ref.name = base.profile.name.clone();
+        base.profile.seats[0].id = SeatId::new("s".repeat(64)).expect("long valid seat");
+        let planning = compile_epic_plan_package(&base).expect("bounded planning package");
+        assert_eq!(planning.package.profile.name, "epic-plan");
+        assert!(planning
+            .package
+            .profile
+            .seats
+            .iter()
+            .all(|seat| seat.id.as_str().len() < 64));
     }
 
     #[test]

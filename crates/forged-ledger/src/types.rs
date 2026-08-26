@@ -1167,6 +1167,11 @@ pub enum RevokeScope {
     /// An operator's stop of ONE attempt. Resumes through confirmed death
     /// alone and ends at [`AttemptState::Stopped`], touching no lease.
     Attempt,
+    /// The immutable stage wall-clock deadline expired. This marker fences
+    /// provider effects until verified death, then exits as a failed
+    /// transport attempt so the existing bounded retry policy remains the
+    /// only retry authority.
+    Deadline,
 }
 
 impl RevokeScope {
@@ -1175,6 +1180,7 @@ impl RevokeScope {
         match self {
             RevokeScope::Bead => "bead",
             RevokeScope::Attempt => "attempt",
+            RevokeScope::Deadline => "deadline",
         }
     }
 }
@@ -1186,6 +1192,7 @@ impl TryFrom<&str> for RevokeScope {
         match s {
             "bead" => Ok(RevokeScope::Bead),
             "attempt" => Ok(RevokeScope::Attempt),
+            "deadline" => Ok(RevokeScope::Deadline),
             other => Err(refused(
                 ErrorCode::InvalidRequest,
                 format!("unknown revoke scope: {other:?}"),

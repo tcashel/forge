@@ -374,6 +374,9 @@ pub struct EpicStartArgs {
     /// Model roster inherited by child slices.
     #[arg(long)]
     pub roster: Option<String>,
+    /// Explicitly authorize provider-authored planning of incomplete blocked stubs.
+    #[arg(long)]
+    pub rolling: bool,
     /// Override the derived idempotency key.
     #[arg(long)]
     pub idempotency_key: Option<String>,
@@ -1558,6 +1561,7 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
                         "baseRef": a.base_ref,
                         "profile": a.profile,
                         "roster": a.roster,
+                        "rolling": a.rolling,
                     }),
                 ),
             ),

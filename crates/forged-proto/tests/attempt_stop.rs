@@ -24,6 +24,7 @@ fn config() -> ReconcileConfig {
             (Stage::ReviewCodex, 1800),
             (Stage::Fix, 1800),
         ]),
+        termination_grace_s: 5,
         gate_commands: Vec::new(),
     }
 }
@@ -75,7 +76,7 @@ async fn an_operator_stop_settles_terminally_without_reclaiming_the_lease() {
         .expect("revoke");
 
     let ports = FakePorts::new();
-    stop_attempt(&ledger, &ports, claim.attempt_id)
+    stop_attempt(&ledger, &ports, claim.attempt_id, 5)
         .await
         .expect("stop");
 
@@ -117,7 +118,7 @@ async fn a_successor_claims_the_same_packet_immediately_after_a_stop() {
         .expect("revoke");
 
     let ports = FakePorts::new();
-    stop_attempt(&ledger, &ports, claim.attempt_id)
+    stop_attempt(&ledger, &ports, claim.attempt_id, 5)
         .await
         .expect("stop");
 
@@ -152,7 +153,7 @@ async fn a_stop_that_cannot_confirm_death_stays_revoking() {
     let ports = FakePorts::new();
     *ports.kill_failure.lock().expect("lock") =
         Some(PortError::Unavailable("no sentinel to read".to_owned()));
-    let error = stop_attempt(&ledger, &ports, claim.attempt_id)
+    let error = stop_attempt(&ledger, &ports, claim.attempt_id, 5)
         .await
         .expect_err("unverified death must not settle the attempt");
     assert!(
@@ -184,7 +185,7 @@ async fn a_stop_refuses_an_unrevoked_attempt_before_killing_anything() {
 
     // No durable `revoking` marker: the order is not negotiable.
     let ports = FakePorts::new();
-    stop_attempt(&ledger, &ports, claim.attempt_id)
+    stop_attempt(&ledger, &ports, claim.attempt_id, 5)
         .await
         .expect_err("stopping a running attempt is refused");
     assert_eq!(
@@ -212,10 +213,10 @@ async fn a_repeated_stop_converges_on_the_terminal_row() {
         .expect("revoke");
 
     let ports = FakePorts::new();
-    stop_attempt(&ledger, &ports, claim.attempt_id)
+    stop_attempt(&ledger, &ports, claim.attempt_id, 5)
         .await
         .expect("first stop");
-    stop_attempt(&ledger, &ports, claim.attempt_id)
+    stop_attempt(&ledger, &ports, claim.attempt_id, 5)
         .await
         .expect("a second stop converges rather than refusing");
     assert_eq!(
@@ -241,7 +242,7 @@ async fn reconcile_leaves_a_stopped_attempt_alone() {
         .revoke_attempt(claim.attempt_id, "operator requested")
         .expect("revoke");
     let stop_ports = FakePorts::new();
-    stop_attempt(&ledger, &stop_ports, claim.attempt_id)
+    stop_attempt(&ledger, &stop_ports, claim.attempt_id, 5)
         .await
         .expect("stop");
 
@@ -312,7 +313,7 @@ async fn reconcile_resumes_a_failed_stop_as_a_stop_and_never_reclaims() {
     let ports = FakePorts::new();
     *ports.kill_failure.lock().expect("lock") =
         Some(PortError::Unavailable("no sentinel to read".to_owned()));
-    stop_attempt(&ledger, &ports, claim.attempt_id)
+    stop_attempt(&ledger, &ports, claim.attempt_id, 5)
         .await
         .expect_err("unverified death must not settle the attempt");
     let marker = ledger.get_attempt(claim.attempt_id).expect("get");
@@ -518,7 +519,7 @@ async fn a_stop_reads_back_the_terminal_state_it_actually_settled_in() {
     ledger.mark_reclaimed(claim.attempt_id).expect("saga won");
 
     let ports = FakePorts::new();
-    let settled = stop_attempt(&ledger, &ports, claim.attempt_id)
+    let settled = stop_attempt(&ledger, &ports, claim.attempt_id, 5)
         .await
         .expect("a terminal row is an answer, not a refusal");
     assert_eq!(settled, AttemptState::Reclaimed);

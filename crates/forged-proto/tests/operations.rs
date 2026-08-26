@@ -14,11 +14,13 @@ mod support;
 use std::collections::HashMap;
 
 use forged_ledger::{
-    EffectClass, Ledger, NewPacket, NewRun, OperationOutcome, OperationState, SpecFence,
+    AttemptState, EffectClass, Ledger, NewPacket, NewRun, OperationOutcome, OperationState,
+    RevokeScope, SpecFence,
 };
 use forged_proto::{
-    advance, project_run, reconcile, record, widen_rfc3339, GatePhase, MachineStage, NextAction,
-    PrSnapshot, ProtoEvent, ReconcileConfig, SessionLiveness,
+    advance, parse_proto_events, project_run, reconcile, record, stage_deadline_at,
+    stage_deadline_reached, widen_rfc3339, GatePhase, MachineStage, NextAction, PrSnapshot,
+    ProtoEvent, ReconcileConfig, SessionLiveness,
 };
 use forged_types::{OperationRequest, OperationResponse, RunId, Stage};
 use support::*;
@@ -29,6 +31,27 @@ fn now_stamp() -> String {
     widen_rfc3339(&jiff::Timestamp::now().to_string())
 }
 
+fn seconds_after(anchor: &str, seconds: i64) -> String {
+    let timestamp = anchor.parse::<jiff::Timestamp>().expect("timestamp");
+    widen_rfc3339(
+        &timestamp
+            .checked_add(jiff::Span::new().seconds(seconds))
+            .expect("shift")
+            .to_string(),
+    )
+}
+
+#[test]
+fn deadline_boundary_uses_one_nanosecond_precise_clock_contract() {
+    let started = "2026-08-12T00:00:00.000000123Z";
+    let deadline = stage_deadline_at(started, 2).expect("deadline");
+    assert_eq!(deadline, "2026-08-12T00:00:02.000000123Z");
+    assert!(!stage_deadline_reached(started, 2, "2026-08-12T00:00:02.000000122Z").expect("before"));
+    assert!(stage_deadline_reached(started, 2, &deadline).expect("at"));
+    assert!(stage_deadline_at(started, forged_types::MAX_STAGE_BUDGET_S).is_ok());
+    assert!(stage_deadline_at(started, u64::MAX).is_err());
+}
+
 fn config() -> ReconcileConfig {
     ReconcileConfig {
         stage_budget_s: HashMap::from([
@@ -37,8 +60,33 @@ fn config() -> ReconcileConfig {
             (Stage::ReviewCodex, 1800),
             (Stage::Fix, 1800),
         ]),
+        termination_grace_s: 5,
         gate_commands: vec!["cargo test --workspace".to_owned()],
     }
+}
+
+fn packet_body(budget_s: u32) -> String {
+    serde_json::json!({
+        "schema": "forged.packet/1",
+        "beadId": "bead-1",
+        "worktree": "/tmp/worktree",
+        "branch": "feat/x",
+        "baseRef": "main",
+        "contract": {
+            "instructions": "implement",
+            "gateCommands": [],
+            "deliverable": "commitsInWorktree",
+            "budgetS": budget_s
+        },
+        "resultSchema": "forged.result/1",
+        "providerHints": {
+            "provider": "claude",
+            "model": "test",
+            "sandbox": "workspaceWrite"
+        },
+        "fieldNotes": []
+    })
+    .to_string()
 }
 
 fn seed_run(ledger: &Ledger) {
@@ -574,6 +622,232 @@ async fn resolve_settles_only_with_worktree_and_the_expected_lease_holder() {
         .expect("row survives");
     assert_eq!(row.state, OperationState::Terminal);
     ledger.close().expect("close");
+}
+
+#[tokio::test]
+async fn frozen_deadline_ignores_heartbeat_and_grants_one_retry_after_verified_kill() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ledger = Ledger::open(&dir.path().join("state.db")).expect("open");
+    seed_run(&ledger);
+    // Reconciliation receives the frozen package policy projected by core;
+    // the packet contract is not a second timeout authority.
+    let body = packet_body(3_600);
+    let packet_id = ledger
+        .open_packet(NewPacket {
+            run_id: RUN.to_owned(),
+            stage: Stage::Implement,
+            seq: 1,
+            spec_path: "spec.md".to_owned(),
+            spec_sha256: "cafe".to_owned(),
+            spec_revision: None,
+            body_json: body,
+        })
+        .expect("open packet");
+    let claim = ledger
+        .claim_packet(
+            &packet_id,
+            "claude:deadline:1",
+            &SpecFence::Sha256("cafe".to_owned()),
+        )
+        .expect("claim");
+    let started_at = ledger
+        .get_attempt(claim.attempt_id)
+        .expect("attempt")
+        .started_at;
+    let mut live_config = config();
+    live_config.stage_budget_s.insert(Stage::Implement, 2);
+    let ports = FakePorts::new();
+    {
+        let mut liveness = ports.liveness_script.lock().expect("lock");
+        liveness.push_back(SessionLiveness::Running);
+        // Even a clean exit must not outrank the exact deadline boundary.
+        // Reconcile checks its captured clock before accepting liveness.
+        liveness.push_back(SessionLiveness::Exited(0));
+    }
+
+    let before = reconcile(
+        &ledger,
+        RUN,
+        &ports,
+        &live_config,
+        &seconds_after(&started_at, 1),
+    )
+    .await
+    .expect("before deadline");
+    assert_eq!(before.left_running, vec![claim.attempt_id]);
+    ledger
+        .heartbeat_attempt(&claim.claim_token)
+        .expect("fresh heartbeat");
+
+    let expired = reconcile(
+        &ledger,
+        RUN,
+        &ports,
+        &live_config,
+        &seconds_after(&started_at, 2),
+    )
+    .await
+    .expect("deadline settlement");
+    assert_eq!(expired.timed_out, vec![claim.attempt_id]);
+    assert!(expired.reclaimed.is_empty());
+    assert_eq!(
+        ports.liveness_script.lock().expect("lock").len(),
+        1,
+        "terminal liveness is not consulted after the deadline is reached"
+    );
+    let calls = ports.recorded();
+    assert!(calls.iter().any(|call| matches!(
+        call,
+        PortCall::KillConfirmed {
+            session,
+            termination_grace_s: 5,
+            ..
+        } if session == "claude:deadline:1"
+    )));
+    assert!(!calls
+        .iter()
+        .any(|call| matches!(call, PortCall::ReclaimLease { .. })));
+
+    let timed_out = ledger.get_attempt(claim.attempt_id).expect("timed out");
+    assert_eq!(timed_out.state, AttemptState::Failed);
+    assert_eq!(timed_out.revoke_scope, Some(RevokeScope::Deadline));
+    assert!(timed_out
+        .fail_note
+        .as_deref()
+        .is_some_and(|note| note.starts_with("transport: stage deadline exceeded")));
+    let rows = ledger.list_events(Some(RUN), 0, 1_000).expect("events");
+    assert_eq!(
+        rows.iter().filter(|row| row.kind == "proto.retry").count(),
+        1,
+        "one timed-out attempt earns exactly one retry grant"
+    );
+    let retries: Vec<_> = parse_proto_events(&rows)
+        .expect("replay")
+        .into_iter()
+        .filter_map(|event| match event {
+            ProtoEvent::Retry {
+                packet_id,
+                attempt_id,
+                transport_failures,
+                ..
+            } => Some((packet_id, attempt_id, transport_failures)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        retries,
+        vec![(packet_id.clone(), Some(claim.attempt_id), 1)]
+    );
+    reconcile(
+        &ledger,
+        RUN,
+        &ports,
+        &live_config,
+        &seconds_after(&started_at, 3),
+    )
+    .await
+    .expect("replayed reconcile");
+    assert_eq!(
+        ledger
+            .list_events(Some(RUN), 0, 1_000)
+            .expect("events")
+            .iter()
+            .filter(|row| row.kind == "proto.retry")
+            .count(),
+        1,
+        "terminal replay cannot grant a second retry"
+    );
+
+    ledger
+        .claim_packet(
+            &packet_id,
+            "claude:successor:2",
+            &SpecFence::Sha256("cafe".to_owned()),
+        )
+        .expect("one successor");
+    assert!(ledger
+        .claim_packet(
+            &packet_id,
+            "claude:duplicate:3",
+            &SpecFence::Sha256("cafe".to_owned()),
+        )
+        .is_err());
+}
+
+#[tokio::test]
+async fn deadline_marker_retains_custody_until_kill_can_be_verified_then_replays_once() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ledger = Ledger::open(&dir.path().join("state.db")).expect("open");
+    seed_run(&ledger);
+    let packet_id = ledger
+        .open_packet(NewPacket {
+            run_id: RUN.to_owned(),
+            stage: Stage::Implement,
+            seq: 1,
+            spec_path: "spec.md".to_owned(),
+            spec_sha256: "cafe".to_owned(),
+            spec_revision: None,
+            body_json: packet_body(1),
+        })
+        .expect("open packet");
+    let claim = ledger
+        .claim_packet(
+            &packet_id,
+            "claude:deadline:1",
+            &SpecFence::Sha256("cafe".to_owned()),
+        )
+        .expect("claim");
+    ledger
+        .revoke_attempt_scoped(
+            claim.attempt_id,
+            "transport: stage deadline exceeded: crash replay",
+            RevokeScope::Deadline,
+        )
+        .expect("marker");
+    let ports = FakePorts::new();
+    *ports.kill_failure.lock().expect("lock") = Some(forged_proto::PortError::Unavailable(
+        "identity not verifiable".to_owned(),
+    ));
+    let failed_kill = reconcile(&ledger, RUN, &ports, &config(), &now_stamp()).await;
+    assert!(failed_kill.is_err());
+    let retained = ledger.get_attempt(claim.attempt_id).expect("retained");
+    assert_eq!(retained.state, AttemptState::Revoking);
+    assert_eq!(retained.revoke_scope, Some(RevokeScope::Deadline));
+    assert!(ledger
+        .list_events(Some(RUN), 0, 1_000)
+        .expect("events")
+        .iter()
+        .all(|row| row.kind != "proto.retry"));
+
+    forged_proto::grant_retry_for_attempt(
+        &ledger,
+        RUN,
+        &packet_id,
+        claim.attempt_id,
+        &retained.updated_at,
+    )
+    .expect("simulate crash after retry grant");
+    *ports.kill_failure.lock().expect("lock") = None;
+    let resumed = reconcile(&ledger, RUN, &ports, &config(), &now_stamp())
+        .await
+        .expect("resume marker");
+    assert_eq!(resumed.timed_out, vec![claim.attempt_id]);
+    assert_eq!(
+        ledger.get_attempt(claim.attempt_id).expect("settled").state,
+        AttemptState::Failed
+    );
+    reconcile(&ledger, RUN, &ports, &config(), &now_stamp())
+        .await
+        .expect("terminal replay");
+    assert_eq!(
+        ledger
+            .list_events(Some(RUN), 0, 1_000)
+            .expect("events")
+            .iter()
+            .filter(|row| row.kind == "proto.retry")
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]

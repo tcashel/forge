@@ -320,6 +320,7 @@ impl ViewBuilder {
         let pid = packet_id(&self.run_id, stage, seq);
         self.events.push(ProtoEvent::Retry {
             packet_id: pid,
+            attempt_id: None,
             transport_failures: failures,
             retry_after: after.to_owned(),
         });
@@ -393,6 +394,7 @@ impl ViewBuilder {
                 .into_iter()
                 .map(|stage| (stage, 1_800))
                 .collect(),
+                termination_grace_s: forged_types::DEFAULT_TERMINATION_GRACE_S,
                 transport_retry_budget: self.budget,
                 host_policy: forged_types::HostPolicyV1::Off,
                 herdr_socket: None,
@@ -451,6 +453,8 @@ pub enum PortCall {
     KillConfirmed {
         /// The session argument, verbatim.
         session: String,
+        /// Frozen upper bound for each termination phase.
+        termination_grace_s: u64,
         /// Whether this call returned `KillOutcome::Killed`.
         returned_killed: bool,
     },
@@ -570,7 +574,11 @@ impl ReconcilePorts for FakePorts {
         Ok(scripted.unwrap_or(SessionLiveness::Vanished))
     }
 
-    async fn kill_confirmed(&self, session: &str) -> Result<KillOutcome, PortError> {
+    async fn kill_confirmed(
+        &self,
+        session: &str,
+        termination_grace_s: u64,
+    ) -> Result<KillOutcome, PortError> {
         self.interpose("kill_confirmed");
         if let Some(failure) = self.kill_failure.lock().expect("lock").clone() {
             return Err(failure);
@@ -594,6 +602,7 @@ impl ReconcilePorts for FakePorts {
         });
         self.push(PortCall::KillConfirmed {
             session: session.to_owned(),
+            termination_grace_s,
             returned_killed: outcome == KillOutcome::Killed,
         });
         Ok(outcome)

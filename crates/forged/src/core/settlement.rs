@@ -4,7 +4,8 @@
 use std::path::Path;
 
 use forged_ledger::{
-    EffectClass, OperationState, RevokeScope, RunOutcome, RunRow, RunSettlement, RunState,
+    AttemptState, EffectClass, OperationState, RevokeScope, RunOutcome, RunRow, RunSettlement,
+    RunState,
 };
 use forged_types::{ErrorCode, OperationRequest, OperationResponse};
 use serde_json::{json, Value};
@@ -94,15 +95,48 @@ async fn stop_live_attempts(ctx: &Ctx, run_id: &str, reason: &str) -> Result<Vec
         if live.is_empty() {
             return Ok(stopped);
         }
-        for attempt in live {
-            let attempt_id = attempt.attempt_id;
+        let view = crate::core::drive::project(ctx, run_id).await?;
+        let config = forged_proto::ReconcileConfig {
+            termination_grace_s: view.policy.termination_grace_s,
+            stage_budget_s: view.policy.stage_budget_s.into_iter().collect(),
+            gate_commands: view.policy.gate_commands,
+        };
+        let ports = ForgedPorts::new(ctx.ledger.clone(), ctx.config.clone());
+        for observed in live {
+            let attempt_id = observed.attempt_id;
             let reason = reason.to_owned();
-            on_ledger(&ctx.ledger, move |ledger| {
+            let marker = on_ledger(&ctx.ledger, move |ledger| {
                 ledger.revoke_attempt_scoped(attempt_id, &reason, RevokeScope::Attempt)
             })
-            .await?;
-            let ports = ForgedPorts::new(ctx.ledger.clone(), ctx.config.clone());
-            forged_proto::stop_attempt(&ctx.ledger, &ports, attempt_id).await?;
+            .await;
+            if let Err(error) = marker {
+                // A run-scoped deadline reconcile (or another settlement)
+                // may have made this snapshot row terminal. Re-read that
+                // durable result; only an unrelated refusal still fails.
+                if error.code != ErrorCode::InvalidRequest {
+                    return Err(error);
+                }
+            }
+            // `revoke_attempt_scoped` is first-writer-wins. Read its durable
+            // row before choosing the matching terminal order so an older
+            // snapshot can never replace a sibling's Deadline scope.
+            let attempt =
+                on_ledger(&ctx.ledger, move |ledger| ledger.get_attempt(attempt_id)).await?;
+            if !matches!(
+                attempt.state,
+                AttemptState::Running | AttemptState::Revoking
+            ) {
+                stopped.push(attempt_id);
+                continue;
+            }
+            if attempt.revoke_scope == Some(RevokeScope::Deadline) {
+                forged_proto::reconcile_attempts(&ctx.ledger, run_id, &ports, &config, &now_iso())
+                    .await?;
+                stopped.push(attempt_id);
+                continue;
+            }
+            forged_proto::stop_attempt(&ctx.ledger, &ports, attempt_id, config.termination_grace_s)
+                .await?;
             stopped.push(attempt_id);
         }
     }
@@ -431,8 +465,16 @@ pub(crate) async fn settle(
         });
     }
 
-    let (stopped_attempts, bead, retired, cleanup_error) =
-        settle_aftermath(ctx, run_id, &settlement, &run, false).await?;
+    let internal = is_internal_epic_run(ctx, run_id).await?;
+    let (stopped_attempts, bead, retired, cleanup_error) = if internal {
+        let stopped = stop_live_attempts(ctx, run_id, &settlement.reason).await?;
+        // Preserve planning artifacts through typed stops. The epic apply
+        // seam performs the required clean retirement immediately before the
+        // guarded Beads write.
+        (stopped, Value::Null, false, None)
+    } else {
+        settle_aftermath(ctx, run_id, &settlement, &run, false).await?
+    };
 
     Ok(json!({
         "runId": run_id,
@@ -450,6 +492,21 @@ pub(crate) async fn settle(
         "worktreeRetired": retired,
         "worktreeCleanupError": cleanup_error,
     }))
+}
+
+async fn is_internal_epic_run(ctx: &Ctx, run_id: &str) -> Result<bool, Failure> {
+    Ok(super::drive::project(ctx, run_id)
+        .await?
+        .execution_package
+        .is_some_and(|package| {
+            matches!(
+                (
+                    package.protocol_ref.name.as_str(),
+                    package.protocol_ref.version
+                ),
+                ("epic-plan" | "epic-assurance", 1)
+            )
+        }))
 }
 
 /// `run stop` — the explicit whole-run terminal operation.
@@ -791,7 +848,16 @@ async fn adjudicate_locked(
         })?
     };
     let (stopped_attempts, bead, retired, cleanup_error) =
-        settle_aftermath(ctx, run_id, &settlement, &run, true).await?;
+        if is_internal_epic_run(ctx, run_id).await? {
+            (
+                stop_live_attempts(ctx, run_id, &settlement.reason).await?,
+                Value::Null,
+                false,
+                None,
+            )
+        } else {
+            settle_aftermath(ctx, run_id, &settlement, &run, true).await?
+        };
     Ok(json!({
         "runId": run_id,
         "outcome": settlement.outcome.as_str(),

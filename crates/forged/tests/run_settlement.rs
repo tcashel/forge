@@ -2,6 +2,8 @@
 
 mod support;
 
+use std::path::PathBuf;
+
 use serde_json::json;
 use support::{fabricate_run, git, TestEnv};
 
@@ -337,4 +339,123 @@ fn clean_candidate_claim_is_awaiting_delivery_not_stale() {
             .is_some_and(|detail| detail.contains("retains its Beads claim")),
         "{response}"
     );
+}
+
+#[test]
+fn settlement_refreshes_siblings_after_whole_run_deadline_reconciliation() {
+    let env = TestEnv::new("forged-run-deadline-snapshot");
+    env.forged(&["init"]);
+    let run = "deadline-snapshot";
+    seed(&env, run);
+
+    let ledger = env.ledger();
+    let mut attempts = Vec::new();
+    for seq in 0..2 {
+        let packet_id = format!("{run}/implement/{seq}");
+        let digest = "a".repeat(64);
+        let packet = forged_types::WorkPacket {
+            schema: "forged.packet/1".to_owned(),
+            packet_id: packet_id.clone(),
+            run_id: run.to_owned(),
+            bead_id: format!("bead-{run}"),
+            stage: forged_types::Stage::Implement,
+            execution: None,
+            lane_seq: None,
+            spec: forged_types::SpecRef {
+                path: "beads://fixture".to_owned(),
+                sha256: digest.clone(),
+                revision: None,
+            },
+            worktree: PathBuf::from("/unread/worktree"),
+            branch: format!("forged/{run}"),
+            base_ref: "main".to_owned(),
+            contract: forged_types::StageContract {
+                instructions: "fixture".to_owned(),
+                gate_commands: Vec::new(),
+                deliverable: forged_types::Deliverable::CommitsInWorktree,
+                budget_s: 1_800,
+            },
+            result_schema: "forged.result/1".to_owned(),
+            provider_hints: forged_types::ProviderHints {
+                provider: "claude".to_owned(),
+                model: "fixture".to_owned(),
+                effort: None,
+                sandbox: forged_types::Sandbox::ReadOnly,
+            },
+            field_notes: Vec::new(),
+        };
+        ledger
+            .open_packet(forged_ledger::NewPacket {
+                run_id: run.to_owned(),
+                stage: forged_types::Stage::Implement,
+                seq,
+                spec_path: packet.spec.path.clone(),
+                spec_sha256: digest.clone(),
+                spec_revision: None,
+                body_json: packet.stored_body().expect("stored packet"),
+            })
+            .expect("open packet");
+        let attempt = ledger
+            .claim_packet(
+                &packet_id,
+                &format!("claude:{packet_id}:2147483647"),
+                &forged_ledger::SpecFence::Sha256(digest),
+            )
+            .expect("claim packet");
+        let packet_dir = env.packet_dir(run, "implement", seq);
+        std::fs::create_dir_all(&packet_dir).expect("packet dir");
+        std::fs::write(packet_dir.join("provider.pid"), "2147483647").expect("dead pid");
+        attempts.push(attempt.attempt_id);
+    }
+    let db = env.anvil.join("state.db");
+    let connection = rusqlite::Connection::open(db).expect("open attempt clock");
+    connection
+        .execute(
+            "UPDATE attempts SET started_at = '2020-01-01T00:00:00.000000000Z', \
+             updated_at = '2020-01-01T00:00:00.000000000Z'",
+            [],
+        )
+        .expect("expire attempts");
+    drop(connection);
+    ledger
+        .revoke_attempt_scoped(
+            attempts[0],
+            "transport: stage deadline exceeded: seeded marker",
+            forged_ledger::RevokeScope::Deadline,
+        )
+        .expect("seed first deadline marker");
+    ledger.close().expect("close ledger");
+
+    let (code, stopped) = env.forged(&[
+        "run",
+        "stop",
+        "--run",
+        run,
+        "--outcome",
+        "cancelled",
+        "--reason",
+        "operator cancelled",
+    ]);
+    assert_eq!(
+        code, 0,
+        "settlement must converge from refreshed rows: {stopped}"
+    );
+    assert_eq!(stopped["ok"], json!(true), "{stopped}");
+    assert_eq!(
+        stopped["result"]["stoppedAttempts"],
+        json!(attempts),
+        "settlement reports every attempt the run-scoped pass drained"
+    );
+
+    let ledger = env.ledger();
+    for attempt_id in attempts.iter().copied() {
+        let attempt = ledger.get_attempt(attempt_id).expect("settled attempt");
+        assert_eq!(attempt.state, forged_ledger::AttemptState::Failed);
+        assert_eq!(
+            attempt.revoke_scope,
+            Some(forged_ledger::RevokeScope::Deadline),
+            "whole-run reconcile owns every expired attempt's terminal scope"
+        );
+    }
+    ledger.close().expect("close ledger");
 }

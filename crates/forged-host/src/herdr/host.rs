@@ -223,8 +223,6 @@ pub enum HerdrTabCreateError {
 // iterations would let the real wait stretch far beyond the spec'd limit.
 const READINESS_BUDGET: Duration = Duration::from_secs(3);
 const READINESS_INTERVAL: Duration = Duration::from_millis(50);
-const CLOSE_VERIFY_BUDGET: Duration = Duration::from_secs(5);
-const KILL_REVERIFY_BUDGET: Duration = Duration::from_secs(2);
 const KILL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// What a `pane.process_info` probe concluded about a pane.
@@ -303,6 +301,7 @@ pub struct HerdrHost {
     /// Exact durable layout placement. Its ids, never labels, grant targeting
     /// authority. `None` preserves the legacy repository-workspace split.
     layout: Option<HerdrLayoutTarget>,
+    termination_grace: Duration,
 }
 
 /// A controller connection for durable pane ids recorded by forged. Unlike
@@ -650,7 +649,14 @@ impl HerdrHost {
             workspace_label: None,
             workspace: Mutex::new(None),
             layout: None,
+            termination_grace: Duration::from_secs(forged_types::DEFAULT_TERMINATION_GRACE_S),
         })
+    }
+
+    /// Freeze the provider termination phase bound for this host instance.
+    pub fn with_termination_grace_s(mut self, grace_s: u64) -> Self {
+        self.termination_grace = Duration::from_secs(grace_s);
+        self
     }
 
     /// Place every seat this host spawns inside the workspace named `label`,
@@ -1252,6 +1258,7 @@ impl SessionHost for HerdrHost {
     async fn kill_confirmed(&self, id: &HostSessionId) -> Result<Confirmed, HostError> {
         let status_path = self.session_status_path(id)?;
         let pane_id = id.as_str().to_string();
+        let grace = self.termination_grace;
 
         // Entry reads, once each, before acting: sentinel then pane probe.
         let sentinel_present = sentinel::read_status(&status_path)?.is_some();
@@ -1311,7 +1318,7 @@ impl SessionHost for HerdrHost {
             if close_reported_gone {
                 return Ok(Confirmed::Killed);
             }
-            let deadline = Instant::now() + CLOSE_VERIFY_BUDGET;
+            let deadline = Instant::now() + grace;
             loop {
                 if self.conn.pane_closed_observed(&pane_id) {
                     return Ok(Confirmed::Killed);
@@ -1329,16 +1336,13 @@ impl SessionHost for HerdrHost {
 
         // Verify every captured pid dead; escalate to SIGKILL on the
         // foreground process group if survivors remain.
-        if self.all_targets_dead(&targets, CLOSE_VERIFY_BUDGET).await? {
+        if self.all_targets_dead(&targets, grace).await? {
             return Ok(Confirmed::Killed);
         }
         if let Some(pgid) = pgid {
             let _ = killpg(Pid::from_raw(pgid), Signal::SIGKILL);
         }
-        if self
-            .all_targets_dead(&targets, KILL_REVERIFY_BUDGET)
-            .await?
-        {
+        if self.all_targets_dead(&targets, grace).await? {
             return Ok(Confirmed::Killed);
         }
         Err(HostError::KillVerifyTimeout)

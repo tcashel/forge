@@ -19,9 +19,9 @@ use crate::usage::{
 /// packet to the wrong driver is a caller bug this crate does not detect
 /// and does not report.
 ///
-/// `provider_hints.sandbox` is ignored — the claude CLI has no read-only
-/// mode, so review-stage read-onlyness is carried by the prompt, not the
-/// flags. `provider_hints.effort` is likewise ignored — the claude CLI has
+/// Read-only packets use plan permission mode and a closed non-writing tool
+/// allow-list; workspace-write packets retain the unattended bypass used by
+/// implementation/fix stages. `provider_hints.effort` is ignored — the claude CLI has
 /// no reasoning-effort flag — so [`ClaudeDriver::invocation`] never returns
 /// [`ProviderError::UnsupportedEffort`], not even for an unknown effort.
 #[derive(Debug, Clone, PartialEq)]
@@ -45,10 +45,13 @@ impl ProviderDriver for ClaudeDriver {
         let model = &packet.provider_hints.model;
         validate_model(model)?;
         let session_id = claude_session_id(claim_token);
+        let permission = match packet.provider_hints.sandbox {
+            forged_types::Sandbox::ReadOnly => "--permission-mode plan --tools Read,Grep,Glob",
+            forged_types::Sandbox::WorkspaceWrite => "--dangerously-skip-permissions",
+        };
         let shell_line = format!(
-            "claude -p --output-format stream-json --verbose \
-             --dangerously-skip-permissions --session-id {session_id} \
-             --model {model} < {prompt} > {stdout}"
+            "claude -p --output-format stream-json --verbose {permission} \
+             --session-id {session_id} --model {model} < {prompt} > {stdout}"
         );
         Ok(Invocation {
             shell_line,

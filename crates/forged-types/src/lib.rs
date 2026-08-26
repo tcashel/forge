@@ -39,8 +39,9 @@ pub use contract::{
     Capability, DefinitionError, EscalationTrigger, ExecutionPackageV1, ExecutionPolicyV1,
     HostPolicyV1, ProfileDefinitionV1, ProfileRef, ProtocolRef, ProviderCandidateV1,
     ResolvedRosterV1, RoleId, RosterDefinitionV1, RosterRef, RosterRevisionV1, SeatDefinitionV1,
-    SeatExecutionV1, SeatId, SeatPurpose, EXECUTION_PACKAGE_SCHEMA_V1, PROFILE_SCHEMA_V1,
-    RESOLVED_ROSTER_SCHEMA_V1, ROSTER_SCHEMA_V1,
+    SeatExecutionV1, SeatId, SeatPurpose, DEFAULT_TERMINATION_GRACE_S, EXECUTION_PACKAGE_SCHEMA_V1,
+    MAX_STAGE_BUDGET_S, MAX_TERMINATION_GRACE_S, PROFILE_SCHEMA_V1, RESOLVED_ROSTER_SCHEMA_V1,
+    ROSTER_SCHEMA_V1,
 };
 pub use controller_env::CONTROLLER_ENV;
 pub use envelope::{OpError, OperationRequest, OperationResponse};
@@ -61,9 +62,9 @@ pub use herdr_projection::{
 };
 pub use ids::{claude_session_id, new_claim_token, RunId, RunIdError};
 pub use packet::{
-    AcceptedRisk, Deliverable, Finding, GateRow, Outcome, PacketColumns, PacketResult,
-    ProviderHints, Sandbox, Severity, SpecAmendment, SpecRef, Stage, StageContract, Verdict,
-    WorkPacket,
+    AcceptedRisk, Deliverable, Finding, GateRow, NativeBeadSpecV1, Outcome, PacketColumns,
+    PacketResult, PlanTraceabilityV1, ProviderHints, Sandbox, Severity, SpecAmendment, SpecRef,
+    Stage, StageContract, Verdict, WorkPacket,
 };
 pub use provider_session_inventory::{
     ProviderSessionActivity, ProviderSessionAttemptV1, ProviderSessionDesiredWorkV1,
