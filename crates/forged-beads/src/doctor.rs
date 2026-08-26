@@ -86,8 +86,7 @@ pub async fn run_doctor(cfg: DoctorConfig) -> Vec<ProbeResult> {
     results
 }
 
-/// `<bd_path> version --json` (works with no DB), requiring a semver
-/// `>= 1.2.0` and `< 2.0.0`.
+/// `<bd_path> version --json` (works with no DB), requiring semver `>= 1.2.1`.
 ///
 /// Observed envelope (bd 1.2.1 under `BD_JSON_ENVELOPE=1`):
 /// `{"data": {"build": "dev", "commit": "634cbbc4...", "version": "1.2.1"},
@@ -114,17 +113,63 @@ async fn bd_version(cfg: &DoctorConfig) -> Result<String, String> {
         .or_else(|| parsed.get("version"))
         .and_then(Value::as_str)
         .ok_or_else(|| format!("no version field in {}", out.stdout))?;
-    let mut parts = version.split('.');
-    let major: u64 = parts
-        .next()
-        .and_then(|p| p.parse().ok())
-        .ok_or_else(|| format!("unparseable semver {version}"))?;
-    let minor: u64 = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
-    if major == 1 && minor >= 2 {
+    if supported_bd_version(version) {
         Ok(format!("bd {version}"))
     } else {
-        Err(format!("bd {version} outside the required >=1.2.0, <2.0.0"))
+        Err(format!("bd {version} outside the required >=1.2.1"))
     }
+}
+
+/// Return whether `version` is valid semver at or above the supported bd
+/// minimum, `1.2.1`. Prereleases of the minimum itself are not supported.
+pub fn supported_bd_version(version: &str) -> bool {
+    let (without_build, build) = version
+        .split_once('+')
+        .map_or((version, None), |(core, build)| (core, Some(build)));
+    if build.is_some_and(|value| !valid_semver_identifiers(value, false)) {
+        return false;
+    }
+    let (core, prerelease) = without_build
+        .split_once('-')
+        .map_or((without_build, None), |(core, prerelease)| {
+            (core, Some(prerelease))
+        });
+    if prerelease.is_some_and(|value| !valid_semver_identifiers(value, true)) {
+        return false;
+    }
+    let mut parts = core.split('.');
+    let parse = |part: Option<&str>| {
+        let part = part?;
+        if part.is_empty() || (part.len() > 1 && part.starts_with('0')) {
+            return None;
+        }
+        part.parse::<u64>().ok()
+    };
+    let version = match (
+        parse(parts.next()),
+        parse(parts.next()),
+        parse(parts.next()),
+    ) {
+        (Some(major), Some(minor), Some(patch)) => (major, minor, patch),
+        _ => return false,
+    };
+    if parts.next().is_some() {
+        return false;
+    }
+    version > (1, 2, 1) || (version == (1, 2, 1) && prerelease.is_none())
+}
+
+fn valid_semver_identifiers(value: &str, reject_numeric_leading_zero: bool) -> bool {
+    value.split('.').all(|identifier| {
+        !identifier.is_empty()
+            && identifier
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            && !(reject_numeric_leading_zero
+                && identifier.len() > 1
+                && identifier.starts_with('0')
+                && identifier.bytes().all(|byte| byte.is_ascii_digit()))
+    })
 }
 
 /// On a scratch `BEADS_DIR` under a scratch `HOME` (both fresh dirs created
@@ -463,6 +508,29 @@ async fn anvil_home_writable(cfg: &DoctorConfig) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bd_version_accepts_every_semver_at_or_above_1_2_1() {
+        for version in ["1.2.1", "1.2.1+build.7", "1.3.0-rc.1", "2.0.0", "10.0.0"] {
+            assert!(supported_bd_version(version), "{version} should pass");
+        }
+    }
+
+    #[test]
+    fn bd_version_rejects_older_prerelease_and_malformed_values() {
+        for version in [
+            "1.2.0",
+            "1.2.1-rc.1",
+            "1.1.99",
+            "1.2",
+            "01.2.1",
+            "1.2.1-01",
+            "1.2.1+bad+build",
+            "not-semver",
+        ] {
+            assert!(!supported_bd_version(version), "{version} should fail");
+        }
+    }
 
     #[test]
     fn backend_detail_keeps_embedded_mode_unchanged() {

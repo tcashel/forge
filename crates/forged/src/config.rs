@@ -1,5 +1,6 @@
 //! Config resolution: one operator-scoped YAML file, read once at startup,
-//! plus the sanctioned environment reads (`FORGED_CONFIG`, `BEADS_DIR`).
+//! plus the sanctioned environment reads (`FORGED_CONFIG`, `BEADS_DIR`,
+//! `BD_BIN`).
 //!
 //! An existing legacy `config.json` remains readable and is projected into
 //! the provider-neutral `standard` profile. Authoring data is never runtime
@@ -7,6 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 use forged_types::{
@@ -384,6 +386,36 @@ fn config_path(anvil_home: &std::path::Path) -> PathBuf {
     yaml
 }
 
+fn resolve_bd_path(
+    configured: Option<String>,
+    environment: Option<std::ffi::OsString>,
+    search_path: Option<std::ffi::OsString>,
+) -> PathBuf {
+    if let Some(configured) = configured {
+        return PathBuf::from(configured);
+    }
+    let requested = environment
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| std::ffi::OsString::from("bd"));
+    let unresolved = PathBuf::from(&requested);
+    if unresolved.components().count() != 1 {
+        return unresolved;
+    }
+    let Some(search_path) = search_path.filter(|value| !value.is_empty()) else {
+        return unresolved;
+    };
+    std::env::split_paths(&search_path)
+        .filter(|directory| directory.is_absolute())
+        .map(|directory| directory.join(&requested))
+        .find(|candidate| {
+            candidate.metadata().is_ok_and(|metadata| {
+                metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+            })
+        })
+        .and_then(|candidate| candidate.canonicalize().ok())
+        .unwrap_or(unresolved)
+}
+
 impl ForgedConfig {
     /// Resolve and validate the non-cognitive policy frozen into every new
     /// package. Upgrade code uses the same boundary to snapshot policy for
@@ -436,10 +468,11 @@ impl ForgedConfig {
             .filter(|v| !v.is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(|| anvil_home.join("beads"));
-        let bd_path = file
-            .bd_path
-            .map(PathBuf::from)
-            .unwrap_or_else(|| anvil_home.join("tools/bd-1.2.1/bin/bd"));
+        let bd_path = resolve_bd_path(
+            file.bd_path,
+            std::env::var_os("BD_BIN"),
+            std::env::var_os("PATH"),
+        );
         let codex_home = file.codex_home.map(PathBuf::from).unwrap_or_else(|| {
             std::env::var_os("HOME")
                 .map(PathBuf::from)
@@ -683,12 +716,7 @@ impl ForgedConfig {
             gate_commands: Some(default_gate_commands()),
             stage_budget_s: Some(default_stage_budget_s()),
             transport_retry_budget: Some(DEFAULT_TRANSPORT_RETRY_BUDGET),
-            bd_path: Some(
-                self.anvil_home
-                    .join("tools/bd-1.2.1/bin/bd")
-                    .to_string_lossy()
-                    .into_owned(),
-            ),
+            bd_path: None,
             codex_home: Some(
                 std::env::var_os("HOME")
                     .map(PathBuf::from)
@@ -1177,7 +1205,7 @@ pub(crate) fn scratch_config(anvil_home: &std::path::Path) -> ForgedConfig {
         gate_commands: default_gate_commands(),
         stage_budget_s: default_stage_budget_s(),
         transport_retry_budget: DEFAULT_TRANSPORT_RETRY_BUDGET,
-        bd_path: anvil_home.join("tools/bd-1.2.1/bin/bd"),
+        bd_path: PathBuf::from("bd"),
         beads_dir: anvil_home.join("beads"),
         codex_home: anvil_home.join("codex-home"),
         host_policy: HostPolicy::Preferred,
@@ -1206,7 +1234,7 @@ mod tests {
             gate_commands: default_gate_commands(),
             stage_budget_s: default_stage_budget_s(),
             transport_retry_budget: DEFAULT_TRANSPORT_RETRY_BUDGET,
-            bd_path: PathBuf::from("/tmp/anvil/tools/bd-1.2.1/bin/bd"),
+            bd_path: PathBuf::from("/tmp/configured/bd"),
             beads_dir: PathBuf::from("/tmp/anvil/beads"),
             codex_home: PathBuf::from("/tmp/home/.codex"),
             host_policy: HostPolicy::Preferred,
@@ -1223,9 +1251,62 @@ mod tests {
         assert!(text.starts_with("# forged authoring config"));
         let parsed: ConfigFile = serde_yaml::from_str(&text).expect("parse yaml");
         assert_eq!(parsed.default_profile.as_deref(), Some("standard"));
+        assert!(
+            parsed.bd_path.is_none(),
+            "generated config must preserve PATH-based bd resolution"
+        );
         let compiled = cfg.compile_definition(None, None).expect("compile");
         assert_eq!(compiled.package.profile_ref.name, "standard");
         assert_eq!(compiled.compatibility_roster.len(), 4);
+    }
+
+    #[test]
+    fn bd_resolution_prefers_config_then_nonempty_environment_then_path() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path_bd = directory.path().join("bd");
+        std::fs::write(&path_bd, "#!/bin/sh\n").expect("bd fixture");
+        let mut permissions = path_bd.metadata().expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&path_bd, permissions).expect("executable fixture");
+        let search_path = Some(directory.path().as_os_str().to_os_string());
+
+        assert_eq!(
+            resolve_bd_path(
+                Some("/configured/bd".to_owned()),
+                Some(std::ffi::OsString::from("/environment/bd")),
+                search_path.clone(),
+            ),
+            PathBuf::from("/configured/bd")
+        );
+        assert_eq!(
+            resolve_bd_path(
+                None,
+                Some(std::ffi::OsString::from("/environment/bd")),
+                search_path.clone(),
+            ),
+            PathBuf::from("/environment/bd")
+        );
+        assert_eq!(
+            resolve_bd_path(
+                None,
+                Some(std::ffi::OsString::from("bd")),
+                search_path.clone(),
+            ),
+            path_bd.canonicalize().expect("canonical bd")
+        );
+        assert_eq!(
+            resolve_bd_path(None, Some(std::ffi::OsString::new()), search_path),
+            path_bd.canonicalize().expect("canonical bd")
+        );
+        assert_eq!(resolve_bd_path(None, None, None), PathBuf::from("bd"));
+        assert_eq!(
+            resolve_bd_path(
+                None,
+                Some(std::ffi::OsString::from("missing-bd")),
+                Some(directory.path().as_os_str().to_os_string()),
+            ),
+            PathBuf::from("missing-bd")
+        );
     }
 
     #[test]

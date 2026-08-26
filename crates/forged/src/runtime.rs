@@ -111,6 +111,8 @@ struct RuntimeManifest {
     anvil_home: String,
     config_path: String,
     beads_dir: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bd_bin: Option<String>,
     plist_path: String,
     installed_at: String,
 }
@@ -136,6 +138,13 @@ impl RuntimeManifest {
             if !Path::new(value).is_absolute() {
                 return Err(Failure::internal(format!(
                     "runtime manifest {name} is not absolute: {value:?}"
+                )));
+            }
+        }
+        if let Some(value) = &self.bd_bin {
+            if !Path::new(value).is_absolute() {
+                return Err(Failure::internal(format!(
+                    "runtime manifest bdBin is not absolute: {value:?}"
                 )));
             }
         }
@@ -897,30 +906,45 @@ fn xml_escape(value: &str) -> String {
         .replace('\'', "&apos;")
 }
 
+fn nonempty_environment_value(value: Option<std::ffi::OsString>) -> Option<String> {
+    value
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string_lossy().into_owned())
+}
+
 fn launchd_environment(
     paths: &RuntimePaths,
     manifest: &RuntimeManifest,
 ) -> BTreeMap<String, String> {
+    launchd_environment_with_bd_bin(paths, manifest, std::env::var_os("BD_BIN"))
+}
+
+fn launchd_environment_with_bd_bin(
+    paths: &RuntimePaths,
+    manifest: &RuntimeManifest,
+    bd_bin: Option<std::ffi::OsString>,
+) -> BTreeMap<String, String> {
+    let service_path = [
+        paths.home.join(".local/bin"),
+        paths.home.join(".cargo/bin"),
+        PathBuf::from("/opt/homebrew/bin"),
+        PathBuf::from("/usr/local/bin"),
+        PathBuf::from("/usr/bin"),
+        PathBuf::from("/bin"),
+        PathBuf::from("/usr/sbin"),
+        PathBuf::from("/sbin"),
+    ]
+    .into_iter()
+    .filter(|entry| entry.is_dir())
+    .map(|entry| entry.to_string_lossy().into_owned())
+    .collect::<Vec<_>>()
+    .join(":");
     let mut env = BTreeMap::from([
         ("HOME".to_owned(), paths.home.to_string_lossy().into_owned()),
         ("ANVIL_HOME".to_owned(), manifest.anvil_home.clone()),
         ("FORGED_CONFIG".to_owned(), manifest.config_path.clone()),
         ("BEADS_DIR".to_owned(), manifest.beads_dir.clone()),
-        (
-            "PATH".to_owned(),
-            [
-                "/opt/homebrew/bin",
-                "/usr/local/bin",
-                "/usr/bin",
-                "/bin",
-                "/usr/sbin",
-                "/sbin",
-            ]
-            .into_iter()
-            .filter(|entry| Path::new(entry).is_dir())
-            .collect::<Vec<_>>()
-            .join(":"),
-        ),
+        ("PATH".to_owned(), service_path),
     ]);
     for key in [
         "BEADS_CREDENTIALS_FILE",
@@ -930,6 +954,13 @@ fn launchd_environment(
         if let Ok(value) = std::env::var(key) {
             env.insert(key.to_owned(), value);
         }
+    }
+    let bd_bin = manifest
+        .bd_bin
+        .clone()
+        .or_else(|| nonempty_environment_value(bd_bin));
+    if let Some(value) = bd_bin {
+        env.insert("BD_BIN".to_owned(), value);
     }
     env
 }
@@ -2086,6 +2117,12 @@ fn new_manifest(
     config: &ForgedConfig,
     mut binary: BinaryIdentity,
 ) -> Result<RuntimeManifest, Failure> {
+    if !config.bd_path.is_absolute() {
+        return Err(Failure::invalid(format!(
+            "service installation requires bd to resolve to an absolute path, got {}",
+            config.bd_path.display()
+        )));
+    }
     let generation = Uuid::now_v7().to_string();
     let target = paths.binary_path(&binary.sha256);
     binary.path = target.to_string_lossy().into_owned();
@@ -2103,6 +2140,7 @@ fn new_manifest(
             .into_owned(),
         config_path: config.config_path.to_string_lossy().into_owned(),
         beads_dir: config.beads_dir.to_string_lossy().into_owned(),
+        bd_bin: Some(config.bd_path.to_string_lossy().into_owned()),
         plist_path: paths.plist.to_string_lossy().into_owned(),
         installed_at: now_iso(),
     };
@@ -2117,7 +2155,11 @@ fn manifest_matches_config(
     Ok(
         Path::new(&manifest.anvil_home) == canonicalize_anchor(&config.anvil_home)?
             && Path::new(&manifest.config_path) == canonicalize_anchor(&config.config_path)?
-            && Path::new(&manifest.beads_dir) == canonicalize_anchor(&config.beads_dir)?,
+            && Path::new(&manifest.beads_dir) == canonicalize_anchor(&config.beads_dir)?
+            && manifest
+                .bd_bin
+                .as_deref()
+                .is_some_and(|path| Path::new(path) == config.bd_path.as_path()),
     )
 }
 
@@ -3325,8 +3367,11 @@ mod tests {
     #[test]
     fn launchd_environment_preserves_canonical_home_authority() {
         let (root, config, paths) = setup();
+        fs::create_dir_all(paths.home.join(".local/bin")).expect("local bin");
+        fs::create_dir_all(paths.home.join(".cargo/bin")).expect("cargo bin");
         let manifest = seed_old_install(root.path(), &config, &paths);
-        let environment = launchd_environment(&paths, &manifest);
+        let environment =
+            launchd_environment_with_bd_bin(&paths, &manifest, Some("/operator/bin/bd".into()));
 
         assert_eq!(
             environment.get("HOME").map(String::as_str),
@@ -3342,6 +3387,37 @@ mod tests {
         assert_eq!(reconstructed.plist, paths.plist);
         assert_eq!(reconstructed.label, paths.label);
         assert_eq!(reconstructed.domain, paths.domain);
+        let path = environment.get("PATH").expect("PATH");
+        let entries = path.split(':').collect::<Vec<_>>();
+        assert_eq!(entries[0], paths.home.join(".local/bin").to_string_lossy());
+        assert_eq!(entries[1], paths.home.join(".cargo/bin").to_string_lossy());
+        assert_eq!(
+            environment.get("BD_BIN").map(String::as_str),
+            Some(config.bd_path.to_string_lossy().as_ref())
+        );
+        let mut legacy_manifest = manifest.clone();
+        legacy_manifest.bd_bin = None;
+        assert_eq!(
+            launchd_environment_with_bd_bin(
+                &paths,
+                &legacy_manifest,
+                Some("/operator/bin/bd".into())
+            )
+            .get("BD_BIN")
+            .map(String::as_str),
+            Some("/operator/bin/bd")
+        );
+        assert!(
+            !launchd_environment_with_bd_bin(&paths, &legacy_manifest, Some("".into()))
+                .contains_key("BD_BIN")
+        );
+
+        let mut legacy_json = serde_json::to_value(&manifest).expect("manifest json");
+        legacy_json
+            .as_object_mut()
+            .expect("manifest object")
+            .remove("bdBin");
+        assert!(serde_json::from_value::<RuntimeManifest>(legacy_json).is_ok());
 
         let plist = render_plist(&paths, &manifest);
         assert!(plist.contains(&format!(

@@ -19,12 +19,14 @@ cargo test  --workspace
 cargo test -p forged --features failpoints
 ```
 
-CI (`.github/workflows/rust.yml`) runs exactly these. The bd-gated tests
-require a sandboxed **bd 1.2.1** binary and SKIP loudly when the machine has
-none — but they FAIL, never skip, when a bd binary is present at an
-unaccepted version (an upgrade is exactly when the pinned JSON shape must be
-re-checked) or when `FORGED_REQUIRE_BD=1` declares a bd-less run a failed
-one. The genuine lease-expiry case is `#[ignore]`d (5+ real minutes) — run it
+CI (`.github/workflows/rust.yml`) runs exactly these. The bd-gated tests use
+only an explicit `FORGED_TEST_BD` binary reporting semver `>=1.2.1`; they do
+not fall back to arbitrary host `PATH`. They SKIP loudly when none is supplied,
+but FAIL, never skip, when the supplied binary is missing, older, malformed,
+or fails the exercised JSON/behavior contracts, and when
+`FORGED_REQUIRE_BD=1` declares an unsupplied bd a failed run. Future major
+versions are intentionally exercised rather than rejected by a version pin.
+The genuine lease-expiry case is `#[ignore]`d (5+ real minutes) — run it
 deliberately with `FORGED_SLOW_TESTS=1 cargo test -p forged --features
 failpoints -- --ignored --nocapture` when you touch lease code.
 
@@ -63,8 +65,8 @@ artifacts under `~/.anvil/runs/`, beads in `$BEADS_DIR`. Never commit any of
 it. Tests write only under `CARGO_TARGET_TMPDIR` scratch dirs; bd-gated
 tests bind `HomeBeadsGuard` FIRST (a leaked machine-global `~/.beads` from a
 scratch run is a test failure). Never run package managers (`brew`, `cargo
-install` into PATH, etc.) from an agent — the live bd binary is pinned by
-the operator.
+install` into PATH, etc.) from an agent — the operator supplies the compatible
+bd binary explicitly.
 
 ## Conventions
 

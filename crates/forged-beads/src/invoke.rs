@@ -152,12 +152,10 @@ pub(crate) fn bd_env(cfg: &BdConfig) -> Vec<(String, String)> {
 /// [`BdError::Timeout`] is returned.
 ///
 /// This is the crate's ONLY bd spawn point, so it is where the
-/// explicit-resolution rule is enforced: a `bd_path` that is not absolute is
-/// refused BEFORE spawning. `Command::new` searches `PATH` for any relative
-/// program name, and `BdConfig`'s fields are public — a caller writing
-/// `bd_path: PathBuf::from("bd")` would otherwise silently get whatever bd
-/// the machine happens to have installed, which is the one thing this crate
-/// promises never to do.
+/// absolute-resolution rule is enforced: a `bd_path` that is not absolute is
+/// refused BEFORE spawning. The caller may resolve an operator-selected PATH
+/// command once while loading config, but this lower-level wrapper never
+/// performs a second ambient lookup.
 pub(crate) async fn run_bd(
     cfg: &BdConfig,
     args: &[&str],
@@ -168,8 +166,8 @@ pub(crate) async fn run_bd(
         return Err(BdError::SpawnFailed {
             context: context.to_string(),
             detail: format!(
-                "bd_path {:?} is not absolute: bd is resolved from explicit config only, never \
-                 from PATH or any other machine state",
+                "bd_path {:?} is not absolute: resolve the selected bd executable before \
+                 constructing BdConfig; the invocation wrapper never searches PATH",
                 cfg.bd_path
             ),
         });

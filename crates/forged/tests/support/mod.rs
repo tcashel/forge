@@ -6,7 +6,7 @@
 //! tree. The bd-gated helpers (`HomeBeadsGuard`, `sandboxed_bd`, …) are
 //! ported from `crates/forged-beads/tests/support/mod.rs` — integration
 //! test modules are not importable across crates — preserving their
-//! behavior, with the version predicate tightened to exactly 1.2.1.
+//! behavior and accepting explicit sandboxed bd semver `>=1.2.1`.
 
 #![allow(dead_code)]
 
@@ -193,62 +193,80 @@ pub fn show_bead(bd: &Path, s: &Scratch, id: &str) -> Value {
     }
 }
 
-/// Resolve the sandboxed bd binary: `$FORGED_TEST_BD`, else
-/// `~/.anvil/tools/bd-1.2.1/bin/bd`, else `None` — never the PATH bd. The
-/// ported predicate is tightened to EXACT equality with 1.2.1; any other
-/// version is skipped with the same loud SKIP message.
+/// Resolve the explicitly supplied sandboxed bd binary. Never search the host
+/// `PATH` or an operator tool directory: an absent `FORGED_TEST_BD` is the only
+/// skippable state, while an invalid supplied binary fails in [`require_bd`].
 pub fn sandboxed_bd() -> Option<PathBuf> {
     static BD: OnceLock<Option<PathBuf>> = OnceLock::new();
-    BD.get_or_init(|| {
-        let mut candidates = Vec::new();
-        if let Some(p) = std::env::var_os("FORGED_TEST_BD") {
-            candidates.push(PathBuf::from(p));
-        }
-        if let Some(h) = std::env::var_os("HOME") {
-            candidates.push(PathBuf::from(h).join(".anvil/tools/bd-1.2.1/bin/bd"));
-        }
-        candidates
-            .into_iter()
-            .find(|c| c.exists() && verify_bd_version(c))
-    })
-    .clone()
+    BD.get_or_init(|| bd_candidate().filter(|candidate| verify_bd_version(candidate)))
+        .clone()
+}
+
+fn bd_candidate() -> Option<PathBuf> {
+    std::env::var_os("FORGED_TEST_BD")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
 }
 
 fn verify_bd_version(bd: &Path) -> bool {
+    reported_bd_version(bd)
+        .is_ok_and(|version| forged_beads::doctor::supported_bd_version(&version))
+}
+
+fn reported_bd_version(bd: &Path) -> Result<String, String> {
+    if !bd.is_file() {
+        return Err(format!("{} is not a file", bd.display()));
+    }
     let s = scratch("forged-bd-version-verify");
     let out = raw_bd(bd, &s, &["version", "--json"]).output();
-    let ok = match out {
+    let result = match out {
         Ok(o) if o.status.success() => {
             let stdout = String::from_utf8_lossy(&o.stdout).into_owned();
             serde_json::from_str::<Value>(&stdout)
-                .ok()
+                .map_err(|error| format!("version output is not JSON: {error}: {stdout}"))
                 .and_then(|v| {
                     v.get("data")
                         .and_then(|d| d.get("version"))
                         .or_else(|| v.get("version"))
                         .and_then(Value::as_str)
-                        .map(|ver| ver == "1.2.1")
+                        .map(str::to_owned)
+                        .ok_or_else(|| format!("version output has no version field: {stdout}"))
                 })
-                .unwrap_or(false)
         }
-        _ => false,
+        Ok(output) => Err(format!(
+            "version probe exited {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        )),
+        Err(error) => Err(format!("version probe could not start: {error}")),
     };
     let _ = std::fs::remove_dir_all(&s.root);
-    ok
+    result
 }
 
 /// Resolve the sandboxed bd or SKIP loudly.
 pub fn require_bd() -> Option<PathBuf> {
-    match sandboxed_bd() {
-        Some(bd) => Some(bd),
-        None => {
-            eprintln!(
-                "SKIP: sandboxed bd 1.2.1 not found (set FORGED_TEST_BD or install \
-                 ~/.anvil/tools/bd-1.2.1/bin/bd); bd-gated test not run"
-            );
-            None
-        }
+    if let Some(bd) = sandboxed_bd() {
+        return Some(bd);
     }
+    if let Some(candidate) = bd_candidate() {
+        let detail = match reported_bd_version(&candidate) {
+            Ok(version) => format!("reported unsupported version {version:?}"),
+            Err(error) => error,
+        };
+        panic!(
+            "FORGED_TEST_BD={} is not a usable bd semver >=1.2.1: {detail}; \
+             supplied versions are exercised rather than skipped",
+            candidate.display()
+        );
+    }
+    let message = "sandboxed bd >=1.2.1 not supplied (set FORGED_TEST_BD to an explicit binary)";
+    assert!(
+        std::env::var_os("FORGED_REQUIRE_BD").is_none_or(|value| value != "1"),
+        "FORGED_REQUIRE_BD=1 and {message}: the bd contract was not checked"
+    );
+    eprintln!("SKIP: {message}; bd-gated test not run");
+    None
 }
 
 // ------------------------------------------------------------- git repos
