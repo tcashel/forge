@@ -690,16 +690,21 @@ pub(super) async fn epic_submission_stop(ctx: &Ctx, epic: &str) -> Result<Option
     })
 }
 
+fn is_assurance_cleanup_input(input: &Value, run_id: &str) -> bool {
+    input.get("code").and_then(Value::as_str) == Some("assurance-cleanup-failed")
+        && input.pointer("/evidence/runId").and_then(Value::as_str) == Some(run_id)
+}
+
 async fn complete_assurance_cleanup(
     ctx: &Ctx,
     view: &EpicView,
-    completed: &Value,
-) -> Result<(), Failure> {
+    finalized: &Value,
+) -> Result<Option<Value>, Failure> {
     let state = view
         .assurance
         .as_ref()
         .ok_or_else(|| Failure::internal("assurance completion has no matching assurance run"))?;
-    forged_git::retire_worktree(
+    let cleanup = forged_git::retire_worktree(
         Path::new(&view.config.repo),
         &ctx.config.runs_root,
         &state.run_id,
@@ -708,20 +713,89 @@ async fn complete_assurance_cleanup(
             run_state_terminal: true,
         },
     )
+    .await;
+    if let Err(error) = cleanup {
+        let (code, kind, paths, message) = match error {
+            forged_git::GitError::WorktreeDirty { paths } => {
+                let message = format!("worktree is dirty: {paths:?}");
+                ("WORKTREE_DIRTY", "dirty", paths, message)
+            }
+            forged_git::GitError::WorktreeUnresolved { paths } => {
+                let message = format!("worktree has unresolved merge state: {paths:?}");
+                ("WORKTREE_UNRESOLVED", "unresolved", paths, message)
+            }
+            error => return Err(error.into()),
+        };
+        if let Some(input) = view
+            .input
+            .as_ref()
+            .filter(|input| is_assurance_cleanup_input(input, &state.run_id))
+        {
+            return Ok(Some(input.clone()));
+        }
+        let worktree = ctx.config.worktree(&state.run_id);
+        let input = require_input_with_evidence(
+            ctx,
+            &view.config.epic_id,
+            "assurance-cleanup-failed",
+            None,
+            format!(
+                "assurance worktree {:?} is {kind}; clean or resolve it, then explicitly advance the epic to retry cleanup",
+                worktree
+            ),
+            Some(json!({
+                "schema": "forged.epic.assurance-cleanup-input/1",
+                "runId": state.run_id,
+                "worktree": worktree,
+                "error": {
+                    "code": code,
+                    "kind": kind,
+                    "message": message,
+                    "paths": paths,
+                },
+            })),
+        )
+        .await?;
+        return Ok(Some(input));
+    }
+    let _submit_guard =
+        super::handoff::acquire_submit(ctx, &view.config.epic_id, super::handoff::Scope::Epic)
+            .await?;
+    if view
+        .input
+        .as_ref()
+        .is_some_and(|input| is_assurance_cleanup_input(input, &state.run_id))
+    {
+        append_resolution_event(
+            ctx,
+            &view.config.epic_id,
+            json!({
+                "resolutionId": format!("assurance-cleanup:{}", state.run_id),
+                "childId": Value::Null,
+                "note": "assurance worktree cleanup completed",
+            }),
+            false,
+        )
+        .await?;
+    }
+    crate::failpoint::hit("epic.stop.guarded.before-commit");
+    let epic = view.config.epic_id.clone();
+    let completed = finalized.clone();
+    on_ledger(&ctx.ledger, move |ledger| {
+        ledger.append_event_settling_desired(
+            DesiredSubjectKind::Epic,
+            &epic,
+            ASSURANCE_COMPLETED,
+            completed,
+            DesiredState::Stopped,
+            DesiredReconcileOutcome::Terminal,
+            false,
+            None,
+            Some("transitionId"),
+        )
+    })
     .await?;
-    append_stop_event(
-        ctx,
-        &view.config.epic_id,
-        ASSURANCE_COMPLETED,
-        completed.clone(),
-        EpicStopTransition {
-            state: DesiredState::Stopped,
-            outcome: DesiredReconcileOutcome::Terminal,
-            error: None,
-            identity_field: Some("transitionId"),
-        },
-    )
-    .await
+    Ok(None)
 }
 
 async fn append(ctx: &Ctx, epic: &str, kind: &str, value: Value) -> Result<(), Failure> {
@@ -3784,7 +3858,9 @@ async fn complete_assurance(
     // assurance worktree has been retired.
     append(ctx, &config.epic_id, ASSURANCE_FINALIZED, value.clone()).await?;
     crate::failpoint::hit("epic.assurance.finalized.after");
-    complete_assurance_cleanup(ctx, view, &value).await?;
+    if let Some(input) = complete_assurance_cleanup(ctx, view, &value).await? {
+        return Ok(Step::Stop(json!({"inputRequired": input})));
+    }
     Ok(Step::Stop(json!({"finalPr": state.pr, "assurance": value})))
 }
 
@@ -4022,14 +4098,24 @@ async fn planning_after_completed_wave(
 async fn advance_once(ctx: &Ctx, epic: &str) -> Result<Step, Failure> {
     let view = project(ctx, epic).await?;
     if let Some(completed) = view.assurance_completed.as_ref() {
-        complete_assurance_cleanup(ctx, &view, completed).await?;
         return Ok(Step::Stop(json!({
             "finalPr": view.pr,
             "assurance": completed,
         })));
     }
     if let Some(finalized) = view.assurance_finalized.as_ref() {
-        complete_assurance_cleanup(ctx, &view, finalized).await?;
+        if let Some(input) = view.input.as_ref() {
+            let cleanup_input = view
+                .assurance
+                .as_ref()
+                .is_some_and(|state| is_assurance_cleanup_input(input, &state.run_id));
+            if !cleanup_input {
+                return Ok(Step::Stop(json!({"inputRequired": input})));
+            }
+        }
+        if let Some(input) = complete_assurance_cleanup(ctx, &view, finalized).await? {
+            return Ok(Step::Stop(json!({"inputRequired": input})));
+        }
         return Ok(Step::Stop(json!({
             "finalPr": view.pr,
             "assurance": finalized,

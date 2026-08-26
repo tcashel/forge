@@ -988,9 +988,12 @@ fn assurance_start_crash_recovers_one_run_and_one_draft_pr() {
 }
 
 #[cfg(feature = "failpoints")]
-#[test]
-fn assurance_finalization_crashes_replay_completion_and_cleanup() {
-    let env = TestEnv::new("forged-rolling-assurance-finalize-crash");
+fn assert_assurance_finalization_cleanup_recovery(unresolved_cleanup: bool) {
+    let env = TestEnv::new(if unresolved_cleanup {
+        "forged-rolling-assurance-finalize-unresolved"
+    } else {
+        "forged-rolling-assurance-finalize-dirty"
+    });
     env.enable_dynamic_gh();
     env.seed_epic(
         "epic-assurance-finalize-crash",
@@ -1141,10 +1144,123 @@ fn assurance_finalization_crashes_replay_completion_and_cleanup() {
         serde_json::from_str(&operation_response).expect("finalization response JSON");
     assert_eq!(operation_response["ok"], json!(true));
     drop(connection);
+
+    let unrelated_input = json!({
+        "code": "operator-contract-question",
+        "childId": "child-assurance-finalize-crash",
+        "detail": "answer this unrelated question first",
+    });
+    let ledger = env.ledger();
+    ledger
+        .append_event_once(
+            "epic-assurance-finalize-crash",
+            "forged.epic.input.required",
+            unrelated_input.clone(),
+        )
+        .expect("inject unrelated input hold");
+    ledger.close().expect("close ledger");
+    let (code, unrelated) =
+        env.forged(&["epic", "advance", "--epic", "epic-assurance-finalize-crash"]);
+    assert_eq!(code, 0, "unrelated input retains precedence: {unrelated}");
+    assert_eq!(
+        unrelated["result"]["stopped"]["inputRequired"], unrelated_input,
+        "finalized cleanup must not bypass unrelated input"
+    );
+    assert!(
+        assurance_worktree.exists(),
+        "unrelated input prevents cleanup from touching the worktree"
+    );
+    let (code, resolved) = env.forged(&[
+        "epic",
+        "resolve",
+        "--epic",
+        "epic-assurance-finalize-crash",
+        "--child",
+        "child-assurance-finalize-crash",
+        "--note",
+        "unrelated question answered",
+    ]);
+    assert_eq!(code, 0, "resolve unrelated input: {resolved}");
+
+    let blocker = if unresolved_cleanup {
+        let assurance_git_dir = git(&assurance_worktree, &["rev-parse", "--absolute-git-dir"]);
+        let merge_head = std::path::Path::new(assurance_git_dir.trim()).join("MERGE_HEAD");
+        std::fs::write(&merge_head, format!("{default_sha}\n"))
+            .expect("mark assurance worktree unresolved");
+        merge_head
+    } else {
+        let dirty_path = assurance_worktree.join("operator-notes.txt");
+        std::fs::write(&dirty_path, "preserve me\n").expect("dirty assurance worktree");
+        dirty_path
+    };
+    let (code, held) = env.forged(&["epic", "advance", "--epic", "epic-assurance-finalize-crash"]);
+    assert_eq!(code, 0, "blocked cleanup becomes typed input: {held}");
+    let cleanup_input = held["result"]["stopped"]["inputRequired"].clone();
+    assert_eq!(cleanup_input["code"], json!("assurance-cleanup-failed"));
+    assert_eq!(
+        cleanup_input["evidence"]["error"]["code"],
+        if unresolved_cleanup {
+            json!("WORKTREE_UNRESOLVED")
+        } else {
+            json!("WORKTREE_DIRTY")
+        }
+    );
+    assert_eq!(
+        cleanup_input["evidence"]["error"]["kind"],
+        if unresolved_cleanup {
+            json!("unresolved")
+        } else {
+            json!("dirty")
+        }
+    );
+    assert_eq!(
+        cleanup_input["evidence"]["runId"],
+        json!("epic-assurance-finalize-crash-epic-assurance")
+    );
+    assert_eq!(
+        cleanup_input["evidence"]["worktree"],
+        json!(assurance_worktree)
+    );
+    assert_eq!(
+        cleanup_input["evidence"]["error"]["paths"],
+        if unresolved_cleanup {
+            json!(["MERGE_HEAD"])
+        } else {
+            json!(["operator-notes.txt"])
+        }
+    );
+    let (code, held_again) =
+        env.forged(&["epic", "advance", "--epic", "epic-assurance-finalize-crash"]);
+    assert_eq!(
+        code, 0,
+        "repeated dirty cleanup remains typed input: {held_again}"
+    );
+    assert_eq!(
+        held_again["result"]["stopped"]["inputRequired"], cleanup_input,
+        "the standing cleanup hold is reused verbatim"
+    );
+    let ledger = env.ledger();
+    assert_eq!(
+        ledger
+            .list_events(Some("epic-assurance-finalize-crash"), 0, 65_536)
+            .expect("epic events")
+            .iter()
+            .filter(|event| event.kind == "forged.epic.input.required")
+            .count(),
+        2,
+        "cleanup retries must not append duplicate input events"
+    );
+    ledger.close().expect("close ledger");
+    std::fs::remove_file(&blocker).expect("clean assurance worktree blocker");
+
     let (code, status) = env.forged(&["epic", "status", "--epic", "epic-assurance-finalize-crash"]);
     assert_eq!(code, 0, "status during cleanup gap: {status}");
     assert!(status["result"]["finalPr"].is_null());
     assert!(status["result"]["assurance"]["completed"].is_null());
+    assert_eq!(
+        status["result"]["inputRequired"], cleanup_input,
+        "the cleanup hold remains inspectable until a clean retry"
+    );
     let (code, detail) = env.forged(&[
         "work",
         "detail",
@@ -1220,6 +1336,24 @@ fn assurance_finalization_crashes_replay_completion_and_cleanup() {
         desired.last_outcome,
         Some(forged_ledger::DesiredReconcileOutcome::Terminal)
     );
+    let events = ledger
+        .list_events(Some("epic-assurance-finalize-crash"), 0, 65_536)
+        .expect("epic events");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == "forged.epic.input.required")
+            .count(),
+        2
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == "forged.epic.input.resolved")
+            .count(),
+        2,
+        "successful cleanup clears its typed input rail"
+    );
     ledger.close().expect("close ledger");
     assert_eq!(rev_parse(&env.repos.origin, "main"), default_sha);
 
@@ -1245,6 +1379,38 @@ fn assurance_finalization_crashes_replay_completion_and_cleanup() {
     assert!(gh_calls.iter().all(|call| {
         !call.iter().any(|arg| arg == "merge") && !call.iter().any(|arg| arg == "ready")
     }));
+
+    let unavailable_repo = env.root.join("repo-unavailable-after-completion");
+    std::fs::rename(&env.repos.repo, &unavailable_repo)
+        .expect("make repository unavailable after terminal completion");
+    let (code, replayed_without_repo) =
+        env.forged(&["epic", "advance", "--epic", "epic-assurance-finalize-crash"]);
+    assert_eq!(
+        code, 0,
+        "terminal replay must not touch the unavailable repository: {replayed_without_repo}"
+    );
+    assert_eq!(
+        replayed_without_repo["result"]["stopped"]["assurance"]["pr"]["number"],
+        draft_pr["number"]
+    );
+    let (code, terminal_status) =
+        env.forged(&["epic", "status", "--epic", "epic-assurance-finalize-crash"]);
+    assert_eq!(
+        code, 0,
+        "terminal status remains durable without the repository: {terminal_status}"
+    );
+    assert_eq!(
+        terminal_status["result"]["finalPr"]["number"],
+        draft_pr["number"]
+    );
+    assert!(terminal_status["result"]["inputRequired"].is_null());
+}
+
+#[cfg(feature = "failpoints")]
+#[test]
+fn assurance_finalization_crashes_replay_completion_and_cleanup() {
+    assert_assurance_finalization_cleanup_recovery(false);
+    assert_assurance_finalization_cleanup_recovery(true);
 }
 
 #[cfg(feature = "failpoints")]
