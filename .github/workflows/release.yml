@@ -90,42 +90,40 @@ jobs:
       - name: Build
         run: cargo build --workspace --locked
 
-      - name: Provision current stable Beads for the publication probe
-        id: current_beads
+      - name: Provision the pinned Beads v1.2.1 compatibility binary
+        id: release_beads
+        env:
+          BEADS_VERSION: '1.2.1'
+          BEADS_COMMIT: 634cbbc4bc580fa5124f63fdf65d137a46d5b4ff
+          BEADS_LINUX_AMD64_SHA256: 48aecf42ffdefa6470298d8022deeb762e30c8729dc0a4bdda93888c0b0354e2
         shell: bash
         run: |
           set -euo pipefail
-          beads_dir="$RUNNER_TEMP/forge-beads-current"
+          beads_dir="$RUNNER_TEMP/forge-beads-$BEADS_VERSION"
           mkdir -p "$beads_dir"
-          curl -fsSL --retry 3 \
-            -o "$beads_dir/checksums.txt" \
-            https://github.com/gastownhall/beads/releases/latest/download/checksums.txt
-          mapfile -t rows < <(
-            awk '$2 ~ /^beads_[0-9]+\.[0-9]+\.[0-9]+_linux_amd64\.tar\.gz$/ { print }' \
-              "$beads_dir/checksums.txt"
-          )
-          if [[ "${#rows[@]}" -ne 1 ]]; then
-            echo "expected exactly one stable Linux amd64 Beads asset" >&2
-            exit 1
-          fi
-          read -r digest asset <<<"${rows[0]}"
+          asset="beads_${BEADS_VERSION}_linux_amd64.tar.gz"
           curl -fsSL --retry 3 \
             -o "$beads_dir/$asset" \
-            "https://github.com/gastownhall/beads/releases/latest/download/$asset"
-          printf '%s  %s\n' "$digest" "$beads_dir/$asset" | sha256sum -c -
+            "https://github.com/gastownhall/beads/releases/download/v$BEADS_VERSION/$asset"
+          printf '%s  %s\n' "$BEADS_LINUX_AMD64_SHA256" "$beads_dir/$asset" \
+            | sha256sum -c -
           tar -xzf "$beads_dir/$asset" -C "$beads_dir" bd
           chmod 0755 "$beads_dir/bd"
-          "$beads_dir/bd" version --json
+          version_json="$("$beads_dir/bd" version --json)"
+          printf '%s\n' "$version_json"
+          jq -e \
+            --arg version "$BEADS_VERSION" \
+            --arg commit "$BEADS_COMMIT" \
+            '.version == $version and .commit == $commit' \
+            <<<"$version_json" >/dev/null
           printf 'path=%s\n' "$beads_dir/bd" >> "$GITHUB_OUTPUT"
 
-      - name: Probe current stable Beads capabilities
-        # Pull requests keep upstream incompatibility visible while the
-        # remaining release machinery is validated. Publication fails closed
-        # until current stable carries every required command and passes the
-        # genuine lease/doctor behavior test.
-        continue-on-error: ${{ github.event_name == 'pull_request' }}
+      - name: Probe pinned Beads capabilities
+        # v0.5.0 carries a temporary, explicit compatibility exception for the
+        # v1.2.1 artifact. Publication still fails closed unless that exact
+        # binary passes every required command and genuine lease/doctor probe.
         env:
-          FORGED_TEST_BD: ${{ steps.current_beads.outputs.path }}
+          FORGED_TEST_BD: ${{ steps.release_beads.outputs.path }}
           FORGED_REQUIRE_BD: '1'
         shell: bash
         run: |

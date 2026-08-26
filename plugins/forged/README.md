@@ -88,11 +88,12 @@ Pi:
 pi install /absolute/prefix/share/forge
 ```
 
-Before setup, provide `bd >=1.2.1` through `PATH` or `BD_BIN`. Setup requires
-the epic and lease command surface, then Forge's doctor verifies behavior;
-version order alone is not compatibility evidence. Forge does not pin or
-install Beads, Git, GitHub CLI, provider CLIs, credentials, profiles,
-configuration, or services.
+Before setup, provide Beads through `PATH` or `BD_BIN`. Forge `v0.5.0` is
+release-qualified with exact `bd 1.2.1`; upstream `bd 1.2.2` lacks required
+commands and is unsupported. Setup requires the epic and lease command surface,
+then Forge's doctor verifies behavior; version order alone is not compatibility
+evidence. Forge does not install, upgrade, or downgrade Beads, Git, GitHub CLI,
+provider CLIs, credentials, profiles, configuration, or services.
 
 Use `/forge` for the native terminal cockpit. It presents work queues,
 attention, 30-day usage trends, and provider attempts directly from Forged's

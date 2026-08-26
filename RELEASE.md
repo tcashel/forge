@@ -23,14 +23,22 @@ must clear the `bd >=1.2.1` version floor and the required epic, heartbeat,
 reclaim, merge-slot, schema, and lease-behavior probes. Version order alone is
 not compatibility evidence.
 
-Release CI downloads and checksum-verifies the current stable upstream
-artifact; it does not pin an exact Beads version. When that artifact clears the
-capability and doctor probes, the workflow uses it for every genuine Beads
-integration test. Pull requests retain a visible warning when the probe fails;
-`workflow_dispatch` fails before packaging or publication unless it passes. As
-of 2026-08-26, upstream `v1.2.2` intentionally omits the heartbeat and reclaim
-capabilities, so do not publish `v0.5.0` until a supported current stable Beads
-release clears the workflow probe.
+Forge `v0.5.0` carries a temporary compatibility exception for the exact
+upstream `v1.2.1` Linux amd64 artifact. Release CI binds that artifact to
+SHA-256
+`48aecf42ffdefa6470298d8022deeb762e30c8729dc0a4bdda93888c0b0354e2`,
+requires the binary to report version `1.2.1` and commit
+`634cbbc4bc580fa5124f63fdf65d137a46d5b4ff`, and then uses it for every
+genuine Beads integration test. Upstream classifies `v1.2.1` as a prerelease
+and replaced it with rollback release `v1.2.2`; `v1.2.2` intentionally omits
+the heartbeat and reclaim capabilities Forge requires.
+
+This exception does not make Forge install or manage Beads on an operator
+host. It records the dependency risk accepted for `v0.5.0` while keeping every
+capability, doctor, schema, and lease-behavior probe fail-closed. A later Forge
+release must remove or deliberately update the pin only after its candidate
+Beads binary clears the same probes. Any probe failure blocks both pull-request
+validation and publication.
 
 ## Prepare the release pull request
 
