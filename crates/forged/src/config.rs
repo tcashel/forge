@@ -393,14 +393,22 @@ fn resolve_bd_path(
 ) -> PathBuf {
     if let Some(configured) = configured {
         let path = PathBuf::from(configured);
-        return path.canonicalize().unwrap_or(path);
+        return if path.is_absolute() {
+            path.canonicalize().unwrap_or(path)
+        } else {
+            path
+        };
     }
     let requested = environment
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| std::ffi::OsString::from("bd"));
     let unresolved = PathBuf::from(&requested);
     if unresolved.components().count() != 1 {
-        return unresolved.canonicalize().unwrap_or(unresolved);
+        return if unresolved.is_absolute() {
+            unresolved.canonicalize().unwrap_or(unresolved)
+        } else {
+            unresolved
+        };
     }
     let Some(search_path) = search_path.filter(|value| !value.is_empty()) else {
         return unresolved;
@@ -1273,6 +1281,16 @@ mod tests {
         let linked_bd = directory.path().join("linked-bd");
         std::os::unix::fs::symlink(&path_bd, &linked_bd).expect("linked bd fixture");
 
+        let current_directory = std::env::current_dir().expect("current directory");
+        let relative_directory =
+            tempfile::tempdir_in(&current_directory).expect("relative tempdir");
+        let relative_bd = relative_directory.path().join("bd");
+        std::fs::write(&relative_bd, "#!/bin/sh\n").expect("relative bd fixture");
+        let relative_bd = relative_bd
+            .strip_prefix(&current_directory)
+            .expect("relative bd path")
+            .to_path_buf();
+
         assert_eq!(
             resolve_bd_path(
                 Some(linked_bd.to_string_lossy().into_owned()),
@@ -1288,6 +1306,22 @@ mod tests {
                 search_path.clone(),
             ),
             path_bd.canonicalize().expect("canonical environment bd")
+        );
+        assert_eq!(
+            resolve_bd_path(
+                Some(relative_bd.to_string_lossy().into_owned()),
+                None,
+                search_path.clone(),
+            ),
+            relative_bd
+        );
+        assert_eq!(
+            resolve_bd_path(
+                None,
+                Some(relative_bd.as_os_str().to_os_string()),
+                search_path.clone(),
+            ),
+            relative_bd
         );
 
         assert_eq!(
