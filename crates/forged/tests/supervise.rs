@@ -67,6 +67,17 @@ fn recovered_live_attempt_persists_a_wake_no_later_than_its_deadline() {
     wait_until("provider attempt starts", || {
         implementation_starts(&env, "run-deadline-wake") == 1
     });
+    // Capture the immutable deadline before observing it: the provider may
+    // validly time out while the supervisor tick finishes.
+    let ledger = env.ledger();
+    let attempt = ledger
+        .list_live_attempts(Some("run-deadline-wake"))
+        .expect("live attempts")
+        .into_iter()
+        .next()
+        .expect("running provider attempt");
+    let deadline = forged_proto::stage_deadline_at(&attempt.started_at, 3).expect("deadline");
+    ledger.close().expect("close");
 
     let (code, adopted) = env.forged(&["supervise", "--once"]);
     assert_eq!(code, 0, "adopt tick: {adopted}");
@@ -76,13 +87,6 @@ fn recovered_live_attempt_persists_a_wake_no_later_than_its_deadline() {
         .get_desired_work(DesiredSubjectKind::Run, "run-deadline-wake")
         .expect("desired query")
         .expect("desired row");
-    let attempt = ledger
-        .list_live_attempts(Some("run-deadline-wake"))
-        .expect("live attempts")
-        .into_iter()
-        .next()
-        .expect("running provider attempt");
-    let deadline = forged_proto::stage_deadline_at(&attempt.started_at, 3).expect("deadline");
     assert!(
         desired
             .next_wake_at
