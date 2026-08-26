@@ -4997,25 +4997,19 @@ pub async fn epic_resolve(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
                 let issue = forged_beads::show_issue(&ctx.config.bd_config(), &child).await?;
                 let fields = native_fields(&issue);
                 let digest = fields_digest(&fields)?;
-                if issue.status == "open"
+                let external_apply = if issue.status == "open"
                     && issue.assignee.is_none()
                     && complete_native_fields(&fields)
                 {
                     if let Some(planning) = planning.filter(|state| state.applied.is_none()) {
-                        append(
-                            ctx,
-                            &epic,
-                            PLAN_APPLIED,
-                            json!({
-                                "childId": child,
-                                "runId": planning.run_id,
-                                "preDigest": planning.pre_digest,
-                                "postDigest": digest,
-                                "observedRevision": issue.revision,
-                                "apply": {"external": true, "status": "open"},
-                            }),
-                        )
-                        .await?;
+                        Some(json!({
+                            "childId": child,
+                            "runId": planning.run_id,
+                            "preDigest": planning.pre_digest,
+                            "postDigest": digest,
+                            "observedRevision": issue.revision,
+                            "apply": {"external": true, "status": "open"},
+                        }))
                     } else {
                         return Err(Failure::invalid(format!(
                             "planning stub {child:?} cannot adopt an open spec without an active planning cycle"
@@ -5035,10 +5029,78 @@ pub async fn epic_resolve(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
                             "unmaterialized planning stub {child:?} changed before retry"
                         )));
                     }
+                    None
                 } else {
                     return Err(Failure::invalid(format!(
                         "planning stub {child:?} must remain blocked and unassigned or be a complete open spec"
                     )));
+                };
+                // Retire before either event hides the active cycle from the
+                // projection. A cleanup refusal must preserve the old run id
+                // and standing input so the same resolution can be retried.
+                // Replay exact terminal settlement to finish containment; an
+                // active internal run is fenced and cancelled first.
+                if let Some(planning) = planning.filter(|state| state.applied.is_none()) {
+                    let planning_run_id = planning.run_id.clone();
+                    let planning_run = on_ledger(&ctx.ledger, move |ledger| {
+                        match ledger.get_run(&planning_run_id) {
+                            Ok(run) => Ok(Some(run)),
+                            Err(error) if error.code() == ErrorCode::RunNotFound => Ok(None),
+                            Err(error) => Err(error),
+                        }
+                    })
+                    .await?;
+                    let settlement = match planning_run {
+                        None => None,
+                        Some(run) if run.state != RunState::Stopped => {
+                            Some(super::settlement::Settlement {
+                                outcome: RunOutcome::Cancelled,
+                                reason: "operator resolved the parent planning hold; retry in a fresh cycle"
+                                    .to_owned(),
+                                delivery_pr: None,
+                                delivery_sha: None,
+                                superseded_by: None,
+                            })
+                        }
+                        Some(run) => Some(super::settlement::Settlement {
+                            outcome: run.terminal_outcome.ok_or_else(|| {
+                                Failure::invalid(format!(
+                                    "planning run {:?} has no terminal outcome to replay",
+                                    run.run_id
+                                ))
+                            })?,
+                            reason: run.stop_reason.ok_or_else(|| {
+                                Failure::invalid(format!(
+                                    "planning run {:?} has no terminal reason to replay",
+                                    run.run_id
+                                ))
+                            })?,
+                            delivery_pr: run.delivery_pr,
+                            delivery_sha: run.delivery_sha,
+                            superseded_by: run.superseded_by,
+                        }),
+                    };
+                    if let Some(settlement) = settlement {
+                        super::settlement::settle(
+                            ctx,
+                            &planning.run_id,
+                            settlement,
+                        )
+                        .await?;
+                    }
+                    forged_git::retire_worktree(
+                        Path::new(&view.config.repo),
+                        &ctx.config.runs_root,
+                        &planning.run_id,
+                        &forged_git::RetireOptions {
+                            force: false,
+                            run_state_terminal: true,
+                        },
+                    )
+                    .await?;
+                }
+                if let Some(external_apply) = external_apply {
+                    append(ctx, &epic, PLAN_APPLIED, external_apply).await?;
                 }
                 append_resolution_event(ctx, &epic, resolved_event.clone(), view.paused.is_some())
                     .await?;

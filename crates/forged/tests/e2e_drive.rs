@@ -1668,6 +1668,11 @@ fn resolving_pre_cycle_planning_stop_never_opens_the_placeholder() {
 fn durable_planning_input_mismatch_is_child_addressed_and_preserved() {
     let env = TestEnv::new("forged-rolling-input-mismatch");
     start_rolling_plan(&env);
+    let (code, prepared) = env.forged(&["epic", "advance", "--epic", "epic-rolling"]);
+    assert_eq!(code, 0, "prepare active planning run: {prepared}");
+    assert!(prepared["result"]["progress"]["planningAdvanced"].is_object());
+    let worktree = env.worktree("child-stub-epic-plan");
+    assert!(worktree.exists());
     let input = env
         .anvil
         .join("runs/child-stub-epic-plan/planning-input.md");
@@ -1686,6 +1691,70 @@ fn durable_planning_input_mismatch_is_child_addressed_and_preserved() {
         std::fs::read_to_string(&input).expect("preserved mismatch"),
         "partial planning input\n",
         "mismatched evidence is preserved for adjudication"
+    );
+    let (_, active) = env.forged(&["run", "status", "--run", "child-stub-epic-plan"]);
+    assert_eq!(active["result"]["run"]["state"], json!("active"));
+
+    #[cfg(feature = "failpoints")]
+    for crash in 1..=2 {
+        let status = env
+            .forged_cmd(&[
+                "epic",
+                "resolve",
+                "--epic",
+                "epic-rolling",
+                "--child",
+                "child-stub",
+                "--note",
+                "discard the torn input and retry from its durable checkpoint",
+            ])
+            .env("FORGED_FAILPOINT", "run.settle.controller-revoked.after")
+            .env("FORGED_FAILPOINT_MODE", "crash")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("crashing planning resolution");
+        assert!(!status.success(), "settlement crash {crash} must fire");
+        let (_, interrupted) = env.forged(&["run", "status", "--run", "child-stub-epic-plan"]);
+        assert_eq!(interrupted["result"]["run"]["state"], json!("stopped"));
+        assert_eq!(interrupted["result"]["run"]["outcome"], json!("cancelled"));
+        assert!(
+            worktree.exists(),
+            "terminal state alone cannot authorize retirement after crash {crash}"
+        );
+        assert!(git(&env.repos.repo, &["worktree", "list", "--porcelain"])
+            .contains(&worktree.to_string_lossy().into_owned()));
+    }
+
+    let (code, resolved) = env.forged(&[
+        "epic",
+        "resolve",
+        "--epic",
+        "epic-rolling",
+        "--child",
+        "child-stub",
+        "--note",
+        "discard the torn input and retry from its durable checkpoint",
+    ]);
+    assert_eq!(code, 0, "resolve active planning hold: {resolved}");
+    let (_, stopped) = env.forged(&["run", "status", "--run", "child-stub-epic-plan"]);
+    assert_eq!(stopped["result"]["run"]["state"], json!("stopped"));
+    assert_eq!(
+        stopped["result"]["run"]["outcome"],
+        json!("cancelled"),
+        "resolution fences the active cycle before cleanup"
+    );
+    assert!(!worktree.exists());
+    assert!(!git(&env.repos.repo, &["worktree", "list", "--porcelain"])
+        .contains(&worktree.to_string_lossy().into_owned()));
+    let (code, restarted) = env.forged(&["epic", "advance", "--epic", "epic-rolling"]);
+    assert_eq!(
+        code, 0,
+        "restart after active-cycle resolution: {restarted}"
+    );
+    assert_eq!(
+        restarted["result"]["progress"]["planning"]["runId"],
+        json!("child-stub-epic-plan-g2")
     );
 }
 
@@ -1756,6 +1825,10 @@ fn blocking_plan_review_resolves_into_a_fresh_child_bound_cycle() {
         json!("the frozen root excludes the required dependency mutation")
     );
     assert_eq!(env.gh_calls().len(), gh_before_plan);
+    let first_worktree = env.worktree("child-stub-epic-plan");
+    assert!(first_worktree.exists());
+    assert!(git(&env.repos.repo, &["worktree", "list", "--porcelain"])
+        .contains(&first_worktree.to_string_lossy().into_owned()));
 
     let (code, resolved) = env.forged(&[
         "epic",
@@ -1768,6 +1841,15 @@ fn blocking_plan_review_resolves_into_a_fresh_child_bound_cycle() {
         "root authority remains unchanged; keep the child scope",
     ]);
     assert_eq!(code, 0, "resolve blocked planning: {resolved}");
+    assert!(
+        !first_worktree.exists(),
+        "resolution retires the rejected planning cycle before forgetting it"
+    );
+    assert!(
+        !git(&env.repos.repo, &["worktree", "list", "--porcelain"])
+            .contains(&first_worktree.to_string_lossy().into_owned()),
+        "resolution removes the rejected cycle's worktree registration"
+    );
     let (code, restarted) = env.forged(&["epic", "advance", "--epic", "epic-rolling"]);
     assert_eq!(code, 0, "restart planning: {restarted}");
     assert_eq!(
@@ -1998,8 +2080,8 @@ fn dirty_planning_worktree_blocks_apply_and_preserves_child_artifacts() {
     let env = TestEnv::new("forged-rolling-dirty-plan");
     prepare_reviewed_rolling_plan(&env);
     let worktree = env.worktree("child-stub-epic-plan");
-    std::fs::write(worktree.join("provider-mutation.txt"), "unexpected write\n")
-        .expect("dirty planning worktree");
+    let dirty_path = worktree.join("provider-mutation.txt");
+    std::fs::write(&dirty_path, "unexpected write\n").expect("dirty planning worktree");
 
     let (code, held) = env.forged(&["epic", "advance", "--epic", "epic-rolling"]);
     assert_eq!(code, 0, "dirty worktree becomes typed epic input: {held}");
@@ -2014,6 +2096,57 @@ fn dirty_planning_worktree_blocks_apply_and_preserves_child_artifacts() {
             .expect("stub status"),
         "blocked",
         "no Beads mutation crosses the dirty-worktree gate"
+    );
+
+    let (code, refused) = env.forged(&[
+        "epic",
+        "resolve",
+        "--epic",
+        "epic-rolling",
+        "--child",
+        "child-stub",
+        "--note",
+        "retry after preserving the provider artifact",
+    ]);
+    assert_ne!(code, 0, "dirty planning cleanup must refuse: {refused}");
+    assert_eq!(refused["error"]["code"], json!("WORKTREE_DIRTY"));
+    let (_, status) = env.forged(&["epic", "status", "--epic", "epic-rolling"]);
+    assert_eq!(
+        status["result"]["inputRequired"]["code"],
+        json!("planning-worktree-not-clean"),
+        "failed cleanup leaves the original adjudication hold durable"
+    );
+    assert!(worktree.exists(), "failed cleanup preserves the artifacts");
+    assert!(env
+        .ledger()
+        .list_events(Some("epic-rolling"), 0, 65_536)
+        .expect("epic events")
+        .iter()
+        .all(|event| event.kind != "forged.epic.input.resolved"));
+
+    std::fs::remove_file(&dirty_path).expect("clean planning worktree");
+    let (code, resolved) = env.forged(&[
+        "epic",
+        "resolve",
+        "--epic",
+        "epic-rolling",
+        "--child",
+        "child-stub",
+        "--note",
+        "retry after preserving the provider artifact",
+    ]);
+    assert_eq!(code, 0, "cleaned planning cycle resolves: {resolved}");
+    assert!(!worktree.exists(), "clean retry retires the old cycle");
+    assert!(
+        !git(&env.repos.repo, &["worktree", "list", "--porcelain"])
+            .contains(&worktree.to_string_lossy().into_owned()),
+        "clean retry removes the old worktree registration"
+    );
+    let (code, restarted) = env.forged(&["epic", "advance", "--epic", "epic-rolling"]);
+    assert_eq!(code, 0, "cleaned planning cycle restarts: {restarted}");
+    assert_eq!(
+        restarted["result"]["progress"]["planning"]["runId"],
+        json!("child-stub-epic-plan-g2")
     );
 }
 
