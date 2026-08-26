@@ -11,7 +11,7 @@ use forged_ledger::{
     AdmissionReservationRow, DesiredReconcileOutcome, DesiredReconcileUpdate,
     DesiredRestartReservation, DesiredState, DesiredSubjectKind, DesiredWorkRow, RunState,
 };
-use forged_types::{AdmissionOutcome, OperationRequest, OperationResponse};
+use forged_types::{AdmissionOutcome, ErrorCode, OperationRequest, OperationResponse};
 use serde_json::{json, Value};
 
 use crate::config::{now_iso, HostPolicy};
@@ -227,8 +227,32 @@ async fn finish_action(
     action: &str,
     update: DesiredReconcileUpdate,
 ) -> Result<Value, Failure> {
-    let row = finish(ctx, row, token, update).await?;
-    Ok(json!({"action": action, "desiredWork": row_json(&row)}))
+    match finish(ctx, row, token, update).await {
+        Ok(row) => Ok(json!({"action": action, "desiredWork": row_json(&row)})),
+        Err(error) if error.recoverable && error.code == ErrorCode::OperationInProgress => {
+            // Foreground controllers and explicit control operations may
+            // advance desired state while this tick is observing the
+            // subject. Losing the exact reconciliation token is therefore a
+            // successful ownership handoff, not a failed supervisor pass.
+            // Only the guarded finish call is absorbed here; every other
+            // failure keeps its ordinary hard-error path.
+            let kind = row.subject_kind;
+            let id = row.subject_id.clone();
+            let current = on_ledger(&ctx.ledger, move |ledger| {
+                ledger.get_desired_work(kind, &id)
+            })
+            .await?;
+            match current {
+                Some(current) => Ok(json!({
+                    "action": "superseded",
+                    "detail": error.message,
+                    "desiredWork": row_json(&current),
+                })),
+                None => Err(error),
+            }
+        }
+        Err(error) => Err(error),
+    }
 }
 
 async fn finish_attention(
@@ -1047,10 +1071,11 @@ pub(super) async fn tick(
         };
         let Some(admission) = admissions.get(&(admission_kind, candidate.subject_id.clone()))
         else {
-            let reconciled = finish(
+            let report = finish_action(
                 ctx,
                 &candidate,
                 &token,
+                "ineligible",
                 DesiredReconcileUpdate {
                     desired_state: None,
                     outcome: DesiredReconcileOutcome::Attention,
@@ -1063,12 +1088,16 @@ pub(super) async fn tick(
                 },
             )
             .await?;
-            subjects.push(json!({
-                "action": "ineligible",
-                "subject": {"kind": candidate.subject_kind.as_str(), "id": candidate.subject_id},
-                "detail": "no admission candidate was projected",
-                "desiredWork": row_json(&reconciled),
-            }));
+            if report["action"] == "superseded" {
+                subjects.push(report);
+            } else {
+                subjects.push(json!({
+                    "action": "ineligible",
+                    "subject": {"kind": candidate.subject_kind.as_str(), "id": candidate.subject_id},
+                    "detail": "no admission candidate was projected",
+                    "desiredWork": report["desiredWork"],
+                }));
+            }
             continue;
         };
         if admission.decision.outcome != AdmissionOutcome::Admitted {
@@ -1079,10 +1108,16 @@ pub(super) async fn tick(
             };
             let next_wake_at = admission.decision.next_eligible_wake_at.clone();
             let reason = format!("admission: {:?}", admission.decision.reason);
-            let reconciled = finish(
+            let action = if admission.decision.outcome == AdmissionOutcome::Deferred {
+                "deferred"
+            } else {
+                "ineligible"
+            };
+            let report = finish_action(
                 ctx,
                 &candidate,
                 &token,
+                action,
                 DesiredReconcileUpdate {
                     desired_state: None,
                     outcome,
@@ -1097,11 +1132,15 @@ pub(super) async fn tick(
                 },
             )
             .await?;
-            subjects.push(json!({
-                "action": if admission.decision.outcome == AdmissionOutcome::Deferred { "deferred" } else { "ineligible" },
-                "admission": admission.decision,
-                "desiredWork": row_json(&reconciled),
-            }));
+            if report["action"] == "superseded" {
+                subjects.push(report);
+            } else {
+                subjects.push(json!({
+                    "action": action,
+                    "admission": admission.decision,
+                    "desiredWork": report["desiredWork"],
+                }));
+            }
             continue;
         }
         let Some(reservation) = admission.reservation.clone() else {

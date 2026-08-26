@@ -280,6 +280,120 @@ fn capacity_queued_submit_replays_by_key_and_fresh_key_retries_later() {
     ]);
 }
 
+#[cfg(feature = "failpoints")]
+#[test]
+fn once_reports_superseded_when_foreground_progress_clears_a_deferred_claim() {
+    let _serial = serialize_process_fixture();
+    let env = TestEnv::new("supervise-deferred-claim-superseded");
+    let config_path = env.anvil.join("config.json");
+    let mut config: Value =
+        serde_json::from_str(&std::fs::read_to_string(&config_path).expect("read config"))
+            .expect("config JSON");
+    config["admission"] = json!({
+        "totalActive": 1,
+        "providerActive": 4,
+        "repositoryWriteActive": 1,
+        "deferSeconds": 60,
+    });
+    std::fs::write(
+        &config_path,
+        serde_json::to_vec_pretty(&config).expect("serialize admission config"),
+    )
+    .expect("write admission config");
+
+    let holder = "run-supervisor-capacity-holder";
+    let target = "run-supervisor-deferred-target";
+    start_run(&env, holder);
+    start_run(&env, target);
+    env.set_scenario("implement", "hang", 1);
+    let (code, submitted) = env.forged(&["run", "submit", "--run", holder]);
+    assert_eq!(code, 0, "holder submit: {submitted}");
+    wait_until("holder consumes the only admission slot", || {
+        implementation_starts(&env, holder) == 1
+    });
+    let ledger = env.ledger();
+    ledger
+        .record_desired_outcome(
+            DesiredSubjectKind::Run,
+            holder,
+            DesiredState::Running,
+            DesiredReconcileOutcome::Adopted,
+            Some("9999-01-01T00:00:00.000000000Z".to_owned()),
+            None,
+        )
+        .expect("park capacity holder observation");
+    ledger
+        .authorize_desired_work(DesiredSubjectKind::Run, target, 1)
+        .expect("authorize due target");
+    ledger.close().expect("close ledger");
+
+    let failpoint = env.root.join("supervisor-deferred-finish-fp");
+    std::fs::create_dir_all(&failpoint).expect("failpoint dir");
+    let reached = failpoint.join("admission.batch.commit.after.reached");
+    let release = failpoint.join("admission.batch.commit.after.release");
+    let supervisor = env
+        .forged_cmd(&["supervise", "--once"])
+        .env("FORGED_FAILPOINT", "admission.batch.commit.after")
+        .env("FORGED_FAILPOINT_MODE", "pause")
+        .env("FORGED_FAILPOINT_DIR", &failpoint)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("supervisor tick spawns");
+    wait_until("supervisor commits the deferred decision", || {
+        reached.exists()
+    });
+
+    // This is the exact production race: the detached controller or an
+    // explicit control operation advances desired state after the tick's
+    // observation but before its guarded reconciliation finish.
+    let ledger = env.ledger();
+    ledger
+        .record_desired_outcome(
+            DesiredSubjectKind::Run,
+            target,
+            DesiredState::Running,
+            DesiredReconcileOutcome::Authorized,
+            Some("9999-01-01T00:00:00.000000000Z".to_owned()),
+            None,
+        )
+        .expect("foreground progress clears the tick claim");
+    ledger.close().expect("close ledger");
+    std::fs::write(&release, b"").expect("release supervisor failpoint");
+
+    let output = supervisor
+        .wait_with_output()
+        .expect("supervisor tick exits");
+    assert!(
+        output.status.success(),
+        "recoverable ownership handoff failed the tick: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: Value = serde_json::from_slice(&output.stdout).expect("supervisor response JSON");
+    let report = response["result"]["subjects"]
+        .as_array()
+        .and_then(|subjects| {
+            subjects
+                .iter()
+                .find(|subject| subject["desiredWork"]["subject"]["id"] == json!(target))
+        })
+        .expect("target subject report");
+    assert_eq!(report["action"], json!("superseded"), "{response}");
+
+    let (code, cleanup) = env.forged(&[
+        "run",
+        "stop",
+        "--run",
+        holder,
+        "--outcome",
+        "cancelled",
+        "--reason",
+        "test cleanup",
+    ]);
+    assert_eq!(code, 0, "holder cleanup: {cleanup}");
+}
+
 #[test]
 fn once_adopts_live_work_and_concurrent_ticks_restart_once() {
     let _serial = serialize_process_fixture();
