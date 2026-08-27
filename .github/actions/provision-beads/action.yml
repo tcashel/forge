@@ -1,0 +1,72 @@
+name: Provision pinned Beads
+description: >-
+  Download, verify, and expose the pinned Beads compatibility binary. The
+  version/commit/sha256 pins in this file are the single source of truth for
+  every job that needs bd; provisioning fails closed unless the published
+  artifact matches all three.
+
+inputs:
+  export-gated-test-env:
+    description: >-
+      When 'true', also export FORGED_TEST_BD and FORGED_REQUIRE_BD=1 to
+      $GITHUB_ENV so the bd-gated tests fail rather than skip. Any value other
+      than 'true' or 'false' is rejected: a typo here would silently downgrade
+      those tests to skips.
+    required: false
+    default: 'false'
+
+outputs:
+  path:
+    description: Absolute path to the verified bd binary.
+    value: ${{ steps.provision.outputs.path }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Provision the pinned Beads v1.2.1 compatibility binary
+      id: provision
+      env:
+        BEADS_VERSION: '1.2.1'
+        BEADS_COMMIT: 634cbbc4bc580fa5124f63fdf65d137a46d5b4ff
+        BEADS_LINUX_AMD64_SHA256: 48aecf42ffdefa6470298d8022deeb762e30c8729dc0a4bdda93888c0b0354e2
+      shell: bash
+      run: |
+        set -euo pipefail
+        beads_dir="$RUNNER_TEMP/forge-beads-$BEADS_VERSION"
+        mkdir -p "$beads_dir"
+        asset="beads_${BEADS_VERSION}_linux_amd64.tar.gz"
+        curl -fsSL --retry 3 \
+          -o "$beads_dir/$asset" \
+          "https://github.com/gastownhall/beads/releases/download/v$BEADS_VERSION/$asset"
+        printf '%s  %s\n' "$BEADS_LINUX_AMD64_SHA256" "$beads_dir/$asset" \
+          | sha256sum -c -
+        tar -xzf "$beads_dir/$asset" -C "$beads_dir" bd
+        chmod 0755 "$beads_dir/bd"
+        version_json="$("$beads_dir/bd" version --json)"
+        printf '%s\n' "$version_json"
+        jq -e \
+          --arg version "$BEADS_VERSION" \
+          --arg commit "$BEADS_COMMIT" \
+          '.version == $version and .commit == $commit' \
+          <<<"$version_json" >/dev/null
+        printf 'path=%s\n' "$beads_dir/bd" >> "$GITHUB_OUTPUT"
+
+    - name: Export pinned Beads binary for gated tests
+      env:
+        EXPORT_GATED_TEST_ENV: ${{ inputs.export-gated-test-env }}
+        BD_PATH: ${{ steps.provision.outputs.path }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        case "$EXPORT_GATED_TEST_ENV" in
+          true) ;;
+          false) exit 0 ;;
+          *)
+            echo "export-gated-test-env must be 'true' or 'false', got '$EXPORT_GATED_TEST_ENV'" >&2
+            exit 1
+            ;;
+        esac
+        {
+          printf 'FORGED_TEST_BD=%s\n' "$BD_PATH"
+          printf 'FORGED_REQUIRE_BD=1\n'
+        } >> "$GITHUB_ENV"
