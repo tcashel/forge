@@ -128,8 +128,10 @@ jobs:
   # This measures the workspace as it ships. The failpoint kill-matrix is
   # cfg'd out here — `failpoints` is off by default, so that code is not
   # compiled into this build and is neither covered nor counted against it.
+  # Runs on PRs as well as main so Codecov can compare head against base and
+  # post the PR coverage comment. Never part of ci-ok: coverage informs, it
+  # does not gate.
   coverage:
-    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

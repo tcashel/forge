@@ -1,0 +1,21 @@
+# Codecov behavior. Coverage informs and never gates: both statuses are
+# informational, and the required CI check remains rust.yml's ci-ok.
+
+coverage:
+  status:
+    project:
+      default:
+        informational: true
+    patch:
+      default:
+        informational: true
+
+comment:
+  layout: "reach, diff, flags, files"
+  behavior: default
+  require_changes: false
+
+# Integration-test sources are instrumented alongside the workspace; their
+# own line coverage is not a signal anyone acts on.
+ignore:
+  - "crates/*/tests"
