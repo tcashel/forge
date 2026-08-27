@@ -6,17 +6,12 @@ use serde_json::{Map, Value};
 
 use crate::error::ProviderError;
 use crate::invocation::{
-    validate_embedded_path, validate_model, Invocation, PacketDirs, ProviderDriver,
+    validate_effort, validate_embedded_path, validate_model, Invocation, PacketDirs, ProviderDriver,
 };
 use crate::usage::{
     disjoint_input, object_line, optional_token, required_token, PricingBasis, UsageCapture,
     UsageRow,
 };
-
-/// The closed set of reasoning efforts the codex CLI accepts. The closed
-/// set is what makes the single-quoted TOML `-c` value safe to embed in a
-/// shell line.
-pub(crate) const EFFORTS: [&str; 5] = ["minimal", "low", "medium", "high", "xhigh"];
 
 /// Runs one packet through the `codex` CLI.
 ///
@@ -52,13 +47,9 @@ impl ProviderDriver for CodexDriver {
         };
         let effort_arg = match packet.provider_hints.effort.as_deref() {
             None => String::new(),
-            Some(effort) if EFFORTS.contains(&effort) => {
-                format!(" -c 'model_reasoning_effort=\"{effort}\"'")
-            }
             Some(effort) => {
-                return Err(ProviderError::UnsupportedEffort {
-                    effort: effort.to_owned(),
-                })
+                validate_effort(effort)?;
+                format!(" -c 'model_reasoning_effort=\"{effort}\"'")
             }
         };
         let shell_line = format!(

@@ -499,6 +499,21 @@ impl RosterDefinitionV1 {
                                 "model must be a non-empty printable identifier",
                             ));
                         }
+                        match candidate.effort.as_deref() {
+                            Some(effort) if !valid_effort_value(effort) => {
+                                errors.push(DefinitionError::at(
+                                    format!("{path}.effort"),
+                                    "effort must match ^[A-Za-z0-9._-]{1,64}$",
+                                ));
+                            }
+                            Some(_) if candidate.provider == "claude" => {
+                                errors.push(DefinitionError::at(
+                                    format!("{path}.effort"),
+                                    "claude candidates take no effort; the model name selects capability",
+                                ));
+                            }
+                            _ => {}
+                        }
                         let writes = candidate
                             .capabilities
                             .contains(&Capability::RepositoryWrite);
@@ -536,6 +551,17 @@ fn valid_provider_value(value: &str) -> bool {
     !value.trim().is_empty()
         && value.len() <= 128
         && value.chars().all(|c| !c.is_control() && !c.is_whitespace())
+}
+
+/// The shell/TOML-embedding charset the provider drivers enforce for
+/// reasoning efforts. Vocabulary is the provider CLI's contract; validating
+/// the charset here surfaces an unembeddable value at `definition validate`
+/// instead of the first packet of a run.
+fn valid_effort_value(value: &str) -> bool {
+    (1..=64).contains(&value.len())
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
 #[cfg(test)]
@@ -722,6 +748,51 @@ mod tests {
         assert!(errors
             .iter()
             .any(|error| error.path.ends_with(".capabilities")));
+    }
+
+    #[test]
+    fn roster_validation_guards_effort_charset_and_claude_effort_presence() {
+        let profile = standard_profile();
+        let mut roster = RosterDefinitionV1 {
+            schema: ROSTER_SCHEMA_V1.to_owned(),
+            name: "default".to_owned(),
+            roles: profile
+                .seats
+                .iter()
+                .map(|seat| (seat.role.clone(), vec![candidate(Sandbox::ReadOnly, false)]))
+                .collect(),
+        };
+        for ok in ["max", "ultra", "xhigh", "future.tier-2"] {
+            let implementation = roster
+                .roles
+                .get_mut(&RoleId::new("implementation").expect("role"))
+                .expect("candidate");
+            implementation[0].effort = Some(ok.to_owned());
+            let errors = roster.validate_for(&profile);
+            assert!(
+                !errors.iter().any(|error| error.path.ends_with(".effort")),
+                "{ok} should validate"
+            );
+        }
+        let implementation = roster
+            .roles
+            .get_mut(&RoleId::new("implementation").expect("role"))
+            .expect("candidate");
+        implementation[0].effort = Some("xhigh\"'".to_owned());
+        let errors = roster.validate_for(&profile);
+        assert!(errors.iter().any(
+            |error| error.path.ends_with(".effort") && error.message.contains("[A-Za-z0-9._-]")
+        ));
+
+        let implementation = roster
+            .roles
+            .get_mut(&RoleId::new("implementation").expect("role"))
+            .expect("candidate");
+        implementation[0].provider = "claude".to_owned();
+        implementation[0].effort = Some("high".to_owned());
+        let errors = roster.validate_for(&profile);
+        assert!(errors.iter().any(|error| error.path.ends_with(".effort")
+            && error.message.contains("claude candidates take no effort")));
     }
 
     fn execution_policy(stage_budget_s: u64, termination_grace_s: u64) -> ExecutionPolicyV1 {

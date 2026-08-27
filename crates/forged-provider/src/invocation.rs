@@ -194,6 +194,28 @@ pub(crate) fn validate_embedded_path(path: &Path) -> Result<String, ProviderErro
     }
 }
 
+/// Validate a reasoning effort before embedding it: matching
+/// `^[A-Za-z0-9._-]{1,64}$`, else [`ProviderError::UnsupportedEffort`].
+///
+/// The charset is what keeps the value safe inside the codex single-quoted
+/// TOML `-c` override and the bare pi `--thinking` argument. Effort
+/// vocabulary is deliberately NOT validated here: the provider CLI is the
+/// authority on which efforts exist, and a value it rejects fails the
+/// attempt with the CLI's own error instead of a stale forged allowlist.
+pub(crate) fn validate_effort(effort: &str) -> Result<(), ProviderError> {
+    let safe = (1..=64).contains(&effort.len())
+        && effort
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+    if safe {
+        Ok(())
+    } else {
+        Err(ProviderError::UnsupportedEffort {
+            effort: effort.to_owned(),
+        })
+    }
+}
+
 /// Validate a model string before embedding it: non-empty and matching
 /// `^[A-Za-z0-9][A-Za-z0-9._:/-]*$`, else `UnsafeShellLine` naming the
 /// offending value.
@@ -252,6 +274,23 @@ mod tests {
                 matches!(
                     validate_embedded_path(Path::new(bad)),
                     Err(ProviderError::UnsafePath { .. })
+                ),
+                "{bad:?} should be unsafe"
+            );
+        }
+    }
+
+    #[test]
+    fn effort_charset_rule() {
+        for ok in ["minimal", "xhigh", "max", "ultra", "future.tier-2", "a"] {
+            assert!(validate_effort(ok).is_ok(), "{ok} should be safe");
+        }
+        let long = "x".repeat(65);
+        for bad in ["", "xhigh\"'", "hi gh", "x;rm", "e$fort", long.as_str()] {
+            assert!(
+                matches!(
+                    validate_effort(bad),
+                    Err(ProviderError::UnsupportedEffort { .. })
                 ),
                 "{bad:?} should be unsafe"
             );
