@@ -30,10 +30,14 @@ The genuine lease-expiry case is `#[ignore]`d (5+ real minutes) — run it
 deliberately with `FORGED_SLOW_TESTS=1 cargo test -p forged --features
 failpoints -- --ignored --nocapture` when you touch lease code.
 
-The two `cargo nextest run` gates need `cargo-nextest` on `PATH`; the operator
-installs it, never an agent. Its config at `.config/nextest.toml` carries the
-serialization contract for `crates/forged/tests/supervise.rs` — plain
-`cargo test` compiles and runs those cases but no longer keeps them disjoint.
+The two `cargo nextest run` gates need `cargo-nextest` on `PATH` (a
+development tool, not a Cargo dependency — cargo cannot declare binary tool
+deps); the operator installs it, never an agent. Its config at
+`.config/nextest.toml` carries the serialization contract for
+`crates/forged/tests/supervise.rs`. Under any other runner — plain
+`cargo test` included — those cases SKIP loudly unless `RUST_TEST_THREADS=1`
+marks a deliberately serial run. If you see those skips, switch runners; never
+reintroduce an in-process lock to chase them.
 
 ## Invariants that must never be broken
 

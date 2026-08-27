@@ -15,7 +15,12 @@ cargo nextest run -p forged --features failpoints
 ```
 
 The two test gates run under [cargo-nextest](https://nexte.st), installed once
-with `cargo install cargo-nextest --locked` or from a prebuilt binary.
+with `cargo install cargo-nextest --locked` or from a prebuilt binary. It is a
+required development tool — Cargo cannot declare binary tools as
+dev-dependencies — and `.config/nextest.toml` declares the minimum version.
+Under plain `cargo test` the `supervise` suite skips loudly rather than run
+unserialized; `RUST_TEST_THREADS=1 cargo test` is the deliberate serial
+fallback.
 
 The suite has two deliberate layers, and nextest filtersets address each
 directly. Unit tests live in-source under `#[cfg(test)]`; integration and

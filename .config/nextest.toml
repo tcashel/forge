@@ -3,7 +3,14 @@
 # production deadline bounds against the wall clock, so they must never
 # co-schedule with each other. This group replaces the in-binary Mutex they
 # used to take: nextest runs every test in its own process, where a
-# process-local lock serializes nothing.
+# process-local lock serializes nothing. Under any runner that does not read
+# this file, those cases skip loudly (see require_serialized_runner in
+# crates/forged/tests/supervise.rs).
+
+# nextest is this workspace's test runner; the floor matches the version CI
+# pins. Below it, nextest refuses to run (exit 92) rather than half-honoring
+# the contract above.
+nextest-version = { required = "0.9.143" }
 
 [test-groups]
 supervise-process-fixtures = { max-threads = 1 }

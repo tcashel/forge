@@ -14,11 +14,31 @@ use serde_json::{json, Value};
 use support::TestEnv;
 
 const WAIT: Duration = Duration::from_secs(30);
-// These cases deliberately create and signal detached process groups. Keeping
-// their OS-level fixtures disjoint, while retaining production timing bounds,
-// is the `supervise-process-fixtures` test group in `.config/nextest.toml`.
-// Only nextest honours it: run this binary through plain `cargo test` and the
-// cases are no longer serialized against each other.
+// These cases deliberately create and signal detached process groups and
+// assert production timing bounds, so they must never co-schedule. Under
+// nextest the `supervise-process-fixtures` group in `.config/nextest.toml`
+// enforces that; under any other runner the cases SKIP loudly instead of
+// running unserialized. Never reintroduce an in-process lock here: nextest
+// runs every test in its own process, where such a lock serializes nothing.
+
+/// Confirm the runner keeps this binary's cases disjoint, or SKIP loudly.
+/// `NEXTEST` is set in test environments by nextest (whose test group
+/// serializes the binary); `RUST_TEST_THREADS=1` marks a deliberately serial
+/// libtest run. The `--test-threads=1` flag leaves no environment trace and
+/// cannot be honored here — use the environment variable instead.
+fn require_serialized_runner() -> bool {
+    if std::env::var_os("NEXTEST").is_some() {
+        return true;
+    }
+    if std::env::var("RUST_TEST_THREADS").is_ok_and(|threads| threads == "1") {
+        return true;
+    }
+    eprintln!(
+        "SKIP: supervise cases need `cargo nextest run` (serialization \
+         contract in .config/nextest.toml) or RUST_TEST_THREADS=1; test not run"
+    );
+    false
+}
 
 struct PausedProcessGroup(Option<i32>);
 
@@ -64,6 +84,9 @@ fn start_run(env: &TestEnv, run: &str) {
 
 #[test]
 fn recovered_live_attempt_persists_a_wake_no_later_than_its_deadline() {
+    if !require_serialized_runner() {
+        return;
+    }
     let env = TestEnv::new("supervise-provider-deadline-wake");
     let config_path = env.anvil.join("config.json");
     let mut config: Value = serde_json::from_str(
@@ -179,6 +202,9 @@ fn implementation_starts(env: &TestEnv, run: &str) -> usize {
 
 #[test]
 fn never_submitted_and_failed_submissions_never_become_desired() {
+    if !require_serialized_runner() {
+        return;
+    }
     let env = TestEnv::new("supervise-authorization-boundary");
     start_run(&env, "run-never-submitted");
     let (code, report) = env.forged(&["supervise", "--once"]);
@@ -218,6 +244,9 @@ fn never_submitted_and_failed_submissions_never_become_desired() {
 
 #[test]
 fn capacity_queued_submit_replays_by_key_and_fresh_key_retries_later() {
+    if !require_serialized_runner() {
+        return;
+    }
     let env = TestEnv::new("supervise-queued-submit-replay");
     let config_path = env.anvil.join("config.json");
     let mut config: Value = serde_json::from_str(
@@ -323,6 +352,9 @@ fn capacity_queued_submit_replays_by_key_and_fresh_key_retries_later() {
 #[cfg(feature = "failpoints")]
 #[test]
 fn once_reports_superseded_when_foreground_progress_clears_a_deferred_claim() {
+    if !require_serialized_runner() {
+        return;
+    }
     let env = TestEnv::new("supervise-deferred-claim-superseded");
     let config_path = env.anvil.join("config.json");
     let mut config: Value =
@@ -435,6 +467,9 @@ fn once_reports_superseded_when_foreground_progress_clears_a_deferred_claim() {
 
 #[test]
 fn once_adopts_live_work_and_concurrent_ticks_restart_once() {
+    if !require_serialized_runner() {
+        return;
+    }
     let env = TestEnv::new("supervise-restart-singleton");
     let config_path = env.anvil.join("config.json");
     let mut config: Value = serde_json::from_str(
@@ -575,6 +610,9 @@ fn once_adopts_live_work_and_concurrent_ticks_restart_once() {
 #[cfg(feature = "failpoints")]
 #[test]
 fn restart_recovers_a_preparing_admission_after_spawn_crash() {
+    if !require_serialized_runner() {
+        return;
+    }
     let env = TestEnv::new("supervise-recover-preparing-admission");
     let config_path = env.anvil.join("config.json");
     let mut config: Value = serde_json::from_str(
@@ -710,6 +748,9 @@ fn restart_recovers_a_preparing_admission_after_spawn_crash() {
 
 #[test]
 fn live_controller_adoption_bypasses_full_repository_capacity() {
+    if !require_serialized_runner() {
+        return;
+    }
     let env = TestEnv::new("supervise-adopt-full-capacity");
     start_run(&env, "run-adopt-full");
     env.set_scenario("implement", "hang", 1);
@@ -765,6 +806,9 @@ fn live_controller_adoption_bypasses_full_repository_capacity() {
 
 #[test]
 fn foreground_mode_exits_cleanly_on_sigint_without_duplicate_effects() {
+    if !require_serialized_runner() {
+        return;
+    }
     let env = TestEnv::new("supervise-foreground-signal");
     start_run(&env, "run-foreground");
     env.set_scenario("implement", "hang", 2);
@@ -853,6 +897,9 @@ fn foreground_mode_exits_cleanly_on_sigint_without_duplicate_effects() {
 
 #[test]
 fn foreground_mode_exits_cleanly_on_sigterm() {
+    if !require_serialized_runner() {
+        return;
+    }
     let env = TestEnv::new("supervise-foreground-sigterm");
     start_run(&env, "run-sigterm");
     env.set_scenario("implement", "hang", 2);
@@ -913,6 +960,9 @@ fn foreground_mode_exits_cleanly_on_sigterm() {
 
 #[test]
 fn unresolved_input_reparks_but_resolution_wakes_the_next_tick() {
+    if !require_serialized_runner() {
+        return;
+    }
     let env = TestEnv::new("supervise-input-resolution");
     env.enable_dynamic_gh();
     env.seed_epic("epic-input", &[("direct-decision", &env.spec, true)]);
