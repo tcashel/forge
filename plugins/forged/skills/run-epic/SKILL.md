@@ -99,7 +99,15 @@ forged epic resolve --epic "$EPIC_ID" --child "$CHILD_ID" \
 forged epic submit --epic "$EPIC_ID"
 ```
 
-Do not invoke `epic resolve` for an input requirement that names no child; report
-that global blocker because the current typed command deliberately requires a
-child id. No external-tracker integration, auto-routing, install action,
+For an input requirement that names no child (for example
+`integration-setup-failed`, raised when the integration branch cannot be
+pushed), fix the underlying condition first, then resolve the epic-level hold
+by omitting `--child`:
+
+```bash
+forged epic resolve --epic "$EPIC_ID" --note "$RESOLUTION_NOTE"
+forged epic submit --epic "$EPIC_ID"
+```
+
+No external-tracker integration, auto-routing, install action,
 protocol change, or implicit default-branch approval is allowed.

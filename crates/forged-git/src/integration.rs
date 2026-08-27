@@ -23,9 +23,20 @@ fn stdout(output: &std::process::Output, context: &str) -> Result<String, GitErr
     if output.status.success() {
         return Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned());
     }
+    // Hooks and remotes explain rejections on either stream; a diagnostic
+    // that drops stdout can reduce a hook refusal to "failed to push some
+    // refs", so both streams survive into the durable error.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let out = String::from_utf8_lossy(&output.stdout);
+    let detail = match (stderr.trim().is_empty(), out.trim().is_empty()) {
+        (false, true) => stderr.into_owned(),
+        (true, false) => out.into_owned(),
+        (true, true) => String::new(),
+        (false, false) => format!("{}\nstdout: {}", stderr.trim_end(), out.trim_end()),
+    };
     Err(GitError::Exec {
         command: format!("{context} (status {:?})", output.status.code()),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        stderr: detail,
     })
 }
 
@@ -60,10 +71,17 @@ pub async fn remote_branch_sha(repo: &Path, branch: &str) -> Result<String, GitE
 
 /// Ensure `origin/<integration>` exists, cutting it from the fetched
 /// `origin/<base>` only when absent. Existing integration refs are reused.
+///
+/// The cut is pushed from a disposable worktree at `scratch` checked out on
+/// the integration branch, never from the operator checkout: repository
+/// pre-push hooks that inspect `HEAD` must observe the ref being pushed,
+/// not whatever the operator happens to have checked out. Hooks are never
+/// bypassed.
 pub async fn ensure_integration_branch(
     repo: &Path,
     integration: &str,
     base: &str,
+    scratch: &Path,
 ) -> Result<String, GitError> {
     validate_branch(repo, integration).await?;
     validate_branch(repo, base).await?;
@@ -101,8 +119,43 @@ pub async fn ensure_integration_branch(
     let remote_base = format!("refs/remotes/origin/{base}");
     let resolved = git(repo, &["rev-parse", &remote_base]).await?;
     let sha = stdout(&resolved, "git rev-parse integration base")?;
-    let refspec = format!("{sha}:{integration_ref}");
-    let pushed = git(repo, &["push", "origin", &refspec]).await?;
-    stdout(&pushed, "git push integration branch")?;
+
+    let scratch_str = scratch.to_str().ok_or_else(|| GitError::Exec {
+        command: "integration scratch worktree".to_owned(),
+        stderr: format!("scratch path {} is not valid UTF-8", scratch.display()),
+    })?;
+    if let Some(parent) = scratch.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|error| GitError::Exec {
+                command: "integration scratch worktree".to_owned(),
+                stderr: error.to_string(),
+            })?;
+    }
+    // Leftover scratch state from an interrupted cut is disposable, and the
+    // remote branch is absent here, so resetting a stale local branch to the
+    // fresh cut with `-B` loses nothing durable. Registered, unregistered,
+    // and pruned-but-present leftovers are all reclaimed.
+    let _ = git(repo, &["worktree", "remove", "--force", scratch_str]).await;
+    let _ = tokio::fs::remove_dir_all(scratch).await;
+    let _ = git(repo, &["worktree", "prune"]).await;
+    let added = git(
+        repo,
+        &[
+            "worktree",
+            "add",
+            "--force",
+            "-B",
+            integration,
+            scratch_str,
+            &sha,
+        ],
+    )
+    .await?;
+    stdout(&added, "git worktree add integration scratch")?;
+    let pushed = git(scratch, &["push", "origin", integration]).await;
+    // Removal is best-effort: the next cut clears leftovers before adding.
+    let _ = git(repo, &["worktree", "remove", "--force", scratch_str]).await;
+    stdout(&pushed?, "git push integration branch")?;
     Ok(sha)
 }
