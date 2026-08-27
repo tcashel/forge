@@ -1,0 +1,91 @@
+name: workflows-lint
+
+# Static analysis of the CI configuration itself. Two independent tools:
+# actionlint checks that the workflows are *correct* (schema, expression
+# syntax, shell), zizmor checks that they are *safe* (credential persistence,
+# template injection, cache poisoning).
+#
+# Not part of rust.yml's `ci-ok` needs: this observes, it does not gate.
+on:
+  pull_request:
+    paths:
+      - .github/**
+  push:
+    branches: [main]
+    paths:
+      - .github/**
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  actionlint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # taiki-e/install-action has no actionlint manifest at the pinned commit,
+      # so this provisions the release binary directly. Version and sha256 are
+      # the single source of truth and it fails closed on a mismatch — the same
+      # contract as .github/actions/provision-beads.
+      - name: Provision the pinned actionlint binary
+        id: provision
+        env:
+          ACTIONLINT_VERSION: '1.7.12'
+          ACTIONLINT_LINUX_AMD64_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/actionlint-$ACTIONLINT_VERSION"
+          mkdir -p "$dir"
+          asset="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl -fsSL --retry 3 \
+            -o "$dir/$asset" \
+            "https://github.com/rhysd/actionlint/releases/download/v$ACTIONLINT_VERSION/$asset"
+          printf '%s  %s\n' "$ACTIONLINT_LINUX_AMD64_SHA256" "$dir/$asset" \
+            | sha256sum -c -
+          tar -xzf "$dir/$asset" -C "$dir" actionlint
+          chmod 0755 "$dir/actionlint"
+          "$dir/actionlint" -version
+          printf 'path=%s\n' "$dir/actionlint" >> "$GITHUB_OUTPUT"
+
+      # With no file arguments actionlint discovers .github/workflows itself.
+      # shellcheck is present on the runner image, so `run:` bodies are linted
+      # as shell too; actionlint disables the rules that misfire on `${{ }}`.
+      - name: actionlint
+        env:
+          ACTIONLINT: ${{ steps.provision.outputs.path }}
+        run: |
+          set -euo pipefail
+          "$ACTIONLINT" -color
+
+  zizmor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: taiki-e/install-action@fcf5432d9f50d67e37ee6e29bdb7a224ff67b4a7 # v2.86.8
+        with:
+          tool: zizmor@1.29.0
+
+      # Offline deliberately. The only audits that need a token are
+      # impostor-commit, ref-confusion, and typosquat-uses, all of which check
+      # whether a `uses:` ref is what it claims to be — and every third-party
+      # action in this repo is already pinned to a full commit SHA, which is
+      # the property those audits exist to establish. Staying offline keeps the
+      # job hermetic, unrate-limited, and free of any token at all.
+      #
+      # `--min-severity high` is a starting bar, not a verdict: it is set so
+      # this job reports the findings worth stopping for while the medium and
+      # low ones (notably `artipacked` and `excessive-permissions`, which
+      # release.yml already remediates but rust.yml and plugin.yml do not) are
+      # triaged. Lower the bar as those are closed.
+      - name: zizmor
+        run: zizmor --offline --min-severity high .

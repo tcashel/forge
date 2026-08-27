@@ -11,3 +11,14 @@ supervise-process-fixtures = { max-threads = 1 }
 [[profile.default.overrides]]
 filter = 'package(=forged) & binary(=supervise)'
 test-group = 'supervise-process-fixtures'
+
+# JUnit XML for the Codecov test-results upload, written to
+# `target/nextest/ci/junit.xml`. CI selects this profile with NEXTEST_PROFILE=ci
+# so the gate commands stay byte-identical to the ones in CLAUDE.md.
+#
+# This profile deliberately declares no `overrides` of its own: nextest falls
+# back to `profile.default.overrides` for any setting a named profile does not
+# configure, so the serialization contract above still binds under `ci`.
+# Adding `[[profile.ci.overrides]]` here would shadow it for matched tests.
+[profile.ci.junit]
+path = "junit.xml"

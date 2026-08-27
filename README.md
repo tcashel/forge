@@ -1,5 +1,7 @@
 # Forge
 
+[![codecov](https://codecov.io/gh/tcashel/forge/branch/main/graph/badge.svg)](https://codecov.io/gh/tcashel/forge)
+
 > Plan. Run. Review. Ship. Don't watch.
 
 **Turn an approved rolling epic into a reviewed, tested draft pull request

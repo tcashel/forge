@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 # One run per branch/ref at a time; only PR runs get cancelled by a newer
 # push (a push-to-main run is left to finish undisturbed).
 concurrency:
@@ -24,10 +27,12 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       # Reads rust-toolchain.toml for the toolchain version; caches by default.
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
           components: rustfmt, clippy
           # Only persist the cache from main; PR branches restore it read-only
@@ -42,11 +47,19 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
+    # Job-level, never workflow-level: the workflow env block above must stay
+    # byte-identical to release.yml's or rust-cache's key diverges. NEXTEST_* is
+    # not among the CARGO*/RUST* prefixes rust-cache hashes, so the caches these
+    # jobs save and release.yml restores are unaffected.
+    env:
+      NEXTEST_PROFILE: ci
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       # Reads rust-toolchain.toml for the toolchain version; caches by default.
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
           # Only persist the cache from main; PR branches restore it read-only
           # so near-duplicate multi-GB caches don't pile up in the pool.
@@ -62,13 +75,27 @@ jobs:
       - name: test
         run: cargo nextest run --workspace
 
+      # Uploads on failure too — a red run is exactly when the per-test detail
+      # is worth having. Observational only: nothing here gates ci-ok.
+      - name: upload test results
+        if: ${{ !cancelled() }}
+        uses: codecov/test-results-action@0fa95f0e1eeaafde2c782583b36b28ad0d8c77d3 # v1.2.1
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: target/nextest/ci/junit.xml
+          flags: workspace
+
   failpoints:
     runs-on: ubuntu-latest
+    env:
+      NEXTEST_PROFILE: ci
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       # Reads rust-toolchain.toml for the toolchain version; caches by default.
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
           # Only persist the cache from main; PR branches restore it read-only
           # so near-duplicate multi-GB caches don't pile up in the pool.
@@ -83,6 +110,53 @@ jobs:
       # stays #[ignore]d (run deliberately with FORGED_SLOW_TESTS=1).
       - name: failpoints
         run: cargo nextest run -p forged --features failpoints
+
+      # Distinct flag: this run is the same crate under a different feature set,
+      # so Codecov must not fold it into the workspace suite.
+      - name: upload test results
+        if: ${{ !cancelled() }}
+        uses: codecov/test-results-action@0fa95f0e1eeaafde2c782583b36b28ad0d8c77d3 # v1.2.1
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: target/nextest/ci/junit.xml
+          flags: failpoints
+
+  # Line coverage for the default feature set, reported to Codecov but not
+  # gated on. Push-only: a PR run would upload against an unmerged ref, and
+  # main is the baseline the badge and trend read from.
+  #
+  # This measures the workspace as it ships. The failpoint kill-matrix is
+  # cfg'd out here — `failpoints` is off by default, so that code is not
+  # compiled into this build and is neither covered nor counted against it.
+  coverage:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Reads rust-toolchain.toml for the toolchain version; caches by default.
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          # cargo-llvm-cov needs llvm-profdata/llvm-cov from the toolchain.
+          components: llvm-tools
+          # Only persist the cache from main; PR branches restore it read-only
+          # so near-duplicate multi-GB caches don't pile up in the pool.
+          cache-save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+
+      - uses: taiki-e/install-action@fcf5432d9f50d67e37ee6e29bdb7a224ff67b4a7 # v2.86.8
+        with:
+          tool: cargo-llvm-cov@0.9.0,cargo-nextest@0.9.143
+
+      - name: coverage
+        run: cargo llvm-cov nextest --workspace --lcov --output-path lcov.info
+
+      - name: upload coverage
+        uses: codecov/codecov-action@0fb7174895f61a3b6b78fc075e0cd60383518dac # v5.5.5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: lcov.info
 
   # Exists so branch protection can require one stable check name.
   ci-ok:
