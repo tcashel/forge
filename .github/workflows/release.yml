@@ -184,6 +184,54 @@ jobs:
       - name: Failpoint matrix
         run: cargo nextest run -p forged --features failpoints
 
+  # Darwin assurance: forged runs on operator Macs and its reclaim saga is
+  # process-group signaling, where darwin semantics diverge from Linux. The
+  # pinned Beads binary is linux-amd64 only, so these jobs provision no bd:
+  # the bd-gated cases SKIP loudly here and bd-contract coverage stays on the
+  # Linux jobs above. Standard macOS runners bill nothing on a public repo.
+  test-macos:
+    if: success() && startsWith(github.ref, 'refs/tags/')
+    needs: preflight
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          cache-save-if: 'false'
+
+      - uses: taiki-e/install-action@fcf5432d9f50d67e37ee6e29bdb7a224ff67b4a7 # v2.86.8
+        with:
+          tool: cargo-nextest@0.9.143
+
+      - name: Build
+        run: cargo build --workspace --locked
+
+      - name: Test
+        run: cargo nextest run --workspace
+
+  failpoints-macos:
+    if: success() && startsWith(github.ref, 'refs/tags/')
+    needs: preflight
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          cache-save-if: 'false'
+
+      - uses: taiki-e/install-action@fcf5432d9f50d67e37ee6e29bdb7a224ff67b4a7 # v2.86.8
+        with:
+          tool: cargo-nextest@0.9.143
+
+      - name: Failpoint matrix
+        run: cargo nextest run -p forged --features failpoints
+
   package:
     if: success() && startsWith(github.ref, 'refs/tags/')
     needs: preflight
@@ -274,7 +322,7 @@ jobs:
 
   release:
     if: success() && startsWith(github.ref, 'refs/tags/')
-    needs: [preflight, test, failpoints, package]
+    needs: [preflight, test, failpoints, test-macos, failpoints-macos, package]
     runs-on: ubuntu-22.04
     permissions:
       contents: write
