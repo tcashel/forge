@@ -4780,6 +4780,16 @@ pub async fn epic_advance(ctx: &Ctx, req: &OperationRequest) -> OperationRespons
 
 /// Drive an epic through child slices and waves until a durable human stop.
 pub async fn epic_drive(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
+    let response = epic_drive_loop(ctx, req).await;
+    // Every terminal error exit of the loop records durable evidence: the
+    // supervisor reads it instead of the controller's process-local log.
+    if let (Some(error), Ok(epic)) = (response.error.as_ref(), param_str(&req.params, "epic")) {
+        super::handoff::record_controller_terminal(ctx, epic, error).await;
+    }
+    response
+}
+
+async fn epic_drive_loop(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
     let epic = match param_str(&req.params, "epic") {
         Ok(value) => value.to_owned(),
         Err(error) => return err_response(&derive_key("epic_drive", None, None, None), &error),

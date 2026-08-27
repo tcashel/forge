@@ -1101,3 +1101,370 @@ fn unresolved_input_reparks_but_resolution_wakes_the_next_tick() {
         let _ = killpg(Pid::from_raw(pid), Signal::SIGKILL);
     }
 }
+
+/// Seconds from `earlier` to `later`, both widened RFC3339 stamps.
+fn seconds_between(earlier: &str, later: &str) -> f64 {
+    let earlier: jiff::Timestamp = earlier.parse().expect("parse earlier stamp");
+    let later: jiff::Timestamp = later.parse().expect("parse later stamp");
+    (later.as_nanosecond() - earlier.as_nanosecond()) as f64 / 1e9
+}
+
+/// Give replacement admission room while a dead controller's attempt still
+/// charges the default single repository-write slot — the same shape the
+/// restart-singleton fixture uses.
+fn raise_admission_limits(env: &TestEnv) {
+    let config_path = env.anvil.join("config.json");
+    let mut config: Value = serde_json::from_str(
+        &std::fs::read_to_string(&config_path).expect("read admission config"),
+    )
+    .expect("config JSON");
+    config["admission"] = json!({
+        "totalActive": 8,
+        "providerActive": 4,
+        "repositoryWriteActive": 2,
+        "deferSeconds": 60,
+    });
+    std::fs::write(
+        &config_path,
+        serde_json::to_vec_pretty(&config).expect("serialize admission config"),
+    )
+    .expect("write admission config");
+}
+
+fn terminal_marker(generation: Option<u32>, message: &str, recoverable: bool) -> Value {
+    json!({
+        "schemaVersion": 1,
+        "generation": generation,
+        "code": "INVALID_REQUEST",
+        "message": message,
+        "recoverable": recoverable,
+    })
+}
+
+#[test]
+fn nonrecoverable_terminal_halts_without_charging_the_budget() {
+    if !require_serialized_runner() {
+        return;
+    }
+    let env = TestEnv::new("supervise-halt-nonrecoverable");
+    raise_admission_limits(&env);
+    start_run(&env, "run-halt");
+    env.set_scenario("implement", "hang", 2);
+    let (code, submitted) = env.forged(&["run", "submit", "--run", "run-halt"]);
+    assert_eq!(code, 0, "submit: {submitted}");
+    let first_pid = controller_pid(&submitted);
+    wait_until("first controller provider start", || {
+        implementation_starts(&env, "run-halt") == 1
+    });
+    killpg(Pid::from_raw(first_pid), Signal::SIGKILL).expect("kill controller group");
+    wait_until("controller group death", || !process_group_alive(first_pid));
+
+    let message = "unsupported reasoning effort \"max\": rejected by provider";
+    let ledger = env.ledger();
+    ledger
+        .append_event(
+            Some("run-halt"),
+            "forged.controller.terminal",
+            terminal_marker(Some(1), message, false),
+        )
+        .expect("terminal marker");
+    ledger
+        .record_desired_outcome(
+            DesiredSubjectKind::Run,
+            "run-halt",
+            DesiredState::Running,
+            DesiredReconcileOutcome::Authorized,
+            Some("2000-01-01T00:00:00.000000000Z".to_owned()),
+            None,
+        )
+        .expect("make dead controller due");
+    ledger.close().expect("close");
+
+    let (code, tick) = env.forged(&["supervise", "--once"]);
+    assert_eq!(code, 0, "halt tick: {tick}");
+    assert_eq!(tick["result"]["subjects"][0]["action"], json!("halted"));
+
+    let ledger = env.ledger();
+    let desired = ledger
+        .get_desired_work(DesiredSubjectKind::Run, "run-halt")
+        .expect("desired query")
+        .expect("desired row");
+    assert_eq!(
+        desired.last_outcome,
+        Some(DesiredReconcileOutcome::Exhausted)
+    );
+    assert!(desired.exhausted_at.is_some(), "halt is durable");
+    assert_eq!(desired.restart_used, 0, "a halt charges no restart budget");
+    assert!(
+        desired.next_wake_at.is_none(),
+        "a halted subject is not due"
+    );
+    let error = desired.last_error.as_deref().expect("halt evidence");
+    assert!(error.contains("halted after one nonrecoverable"), "{error}");
+    assert!(error.contains("unsupported reasoning effort"), "{error}");
+    let events = ledger
+        .list_events(Some("run-halt"), 0, 65_536)
+        .expect("events");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == "forged.controller.started")
+            .count(),
+        1,
+        "no replacement controller was spawned"
+    );
+    let attention: Vec<_> = events
+        .iter()
+        .filter(|event| event.kind == "forged.supervisor.attention")
+        .collect();
+    assert_eq!(attention.len(), 1, "exactly one attention event");
+    assert!(
+        attention[0]
+            .payload_json
+            .contains("restart-budget-exhausted"),
+        "{}",
+        attention[0].payload_json
+    );
+    assert!(
+        attention[0]
+            .payload_json
+            .contains("unsupported reasoning effort"),
+        "attention detail names the recorded failure: {}",
+        attention[0].payload_json
+    );
+    ledger.close().expect("close");
+
+    // A halted subject is not due: another tick neither respawns nor
+    // duplicates attention.
+    let (code, second) = env.forged(&["supervise", "--once"]);
+    assert_eq!(code, 0, "idle tick: {second}");
+    let ledger = env.ledger();
+    assert_eq!(
+        ledger
+            .list_events(Some("run-halt"), 0, 65_536)
+            .expect("events")
+            .into_iter()
+            .filter(|event| event.kind == "forged.supervisor.attention")
+            .count(),
+        1
+    );
+    ledger.close().expect("close");
+
+    // The typed recovery: a bare resubmit authorizes the next control
+    // revision with a fresh budget.
+    let (code, resubmitted) = env.forged(&["run", "submit", "--run", "run-halt"]);
+    assert_eq!(code, 0, "resubmit after halt: {resubmitted}");
+    let ledger = env.ledger();
+    let desired = ledger
+        .get_desired_work(DesiredSubjectKind::Run, "run-halt")
+        .expect("desired query")
+        .expect("desired row");
+    assert_eq!(desired.desired_state, DesiredState::Running);
+    assert!(desired.exhausted_at.is_none(), "resubmit clears the halt");
+    assert_eq!(desired.restart_used, 0);
+    assert_eq!(desired.control_revision, 2);
+    ledger.close().expect("close");
+
+    // Kill confirmation DEFERS while the resubmitted controller's start
+    // time is not yet recorded, so the cleanup stop retries until the
+    // identity is verifiable instead of racing it.
+    wait_until("halt fixture stop lands", || {
+        env.forged(&[
+            "run",
+            "stop",
+            "--run",
+            "run-halt",
+            "--outcome",
+            "cancelled",
+            "--reason",
+            "halt fixture cleanup",
+        ])
+        .0 == 0
+    });
+    let record: Value = serde_json::from_slice(
+        &std::fs::read(env.anvil.join("runs/run-halt/controller/controller.json"))
+            .expect("controller record"),
+    )
+    .expect("controller JSON");
+    let pid = record["driver"]["pid"]
+        .as_i64()
+        .and_then(|pid| i32::try_from(pid).ok())
+        .expect("resubmitted controller pid");
+    wait_until("resubmitted controller group death", || {
+        !process_group_alive(pid)
+    });
+}
+
+#[test]
+fn recoverable_terminal_restarts_with_evidence_and_backoff() {
+    if !require_serialized_runner() {
+        return;
+    }
+    let env = TestEnv::new("supervise-restart-evidence");
+    raise_admission_limits(&env);
+    start_run(&env, "run-backoff");
+    env.set_scenario("implement", "hang", 4);
+    let (code, submitted) = env.forged(&["run", "submit", "--run", "run-backoff"]);
+    assert_eq!(code, 0, "submit: {submitted}");
+    let first_pid = controller_pid(&submitted);
+    wait_until("first controller provider start", || {
+        implementation_starts(&env, "run-backoff") == 1
+    });
+    killpg(Pid::from_raw(first_pid), Signal::SIGKILL).expect("kill first controller group");
+    wait_until("first controller group death", || {
+        !process_group_alive(first_pid)
+    });
+
+    let ledger = env.ledger();
+    ledger
+        .append_event(
+            Some("run-backoff"),
+            "forged.controller.terminal",
+            terminal_marker(Some(1), "transient boot failure", true),
+        )
+        .expect("terminal marker");
+    ledger
+        .record_desired_outcome(
+            DesiredSubjectKind::Run,
+            "run-backoff",
+            DesiredState::Running,
+            DesiredReconcileOutcome::Authorized,
+            Some("2000-01-01T00:00:00.000000000Z".to_owned()),
+            None,
+        )
+        .expect("make dead controller due");
+    ledger.close().expect("close");
+
+    let (code, tick) = env.forged(&["supervise", "--once"]);
+    assert_eq!(code, 0, "restart tick: {tick}");
+    assert_eq!(tick["result"]["subjects"][0]["action"], json!("restarted"));
+    let ledger = env.ledger();
+    let desired = ledger
+        .get_desired_work(DesiredSubjectKind::Run, "run-backoff")
+        .expect("desired query")
+        .expect("desired row");
+    assert_eq!(desired.restart_used, 1);
+    assert_eq!(desired.controller_generation, 2);
+    assert_eq!(
+        desired.last_error.as_deref(),
+        Some("restarted after controller failure: transient boot failure"),
+        "a recoverable death restarts WITH its evidence preserved"
+    );
+    let wake = desired.next_wake_at.as_deref().expect("restart wake");
+    assert!(
+        seconds_between(&desired.updated_at, wake) >= 4.0,
+        "first restart observes at the flat cadence: {} -> {wake}",
+        desired.updated_at
+    );
+    ledger.close().expect("close");
+
+    // Kill the replacement WITHOUT a fresh terminal marker: the stale
+    // generation-1 marker must not halt generation 2 — this death takes the
+    // ordinary restart with a doubled backoff.
+    let record: Value = serde_json::from_slice(
+        &std::fs::read(
+            env.anvil
+                .join("runs/run-backoff/controller/controller.json"),
+        )
+        .expect("controller record"),
+    )
+    .expect("controller JSON");
+    assert_eq!(record["generation"], json!(2));
+    let second_pid = record["driver"]["pid"]
+        .as_i64()
+        .and_then(|pid| i32::try_from(pid).ok())
+        .expect("second controller pid");
+    killpg(Pid::from_raw(second_pid), Signal::SIGKILL).expect("kill second controller group");
+    wait_until("second controller group death", || {
+        !process_group_alive(second_pid)
+    });
+    let ledger = env.ledger();
+    ledger
+        .record_desired_outcome(
+            DesiredSubjectKind::Run,
+            "run-backoff",
+            DesiredState::Running,
+            DesiredReconcileOutcome::Authorized,
+            Some("2000-01-01T00:00:00.000000000Z".to_owned()),
+            None,
+        )
+        .expect("make second death due");
+    ledger.close().expect("close");
+
+    let (code, tick) = env.forged(&["supervise", "--once"]);
+    assert_eq!(code, 0, "second restart tick: {tick}");
+    assert_eq!(tick["result"]["subjects"][0]["action"], json!("restarted"));
+    let ledger = env.ledger();
+    let desired = ledger
+        .get_desired_work(DesiredSubjectKind::Run, "run-backoff")
+        .expect("desired query")
+        .expect("desired row");
+    assert_eq!(desired.restart_used, 2);
+    assert_eq!(desired.controller_generation, 3);
+    let wake = desired.next_wake_at.as_deref().expect("backoff wake");
+    assert!(
+        seconds_between(&desired.updated_at, wake) >= 9.0,
+        "the second restart doubles the observation backoff: {} -> {wake}",
+        desired.updated_at
+    );
+    ledger.close().expect("close");
+
+    let record: Value = serde_json::from_slice(
+        &std::fs::read(
+            env.anvil
+                .join("runs/run-backoff/controller/controller.json"),
+        )
+        .expect("controller record"),
+    )
+    .expect("controller JSON");
+    let third_pid = record["driver"]["pid"]
+        .as_i64()
+        .and_then(|pid| i32::try_from(pid).ok())
+        .expect("third controller pid");
+    let (code, cleanup) = env.forged(&[
+        "run",
+        "stop",
+        "--run",
+        "run-backoff",
+        "--outcome",
+        "cancelled",
+        "--reason",
+        "backoff fixture cleanup",
+    ]);
+    assert_eq!(code, 0, "stop backoff fixture: {cleanup}");
+    wait_until("third controller group death", || {
+        !process_group_alive(third_pid)
+    });
+}
+
+#[test]
+fn a_terminal_drive_error_records_durable_evidence() {
+    if !require_serialized_runner() {
+        return;
+    }
+    let env = TestEnv::new("supervise-terminal-marker");
+    let (code, response) = env.forged(&["run", "drive", "--run", "missing-run"]);
+    assert_ne!(code, 0, "driving a missing run fails: {response}");
+    let message = response["error"]["message"]
+        .as_str()
+        .expect("error message")
+        .to_owned();
+    let ledger = env.ledger();
+    let terminals: Vec<_> = ledger
+        .list_events(Some("missing-run"), 0, 65_536)
+        .expect("events")
+        .into_iter()
+        .filter(|event| event.kind == "forged.controller.terminal")
+        .collect();
+    assert_eq!(terminals.len(), 1, "one terminal marker per terminal exit");
+    let payload: Value =
+        serde_json::from_str(&terminals[0].payload_json).expect("terminal payload");
+    assert_eq!(payload["subjectId"], json!("missing-run"));
+    assert_eq!(
+        payload["generation"],
+        Value::Null,
+        "a foreground drive records no generation and can never gate a halt"
+    );
+    assert_eq!(payload["message"], json!(message));
+    ledger.close().expect("close");
+}

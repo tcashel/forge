@@ -840,6 +840,42 @@ async fn reconcile_claimed(
         .await;
     }
 
+    // A death whose own terminal record says `recoverable: false` is
+    // deterministic configuration/setup truth, not a liveness blip: a
+    // restart replays it byte-for-byte. Halt after this first death — no
+    // budget charge, no respawn — and surface the recorded failure with the
+    // typed resubmit recovery. Only a terminal matching the exact dead
+    // generation gates; a generation-less or stale marker never halts.
+    let terminal = latest_controller_terminal(ctx, &row.subject_id)
+        .await?
+        .filter(|terminal| {
+            observed_generation > 0 && terminal.generation == Some(observed_generation)
+        });
+    if let Some(terminal) = terminal.as_ref() {
+        if !terminal.recoverable {
+            return finish_action(
+                ctx,
+                &row,
+                &token,
+                "halted",
+                DesiredReconcileUpdate {
+                    desired_state: None,
+                    outcome: DesiredReconcileOutcome::Exhausted,
+                    controller_generation: None,
+                    predecessor_generation: Some(observed_generation),
+                    next_wake_at: None,
+                    last_progress_at: None,
+                    last_error: Some(format!(
+                        "halted after one nonrecoverable controller failure: {}",
+                        terminal.message
+                    )),
+                    attention_condition: Some("restart-budget-exhausted".to_owned()),
+                },
+            )
+            .await;
+        }
+    }
+
     let kind = row.subject_kind;
     let id = row.subject_id.clone();
     let reserve_token = token.clone();
@@ -891,6 +927,16 @@ async fn reconcile_claimed(
     {
         Ok(controller) => {
             crate::failpoint::hit("supervisor.spawn.after");
+            // The post-restart wake backs off exponentially with the budget
+            // already spent, mirroring the spawn-failure schedule: a
+            // controller dying at boot must not be re-observed — and so
+            // re-restarted — at the flat poll cadence (six generations in 43
+            // seconds was the incident shape). The just-spawned controller
+            // holds no live attempts, so no stage deadline is outwaited, and
+            // an adoption on the next wake returns to the flat cadence.
+            let backoff = POLL_SECONDS
+                .saturating_mul(2u64.saturating_pow(reserved.restart_used.saturating_sub(1)))
+                .min(MAX_BACKOFF_SECONDS);
             let reconciled = finish(
                 ctx,
                 &reserved,
@@ -900,9 +946,13 @@ async fn reconcile_claimed(
                     outcome: DesiredReconcileOutcome::Restarted,
                     controller_generation: Some(generation),
                     predecessor_generation: predecessor,
-                    next_wake_at: Some(subject_observation_wake(ctx, &reserved).await?),
+                    next_wake_at: Some(deadline_after(&now_iso(), backoff)?),
                     last_progress_at: last_progress(ctx, &reserved.subject_id).await?,
-                    last_error: None,
+                    // The dead generation's recorded failure rides through
+                    // the restart so exhaustion still names it.
+                    last_error: terminal.as_ref().map(|terminal| {
+                        format!("restarted after controller failure: {}", terminal.message)
+                    }),
                     attention_condition: None,
                 },
             )
@@ -926,6 +976,44 @@ async fn reconcile_claimed(
         }
         Err(error) => finish_spawn_failure(ctx, &reserved, &token, error.to_string()).await,
     }
+}
+
+/// A drive loop's recorded terminal failure, parsed fail-open: a malformed
+/// or generation-less marker must never halt supervision, so absence and
+/// unparseable payloads read as "recoverable, unknown generation".
+struct ControllerTerminal {
+    generation: Option<u32>,
+    message: String,
+    recoverable: bool,
+}
+
+async fn latest_controller_terminal(
+    ctx: &Ctx,
+    subject_id: &str,
+) -> Result<Option<ControllerTerminal>, Failure> {
+    let id = subject_id.to_owned();
+    let row = on_ledger(&ctx.ledger, move |ledger| {
+        ledger.latest_event_of_kind(&id, handoff::CONTROLLER_TERMINAL_EVENT)
+    })
+    .await?;
+    Ok(row.and_then(|row| {
+        let payload: Value = serde_json::from_str(&row.payload_json).ok()?;
+        Some(ControllerTerminal {
+            generation: payload
+                .get("generation")
+                .and_then(Value::as_u64)
+                .and_then(|value| u32::try_from(value).ok()),
+            message: payload
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("controller terminal failure")
+                .to_owned(),
+            recoverable: payload
+                .get("recoverable")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
+        })
+    }))
 }
 
 async fn finish_spawn_failure(
