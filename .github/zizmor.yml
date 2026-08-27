@@ -1,0 +1,15 @@
+# zizmor suppressions. Each entry must state why the finding does not apply;
+# an unexplained ignore is a finding in itself.
+
+rules:
+  # cache-poisoning fires on release.yml because it both publishes artifacts
+  # (tag trigger) and restores caches. The published binaries are immune by
+  # construction: the `package` jobs install rustup manually and use no cache
+  # action at all. The flagged jobs are assurance-only (preflight/test/
+  # failpoints and their darwin twins) — they produce no artifacts, save no
+  # caches (cache-save-if is false throughout release.yml), and tag runs can
+  # only restore caches written by trusted push-to-main runs, never by PR
+  # branches. zizmor itself rates the finding Low confidence.
+  cache-poisoning:
+    ignore:
+      - release.yml
