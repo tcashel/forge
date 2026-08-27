@@ -145,11 +145,15 @@ jobs:
         with:
           export-gated-test-env: 'true'
 
+      - uses: taiki-e/install-action@fcf5432d9f50d67e37ee6e29bdb7a224ff67b4a7 # v2.86.8
+        with:
+          tool: cargo-nextest@0.9.143
+
       - name: Build
         run: cargo build --workspace --locked
 
       - name: Test
-        run: cargo test --workspace
+        run: cargo nextest run --workspace
 
       - name: Verify binary version
         run: test "$(target/debug/forged --version)" = "forged $VERSION"
@@ -173,8 +177,12 @@ jobs:
         with:
           export-gated-test-env: 'true'
 
+      - uses: taiki-e/install-action@fcf5432d9f50d67e37ee6e29bdb7a224ff67b4a7 # v2.86.8
+        with:
+          tool: cargo-nextest@0.9.143
+
       - name: Failpoint matrix
-        run: cargo test -p forged --features failpoints
+        run: cargo nextest run -p forged --features failpoints
 
   package:
     if: success() && startsWith(github.ref, 'refs/tags/')

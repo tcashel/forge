@@ -52,11 +52,15 @@ jobs:
           # so near-duplicate multi-GB caches don't pile up in the pool.
           cache-save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
+      - uses: taiki-e/install-action@fcf5432d9f50d67e37ee6e29bdb7a224ff67b4a7 # v2.86.8
+        with:
+          tool: cargo-nextest@0.9.143
+
       - name: build
         run: cargo build --workspace --locked
 
       - name: test
-        run: cargo test --workspace
+        run: cargo nextest run --workspace
 
   failpoints:
     runs-on: ubuntu-latest
@@ -70,11 +74,15 @@ jobs:
           # so near-duplicate multi-GB caches don't pile up in the pool.
           cache-save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
+      - uses: taiki-e/install-action@fcf5432d9f50d67e37ee6e29bdb7a224ff67b4a7 # v2.86.8
+        with:
+          tool: cargo-nextest@0.9.143
+
       # The failpoint kill-matrix — the bd-gated cases SKIP loudly when no
       # sandboxed bd 1.2.1 binary is present, and the genuine-expiry variant
       # stays #[ignore]d (run deliberately with FORGED_SLOW_TESTS=1).
       - name: failpoints
-        run: cargo test -p forged --features failpoints
+        run: cargo nextest run -p forged --features failpoints
 
   # Exists so branch protection can require one stable check name.
   ci-ok:

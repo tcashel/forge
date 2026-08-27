@@ -1,0 +1,13 @@
+# Serialization contract for the `supervise` integration tests. Those cases
+# create, SIGSTOP, and SIGCONT real detached process groups and assert
+# production deadline bounds against the wall clock, so they must never
+# co-schedule with each other. This group replaces the in-binary Mutex they
+# used to take: nextest runs every test in its own process, where a
+# process-local lock serializes nothing.
+
+[test-groups]
+supervise-process-fixtures = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'package(=forged) & binary(=supervise)'
+test-group = 'supervise-process-fixtures'

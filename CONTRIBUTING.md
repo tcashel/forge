@@ -10,9 +10,12 @@ bash scripts/validate-plugin.sh
 cargo fmt   --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo build --workspace --locked
-cargo test  --workspace
-cargo test -p forged --features failpoints
+cargo nextest run --workspace
+cargo nextest run -p forged --features failpoints
 ```
+
+The two test gates run under [cargo-nextest](https://nexte.st), installed once
+with `cargo install cargo-nextest --locked` or from a prebuilt binary.
 
 CI runs the `cargo` gates above in parallel jobs (`lint`, `test`,
 `failpoints`); a PR must pass the `ci-ok` aggregate check before it can

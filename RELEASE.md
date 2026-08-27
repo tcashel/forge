@@ -62,8 +62,8 @@ bash scripts/test-install.sh
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo build --workspace --locked
-cargo test --workspace
-cargo test -p forged --features failpoints
+cargo nextest run --workspace
+cargo nextest run -p forged --features failpoints
 cargo run --quiet -p forged -- --version
 git diff --check
 ```
