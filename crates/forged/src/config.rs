@@ -39,6 +39,10 @@ pub struct ForgedConfig {
     pub db_path: PathBuf,
     pub config_path: PathBuf,
     pub config_file_read: bool,
+    /// The sha256 of the config file bytes this snapshot resolved from;
+    /// `None` when no file was read. This is the reload fingerprint: a
+    /// long-lived surface refreshes only when the digest stops matching.
+    pub config_sha256: Option<String>,
     /// Legacy default projection retained for pre-definition test fixtures.
     pub roster: HashMap<Stage, ProviderHints>,
     pub profiles: BTreeMap<String, ProfileDefinitionV1>,
@@ -454,7 +458,11 @@ impl ForgedConfig {
     pub fn load() -> Result<ForgedConfig, String> {
         let anvil_home = anvil_home();
         let config_path = config_path(&anvil_home);
-        let (file, config_file_read) = match std::fs::read_to_string(&config_path) {
+        Self::load_at(anvil_home, config_path)
+    }
+
+    fn load_at(anvil_home: PathBuf, config_path: PathBuf) -> Result<ForgedConfig, String> {
+        let (file, config_file_read, config_sha256) = match std::fs::read_to_string(&config_path) {
             Ok(text) => {
                 let parsed = if config_path.extension().and_then(|v| v.to_str()) == Some("json") {
                     serde_json::from_str(&text).map_err(|e| e.to_string())
@@ -462,9 +470,11 @@ impl ForgedConfig {
                     serde_yaml::from_str(&text).map_err(|e| e.to_string())
                 }
                 .map_err(|e| format!("config {} does not parse: {e}", config_path.display()))?;
-                (parsed, true)
+                (parsed, true, Some(content_sha256(text.as_bytes())))
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (ConfigFile::default(), false),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                (ConfigFile::default(), false, None)
+            }
             Err(e) => return Err(format!("config {}: {e}", config_path.display())),
         };
 
@@ -509,6 +519,7 @@ impl ForgedConfig {
             db_path: forged_ledger::default_db_path(),
             config_path,
             config_file_read,
+            config_sha256,
             roster: legacy_roster,
             profiles,
             rosters,
@@ -532,6 +543,42 @@ impl ForgedConfig {
             admission,
             anvil_home,
         })
+    }
+
+    /// Re-resolve this snapshot's config file, refreshing every
+    /// file-derived field. The identity anchors — `db_path`, `runs_root`,
+    /// `beads_dir` — are preserved from this snapshot: a live config edit
+    /// may retune rosters, profiles, pricing, or admission, but it must
+    /// never re-point durable state out from under an open surface.
+    pub fn reload(&self) -> Result<ForgedConfig, String> {
+        let mut fresh = Self::load_at(self.anvil_home.clone(), self.config_path.clone())?;
+        fresh.db_path = self.db_path.clone();
+        fresh.runs_root = self.runs_root.clone();
+        fresh.beads_dir = self.beads_dir.clone();
+        Ok(fresh)
+    }
+
+    /// The reload gate for long-lived surfaces: `Ok(None)` when the config
+    /// file still matches this snapshot's fingerprint, `Ok(Some(fresh))`
+    /// when it changed (including appearing or disappearing). A snapshot
+    /// that never read a file and still finds none is unchanged by
+    /// definition — a hand-built config with no backing file never
+    /// reloads over itself.
+    pub fn refreshed(&self) -> Result<Option<ForgedConfig>, String> {
+        match std::fs::read(&self.config_path) {
+            Ok(bytes) => {
+                if self.config_sha256.as_deref() == Some(content_sha256(&bytes).as_str()) {
+                    return Ok(None);
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if self.config_sha256.is_none() {
+                    return Ok(None);
+                }
+            }
+            Err(e) => return Err(format!("config {}: {e}", self.config_path.display())),
+        }
+        self.reload().map(Some)
     }
 
     /// Resolve, validate, canonicalize, and hash a selected definition.
@@ -1162,6 +1209,15 @@ fn compatibility_projection_resolved(
     )
 }
 
+fn content_sha256(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut hex = String::with_capacity(64);
+    for byte in digest {
+        let _ = write!(&mut hex, "{byte:02x}");
+    }
+    hex
+}
+
 fn digest_of<T: Serialize>(value: &T) -> Result<String, String> {
     let value = serde_json::to_value(value).map_err(|e| e.to_string())?;
     let bytes = canonical_json_bytes(&value).map_err(|e| e.to_string())?;
@@ -1206,6 +1262,7 @@ pub(crate) fn scratch_config(anvil_home: &std::path::Path) -> ForgedConfig {
         db_path: anvil_home.join("state.db"),
         config_path: anvil_home.join("config.yaml"),
         config_file_read: false,
+        config_sha256: None,
         roster: default_legacy_roster(),
         profiles: default_profiles(),
         rosters: default_rosters(),
@@ -1235,6 +1292,7 @@ mod tests {
             db_path: PathBuf::from("/tmp/anvil/state.db"),
             config_path: PathBuf::from("/tmp/anvil/config.yaml"),
             config_file_read: false,
+            config_sha256: None,
             roster: default_legacy_roster(),
             profiles: default_profiles(),
             rosters: default_rosters(),
@@ -1921,5 +1979,53 @@ mod tests {
         for stage in [Stage::ReviewClaude, Stage::ReviewCodex, Stage::Fix] {
             assert_eq!(budgets[&stage], 1800, "missing {stage:?} keeps its default");
         }
+    }
+
+    #[test]
+    fn refreshed_reloads_only_when_the_file_content_changes() {
+        let dir = tempfile::tempdir().expect("scratch scope");
+        let path = dir.path().join("config.yaml");
+        std::fs::write(&path, "default_profile: standard\n").expect("write config");
+        let snapshot = ForgedConfig::load_at(dir.path().to_path_buf(), path.clone()).expect("load");
+        assert!(snapshot.config_sha256.is_some());
+        assert!(snapshot.refreshed().expect("unchanged gate").is_none());
+        std::fs::write(&path, "default_profile: high\n").expect("rewrite config");
+        let fresh = snapshot.refreshed().expect("changed gate").expect("reload");
+        assert_eq!(fresh.default_profile, "high");
+        // Identity anchors survive the reload.
+        assert_eq!(fresh.db_path, snapshot.db_path);
+        assert_eq!(fresh.runs_root, snapshot.runs_root);
+        assert_eq!(fresh.beads_dir, snapshot.beads_dir);
+        // A deleted file is a change too: every key back at its default.
+        std::fs::remove_file(&path).expect("remove config");
+        let defaulted = snapshot.refreshed().expect("removal gate").expect("reload");
+        assert!(!defaulted.config_file_read);
+        assert!(defaulted.config_sha256.is_none());
+    }
+
+    #[test]
+    fn a_hand_built_config_with_no_backing_file_never_reloads_over_itself() {
+        let dir = tempfile::tempdir().expect("scratch scope");
+        let snapshot = scratch_config(dir.path());
+        assert!(snapshot.refreshed().expect("absent gate").is_none());
+        // The file appearing IS a change, even for a hand-built snapshot.
+        std::fs::write(&snapshot.config_path, "default_profile: high\n").expect("write config");
+        let fresh = snapshot
+            .refreshed()
+            .expect("appearance gate")
+            .expect("reload");
+        assert_eq!(fresh.default_profile, "high");
+        assert_eq!(fresh.db_path, snapshot.db_path);
+    }
+
+    #[test]
+    fn a_malformed_rewrite_is_a_reload_error() {
+        let dir = tempfile::tempdir().expect("scratch scope");
+        let path = dir.path().join("config.yaml");
+        std::fs::write(&path, "default_profile: standard\n").expect("write config");
+        let snapshot = ForgedConfig::load_at(dir.path().to_path_buf(), path.clone()).expect("load");
+        std::fs::write(&path, "default_profile: [broken").expect("break config");
+        let error = snapshot.refreshed().expect_err("malformed gate");
+        assert!(error.contains("does not parse"), "{error}");
     }
 }

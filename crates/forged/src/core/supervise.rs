@@ -1328,8 +1328,33 @@ pub async fn supervise(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
     let mut ticks = 0u64;
     let mut last_report = Value::Null;
     let mut settlement = BeadSettlementPass::new();
+    // The daemon's config is decided fresh per tick, so a live edit to
+    // rosters, admission, or pricing is served without a service restart. A
+    // malformed mid-edit file keeps the last-good snapshot rather than
+    // stalling supervision.
+    let mut live = Ctx {
+        config: ctx.config.clone(),
+        ledger: ctx.ledger.clone(),
+    };
+    let mut config_reload_error: Option<String> = None;
     loop {
-        match tick(ctx, &mut settlement, false).await {
+        match live.config.refreshed() {
+            Ok(Some(config)) => {
+                live = Ctx {
+                    config,
+                    ledger: ctx.ledger.clone(),
+                };
+                config_reload_error = None;
+            }
+            Ok(None) => config_reload_error = None,
+            Err(error) => {
+                if config_reload_error.as_deref() != Some(error.as_str()) {
+                    eprintln!("forged: supervise keeps last-good config: {error}");
+                    config_reload_error = Some(error);
+                }
+            }
+        }
+        match tick(&live, &mut settlement, false).await {
             Ok(report) => {
                 ticks = ticks.saturating_add(1);
                 if let Some(observer) = observer.as_mut() {

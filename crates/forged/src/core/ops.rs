@@ -85,16 +85,22 @@ pub async fn doctor(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
                 Ok(detail) | Err(detail) => detail,
             },
         }));
+        // The digest names the exact content being SERVED, not merely that a
+        // file parses: an operator comparing it against the file on disk can
+        // prove whether a long-lived surface is behind an edit.
         probes.push(json!({
             "name": "config-file",
             "ok": true,
-            "detail": if ctx.config.config_file_read {
-                format!("read {}", ctx.config.config_path.display())
-            } else {
-                format!(
+            "detail": match (&ctx.config.config_file_read, &ctx.config.config_sha256) {
+                (true, Some(sha)) => format!(
+                    "serving {} (sha256 {})",
+                    ctx.config.config_path.display(),
+                    sha
+                ),
+                _ => format!(
                     "{} absent; every key at its documented default",
                     ctx.config.config_path.display()
-                )
+                ),
             },
         }));
         let (service_ok, service_detail) = crate::runtime::doctor_probe(&ctx.config).await;

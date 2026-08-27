@@ -829,10 +829,19 @@ impl WorkDetailArgs {
 /// call instead of being silently re-created blank (the precheck alone
 /// would race with deletion). A successful open (with legacy-state
 /// migration completed before any dispatch observes the ledger) latches
-/// once for the mount's lifetime.
+/// once for the mount's lifetime. The LEDGER latches; the CONFIG does not:
+/// every call re-fingerprints the config file so this long-lived surface
+/// serves the same file-derived truth a fresh CLI process would.
 struct McpState {
+    /// The mount's identity anchors; never reloaded.
     config: ForgedConfig,
-    ctx: tokio::sync::OnceCell<Arc<Ctx>>,
+    /// The last-good resolved config snapshot. Like "uninitialized", config
+    /// content is decided fresh on every call — latched in neither
+    /// direction — so a mid-session edit to rosters, profiles, pricing, or
+    /// admission is served without a remount. Identity anchors never
+    /// reload (see [`ForgedConfig::reload`]).
+    live: std::sync::Mutex<Arc<ForgedConfig>>,
+    ledger: tokio::sync::OnceCell<forged_ledger::Ledger>,
     #[cfg(test)]
     opens: std::sync::atomic::AtomicUsize,
 }
@@ -840,10 +849,27 @@ struct McpState {
 impl McpState {
     fn new(config: ForgedConfig) -> Self {
         Self {
+            live: std::sync::Mutex::new(Arc::new(config.clone())),
             config,
-            ctx: tokio::sync::OnceCell::new(),
+            ledger: tokio::sync::OnceCell::new(),
             #[cfg(test)]
             opens: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// The per-call config snapshot: unchanged file, cached parse; changed
+    /// file, one reload; malformed file, that call's refusal — the operator
+    /// can fix the file and the next call recovers.
+    fn fresh_config(&self) -> Result<Arc<ForgedConfig>, Failure> {
+        let current = self.live.lock().expect("config lock").clone();
+        match current.refreshed() {
+            Ok(None) => Ok(current),
+            Ok(Some(fresh)) => {
+                let fresh = Arc::new(fresh);
+                *self.live.lock().expect("config lock") = Arc::clone(&fresh);
+                Ok(fresh)
+            }
+            Err(message) => Err(Failure::invalid(message)),
         }
     }
 
@@ -853,11 +879,12 @@ impl McpState {
     /// The existence check is only the fast common-case refusal; the
     /// authority is [`McpState::open`]'s no-create open.
     async fn ctx(&self) -> Result<Arc<Ctx>, Failure> {
+        let config = self.fresh_config()?;
         // Only PROVEN absence earns the setup guidance; an inspection error
         // (permissions, an unreadable parent) is its own failure — routing
         // it to "run forged init" would send the operator to re-initialize
         // over state that exists.
-        match std::fs::metadata(&self.config.db_path) {
+        match std::fs::metadata(&config.db_path) {
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Err(self.uninitialized());
@@ -865,11 +892,19 @@ impl McpState {
             Err(error) => {
                 return Err(Failure::internal(format!(
                     "cannot inspect operator state at {}: {error}",
-                    self.config.db_path.display()
+                    config.db_path.display()
                 )));
             }
         }
-        self.ctx.get_or_try_init(|| self.open()).await.cloned()
+        let ledger = self
+            .ledger
+            .get_or_try_init(|| self.open(&config))
+            .await?
+            .clone();
+        Ok(Arc::new(Ctx {
+            config: (*config).clone(),
+            ledger,
+        }))
     }
 
     /// The uninitialized-scope refusal: the session mount's answer wherever
@@ -883,10 +918,10 @@ impl McpState {
         ))
     }
 
-    async fn open(&self) -> Result<Arc<Ctx>, Failure> {
+    async fn open(&self, config: &Arc<ForgedConfig>) -> Result<forged_ledger::Ledger, Failure> {
         #[cfg(test)]
         self.opens.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let db_path = self.config.db_path.clone();
+        let db_path = config.db_path.clone();
         let opened = tokio::task::spawn_blocking(move || {
             crate::failpoint::hit("mcp.ledger.open.before");
             forged_ledger::Ledger::open_existing(&db_path)
@@ -901,7 +936,7 @@ impl McpState {
             return Err(self.uninitialized());
         };
         let ctx = Arc::new(Ctx {
-            config: self.config.clone(),
+            config: (**config).clone(),
             ledger,
         });
         if let Err(failure) = migrate_legacy_state(&ctx).await {
@@ -910,7 +945,7 @@ impl McpState {
             let _ = ctx.ledger.clone().close();
             return Err(failure);
         }
-        Ok(ctx)
+        Ok(ctx.ledger.clone())
     }
 }
 
@@ -1462,8 +1497,8 @@ pub async fn serve(config: ForgedConfig) -> Result<(), String> {
     .await;
     // Close deliberately on the way out; a never-opened gate has nothing to
     // close.
-    if let Some(ctx) = state.ctx.get() {
-        let _ = ctx.ledger.clone().close();
+    if let Some(ledger) = state.ledger.get() {
+        let _ = ledger.clone().close();
     }
     result
 }
@@ -1485,8 +1520,9 @@ mod tests {
         std::fs::write(&state.config.db_path, b"").expect("touch state.db");
         let (a, b) = tokio::join!(state.ctx(), state.ctx());
         let (a, b) = (a.expect("first call opens"), b.expect("second call joins"));
-        assert!(Arc::ptr_eq(&a, &b), "both calls must observe one context");
+        // Contexts are per-call config snapshots; the LEDGER is the latch.
         assert_eq!(state.opens.load(Ordering::SeqCst), 1);
+        assert_eq!(a.config.db_path, b.config.db_path);
         a.ledger.clone().close().expect("close");
     }
 
@@ -1513,7 +1549,7 @@ mod tests {
             // Nothing latched and the writer was closed: every retry opens
             // from scratch instead of replaying a stored failure or
             // stacking a leaked writer thread per call.
-            assert!(state.ctx.get().is_none());
+            assert!(state.ledger.get().is_none());
             assert_eq!(state.opens.load(Ordering::SeqCst), expected_opens);
         }
     }
@@ -1558,5 +1594,53 @@ mod tests {
         let ctx = state.ctx().await.expect("the retrying call opens");
         assert_eq!(state.opens.load(Ordering::SeqCst), 2);
         ctx.ledger.clone().close().expect("close");
+    }
+
+    #[tokio::test]
+    async fn a_config_edit_is_visible_without_a_remount() {
+        let dir = tempfile::tempdir().expect("scratch scope");
+        let state = scratch_state(dir.path());
+        std::fs::write(&state.config.db_path, b"").expect("touch state.db");
+        let first = state.ctx().await.expect("mount");
+        assert_eq!(first.config.default_profile, "standard");
+        // The operator edits the file mid-session; the next call serves it
+        // with no remount and no second ledger open, and the identity
+        // anchors stay put.
+        std::fs::write(
+            &state.config.config_path,
+            b"default_profile: high\ntransport_retry_budget: 9\n",
+        )
+        .expect("write config");
+        let second = state.ctx().await.expect("post-edit call");
+        assert_eq!(second.config.default_profile, "high");
+        assert_eq!(second.config.transport_retry_budget, 9);
+        assert_eq!(second.config.db_path, first.config.db_path);
+        assert_eq!(state.opens.load(Ordering::SeqCst), 1);
+        first.ledger.clone().close().expect("close");
+    }
+
+    #[tokio::test]
+    async fn a_malformed_config_edit_refuses_that_call_and_recovers() {
+        let dir = tempfile::tempdir().expect("scratch scope");
+        let state = scratch_state(dir.path());
+        std::fs::write(&state.config.db_path, b"").expect("touch state.db");
+        let first = state.ctx().await.expect("mount");
+        std::fs::write(&state.config.config_path, b"default_profile: [broken")
+            .expect("write bad config");
+        let failed = match state.ctx().await {
+            Ok(_) => panic!("a malformed config cannot serve"),
+            Err(failure) => failure,
+        };
+        assert_eq!(failed.code, forged_types::ErrorCode::InvalidRequest);
+        assert!(
+            failed.message.contains("does not parse"),
+            "{}",
+            failed.message
+        );
+        // The operator fixes the file; the next call recovers in place.
+        std::fs::write(&state.config.config_path, b"default_profile: high\n").expect("fix config");
+        let recovered = state.ctx().await.expect("post-fix call");
+        assert_eq!(recovered.config.default_profile, "high");
+        first.ledger.clone().close().expect("close");
     }
 }
