@@ -49,7 +49,7 @@ jobs:
   # push. Cheap: no full workspace build, no package matrix. Everything here
   # must stay fast enough to run on every PR.
   preflight:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.version.outputs.tag }}
       version: ${{ steps.version.outputs.version }}
@@ -123,13 +123,18 @@ jobs:
 
   # Full workspace test suite. Tag-only: PRs get the fast doctor probe above,
   # not a second uncached run of the whole suite CI already covers.
+  #
+  # This job and `failpoints` restore rust.yml's caches (same job id, same
+  # env), so their runner image MUST match rust.yml's — restoring artifacts
+  # built against a newer glibc onto an older image fails with missing
+  # GLIBC_* symbols at publication time.
   test:
     # A custom `if` on a job with `needs` replaces the implicit success
     # check, not layers on it — `success()` must be explicit or a failed
     # preflight would not stop this job from starting on a tag push.
     if: success() && startsWith(github.ref, 'refs/tags/')
     needs: preflight
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     env:
       VERSION: ${{ needs.preflight.outputs.version }}
     steps:
@@ -163,7 +168,7 @@ jobs:
   failpoints:
     if: success() && startsWith(github.ref, 'refs/tags/')
     needs: preflight
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -239,6 +244,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # The Linux package legs stay on the OLDEST supported image on
+          # purpose: the build host's glibc is the floor shipped binaries
+          # demand of every user. These jobs use no cache action, so the
+          # image split from the ubuntu-latest assurance jobs cannot poison
+          # them.
           - runner: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             smoke: true
@@ -323,7 +333,7 @@ jobs:
   release:
     if: success() && startsWith(github.ref, 'refs/tags/')
     needs: [preflight, test, failpoints, test-macos, failpoints-macos, package]
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     permissions:
       contents: write
     env:

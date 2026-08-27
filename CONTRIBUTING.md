@@ -17,6 +17,21 @@ cargo nextest run -p forged --features failpoints
 The two test gates run under [cargo-nextest](https://nexte.st), installed once
 with `cargo install cargo-nextest --locked` or from a prebuilt binary.
 
+The suite has two deliberate layers, and nextest filtersets address each
+directly. Unit tests live in-source under `#[cfg(test)]`; integration and
+end-to-end tests live in each crate's `tests/` directory and mostly drive the
+real `forged` binary. For a fast inner loop, run just the units; run the
+integration layer before handing work off:
+
+```bash
+cargo nextest run --workspace -E 'kind(lib) | kind(bin)'   # units, seconds
+cargo nextest run --workspace -E 'kind(test)'              # integration/e2e
+```
+
+The gate remains the full unfiltered run above. Test results in CI are
+reported per binary, so the layers stay distinguishable in Codecov's Tests
+tab as well.
+
 CI runs the `cargo` gates above in parallel jobs (`lint`, `test`,
 `failpoints`); a PR must pass the `ci-ok` aggregate check before it can
 merge.
