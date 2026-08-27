@@ -14,6 +14,10 @@ cargo test  --workspace
 cargo test -p forged --features failpoints
 ```
 
+CI runs the `cargo` gates above in parallel jobs (`lint`, `test`,
+`failpoints`); a PR must pass the `ci-ok` aggregate check before it can
+merge.
+
 Use conventional-commit messages (`feat(scope): …`, lowercase, ≤ 70 chars).
 Design context lives in [`docs/adr/`](docs/adr/) — read
 [ADR-0032](docs/adr/0032-forged-provider-neutral-rust-orchestrator.md) first;

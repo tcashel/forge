@@ -5,8 +5,23 @@ on:
     branches: [main]
   pull_request:
 
+# One run per branch/ref at a time; only PR runs get cancelled by a newer
+# push (a push-to-main run is left to finish undisturbed).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Trims test-binary debuginfo to line tables only, to cut CI compile time.
+# This env block must stay identical to release.yml's: rust-cache hashes
+# CARGO*/RUST* env values into its cache key, and release.yml's test and
+# failpoints jobs restore the caches saved here (matched by job id).
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
+
 jobs:
-  gates:
+  lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -15,6 +30,9 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           components: rustfmt, clippy
+          # Only persist the cache from main; PR branches restore it read-only
+          # so near-duplicate multi-GB caches don't pile up in the pool.
+          cache-save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       - name: fmt
         run: cargo fmt --all -- --check
@@ -22,14 +40,48 @@ jobs:
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # Reads rust-toolchain.toml for the toolchain version; caches by default.
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          # Only persist the cache from main; PR branches restore it read-only
+          # so near-duplicate multi-GB caches don't pile up in the pool.
+          cache-save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+
       - name: build
         run: cargo build --workspace --locked
 
       - name: test
         run: cargo test --workspace
 
+  failpoints:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # Reads rust-toolchain.toml for the toolchain version; caches by default.
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          # Only persist the cache from main; PR branches restore it read-only
+          # so near-duplicate multi-GB caches don't pile up in the pool.
+          cache-save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+
       # The failpoint kill-matrix — the bd-gated cases SKIP loudly when no
       # sandboxed bd 1.2.1 binary is present, and the genuine-expiry variant
       # stays #[ignore]d (run deliberately with FORGED_SLOW_TESTS=1).
       - name: failpoints
         run: cargo test -p forged --features failpoints
+
+  # Exists so branch protection can require one stable check name.
+  ci-ok:
+    needs: [lint, test, failpoints]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: require all gates green
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped')
+        run: exit 1
