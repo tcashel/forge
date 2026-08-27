@@ -31,11 +31,19 @@ never a config edit.
 
 ```bash
 export ANVIL_HOME="${ANVIL_HOME:-$HOME/.anvil}"
-CONFIG="${FORGED_CONFIG:-$ANVIL_HOME/config.yaml}"
-test -f "$CONFIG" || CONFIG="$ANVIL_HOME/config.json"
+if [ -n "${FORGED_CONFIG:-}" ]; then
+  CONFIG="$FORGED_CONFIG"
+else
+  CONFIG="$ANVIL_HOME/config.yaml"
+  test -f "$CONFIG" || CONFIG="$ANVIL_HOME/config.json"
+fi
 cat "$CONFIG"
 forged definition validate
 ```
+
+A set `FORGED_CONFIG` is authoritative even when the file it names does not
+exist yet — Forged never falls back past it, so neither may this skill: edit
+the named path, never a legacy `config.json` beside it.
 
 If no config exists yet, route to `../setup/SKILL.md` first — `forged init`
 writes the commented default document; this skill refines it.
@@ -72,17 +80,26 @@ the outcome:
 | `synthesis` | readOnly | Adjudicates conflicting findings; strong reasoning, low volume — effort matters more than speed. |
 | `assessment` | readOnly | Fast and cheap; it is the rolling-epic monitor that reads state between waves. Correctness of judgment, not depth. |
 
-Hard rules `forged definition validate` enforces — design to them rather
-than discovering them:
+Two layers of hard rules apply, enforced at different moments — design to
+both rather than discovering them:
 
-- Review, synthesis, and assessment candidates must be read-only: sandbox
-  `readOnly`, capabilities `repositoryRead` + `structuredOutput`, and no
-  `repositoryWrite`. Implementation and remediation carry `repositoryWrite`
-  with sandbox `workspaceWrite`.
-- Rolling epics require a dedicated `assessment` role whose provider is
-  `claude`, `codex`, or `pi`, and whose candidates overlap **no** critique
-  candidate. Reusing a review model for assessment is rejected.
-- Ordering within a role is meaningful: earlier candidates are preferred.
+**`forged definition validate` proves shape.** Every role a profile seat
+names must exist with a non-empty candidate list, identifiers must be
+printable, and sandbox must agree with capabilities: `readOnly` forbids
+`repositoryWrite`, `workspaceWrite` requires it. Ordering within a role is
+meaningful: earlier candidates are preferred.
+
+**Rolling-epic rules are enforced only when the epic starts.** A roster
+that passes validation can still be refused at submission, and no CLI
+probe checks these earlier — never tell the operator validation covered
+them. Design to them upfront:
+
+- A dedicated `assessment` role whose every candidate is read-only
+  (`readOnly` sandbox, `repositoryRead` + `structuredOutput`, no
+  `repositoryWrite`) with provider `claude`, `codex`, or `pi`.
+- Read-only critique candidates — review and synthesis roles.
+- No assessment candidate may overlap any critique candidate; reusing a
+  review model for assessment is rejected at epic start.
 
 Candidate shape (camelCase keys, unknown fields rejected):
 
@@ -140,23 +157,30 @@ in `rowsMissingCost`, and raises `missing-cost` attention — that is honest,
 not broken; resolve it by adding real rates or explicitly accepting
 `accepted-unknown`.
 
-An entry needs the published per-million rates and the context window (which
-is what makes the long-context tier decision provable):
+A `pricing` block **replaces** the built-in card wholesale — it is one
+complete document, never merged with the defaults. Carry forward entries
+for every token-only model the rosters still name, and include the required
+`tools` rates; omitting either loses pricing or fails the parse:
 
 ```yaml
 pricing:
   rates_as_of: "2026-08-27"
   source: "<where these numbers were transcribed from>"
   long_context_threshold: 272000
+  tools:
+    web_search_per_1k: 10.00
   models:
     "org/custom-model:tag":
       context_window: 200000
       short: { input: 3.00, cached_input: 0.30, cache_write: 3.75, output: 15.00 }
       # long: only for models publishing a second tier
+    # ...plus an entry for every other token-only model the rosters name
 ```
 
-Transcribe rates from the provider's published pricing and record the date
-and source; the overview surfaces a stale card rather than hiding it.
+The context window is required — it is what makes the long-context tier
+decision provable. Transcribe rates from the provider's published pricing
+and record the date and source; the overview surfaces a stale card rather
+than hiding it.
 
 ## Apply and verify
 
