@@ -136,6 +136,13 @@ remain awake and available while local controllers and agents run.
 - Normal completion means a reviewed draft PR. Unsafe drift, exhausted budgets,
   ambiguity, or missing authority becomes explicit input-required state.
 
+## Test coverage
+
+[![coverage sunburst](https://codecov.io/gh/tcashel/forge/graphs/sunburst.svg)](https://codecov.io/gh/tcashel/forge)
+
+The inner ring is the workspace; each layer outward is a crate, directory,
+then file, sized by lines and colored by coverage.
+
 ## Documentation
 
 - [Lead-agent plugin and host setup](plugins/forged/README.md)
