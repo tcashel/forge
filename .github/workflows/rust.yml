@@ -24,7 +24,106 @@ env:
   CARGO_PROFILE_TEST_DEBUG: line-tables-only
 
 jobs:
+  # The contract this workflow keeps, in three clauses:
+  #
+  #   1. Every pull request produces a `ci-ok` verdict. `ci-ok` is the one
+  #      required check in the branch ruleset, so a run that never reports it
+  #      leaves the PR permanently unmergeable. That is why the cargo gates are
+  #      skipped by an `if:` on live jobs and never by `paths-ignore` on the
+  #      workflow, and why `ci-ok` runs with `if: always()`.
+  #   2. A documentation-only diff skips those cargo gates, and `ci-ok` still
+  #      reports success. Docs-only means every changed path is `**/*.md` or
+  #      lives under `docs/`; everything else is code, deliberately including
+  #      the workflow files themselves, Cargo.*, scripts, LICENSE and dotfiles.
+  #   3. The classification fails closed. Anything this job cannot settle with
+  #      certainty — an unknown event, an unreachable base commit, an empty
+  #      diff, any git error — is reported as code and the full suite runs.
+  #
+  # Hand-rolled rather than dorny/paths-filter: the classification is a dozen
+  # lines of shell that can be exercised locally, where the action would add a
+  # third-party `uses:` and want a token to reach the API — and this repo pins
+  # every action by full SHA and runs zizmor offline precisely to keep that
+  # surface small. Checkout is unshallow so the base commit is in history.
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.classify.outputs.code }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: classify changed paths
+        id: classify
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -uo pipefail
+
+          # Every abnormal exit lands here: report code and let the gates run.
+          fail_closed() {
+            echo "changes: $1 -- classifying as code" >&2
+            echo 'code=true' >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+
+          case "$EVENT_NAME" in
+            pull_request)
+              # HEAD is the PR merge commit, so `base...HEAD` is exactly the
+              # commits the PR contributes and nothing the base branch moved.
+              base="$PR_BASE_SHA"
+              range=("$base...HEAD")
+              ;;
+            push)
+              base="$PUSH_BEFORE_SHA"
+              # An empty or all-zero before-SHA is a new branch or first push:
+              # there is no predecessor to diff against.
+              case "$base" in
+                *[!0]*) ;;
+                *) fail_closed "push reports no predecessor commit" ;;
+              esac
+              range=("$base" 'HEAD')
+              ;;
+            *)
+              fail_closed "unhandled event '$EVENT_NAME'"
+              ;;
+          esac
+
+          if ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+            git fetch --no-tags --depth=1 origin "$base" 2>/dev/null || true
+            git cat-file -e "$base^{commit}" 2>/dev/null \
+              || fail_closed "base commit $base is not reachable"
+          fi
+
+          # `--no-renames` so a rename is reported as both paths. With rename
+          # detection on, moving `crates/**/main.rs` to `docs/main.md` reports
+          # only the destination and would read as docs-only, skipping the
+          # gates on a change that deleted a source file.
+          list="$RUNNER_TEMP/changed-paths"
+          git diff --name-only -z --no-renames "${range[@]}" -- > "$list" \
+            || fail_closed "git diff against $base failed"
+          [ -s "$list" ] || fail_closed "diff against $base is empty"
+
+          code=false
+          while IFS= read -r -d '' path; do
+            case "$path" in
+              docs/*|*.md) continue ;;
+              *) code=true; break ;;
+            esac
+          done < "$list"
+
+          echo 'changed paths:'
+          tr '\0' '\n' < "$list"
+          echo "code=$code"
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+
   lint:
+    needs: changes
+    # `success()` is not implied once a custom `if` is present (see `changes`).
+    if: success() && needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -46,6 +145,9 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
   test:
+    needs: changes
+    # `success()` is not implied once a custom `if` is present (see `changes`).
+    if: success() && needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     # Job-level, never workflow-level: the workflow env block above must stay
     # byte-identical to release.yml's or rust-cache's key diverges. NEXTEST_* is
@@ -86,6 +188,9 @@ jobs:
           flags: workspace
 
   failpoints:
+    needs: changes
+    # `success()` is not implied once a custom `if` is present (see `changes`).
+    if: success() && needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     env:
       NEXTEST_PROFILE: ci
@@ -122,16 +227,17 @@ jobs:
           flags: failpoints
 
   # Line coverage for the default feature set, reported to Codecov but not
-  # gated on. Push-only: a PR run would upload against an unmerged ref, and
-  # main is the baseline the badge and trend read from.
-  #
-  # This measures the workspace as it ships. The failpoint kill-matrix is
+  # gated on. This measures the workspace as it ships. The failpoint kill-matrix is
   # cfg'd out here — `failpoints` is off by default, so that code is not
   # compiled into this build and is neither covered nor counted against it.
   # Runs on PRs as well as main so Codecov can compare head against base and
   # post the PR coverage comment. Never part of ci-ok: coverage informs, it
-  # does not gate.
+  # does not gate — but it is change-gated like the others, so a docs push does
+  # not burn a twelve-minute instrumented run to reproduce the same number.
   coverage:
+    needs: changes
+    # `success()` is not implied once a custom `if` is present (see `changes`).
+    if: success() && needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -161,11 +267,59 @@ jobs:
           files: lcov.info
 
   # Exists so branch protection can require one stable check name.
+  # On a documentation-only change the cargo gates skip and this job still
+  # reports success, so the required check is answered on every run.
   ci-ok:
-    needs: [lint, test, failpoints]
+    needs: [changes, lint, test, failpoints]
     if: always()
     runs-on: ubuntu-latest
     steps:
+      # Spelled out rather than written as a contains() expression: this is the
+      # one thing branch protection trusts, so it must be readable as a whole.
+      # It fails closed in both directions — an unclassified run, a docs-only
+      # run where a gate did anything other than skip, or a code run where a
+      # gate did anything other than succeed, all fail here.
       - name: require all gates green
-        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped')
-        run: exit 1
+        env:
+          CHANGES: ${{ needs.changes.result }}
+          CODE: ${{ needs.changes.outputs.code }}
+          LINT: ${{ needs.lint.result }}
+          TEST: ${{ needs.test.result }}
+          FAILPOINTS: ${{ needs.failpoints.result }}
+        run: |
+          set -uo pipefail
+          echo "changes=${CHANGES:-} code=${CODE:-} lint=${LINT:-}" \
+               "test=${TEST:-} failpoints=${FAILPOINTS:-}"
+
+          if [ "${CHANGES:-}" != 'success' ]; then
+            echo "change detection reported '${CHANGES:-}'; nothing to certify" >&2
+            exit 1
+          fi
+
+          case "${CODE:-}" in
+            false)
+              # Docs-only. The gates must have skipped; anything else — a
+              # success included — means the graph did not do what this file
+              # says, and the verdict cannot be trusted.
+              for result in "${LINT:-}" "${TEST:-}" "${FAILPOINTS:-}"; do
+                if [ "$result" != 'skipped' ]; then
+                  echo "docs-only run, but a gate reported '$result'" >&2
+                  exit 1
+                fi
+              done
+              echo 'documentation-only change: cargo gates skipped'
+              ;;
+            true)
+              for result in "${LINT:-}" "${TEST:-}" "${FAILPOINTS:-}"; do
+                if [ "$result" != 'success' ]; then
+                  echo "a required gate reported '$result'" >&2
+                  exit 1
+                fi
+              done
+              echo 'all gates green'
+              ;;
+            *)
+              echo "change detection produced no usable verdict ('${CODE:-}')" >&2
+              exit 1
+              ;;
+          esac

@@ -203,12 +203,21 @@ service qualification.
   remote (`git tag -d vX.Y.Z && git push origin :refs/tags/vX.Y.Z`), and
   push the tag again once `main` is fixed. No release was ever created for
   that tag, so this is not moving or reusing a released tag.
-- If the `release` job itself fails partway (draft creation, asset assembly,
-  upload, verification, or publish), re-running just that job is safe:
-  `create-gh-release-action` deletes and recreates its draft release each
-  time it runs, so a stale partial draft is never left behind. The upstream
-  `test`, `failpoints`, and `package` jobs stay cached as green and do not
-  re-run.
+- If the `release` job fails BEFORE publication (draft creation, asset
+  assembly, upload, or draft verification), re-running just that job is
+  safe: `create-gh-release-action` deletes and recreates its draft release
+  each time it runs, so a stale partial draft is never left behind. The
+  upstream `test`, `failpoints`, and `package` jobs stay cached as green
+  and do not re-run.
+- If the job fails AFTER `gh release edit --draft=false` succeeds — one of
+  the read-back, immutability, or tag checks in the final step — the
+  release is already published and immutable, and re-running the job
+  cannot recover it: the version guard now sees this very release as
+  latest and refuses the rerun by design. Verify by hand instead, with the
+  same commands the step runs (`gh release view`, download the assets and
+  `sha256sum -c SHA256SUMS`, compare the tag SHA via `git ls-remote`). If
+  the published release is genuinely defective, do not touch it — mark it
+  withdrawn and prepare the next patch version.
 - Once a release is published (not draft) and marked immutable, never
   delete it, re-tag it, or move it. If its source or assets are wrong, leave
   an explicit record and prepare the next patch version.

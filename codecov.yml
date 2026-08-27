@@ -3,9 +3,16 @@
 
 coverage:
   status:
+    # Project coverage is a real (non-required) check: it compares against
+    # the auto-detected base and fails on a drop beyond the threshold. The
+    # 1% threshold absorbs run-to-run jitter from the e2e-heavy suite; the
+    # ruleset does not require this check, so red here informs but cannot
+    # block a merge.
     project:
       default:
-        informational: true
+        target: auto
+        threshold: 1%
+        base: auto
     patch:
       default:
         informational: true
@@ -14,6 +21,11 @@ comment:
   layout: "reach, diff, flags, files"
   behavior: default
   require_changes: false
+  require_base: false
+  require_head: true
+  # Show project-level coverage movement in the PR comment, not just the
+  # diff coverage.
+  hide_project_coverage: false
 
 # Integration-test sources are instrumented alongside the workspace; their
 # own line coverage is not a signal anyone acts on.
