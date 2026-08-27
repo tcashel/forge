@@ -1,0 +1,57 @@
+name: deny
+
+# Supply-chain policy over the resolved dependency graph (see deny.toml).
+#
+# Three triggers, for two different failure modes. The path-filtered push and
+# pull_request runs catch a *change we make* — a new dependency, a relaxed
+# policy. The weekly run catches a change made *to us*: an advisory published
+# against a dependency we already ship, which no commit of ours would trigger.
+# Without the schedule, a vulnerability disclosed the day after a merge stays
+# invisible until the next dependency edit.
+#
+# Not part of rust.yml's `ci-ok` needs: this observes, it does not gate.
+on:
+  pull_request:
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - crates/**/Cargo.toml
+      - deny.toml
+      - .github/workflows/deny.yml
+  push:
+    branches: [main]
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - crates/**/Cargo.toml
+      - deny.toml
+      - .github/workflows/deny.yml
+  schedule:
+    # Mondays, off the hour to avoid GitHub's peak-of-hour scheduling backlog.
+    - cron: '17 5 * * 1'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Matches release.yml: nothing here talks to git as us.
+          persist-credentials: false
+
+      - uses: taiki-e/install-action@fcf5432d9f50d67e37ee6e29bdb7a224ff67b4a7 # v2.86.8
+        with:
+          tool: cargo-deny@0.20.2
+
+      # Runs every check: advisories, bans, licenses, sources. No Rust
+      # toolchain setup — cargo-deny reads Cargo.lock and the registry index,
+      # and never builds the workspace.
+      - name: cargo deny
+        run: cargo deny check

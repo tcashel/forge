@@ -15,8 +15,8 @@ survives in git history only. If you find yourself looking for `bin/forge.ts`,
 cargo fmt   --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo build --workspace --locked
-cargo test  --workspace
-cargo test -p forged --features failpoints
+cargo nextest run --workspace
+cargo nextest run -p forged --features failpoints
 ```
 
 CI (`.github/workflows/rust.yml`) runs exactly these. The bd-gated tests use
@@ -29,6 +29,15 @@ versions are intentionally exercised rather than rejected by a version pin.
 The genuine lease-expiry case is `#[ignore]`d (5+ real minutes) — run it
 deliberately with `FORGED_SLOW_TESTS=1 cargo test -p forged --features
 failpoints -- --ignored --nocapture` when you touch lease code.
+
+The two `cargo nextest run` gates need `cargo-nextest` on `PATH` (a
+development tool, not a Cargo dependency — cargo cannot declare binary tool
+deps); the operator installs it, never an agent. Its config at
+`.config/nextest.toml` carries the serialization contract for
+`crates/forged/tests/supervise.rs`. Under any other runner — plain
+`cargo test` included — those cases SKIP loudly unless `RUST_TEST_THREADS=1`
+marks a deliberately serial run. If you see those skips, switch runners; never
+reintroduce an in-process lock to chase them.
 
 ## Invariants that must never be broken
 

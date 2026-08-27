@@ -1,0 +1,111 @@
+# cargo-deny policy. Enforced by .github/workflows/deny.yml, which observes
+# rather than gates: it is deliberately absent from rust.yml's `ci-ok` needs.
+#
+# The allow-list below is the minimal set that covers the resolved graph — it
+# was computed from `cargo metadata`, not copied from a template. Every entry
+# is load-bearing: dropping any one of them leaves at least one crate
+# unsatisfiable. Add a license here only after a real crate demands it.
+
+[advisories]
+# Vulnerabilities are always denied; cargo-deny removed the `vulnerability`
+# lint level, so declaring one here would be a deprecated-field error.
+#
+# `unmaintained` is a *scope*, not a lint level — there is no "warn" to set.
+# Scoped to `workspace` so an unmaintained transitive crate reports without
+# failing the run, keeping published vulnerabilities the only hard signal.
+unmaintained = "workspace"
+yanked = "warn"
+
+[licenses]
+allow = [
+    # Covers every permissive dual-license in the graph (`MIT OR Apache-2.0`,
+    # the deprecated `MIT/Apache-2.0` slash form, `Unlicense OR MIT`, and the
+    # `... OR MIT` tails on rustix/zerocopy/r-efi).
+    "MIT",
+    # Required outright by memo-map, minijinja, rmcp, rmcp-macros, and as the
+    # only permissive branch of ryu's `Apache-2.0 OR BSL-1.0`.
+    "Apache-2.0",
+    # unicode-ident is `(MIT OR Apache-2.0) AND Unicode-3.0` — the AND makes
+    # this mandatory, not a dual-license alternative.
+    "Unicode-3.0",
+    # sha1_smol.
+    "BSD-3-Clause",
+    # foldhash.
+    "Zlib",
+    # This workspace's own crates — see the clarifications below.
+    "LicenseRef-Forge-MIT-Rider",
+]
+
+# The nine workspace crates carry `license-file = "../../LICENSE"` with no
+# `license` field, and that file is MIT plus a substantive rider withholding
+# all rights from OpenAI and Anthropic. Two consequences:
+#
+#   1. It is not MIT. Labelling it `MIT` here would misreport the actual grant,
+#      so it gets a `LicenseRef-` identifier of its own.
+#   2. askalono cannot score a ~50-line rider against the MIT template above
+#      the 0.8 confidence threshold, so detection must be short-circuited.
+#
+# `private.ignore` is not the lever: cargo-deny treats a crate as private only
+# when it declares `publish = false`, and these do not.
+#
+# The hash is xxhash32 of the license text and pins the clarification to the
+# exact wording reviewed here — editing LICENSE will fail this check by design,
+# and the diagnostic reports the replacement value.
+[[licenses.clarify]]
+crate = "forged"
+expression = "LicenseRef-Forge-MIT-Rider"
+license-files = [{ path = "../../LICENSE", hash = 0xcbc5640e }]
+
+[[licenses.clarify]]
+crate = "forged-beads"
+expression = "LicenseRef-Forge-MIT-Rider"
+license-files = [{ path = "../../LICENSE", hash = 0xcbc5640e }]
+
+[[licenses.clarify]]
+crate = "forged-gate"
+expression = "LicenseRef-Forge-MIT-Rider"
+license-files = [{ path = "../../LICENSE", hash = 0xcbc5640e }]
+
+[[licenses.clarify]]
+crate = "forged-git"
+expression = "LicenseRef-Forge-MIT-Rider"
+license-files = [{ path = "../../LICENSE", hash = 0xcbc5640e }]
+
+[[licenses.clarify]]
+crate = "forged-host"
+expression = "LicenseRef-Forge-MIT-Rider"
+license-files = [{ path = "../../LICENSE", hash = 0xcbc5640e }]
+
+[[licenses.clarify]]
+crate = "forged-ledger"
+expression = "LicenseRef-Forge-MIT-Rider"
+license-files = [{ path = "../../LICENSE", hash = 0xcbc5640e }]
+
+[[licenses.clarify]]
+crate = "forged-proto"
+expression = "LicenseRef-Forge-MIT-Rider"
+license-files = [{ path = "../../LICENSE", hash = 0xcbc5640e }]
+
+[[licenses.clarify]]
+crate = "forged-provider"
+expression = "LicenseRef-Forge-MIT-Rider"
+license-files = [{ path = "../../LICENSE", hash = 0xcbc5640e }]
+
+[[licenses.clarify]]
+crate = "forged-types"
+expression = "LicenseRef-Forge-MIT-Rider"
+license-files = [{ path = "../../LICENSE", hash = 0xcbc5640e }]
+
+[bans]
+# Duplicate versions are a size and audit-surface smell, not a correctness
+# failure — report them, do not fail on them.
+multiple-versions = "warn"
+
+[sources]
+# Cargo.lock currently resolves every dependency from crates.io: zero `git+`
+# sources, zero alternate registries. These two denials are what keep that
+# true, so a git or vendored-registry dependency has to be argued for in
+# review rather than arriving unnoticed.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

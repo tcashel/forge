@@ -4,6 +4,9 @@ on:
   pull_request:
     paths:
       - .github/workflows/release.yml
+      # The Beads pins this workflow fails closed on live in the composite
+      # action, so a change there must still trigger the PR preflight.
+      - .github/actions/provision-beads/action.yml
       - Cargo.lock
       - Cargo.toml
       - CHANGELOG.md
@@ -19,21 +22,34 @@ on:
       - scripts/test-install.sh
       - scripts/validate-plugin.sh
       - uninstall.sh
-  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
 
 permissions:
   contents: read
 
 concurrency:
   group: release-${{ github.workflow }}-${{ github.ref }}
+  # Only PR runs on the same ref are disposable; a tag is pushed once and its
+  # release/package/test jobs must run to completion rather than be cancelled
+  # by a later event landing on the same group.
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+# This env block must stay identical to rust.yml's: rust-cache hashes
+# CARGO*/RUST* env values into its cache key, and the test and failpoints
+# jobs here restore the caches rust.yml saves from main (matched by job id).
 env:
   CARGO_TERM_COLOR: always
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
 
 jobs:
-  validate:
-    runs-on: ubuntu-22.04
+  # Runs on every PR that touches release-relevant paths, and first on a tag
+  # push. Cheap: no full workspace build, no package matrix. Everything here
+  # must stay fast enough to run on every PR.
+  preflight:
+    runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.version.outputs.tag }}
       version: ${{ steps.version.outputs.version }}
@@ -46,16 +62,9 @@ jobs:
         with:
           node-version: '24'
 
-      - name: Install pinned Rust toolchain
-        shell: bash
-        run: |
-          set -euo pipefail
-          toolchain="$(sed -n 's/^channel = "\([^"]*\)"$/\1/p' rust-toolchain.toml)"
-          test -n "$toolchain"
-          rustup toolchain install "$toolchain" \
-            --profile minimal \
-            --component rustfmt \
-            --component clippy
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          cache-save-if: 'false'
 
       - name: Resolve and validate release version
         id: version
@@ -81,42 +90,8 @@ jobs:
       - name: Validate shared plugin and version parity
         run: bash scripts/validate-plugin.sh
 
-      - name: Format
-        run: cargo fmt --all -- --check
-
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
-      - name: Build
-        run: cargo build --workspace --locked
-
-      - name: Provision the pinned Beads v1.2.1 compatibility binary
+      - uses: ./.github/actions/provision-beads
         id: release_beads
-        env:
-          BEADS_VERSION: '1.2.1'
-          BEADS_COMMIT: 634cbbc4bc580fa5124f63fdf65d137a46d5b4ff
-          BEADS_LINUX_AMD64_SHA256: 48aecf42ffdefa6470298d8022deeb762e30c8729dc0a4bdda93888c0b0354e2
-        shell: bash
-        run: |
-          set -euo pipefail
-          beads_dir="$RUNNER_TEMP/forge-beads-$BEADS_VERSION"
-          mkdir -p "$beads_dir"
-          asset="beads_${BEADS_VERSION}_linux_amd64.tar.gz"
-          curl -fsSL --retry 3 \
-            -o "$beads_dir/$asset" \
-            "https://github.com/gastownhall/beads/releases/download/v$BEADS_VERSION/$asset"
-          printf '%s  %s\n' "$BEADS_LINUX_AMD64_SHA256" "$beads_dir/$asset" \
-            | sha256sum -c -
-          tar -xzf "$beads_dir/$asset" -C "$beads_dir" bd
-          chmod 0755 "$beads_dir/bd"
-          version_json="$("$beads_dir/bd" version --json)"
-          printf '%s\n' "$version_json"
-          jq -e \
-            --arg version "$BEADS_VERSION" \
-            --arg commit "$BEADS_COMMIT" \
-            '.version == $version and .commit == $commit' \
-            <<<"$version_json" >/dev/null
-          printf 'path=%s\n' "$beads_dir/bd" >> "$GITHUB_OUTPUT"
 
       - name: Probe pinned Beads capabilities
         # v0.5.0 carries a temporary, explicit compatibility exception for the
@@ -133,36 +108,160 @@ jobs:
           done
           cargo test -p forged-beads --test audit_doctor \
             doctor_with_the_sandboxed_bd_probes_green -- --nocapture
-          {
-            printf 'FORGED_TEST_BD=%s\n' "$FORGED_TEST_BD"
-            printf 'FORGED_REQUIRE_BD=1\n'
-          } >> "$GITHUB_ENV"
 
-      - name: Test
-        run: cargo test --workspace
-
-      - name: Failpoint matrix
-        run: cargo test -p forged --features failpoints
-
-      - name: Verify binary version
+      - name: Assert tag matches workspace version
+        if: startsWith(github.ref, 'refs/tags/')
         env:
           VERSION: ${{ steps.version.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" != "refs/tags/v$VERSION" ]]; then
+            echo "tag ref $GITHUB_REF does not match workspace version v$VERSION" >&2
+            exit 1
+          fi
+
+  # Full workspace test suite. Tag-only: PRs get the fast doctor probe above,
+  # not a second uncached run of the whole suite CI already covers.
+  #
+  # This job and `failpoints` restore rust.yml's caches (same job id, same
+  # env), so their runner image MUST match rust.yml's — restoring artifacts
+  # built against a newer glibc onto an older image fails with missing
+  # GLIBC_* symbols at publication time.
+  test:
+    # A custom `if` on a job with `needs` replaces the implicit success
+    # check, not layers on it — `success()` must be explicit or a failed
+    # preflight would not stop this job from starting on a tag push.
+    if: success() && startsWith(github.ref, 'refs/tags/')
+    needs: preflight
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.preflight.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          cache-save-if: 'false'
+
+      - uses: ./.github/actions/provision-beads
+        with:
+          export-gated-test-env: 'true'
+
+      - uses: taiki-e/install-action@fcf5432d9f50d67e37ee6e29bdb7a224ff67b4a7 # v2.86.8
+        with:
+          tool: cargo-nextest@0.9.143
+
+      - name: Build
+        run: cargo build --workspace --locked
+
+      - name: Test
+        run: cargo nextest run --workspace
+
+      - name: Verify binary version
         run: test "$(target/debug/forged --version)" = "forged $VERSION"
 
+  # Failpoint matrix runs in its own job so it doesn't serialize behind the
+  # full workspace test job above.
+  failpoints:
+    if: success() && startsWith(github.ref, 'refs/tags/')
+    needs: preflight
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          cache-save-if: 'false'
+
+      - uses: ./.github/actions/provision-beads
+        with:
+          export-gated-test-env: 'true'
+
+      - uses: taiki-e/install-action@fcf5432d9f50d67e37ee6e29bdb7a224ff67b4a7 # v2.86.8
+        with:
+          tool: cargo-nextest@0.9.143
+
+      - name: Failpoint matrix
+        run: cargo nextest run -p forged --features failpoints
+
+  # Darwin assurance: forged runs on operator Macs and its reclaim saga is
+  # process-group signaling, where darwin semantics diverge from Linux. The
+  # pinned Beads binary is linux-amd64 only, so these jobs provision no bd:
+  # the bd-gated cases SKIP loudly here and bd-contract coverage stays on the
+  # Linux jobs above. Standard macOS runners bill nothing on a public repo.
+  test-macos:
+    if: success() && startsWith(github.ref, 'refs/tags/')
+    needs: preflight
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          cache-save-if: 'false'
+
+      - uses: taiki-e/install-action@fcf5432d9f50d67e37ee6e29bdb7a224ff67b4a7 # v2.86.8
+        with:
+          tool: cargo-nextest@0.9.143
+
+      - name: Build
+        run: cargo build --workspace --locked
+
+      - name: Test
+        run: cargo nextest run --workspace
+
+  failpoints-macos:
+    if: success() && startsWith(github.ref, 'refs/tags/')
+    needs: preflight
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          cache-save-if: 'false'
+
+      - uses: taiki-e/install-action@fcf5432d9f50d67e37ee6e29bdb7a224ff67b4a7 # v2.86.8
+        with:
+          tool: cargo-nextest@0.9.143
+
+      - name: Failpoint matrix
+        run: cargo nextest run -p forged --features failpoints
+
   package:
-    needs: validate
+    if: success() && startsWith(github.ref, 'refs/tags/')
+    needs: preflight
     strategy:
       fail-fast: false
       matrix:
         include:
+          # The Linux package legs stay on the OLDEST supported image on
+          # purpose: the build host's glibc is the floor shipped binaries
+          # demand of every user. These jobs use no cache action, so the
+          # image split from the ubuntu-latest assurance jobs cannot poison
+          # them.
           - runner: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
+            smoke: true
           - runner: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
-          - runner: macos-15-intel
-            target: x86_64-apple-darwin
+            smoke: true
           - runner: macos-15
             target: aarch64-apple-darwin
+            smoke: true
+            service_smoke: true
+          - runner: macos-15
+            target: x86_64-apple-darwin
+            smoke: false # cross-compiled; Intel Macs get no test legs (operator decision)
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -170,12 +269,15 @@ jobs:
           persist-credentials: false
 
       - name: Install pinned Rust toolchain
+        env:
+          TARGET: ${{ matrix.target }}
         shell: bash
         run: |
           set -euo pipefail
           toolchain="$(sed -n 's/^channel = "\([^"]*\)"$/\1/p' rust-toolchain.toml)"
           test -n "$toolchain"
           rustup toolchain install "$toolchain" --profile minimal
+          rustup target add "$TARGET"
 
       - name: Build native release binary
         env:
@@ -202,17 +304,22 @@ jobs:
           fi
 
       - name: Smoke install and uninstall
+        if: matrix.smoke
         env:
           TARGET: ${{ matrix.target }}
-          VERSION: ${{ needs.validate.outputs.version }}
+          VERSION: ${{ needs.preflight.outputs.version }}
         run: bash scripts/test-install.sh "dist/forge-$TARGET.tar.gz" "$VERSION" "$TARGET"
 
       - name: Smoke isolated managed service
-        if: runner.os == 'macOS'
+        if: matrix.service_smoke
         env:
           BD_BIN: /usr/bin/true
           FORGED_SERVICE_SMOKE_TEST: '1'
-        run: cargo test --release -p forged --test service_macos_smoke -- --ignored --nocapture
+          TARGET: ${{ matrix.target }}
+        # --target must match the release build above: omitting it makes
+        # cargo rebuild the whole workspace for the host triple into a
+        # second, uncached build tree.
+        run: cargo test --release -p forged --target "$TARGET" --test service_macos_smoke -- --ignored --nocapture
 
       - name: Upload release bundle
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -223,41 +330,33 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  publish:
-    if: github.event_name == 'workflow_dispatch'
-    needs: [validate, package]
-    runs-on: ubuntu-22.04
+  release:
+    if: success() && startsWith(github.ref, 'refs/tags/')
+    needs: [preflight, test, failpoints, test-macos, failpoints-macos, package]
+    runs-on: ubuntu-latest
     permissions:
       contents: write
     env:
-      TAG: ${{ needs.validate.outputs.tag }}
-      VERSION: ${{ needs.validate.outputs.version }}
+      TAG: ${{ needs.preflight.outputs.tag }}
+      VERSION: ${{ needs.preflight.outputs.version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Refuse an unsafe publication ref
+      - name: Refuse an unsafe release ref
+        # GITHUB_REF is the pushed tag by construction; the only remaining
+        # invariants worth a real check are that the tagged commit is on
+        # main, and that the version is a genuine forward step.
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
-          if [[ "$GITHUB_REF" != refs/heads/main ]]; then
-            echo "release publication is allowed only from refs/heads/main, got $GITHUB_REF" >&2
-            exit 1
-          fi
-          if [[ "$(git rev-parse HEAD)" != "$GITHUB_SHA" ]]; then
-            echo "checkout does not match the workflow SHA" >&2
-            exit 1
-          fi
-          if [[ -n "$(git ls-remote --tags origin "refs/tags/$TAG")" ]]; then
-            echo "remote tag already exists: $TAG" >&2
-            exit 1
-          fi
-          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "GitHub release already exists: $TAG" >&2
+          git fetch origin main --quiet
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "tag commit $GITHUB_SHA is not reachable from origin/main" >&2
             exit 1
           fi
           latest_tag="$(gh release view \
@@ -272,6 +371,15 @@ jobs:
           fi
           gh api --silent rate_limit >/dev/null
 
+      - name: Create draft release from changelog
+        uses: taiki-e/create-gh-release-action@eba8ea96c86cca8a37f1b56e94b4d13301fba651 # v1.11.0
+        with:
+          changelog: CHANGELOG.md
+          title: Forge $tag
+          draft: true
+          branch: main
+          token: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Download release bundles
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -279,7 +387,7 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: Assemble release assets and notes
+      - name: Assemble release assets
         shell: bash
         run: |
           set -euo pipefail
@@ -304,35 +412,23 @@ jobs:
               uninstall.sh > SHA256SUMS
           )
 
-          awk -v heading="## [$VERSION] - " '
-            index($0, heading) == 1 { found = 1; print; next }
-            found && /^## \[/ { exit }
-            found && /^\[[^]]+\]:[[:space:]]/ { exit }
-            found { print }
-            END { if (!found) exit 1 }
-          ' CHANGELOG.md > release-notes.md
-          test -s release-notes.md
-
-      - name: Create and verify draft release
+      - name: Upload and verify draft release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
-          gh release create "$TAG" dist/* \
-            --repo "$GITHUB_REPOSITORY" \
-            --target "$GITHUB_SHA" \
-            --title "Forge $TAG" \
-            --notes-file release-notes.md \
-            --draft
+          gh release upload "$TAG" dist/* \
+            --repo "$GITHUB_REPOSITORY"
 
           gh release view "$TAG" \
             --repo "$GITHUB_REPOSITORY" \
-            --json tagName,targetCommitish,isDraft,isPrerelease,assets > draft-release.json
+            --json tagName,isDraft,isPrerelease,assets > draft-release.json
+          # targetCommitish is the default branch when a release is created on
+          # an existing tag; the ls-remote check below binds the exact SHA.
           jq -e \
             --arg tag "$TAG" \
-            --arg sha "$GITHUB_SHA" \
-            '.tagName == $tag and .targetCommitish == $sha and .isDraft and (.isPrerelease | not)' \
+            '.tagName == $tag and .isDraft and (.isPrerelease | not)' \
             draft-release.json >/dev/null
           printf '%s\n' \
             SHA256SUMS \
@@ -368,11 +464,10 @@ jobs:
             --latest
           gh release view "$TAG" \
             --repo "$GITHUB_REPOSITORY" \
-            --json tagName,targetCommitish,isDraft,isPrerelease,isImmutable,assets > published-release.json
+            --json tagName,isDraft,isPrerelease,isImmutable,assets > published-release.json
           jq -e \
             --arg tag "$TAG" \
-            --arg sha "$GITHUB_SHA" \
-            '.tagName == $tag and .targetCommitish == $sha and (.isDraft | not) and (.isPrerelease | not) and .isImmutable' \
+            '.tagName == $tag and (.isDraft | not) and (.isPrerelease | not) and .isImmutable' \
             published-release.json >/dev/null
           jq -r '.assets[].name' published-release.json | sort > published-assets.txt
           diff -u expected-assets.txt published-assets.txt

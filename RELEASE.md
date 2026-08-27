@@ -1,8 +1,8 @@
 # Releasing Forge
 
-This procedure publishes one immutable GitHub Release from the current `main`
-branch. The release workflow derives the version from
-`[workspace.package].version`; it creates the tag and release only after every
+This procedure publishes one immutable GitHub Release from a version tag
+pushed to a commit on `main`. The release workflow validates that tag against
+`[workspace.package].version`; it creates the GitHub Release only after every
 platform build succeeds.
 
 ## Version policy
@@ -62,16 +62,19 @@ bash scripts/test-install.sh
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo build --workspace --locked
-cargo test --workspace
-cargo test -p forged --features failpoints
+cargo nextest run --workspace
+cargo nextest run -p forged --features failpoints
 cargo run --quiet -p forged -- --version
 git diff --check
 ```
 
 5. Confirm the reported binary, workspace, Pi package, and plugin versions all
    equal `X.Y.Z`.
-6. Open the release pull request and let its Rust, plugin, and release-workflow
-   checks pass. Only the operator merges it to `main`.
+6. Open the release pull request and let its checks pass: `ci-ok` (the
+   aggregate of `rust.yml`'s `lint`, `test`, and `failpoints` jobs) and
+   `preflight` (`release.yml`'s cheap version/CHANGELOG/plugin-parity and
+   pinned-Beads probe, which runs on every PR touching release-relevant
+   paths). Only the operator merges it to `main`.
 
 Use a conventional commit such as `chore(release): prepare v0.5.0`.
 
@@ -79,25 +82,40 @@ Use a conventional commit such as `chore(release): prepare v0.5.0`.
 
 Before the first release, enable GitHub private vulnerability reporting and
 release immutability in the repository settings. Immutability applies only to
-future releases, so enable it before dispatch. Verify both settings, update your
-local refs, and verify the release heading exists:
+future releases, so enable it before the first tag push. Verify both
+settings, update your local refs, and verify the release heading exists:
 
 ```sh
 gh api repos/tcashel/forge/private-vulnerability-reporting --jq '.enabled'
 gh api repos/tcashel/forge/immutable-releases --jq '.enabled'
 git fetch origin main --tags
 git show origin/main:CHANGELOG.md | grep -F '## [0.5.0] - 2026-08-26'
-gh workflow run release.yml --ref main
 ```
 
-Replace the example version and date for later releases. The workflow takes no
-inputs. It derives the version from `main`, refuses an existing remote tag or
-release, extracts the matching curated changelog section, and creates a draft
-against the exact dispatch SHA. After verifying the draft tag, target, and
-assets, it publishes the release and marks it latest.
+Replace the example version and date for later releases. Once the release
+pull request has merged, publish by tagging the merged commit on `main` and
+pushing the tag — a lightweight tag is fine:
 
-Do not create or push the tag yourself. The workflow owns tag creation after
-the complete build matrix succeeds.
+```sh
+git checkout main
+git pull --ff-only origin main
+git tag v0.5.0
+git push origin v0.5.0
+```
+
+Pushing the tag is what starts the release workflow. `preflight` re-validates
+the version and CHANGELOG heading, re-checks plugin parity, re-provisions the
+pinned Beads probe, and additionally asserts the pushed tag matches the
+workspace version. `test`, `failpoints`, and the four-target `package` matrix
+then run in parallel, and `release` runs last once all of them succeed:
+it refuses a tag whose commit is not reachable from `origin/main`, refuses a
+version that is not strictly newer than the current published release,
+extracts the matching curated changelog section, creates a draft release,
+uploads the built archives plus `install.sh`/`uninstall.sh`/`SHA256SUMS`,
+verifies the draft, then publishes it and marks it latest.
+
+Do not tag before the release pull request has merged to `main`, and do not
+tag a commit that is not on `main` — the `release` job rejects it.
 
 The release must contain exactly these seven assets:
 
@@ -115,11 +133,11 @@ hosts.
 
 ## Read back the release
 
-Watch the dispatched run and use its `headSha` as the release SHA:
+Watch the tag-triggered run and use its `headSha` as the release SHA:
 
 ```sh
-run_id="$(gh run list --workflow release.yml --event workflow_dispatch \
-  --branch main --limit 1 --json databaseId --jq '.[0].databaseId')"
+run_id="$(gh run list --workflow release.yml --event push \
+  --branch v0.5.0 --limit 1 --json databaseId --jq '.[0].databaseId')"
 gh run watch "$run_id" --exit-status
 gh run view "$run_id" --json databaseId,headSha,status,conclusion
 gh release view v0.5.0 \
@@ -134,6 +152,12 @@ sorted asset names match the list above. Download the assets and verify
 `SHA256SUMS` before qualifying an installation.
 
 ## Qualify macOS and Linux
+
+The `forge-x86_64-apple-darwin.tar.gz` archive is cross-compiled on the
+`macos-15` (arm64) runner and ships with no CI test coverage at all — no
+smoke install, no smoke uninstall, no service smoke. That leg is a
+deliberate operator decision, not an oversight. If you have access to an
+Intel Mac, qualify that archive manually before relying on it.
 
 Test the release on at least one macOS host and one Linux host. Use an isolated
 prefix when the host already has Forge:
@@ -173,12 +197,30 @@ service qualification.
 
 ## Recover a failed release
 
-- If no tag or release exists, fix the cause on `main` and dispatch again.
-- If an unpublished draft exists and no remote tag exists, either verify and
-  publish the exact draft or delete only that draft, fix `main`, and dispatch
-  again.
-- Once a tag exists, do not move, delete, or reuse it. If its source or assets
-  are wrong, leave an explicit record and prepare the next patch version.
+- If `preflight`, `test`, `failpoints`, or `package` fails on the tag push,
+  the `release` job never starts and no draft exists. Fix the cause on
+  `main` through a normal PR, delete the failed tag locally and on the
+  remote (`git tag -d vX.Y.Z && git push origin :refs/tags/vX.Y.Z`), and
+  push the tag again once `main` is fixed. No release was ever created for
+  that tag, so this is not moving or reusing a released tag.
+- If the `release` job fails BEFORE publication (draft creation, asset
+  assembly, upload, or draft verification), re-running just that job is
+  safe: `create-gh-release-action` deletes and recreates its draft release
+  each time it runs, so a stale partial draft is never left behind. The
+  upstream `test`, `failpoints`, and `package` jobs stay cached as green
+  and do not re-run.
+- If the job fails AFTER `gh release edit --draft=false` succeeds — one of
+  the read-back, immutability, or tag checks in the final step — the
+  release is already published and immutable, and re-running the job
+  cannot recover it: the version guard now sees this very release as
+  latest and refuses the rerun by design. Verify by hand instead, with the
+  same commands the step runs (`gh release view`, download the assets and
+  `sha256sum -c SHA256SUMS`, compare the tag SHA via `git ls-remote`). If
+  the published release is genuinely defective, do not touch it — mark it
+  withdrawn and prepare the next patch version.
+- Once a release is published (not draft) and marked immutable, never
+  delete it, re-tag it, or move it. If its source or assets are wrong, leave
+  an explicit record and prepare the next patch version.
 - Never replace assets on a published release. Mark a defective release as
   withdrawn and publish a new version.
 - Roll back a host by installing an explicit earlier version. Do not rewrite

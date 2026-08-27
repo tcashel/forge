@@ -10,9 +10,36 @@ bash scripts/validate-plugin.sh
 cargo fmt   --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo build --workspace --locked
-cargo test  --workspace
-cargo test -p forged --features failpoints
+cargo nextest run --workspace
+cargo nextest run -p forged --features failpoints
 ```
+
+The two test gates run under [cargo-nextest](https://nexte.st), installed once
+with `cargo install cargo-nextest --locked` or from a prebuilt binary. It is a
+required development tool — Cargo cannot declare binary tools as
+dev-dependencies — and `.config/nextest.toml` declares the minimum version.
+Under plain `cargo test` the `supervise` suite skips loudly rather than run
+unserialized; `RUST_TEST_THREADS=1 cargo test` is the deliberate serial
+fallback.
+
+The suite has two deliberate layers, and nextest filtersets address each
+directly. Unit tests live in-source under `#[cfg(test)]`; integration and
+end-to-end tests live in each crate's `tests/` directory and mostly drive the
+real `forged` binary. For a fast inner loop, run just the units; run the
+integration layer before handing work off:
+
+```bash
+cargo nextest run --workspace -E 'kind(lib) | kind(bin)'   # units, seconds
+cargo nextest run --workspace -E 'kind(test)'              # integration/e2e
+```
+
+The gate remains the full unfiltered run above. Test results in CI are
+reported per binary, so the layers stay distinguishable in Codecov's Tests
+tab as well.
+
+CI runs the `cargo` gates above in parallel jobs (`lint`, `test`,
+`failpoints`); a PR must pass the `ci-ok` aggregate check before it can
+merge.
 
 Use conventional-commit messages (`feat(scope): …`, lowercase, ≤ 70 chars).
 Design context lives in [`docs/adr/`](docs/adr/) — read

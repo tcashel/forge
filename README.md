@@ -1,5 +1,7 @@
 # Forge
 
+[![codecov](https://codecov.io/gh/tcashel/forge/branch/main/graph/badge.svg)](https://codecov.io/gh/tcashel/forge)
+
 > Plan. Run. Review. Ship. Don't watch.
 
 **Turn an approved rolling epic into a reviewed, tested draft pull request
@@ -133,6 +135,13 @@ remain awake and available while local controllers and agents run.
 - The CLI and controllers support macOS and Linux; the managed supervisor is macOS-only.
 - Normal completion means a reviewed draft PR. Unsafe drift, exhausted budgets,
   ambiguity, or missing authority becomes explicit input-required state.
+
+## Test coverage
+
+[![coverage sunburst](https://codecov.io/gh/tcashel/forge/graphs/sunburst.svg)](https://codecov.io/gh/tcashel/forge)
+
+The inner ring is the workspace; each layer outward is a crate, directory,
+then file, sized by lines and colored by coverage.
 
 ## Documentation
 
