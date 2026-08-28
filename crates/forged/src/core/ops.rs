@@ -27,19 +27,32 @@ use crate::core::{
 
 // ---------------------------------------------------------------- doctor
 
+/// Every external doctor probe is bounded: a wedged child or socket must
+/// report `ok: false` within this window, never hang the whole operation —
+/// the contract the deleted bd doctor stated and this port keeps.
+const PROBE_TIMEOUT_S: u64 = 10;
+
 /// `doctor` — read-only: `run_doctor`'s probes plus this slice's own.
 pub async fn doctor(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
     read_only("doctor", req, || async {
         let mut probes: Vec<Value> = Vec::new();
         // gh reachability: PR creation and review delivery need it.
-        let gh = tokio::process::Command::new("gh")
-            .args(["auth", "status"])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .kill_on_drop(true)
-            .status()
-            .await;
+        let gh = tokio::time::timeout(
+            std::time::Duration::from_secs(PROBE_TIMEOUT_S),
+            tokio::process::Command::new("gh")
+                .args(["auth", "status"])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .status(),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(std::io::Error::other(format!(
+                "timed out after {PROBE_TIMEOUT_S}s"
+            )))
+        });
         probes.push(match gh {
             Ok(status) if status.success() => {
                 json!({"name": "gh-auth", "ok": true, "detail": "gh auth status ok"})
@@ -67,7 +80,16 @@ pub async fn doctor(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
                     .map(|home| PathBuf::from(home).join(".config/herdr/herdr.sock"))
             });
         probes.push(match &herdr_path {
-            Some(path) => match tokio::net::UnixStream::connect(path).await {
+            Some(path) => match tokio::time::timeout(
+                std::time::Duration::from_secs(PROBE_TIMEOUT_S),
+                tokio::net::UnixStream::connect(path),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                Err(std::io::Error::other(format!(
+                    "timed out after {PROBE_TIMEOUT_S}s"
+                )))
+            }) {
                 Ok(_) => json!({
                     "name": "herdr-ping",
                     "ok": true,
@@ -198,12 +220,17 @@ pub(super) async fn gh_auth_status() -> Result<String, String> {
     let Some(path) = on_path("gh") else {
         return Err("gh not found on PATH".to_owned());
     };
-    let out = tokio::process::Command::new(&path)
-        .args(["auth", "status"])
-        .stdin(std::process::Stdio::null())
-        .output()
-        .await
-        .map_err(|e| format!("{} auth status: {e}", path.display()))?;
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(PROBE_TIMEOUT_S),
+        tokio::process::Command::new(&path)
+            .args(["auth", "status"])
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .map_err(|_| format!("gh auth status timed out after {PROBE_TIMEOUT_S}s"))?
+    .map_err(|e| format!("{} auth status: {e}", path.display()))?;
     if out.status.success() {
         Ok(format!("{} is authenticated", path.display()))
     } else {

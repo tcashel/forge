@@ -2160,8 +2160,11 @@ fn manifest_matches_config(
     Ok(
         Path::new(&manifest.anvil_home) == canonicalize_anchor(&config.anvil_home)?
             && Path::new(&manifest.config_path) == canonicalize_anchor(&config.config_path)?
-            && Path::new(&manifest.beads_dir) == canonicalize_anchor(&config.beads_dir)?
-            && manifest.bd_bin.as_deref().map(Path::new) == resolved_bd_bin(config).as_deref(),
+            && Path::new(&manifest.beads_dir) == canonicalize_anchor(&config.beads_dir)?,
+        // bd is deliberately NOT part of the identity: it exists only for
+        // the one-shot legacy import, the daemon re-reads bd_path from the
+        // config file, and ambient drift (installing or deleting a bd after
+        // install) must never crash-loop the service into a reinstall.
     )
 }
 
@@ -2376,6 +2379,28 @@ async fn install_with_probe<H: ServiceHost, P: ControllerProcessProbe + ?Sized>(
         return Err(blockers_failure(&scan.blockers));
     }
 
+    // A legacy beads store that has never been imported must not be
+    // silently orphaned: installing without a resolvable bd would let the
+    // first native work item permanently close the one-shot import path.
+    // Fresh operators (no beads config) and already-imported stores are
+    // untouched — bd stays optional for them (ADR-0034).
+    if config.beads_dir.join("config.yaml").exists() && resolved_bd_bin(config).is_none() {
+        let ledger = forged_ledger::Ledger::open(&config.db_path).map_err(Failure::from)?;
+        let unimported = ledger.work_store_is_empty().map_err(Failure::from)?
+            && ledger
+                .list_events_by_kind("work.imported")
+                .map_err(Failure::from)?
+                .is_empty();
+        ledger.close().map_err(Failure::from)?;
+        if unimported {
+            return Err(Failure::invalid(format!(
+                "legacy beads store at {} is not yet imported and no bd \
+                 executable resolves; install bd (or set bd_path), run the \
+                 import, then rerun `forged service install`",
+                config.beads_dir.display()
+            )));
+        }
+    }
     let previous_observation = host.inspect(paths).await?;
     let candidate = new_manifest(paths, config, source_identity)?;
     let id = Uuid::now_v7().to_string();
@@ -3344,6 +3369,36 @@ mod tests {
         fs::create_dir_all(&home).expect("home");
         let paths = RuntimePaths::new(&config.anvil_home, &home, 501).expect("runtime paths");
         (root, config, paths)
+    }
+
+    #[test]
+    fn ambient_bd_drift_never_breaks_the_manifest_identity() {
+        // bd exists only for the one-shot import: a bd appearing after an
+        // install (or disappearing after cutover) must not force reinstall.
+        let (_root, config, paths) = setup();
+        let source = _root.path().join("drift-forged");
+        fs::write(&source, b"forged executable").expect("executable");
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o700)).expect("mode");
+        paths.ensure_layout().expect("layout");
+        let identity = binary_identity(&source).expect("identity");
+        let manifest = new_manifest(&paths, &config, identity).expect("manifest");
+        assert!(manifest.bd_bin.is_some(), "the fixture bd resolves");
+        assert!(manifest_matches_config(&manifest, &config).expect("match"));
+        // The bd disappears post-cutover: still the same install.
+        fs::remove_file(&config.bd_path).expect("delete bd");
+        assert!(
+            manifest_matches_config(&manifest, &config).expect("match"),
+            "deleting bd never invalidates the manifest"
+        );
+        // A manifest recorded WITHOUT bd matches after one appears.
+        let mut bare = manifest.clone();
+        bare.bd_bin = None;
+        fs::write(&config.bd_path, b"#!/bin/sh\nexit 0\n").expect("bd back");
+        fs::set_permissions(&config.bd_path, fs::Permissions::from_mode(0o700)).expect("mode");
+        assert!(
+            manifest_matches_config(&bare, &config).expect("match"),
+            "a bd appearing later never invalidates the manifest"
+        );
     }
 
     fn seed_old_install(
