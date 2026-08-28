@@ -5,6 +5,7 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use forged_types::OperationRequest;
 use serde_json::{json, Map, Value};
+use std::path::{Path, PathBuf};
 
 /// forged: the CLI and MCP binary over the forged core.
 #[derive(Debug, Parser)]
@@ -971,7 +972,7 @@ pub struct OperationsOverviewArgs {
 /// `work` subcommands.
 #[derive(Debug, Subcommand)]
 pub enum WorkCmd {
-    /// List slice runs and started epics, optionally scoped by repository.
+    /// List slice runs and started epics with composable work-store filters.
     List(WorkListArgs),
     /// Project bounded cross-run lifecycle, rework, and spend history.
     History(WorkHistoryArgs),
@@ -1017,6 +1018,9 @@ pub struct WorkIdArgs {
 /// `work ready` flags.
 #[derive(Debug, Args)]
 pub struct WorkReadyArgs {
+    /// Exact repository identity from work metadata.repository.
+    #[arg(long)]
+    pub repo: Option<String>,
     /// Return complete work-item snapshots instead of summary rows.
     #[arg(long)]
     pub full: bool,
@@ -1038,17 +1042,29 @@ pub struct WorkCreateArgs {
     #[arg(long)]
     pub title: String,
     /// Context and exact outcome.
-    #[arg(long, allow_hyphen_values = true)]
+    #[arg(long, allow_hyphen_values = true, conflicts_with = "description_file")]
     pub description: Option<String>,
+    /// Read context and outcome verbatim from one UTF-8 file.
+    #[arg(long)]
+    pub description_file: Option<PathBuf>,
     /// Observable completion contract.
-    #[arg(long, allow_hyphen_values = true)]
+    #[arg(long, allow_hyphen_values = true, conflicts_with = "acceptance_file")]
     pub acceptance: Option<String>,
+    /// Read completion criteria verbatim from one UTF-8 file.
+    #[arg(long)]
+    pub acceptance_file: Option<PathBuf>,
     /// Implementation constraints.
-    #[arg(long, allow_hyphen_values = true)]
+    #[arg(long, allow_hyphen_values = true, conflicts_with = "design_file")]
     pub design: Option<String>,
+    /// Read implementation constraints verbatim from one UTF-8 file.
+    #[arg(long)]
+    pub design_file: Option<PathBuf>,
     /// Agent instructions and non-goals.
-    #[arg(long, allow_hyphen_values = true)]
+    #[arg(long, allow_hyphen_values = true, conflicts_with = "notes_file")]
     pub notes: Option<String>,
+    /// Read agent instructions verbatim from one UTF-8 file.
+    #[arg(long)]
+    pub notes_file: Option<PathBuf>,
     /// task or epic (default task).
     #[arg(long)]
     pub kind: Option<String>,
@@ -1079,17 +1095,29 @@ pub struct WorkUpdateArgs {
     #[arg(long)]
     pub title: Option<String>,
     /// New description.
-    #[arg(long, allow_hyphen_values = true)]
+    #[arg(long, allow_hyphen_values = true, conflicts_with = "description_file")]
     pub description: Option<String>,
+    /// Read the new description verbatim from one UTF-8 file.
+    #[arg(long)]
+    pub description_file: Option<PathBuf>,
     /// New acceptance criteria.
-    #[arg(long, allow_hyphen_values = true)]
+    #[arg(long, allow_hyphen_values = true, conflicts_with = "acceptance_file")]
     pub acceptance: Option<String>,
+    /// Read new acceptance criteria verbatim from one UTF-8 file.
+    #[arg(long)]
+    pub acceptance_file: Option<PathBuf>,
     /// New design notes.
-    #[arg(long, allow_hyphen_values = true)]
+    #[arg(long, allow_hyphen_values = true, conflicts_with = "design_file")]
     pub design: Option<String>,
+    /// Read new design notes verbatim from one UTF-8 file.
+    #[arg(long)]
+    pub design_file: Option<PathBuf>,
     /// New agent instructions.
-    #[arg(long, allow_hyphen_values = true)]
+    #[arg(long, allow_hyphen_values = true, conflicts_with = "notes_file")]
     pub notes: Option<String>,
+    /// Read new agent instructions verbatim from one UTF-8 file.
+    #[arg(long)]
+    pub notes_file: Option<PathBuf>,
     /// Override the derived idempotency key.
     #[arg(long)]
     pub idempotency_key: Option<String>,
@@ -1295,9 +1323,15 @@ pub struct WorkMapArgs {
 /// `work list` flags.
 #[derive(Debug, Args)]
 pub struct WorkListArgs {
-    /// Exact repository identity from Bead metadata.repository.
+    /// Exact repository identity from work metadata.repository.
     #[arg(long)]
     pub repo: Option<String>,
+    /// Exact status: open, in_progress, blocked, deferred, or closed.
+    #[arg(long)]
+    pub status: Option<String>,
+    /// Exact custody holder.
+    #[arg(long)]
+    pub assignee: Option<String>,
     /// Override the read-only idempotency key.
     #[arg(long)]
     pub idempotency_key: Option<String>,
@@ -1604,9 +1638,25 @@ fn request(key: Option<String>, run_id: Option<String>, params: Value) -> Operat
     }
 }
 
+fn spec_field_input(
+    inline: Option<String>,
+    file: Option<&Path>,
+    inline_flag: &str,
+    file_flag: &str,
+) -> Result<Option<String>, String> {
+    match (inline, file) {
+        (Some(_), Some(_)) => Err(format!("{inline_flag} cannot be used with {file_flag}")),
+        (Some(value), None) => Ok(Some(value)),
+        (None, Some(path)) => std::fs::read_to_string(path)
+            .map(Some)
+            .map_err(|error| format!("reading {file_flag} {} as UTF-8: {error}", path.display())),
+        (None, None) => Ok(None),
+    }
+}
+
 /// The core name a parsed command routes to, WITHOUT consuming it — what a
 /// failure before request mapping (an unloadable config, an unopenable
-/// ledger, an unreadable `--result` file) needs in order to name the
+/// ledger, an unreadable CLI input file) needs in order to name the
 /// envelope it still owes stdout.
 pub fn command_name(command: &Command) -> &'static str {
     match command {
@@ -1706,8 +1756,9 @@ pub fn command_name(command: &Command) -> &'static str {
     }
 }
 
-/// Map a parsed command onto its core name and request. The only error is
-/// an unreadable `--result` file.
+/// Map a parsed command onto its core name and request. File-backed inputs
+/// are read here so the shared core receives the same field bytes as inline
+/// input without learning about caller-local paths.
 pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), String> {
     Ok(match command {
         Command::Doctor(a) => ("doctor", request(a.idempotency_key, None, json!({}))),
@@ -2196,8 +2247,14 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
         Command::Work { command } => match command {
             WorkCmd::List(a) => {
                 let mut params = Map::new();
-                if let Some(repo) = a.repo {
-                    params.insert("repo".to_owned(), json!(repo));
+                for (name, value) in [
+                    ("repo", a.repo),
+                    ("status", a.status),
+                    ("assignee", a.assignee),
+                ] {
+                    if let Some(value) = value {
+                        params.insert(name.to_owned(), json!(value));
+                    }
                 }
                 (
                     "work_list",
@@ -2306,6 +2363,9 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
             ),
             WorkCmd::Ready(a) => {
                 let mut params = Map::new();
+                if let Some(repo) = a.repo {
+                    params.insert("repo".to_owned(), json!(repo));
+                }
                 if a.full {
                     params.insert("detail".to_owned(), json!("full"));
                 }
@@ -2318,14 +2378,34 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
                 )
             }
             WorkCmd::Create(a) => {
+                let description = spec_field_input(
+                    a.description,
+                    a.description_file.as_deref(),
+                    "--description",
+                    "--description-file",
+                )?;
+                let acceptance = spec_field_input(
+                    a.acceptance,
+                    a.acceptance_file.as_deref(),
+                    "--acceptance",
+                    "--acceptance-file",
+                )?;
+                let design = spec_field_input(
+                    a.design,
+                    a.design_file.as_deref(),
+                    "--design",
+                    "--design-file",
+                )?;
+                let notes =
+                    spec_field_input(a.notes, a.notes_file.as_deref(), "--notes", "--notes-file")?;
                 let mut params = Map::new();
                 params.insert("id".to_owned(), json!(a.id));
                 params.insert("title".to_owned(), json!(a.title));
                 for (name, value) in [
-                    ("description", a.description),
-                    ("acceptanceCriteria", a.acceptance),
-                    ("design", a.design),
-                    ("notes", a.notes),
+                    ("description", description),
+                    ("acceptanceCriteria", acceptance),
+                    ("design", design),
+                    ("notes", notes),
                     ("kind", a.kind),
                     ("status", a.status),
                 ] {
@@ -2345,15 +2425,35 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
                 )
             }
             WorkCmd::Update(a) => {
+                let description = spec_field_input(
+                    a.description,
+                    a.description_file.as_deref(),
+                    "--description",
+                    "--description-file",
+                )?;
+                let acceptance = spec_field_input(
+                    a.acceptance,
+                    a.acceptance_file.as_deref(),
+                    "--acceptance",
+                    "--acceptance-file",
+                )?;
+                let design = spec_field_input(
+                    a.design,
+                    a.design_file.as_deref(),
+                    "--design",
+                    "--design-file",
+                )?;
+                let notes =
+                    spec_field_input(a.notes, a.notes_file.as_deref(), "--notes", "--notes-file")?;
                 let mut params = Map::new();
                 params.insert("id".to_owned(), json!(a.id));
                 params.insert("expectedRevision".to_owned(), json!(a.expected_revision));
                 for (name, value) in [
                     ("title", a.title),
-                    ("description", a.description),
-                    ("acceptanceCriteria", a.acceptance),
-                    ("design", a.design),
-                    ("notes", a.notes),
+                    ("description", description),
+                    ("acceptanceCriteria", acceptance),
+                    ("design", design),
+                    ("notes", notes),
                 ] {
                     if let Some(value) = value {
                         params.insert(name.to_owned(), json!(value));

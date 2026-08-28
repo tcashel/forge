@@ -134,6 +134,174 @@ fn work_ready_reports_total_and_shown_across_the_default_bound() {
 }
 
 #[test]
+fn work_ready_repository_filter_composes_with_summary_bounds() {
+    let env = TestEnv::new("forged-work-ready-repository");
+    assert_eq!(env.forged(&["init"]).0, 0);
+    for (id, repository) in [
+        ("ready-a-1", "/repo/a"),
+        ("ready-a-2", "/repo/a"),
+        ("ready-b", "/repo/b"),
+    ] {
+        result(
+            &env,
+            &[
+                "work",
+                "create",
+                "--id",
+                id,
+                "--title",
+                id,
+                "--repository",
+                repository,
+            ],
+        );
+    }
+
+    let ready = result(
+        &env,
+        &["work", "ready", "--repo", "/repo/a", "--limit", "1"],
+    );
+    assert_eq!(
+        ready["filters"],
+        json!({"detail": "summary", "limit": 1, "repo": "/repo/a"})
+    );
+    assert_eq!(ready["totals"], json!({"shown": 1, "total": 2}));
+    assert_eq!(ready["ready"][0]["id"], json!("ready-a-1"));
+}
+
+#[test]
+fn work_spec_file_inputs_round_trip_verbatim_and_conflict_with_inline_forms() {
+    let env = TestEnv::new("forged-work-spec-files");
+    assert_eq!(env.forged(&["init"]).0, 0);
+    let description = "- first bullet\n- second bullet\n\nA multi-line body.\n";
+    let acceptance = "- preserves leading hyphens\n- preserves final newline\n";
+    let design = "line one\nline two\n";
+    let notes = "do not trim this body\n";
+    let description_path = env.root.join("description.md");
+    let acceptance_path = env.root.join("acceptance.md");
+    let design_path = env.root.join("design.md");
+    let notes_path = env.root.join("notes.md");
+    for (path, body) in [
+        (&description_path, description),
+        (&acceptance_path, acceptance),
+        (&design_path, design),
+        (&notes_path, notes),
+    ] {
+        std::fs::write(path, body).expect("write spec field fixture");
+    }
+
+    result(
+        &env,
+        &[
+            "work",
+            "create",
+            "--id",
+            "file-backed",
+            "--title",
+            "File-backed spec",
+            "--description-file",
+            description_path.to_str().expect("UTF-8 path"),
+            "--acceptance-file",
+            acceptance_path.to_str().expect("UTF-8 path"),
+            "--design-file",
+            design_path.to_str().expect("UTF-8 path"),
+            "--notes-file",
+            notes_path.to_str().expect("UTF-8 path"),
+        ],
+    );
+    let shown = result(&env, &["work", "show", "--id", "file-backed"]);
+    assert_eq!(shown["work"]["spec"]["description"], json!(description));
+    assert_eq!(
+        shown["work"]["spec"]["acceptanceCriteria"],
+        json!(acceptance)
+    );
+    assert_eq!(shown["work"]["spec"]["design"], json!(design));
+    assert_eq!(shown["work"]["spec"]["notes"], json!(notes));
+
+    let updated_bodies = [
+        (&description_path, "updated description\n"),
+        (&acceptance_path, "updated acceptance\n"),
+        (&design_path, "updated design\n"),
+        (&notes_path, "updated notes\n"),
+    ];
+    for (path, body) in updated_bodies {
+        std::fs::write(path, body).expect("update spec field fixture");
+    }
+    let updated = result(
+        &env,
+        &[
+            "work",
+            "update",
+            "--id",
+            "file-backed",
+            "--expected-revision",
+            "1",
+            "--description-file",
+            description_path.to_str().expect("UTF-8 path"),
+            "--acceptance-file",
+            acceptance_path.to_str().expect("UTF-8 path"),
+            "--design-file",
+            design_path.to_str().expect("UTF-8 path"),
+            "--notes-file",
+            notes_path.to_str().expect("UTF-8 path"),
+        ],
+    );
+    assert_eq!(updated["work"]["revision"], json!(2));
+    for (field, expected) in [
+        ("description", "updated description\n"),
+        ("acceptanceCriteria", "updated acceptance\n"),
+        ("design", "updated design\n"),
+        ("notes", "updated notes\n"),
+    ] {
+        assert_eq!(updated["work"]["spec"][field], json!(expected));
+    }
+
+    let conflict = env
+        .forged_cmd(&[
+            "work",
+            "create",
+            "--id",
+            "conflict",
+            "--title",
+            "Conflict",
+            "--description",
+            "inline",
+            "--description-file",
+            description_path.to_str().expect("UTF-8 path"),
+        ])
+        .output()
+        .expect("spawn conflicting create");
+    assert!(!conflict.status.success());
+    let stderr = String::from_utf8_lossy(&conflict.stderr);
+    assert!(
+        stderr.contains("--description") && stderr.contains("--description-file"),
+        "clear conflict error: {stderr}"
+    );
+
+    let update_conflict = env
+        .forged_cmd(&[
+            "work",
+            "update",
+            "--id",
+            "file-backed",
+            "--expected-revision",
+            "1",
+            "--notes",
+            "inline",
+            "--notes-file",
+            notes_path.to_str().expect("UTF-8 path"),
+        ])
+        .output()
+        .expect("spawn conflicting update");
+    assert!(!update_conflict.status.success());
+    let stderr = String::from_utf8_lossy(&update_conflict.stderr);
+    assert!(
+        stderr.contains("--notes") && stderr.contains("--notes-file"),
+        "clear conflict error: {stderr}"
+    );
+}
+
+#[test]
 fn work_ready_limits_equal_attention_list_limits() {
     let env = TestEnv::new("forged-work-ready-limit-parity");
     assert_eq!(env.forged(&["init"]).0, 0);

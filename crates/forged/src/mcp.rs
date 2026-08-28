@@ -232,8 +232,7 @@ impl OverviewArgs {
     }
 }
 
-/// The `work_list` envelope: the shared envelope shape with the one typed
-/// repository selector this discovery operation accepts.
+/// The `work_list` envelope with its typed composable filters.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -252,18 +251,32 @@ pub struct WorkListArgs {
     pub params: WorkListParams,
 }
 
-/// Optional repository scope for `work_list`.
+/// Composable exact scopes for `work_list`.
 #[derive(Debug, Default, Deserialize, Serialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars", inline)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WorkListParams {
-    /// Exact repository identity from Bead `metadata.repository`.
+    /// Exact repository identity from work `metadata.repository`.
     #[serde(
         default,
         deserialize_with = "present_means_named",
         skip_serializing_if = "Option::is_none"
     )]
     pub repo: Option<String>,
+    /// Exact work status.
+    #[serde(
+        default,
+        deserialize_with = "present_means_named",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub status: Option<String>,
+    /// Exact custody holder.
+    #[serde(
+        default,
+        deserialize_with = "present_means_named",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub assignee: Option<String>,
 }
 
 impl WorkListArgs {
@@ -312,6 +325,13 @@ pub struct WorkReadyArgs {
 #[schemars(crate = "rmcp::schemars", inline)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WorkReadyParams {
+    /// Exact repository identity from work `metadata.repository`.
+    #[serde(
+        default,
+        deserialize_with = "present_means_named",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub repo: Option<String>,
     /// Complete snapshots when full; omission returns summary rows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<WorkReadyDetailParam>,
@@ -1485,8 +1505,9 @@ impl ForgedServer {
         name = "work_ready",
         description = "The bounded ready frontier: open, unassigned, unleased items whose \
                        blocks targets are all closed, priority-ordered. Returns summary rows \
-                       by default. params.detail=\"full\" restores complete snapshots; \
-                       params.limit is 1..=500 and defaults to 100."
+                       by default. Optional params.repo filters exact work metadata.repository. \
+                       params.detail=\"full\" restores complete snapshots; params.limit is \
+                       1..=500 and defaults to 100."
     )]
     pub async fn work_ready(&self, args: Parameters<WorkReadyArgs>) -> CallToolResult {
         self.call("work_ready", args.0.into_envelope()).await
@@ -1498,7 +1519,8 @@ impl ForgedServer {
         description = "List all forged work — every slice run and every started epic, live and \
                        historical, each labelled slice or epic. Takes no id: this is how a \
                        caller with no prior knowledge discovers the ids the other tools require. \
-                       Optional params.repo selects the exact Bead metadata.repository identity."
+                       Optional params.repo, params.status, and params.assignee are exact, \
+                       composable work-store filters."
     )]
     pub async fn work_list(&self, args: Parameters<WorkListArgs>) -> CallToolResult {
         self.call("work_list", args.0.into_envelope()).await

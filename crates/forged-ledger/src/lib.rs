@@ -80,7 +80,7 @@ pub use types::{
 };
 pub use work::{
     ImportedWorkItem, NewWorkItem, WorkDepKind, WorkDepRow, WorkDependencyStatus, WorkImportReport,
-    WorkItemSnapshot, WorkKind, WorkRevisionCause, WorkSpecFields, WorkStatus,
+    WorkItemFilters, WorkItemSnapshot, WorkKind, WorkRevisionCause, WorkSpecFields, WorkStatus,
     WORK_BLOCKED_CLAIM_REFUSAL, WORK_CLAIM_REFUSAL_PREFIX,
 };
 pub use work_lease::{work_reclaim_older_than, WorkLeaseRow, WorkReclaimOutcome, WORK_LEASE_TTL_S};

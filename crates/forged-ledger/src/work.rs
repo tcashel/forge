@@ -90,16 +90,34 @@ impl WorkStatus {
         }
     }
 
-    fn decode(idx: usize, value: &str) -> Result<Self, rusqlite::Error> {
+    /// Parse the stored/public spelling used by work filters.
+    pub fn parse(value: &str) -> Option<Self> {
         match value {
-            "open" => Ok(Self::Open),
-            "in_progress" => Ok(Self::InProgress),
-            "blocked" => Ok(Self::Blocked),
-            "deferred" => Ok(Self::Deferred),
-            "closed" => Ok(Self::Closed),
-            other => Err(column_decode_error(idx, "work status", other)),
+            "open" => Some(Self::Open),
+            "in_progress" => Some(Self::InProgress),
+            "blocked" => Some(Self::Blocked),
+            "deferred" => Some(Self::Deferred),
+            "closed" => Some(Self::Closed),
+            _ => None,
         }
     }
+
+    fn decode(idx: usize, value: &str) -> Result<Self, rusqlite::Error> {
+        Self::parse(value).ok_or_else(|| column_decode_error(idx, "work status", value))
+    }
+}
+
+/// Exact predicates for one work-item collection read. Every populated
+/// predicate is emitted into the SQL `WHERE` clause and composes with the
+/// others; no caller needs to inspect decoded metadata to filter rows.
+#[derive(Debug, Clone, Default)]
+pub struct WorkItemFilters {
+    /// Exact `metadata.repository` identity.
+    pub repository: Option<String>,
+    /// Exact coordination status.
+    pub status: Option<WorkStatus>,
+    /// Exact custody holder.
+    pub assignee: Option<String>,
 }
 
 /// Dependency edge kinds: the closed, operator-adjudicated bd 1.2.1 subset.
@@ -312,6 +330,86 @@ const SNAPSHOT_SQL: &str = "SELECT wi.work_id, wi.kind, wi.status, wi.priority, 
      FROM work_items wi \
      JOIN work_revisions wr \
        ON wr.work_id = wi.work_id AND wr.revision = wi.current_revision";
+
+#[derive(Clone, Copy)]
+enum WorkItemCollection {
+    All,
+    ExactIds,
+    Nonterminal,
+    Ready,
+}
+
+fn collection_query(
+    collection: WorkItemCollection,
+    ids: &[String],
+    filters: &WorkItemFilters,
+) -> (String, Vec<String>) {
+    let mut clauses = Vec::new();
+    let mut params = Vec::new();
+    match collection {
+        WorkItemCollection::All => {}
+        WorkItemCollection::ExactIds if ids.is_empty() => clauses.push("1 = 0".to_owned()),
+        WorkItemCollection::ExactIds => {
+            params.push(serde_json::to_string(ids).expect("string ids serialize to JSON"));
+            clauses.push("wi.work_id IN (SELECT value FROM json_each(?1))".to_owned());
+        }
+        WorkItemCollection::Nonterminal => clauses.push("wi.status <> 'closed'".to_owned()),
+        WorkItemCollection::Ready => {
+            clauses.extend([
+                "wi.status = 'open'".to_owned(),
+                "wi.assignee IS NULL".to_owned(),
+                "NOT EXISTS (SELECT 1 FROM work_leases wl WHERE wl.work_id = wi.work_id)"
+                    .to_owned(),
+                "NOT EXISTS (SELECT 1 FROM work_deps d JOIN work_items b ON b.work_id = d.to_id \
+                 WHERE d.from_id = wi.work_id AND d.kind = 'blocks' AND b.status <> 'closed')"
+                    .to_owned(),
+            ]);
+        }
+    }
+    if let Some(repository) = &filters.repository {
+        params.push(repository.clone());
+        clauses.push(format!(
+            "json_extract(wi.metadata_json, '$.repository') = ?{}",
+            params.len()
+        ));
+    }
+    if let Some(status) = filters.status {
+        params.push(status.as_str().to_owned());
+        clauses.push(format!("wi.status = ?{}", params.len()));
+    }
+    if let Some(assignee) = &filters.assignee {
+        params.push(assignee.clone());
+        clauses.push(format!("wi.assignee = ?{}", params.len()));
+    }
+    let where_clause = if clauses.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", clauses.join(" AND "))
+    };
+    let order = match collection {
+        WorkItemCollection::Nonterminal | WorkItemCollection::Ready => {
+            " ORDER BY wi.priority IS NULL, wi.priority, wi.work_id"
+        }
+        WorkItemCollection::All | WorkItemCollection::ExactIds => " ORDER BY wi.work_id",
+    };
+    (format!("{SNAPSHOT_SQL}{where_clause}{order}"), params)
+}
+
+fn collection_tx(
+    conn: &Connection,
+    collection: WorkItemCollection,
+    ids: &[String],
+    filters: &WorkItemFilters,
+) -> Result<Vec<WorkItemSnapshot>, LedgerError> {
+    let (sql, params) = collection_query(collection, ids, filters);
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), snapshot_from_row)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
 
 fn snapshot_from_row(row: &rusqlite::Row<'_>) -> Result<WorkItemSnapshot, rusqlite::Error> {
     let kind: String = row.get(1)?;
@@ -612,14 +710,32 @@ impl Ledger {
     /// operator inspection surface).
     pub fn all_work_items(&self) -> Result<Vec<WorkItemSnapshot>, LedgerError> {
         self.submit(move |conn| {
-            let mut stmt = conn.prepare(&format!("{SNAPSHOT_SQL} ORDER BY wi.work_id"))?;
-            let rows = stmt.query_map([], snapshot_from_row)?;
-            let mut out = Vec::new();
-            for row in rows {
-                out.push(row?);
-            }
-            Ok(out)
+            collection_tx(
+                conn,
+                WorkItemCollection::All,
+                &[],
+                &WorkItemFilters::default(),
+            )
         })
+    }
+
+    /// Every work item matching all populated predicates, id-ordered.
+    pub fn filtered_work_items(
+        &self,
+        filters: WorkItemFilters,
+    ) -> Result<Vec<WorkItemSnapshot>, LedgerError> {
+        self.submit(move |conn| collection_tx(conn, WorkItemCollection::All, &[], &filters))
+    }
+
+    /// Matching snapshots among exact ids, in id order. The selection and
+    /// every field predicate execute in one SQL statement.
+    pub fn filtered_work_items_by_id(
+        &self,
+        ids: &[String],
+        filters: WorkItemFilters,
+    ) -> Result<Vec<WorkItemSnapshot>, LedgerError> {
+        let ids = ids.to_vec();
+        self.submit(move |conn| collection_tx(conn, WorkItemCollection::ExactIds, &ids, &filters))
     }
 
     /// One stored revision's spec fields; `Ok(None)` on a miss. This is how
@@ -1250,25 +1366,31 @@ impl Ledger {
     /// Every non-closed item, priority-ordered (ascending, nulls last) then
     /// id-ordered — the live-plan discovery read.
     pub fn nonterminal_work_items(&self) -> Result<Vec<WorkItemSnapshot>, LedgerError> {
-        self.submit(move |conn| {
-            let mut stmt = conn.prepare(&format!(
-                "{SNAPSHOT_SQL} WHERE wi.status <> 'closed' \
-                 ORDER BY wi.priority IS NULL, wi.priority, wi.work_id"
-            ))?;
-            let rows = stmt.query_map([], snapshot_from_row)?;
-            let mut out = Vec::new();
-            for row in rows {
-                out.push(row?);
-            }
-            Ok(out)
-        })
+        self.nonterminal_work_items_filtered(WorkItemFilters::default())
+    }
+
+    /// Every nonterminal work item matching all populated predicates,
+    /// priority-ordered.
+    pub fn nonterminal_work_items_filtered(
+        &self,
+        filters: WorkItemFilters,
+    ) -> Result<Vec<WorkItemSnapshot>, LedgerError> {
+        self.submit(move |conn| collection_tx(conn, WorkItemCollection::Nonterminal, &[], &filters))
     }
 
     /// The ready frontier: `Open`, unassigned, every `blocks` target closed,
     /// no lease row. Ordered by priority ascending (nulls last — a missing
     /// priority never outranks a stated one), then id.
     pub fn ready_work_items(&self) -> Result<Vec<WorkItemSnapshot>, LedgerError> {
-        self.submit(move |conn| ready_tx(conn))
+        self.ready_work_items_filtered(WorkItemFilters::default())
+    }
+
+    /// The ready frontier restricted by all populated predicates.
+    pub fn ready_work_items_filtered(
+        &self,
+        filters: WorkItemFilters,
+    ) -> Result<Vec<WorkItemSnapshot>, LedgerError> {
+        self.submit(move |conn| collection_tx(conn, WorkItemCollection::Ready, &[], &filters))
     }
 }
 
@@ -1372,23 +1494,12 @@ impl Ledger {
 }
 
 pub(crate) fn ready_tx(conn: &Connection) -> Result<Vec<WorkItemSnapshot>, LedgerError> {
-    let mut stmt = conn.prepare(&format!(
-        "{SNAPSHOT_SQL} \
-         WHERE wi.status = 'open' AND wi.assignee IS NULL \
-           AND NOT EXISTS (SELECT 1 FROM work_leases wl WHERE wl.work_id = wi.work_id) \
-           AND NOT EXISTS ( \
-             SELECT 1 FROM work_deps d \
-             JOIN work_items b ON b.work_id = d.to_id \
-             WHERE d.from_id = wi.work_id AND d.kind = 'blocks' \
-               AND b.status <> 'closed') \
-         ORDER BY wi.priority IS NULL, wi.priority, wi.work_id"
-    ))?;
-    let rows = stmt.query_map([], snapshot_from_row)?;
-    let mut out = Vec::new();
-    for row in rows {
-        out.push(row?);
-    }
-    Ok(out)
+    collection_tx(
+        conn,
+        WorkItemCollection::Ready,
+        &[],
+        &WorkItemFilters::default(),
+    )
 }
 
 #[cfg(test)]
@@ -1655,6 +1766,62 @@ mod tests {
             .map(|s| s.work_id)
             .collect();
         assert_eq!(ready, ["beads-high", "beads-nopri"]);
+    }
+
+    #[test]
+    fn work_item_filters_compose_in_one_sql_where_clause() {
+        let (_dir, l) = ledger();
+        let filtered_item = |id: &str, repository: &str, status: WorkStatus| {
+            let mut value = item(id, status);
+            value
+                .metadata
+                .insert("repository".to_owned(), repository.to_owned());
+            value
+        };
+        l.create_work_item(filtered_item("repo-a-open", "/repo/a", WorkStatus::Open))
+            .unwrap();
+        l.create_work_item(filtered_item(
+            "repo-a-alice",
+            "/repo/a",
+            WorkStatus::Blocked,
+        ))
+        .unwrap();
+        l.assign_unassigned_work_item("repo-a-alice", "alice", WorkStatus::Blocked)
+            .unwrap();
+        l.create_work_item(filtered_item("repo-a-bob", "/repo/a", WorkStatus::Blocked))
+            .unwrap();
+        l.assign_unassigned_work_item("repo-a-bob", "bob", WorkStatus::Blocked)
+            .unwrap();
+        l.create_work_item(filtered_item(
+            "repo-b-alice",
+            "/repo/b",
+            WorkStatus::Blocked,
+        ))
+        .unwrap();
+        l.assign_unassigned_work_item("repo-b-alice", "alice", WorkStatus::Blocked)
+            .unwrap();
+
+        let filters = WorkItemFilters {
+            repository: Some("/repo/a".to_owned()),
+            status: Some(WorkStatus::Blocked),
+            assignee: Some("alice".to_owned()),
+        };
+        let rows = l.filtered_work_items(filters.clone()).unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.work_id.as_str())
+                .collect::<Vec<_>>(),
+            ["repo-a-alice"]
+        );
+
+        let (sql, params) = collection_query(WorkItemCollection::All, &[], &filters);
+        assert!(
+            sql.contains("json_extract(wi.metadata_json, '$.repository') = ?1")
+                && sql.contains("wi.status = ?2")
+                && sql.contains("wi.assignee = ?3"),
+            "all filter predicates must remain in SQL: {sql}"
+        );
+        assert_eq!(params, ["/repo/a", "blocked", "alice"]);
     }
 
     #[test]
