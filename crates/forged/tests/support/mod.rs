@@ -1460,6 +1460,13 @@ impl TestEnv {
         let now = "2026-08-14T00:00:00.000000000Z";
         match field {
             "title" | "description" | "acceptance" | "design" | "notes" => {
+                // The bd shim embedded these into JSON, so `\n` in a test
+                // literal became a real newline on the read. Preserve that
+                // exact round-trip; a value that is not a valid JSON string
+                // body passes through raw.
+                let value = serde_json::from_str::<String>(&format!("\"{value}\""))
+                    .unwrap_or_else(|_| value.to_owned());
+                let value = value.as_str();
                 let column = match field {
                     "acceptance" => "acceptance_criteria",
                     other => other,

@@ -796,10 +796,15 @@ impl Ledger {
         self.submit(move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let before = require_snapshot_tx(&tx, &work_id)?;
-            if let Some(current) = &before.assignee {
-                if current != &holder {
+            if before.status == WorkStatus::Closed && before.assignee.is_none() {
+                tx.commit()?;
+                return Ok(before);
+            }
+            match before.assignee.as_deref() {
+                Some(current) if current == holder => {}
+                current => {
                     return Err(refused(
-                        ErrorCode::BeadsContention,
+                        ErrorCode::BeadLeaseHeld,
                         format!("work item {work_id:?} is held by {current:?}, not {holder:?}"),
                     ));
                 }
@@ -821,22 +826,56 @@ impl Ledger {
         })
     }
 
-    /// Release custody (and the lease) of a non-closed item, returning it to
-    /// `Open` from `InProgress`; `Open`/`Blocked` keep their status. A closed
-    /// item refuses — closure is terminal here; `reopen_work_item` is the
-    /// deliberate exit.
+    /// Idempotently clear custody (and the lease) under the actor CAS,
+    /// status untouched — the bd-era guarded release, closed items included
+    /// (recovery of older already-closed state). Unheld is an idempotent
+    /// no-op; a different holder refuses with `BeadLeaseHeld`.
     pub fn release_work_item(
         &self,
         work_id: &str,
         actor: &str,
     ) -> Result<WorkItemSnapshot, LedgerError> {
-        self.release_with_status(work_id, actor, None, "release")
+        let work_id = work_id.to_owned();
+        let actor = actor.to_owned();
+        self.submit(move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let before = require_snapshot_tx(&tx, &work_id)?;
+            match before.assignee.as_deref() {
+                None => {
+                    tx.commit()?;
+                    return Ok(before);
+                }
+                Some(holder) if holder != actor => {
+                    return Err(refused(
+                        ErrorCode::BeadLeaseHeld,
+                        format!("work item {work_id:?} is held by {holder:?}, not {actor:?}"),
+                    ));
+                }
+                Some(_) => {}
+            }
+            set_coordination_tx(&tx, &work_id, before.status, None)?;
+            clear_lease_tx(&tx, &work_id)?;
+            coordination_event_tx(
+                &tx,
+                &work_id,
+                "release",
+                &before,
+                before.status,
+                None,
+                &actor,
+            )?;
+            let snapshot = require_snapshot_tx(&tx, &work_id)?;
+            tx.commit()?;
+            Ok(snapshot)
+        })
     }
 
-    /// Terminal-run settlement release: custody clears and status becomes
-    /// `Blocked` (blocked/input-required outcomes) or `Open` (cancelled/
-    /// superseded). REFUSES on a closed item — the preserved adjudicated
-    /// guard: terminal run settlement must never reopen a hand-closed item.
+    /// Terminal-run settlement release: custody clears under the actor CAS
+    /// and status becomes `Blocked` (blocked/input-required) or `Open`
+    /// (cancelled/superseded). REFUSES on a closed item — the preserved
+    /// adjudicated guard: terminal run settlement must never reopen a
+    /// hand-closed item. Unheld and already at the target status is an
+    /// idempotent no-op; a different holder refuses with `BeadLeaseHeld`.
     pub fn release_unresolved_work_item(
         &self,
         work_id: &str,
@@ -848,19 +887,8 @@ impl Ledger {
         } else {
             WorkStatus::Open
         };
-        self.release_with_status(work_id, actor, Some(status), "release-unresolved")
-    }
-
-    fn release_with_status(
-        &self,
-        work_id: &str,
-        actor: &str,
-        target: Option<WorkStatus>,
-        verb: &str,
-    ) -> Result<WorkItemSnapshot, LedgerError> {
         let work_id = work_id.to_owned();
         let actor = actor.to_owned();
-        let verb = verb.to_owned();
         self.submit(move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let before = require_snapshot_tx(&tx, &work_id)?;
@@ -873,13 +901,31 @@ impl Ledger {
                     ),
                 ));
             }
-            let status = target.unwrap_or(match before.status {
-                WorkStatus::InProgress => WorkStatus::Open,
-                other => other,
-            });
+            match before.assignee.as_deref() {
+                None if before.status == status => {
+                    tx.commit()?;
+                    return Ok(before);
+                }
+                None => {}
+                Some(holder) if holder != actor => {
+                    return Err(refused(
+                        ErrorCode::BeadLeaseHeld,
+                        format!("work item {work_id:?} is held by {holder:?}, not {actor:?}"),
+                    ));
+                }
+                Some(_) => {}
+            }
             set_coordination_tx(&tx, &work_id, status, None)?;
             clear_lease_tx(&tx, &work_id)?;
-            coordination_event_tx(&tx, &work_id, &verb, &before, status, None, &actor)?;
+            coordination_event_tx(
+                &tx,
+                &work_id,
+                "release-unresolved",
+                &before,
+                status,
+                None,
+                &actor,
+            )?;
             let snapshot = require_snapshot_tx(&tx, &work_id)?;
             tx.commit()?;
             Ok(snapshot)
@@ -1273,13 +1319,19 @@ mod tests {
         l.assign_unassigned_work_item("beads-held", "mine", WorkStatus::Open)
             .unwrap();
         let err = l.close_held_work_item("beads-held", "thief").unwrap_err();
-        assert_eq!(err.code(), ErrorCode::BeadsContention);
+        assert_eq!(err.code(), ErrorCode::BeadLeaseHeld);
         let closed = l.close_held_work_item("beads-held", "mine").unwrap();
         assert_eq!(closed.status, WorkStatus::Closed);
         assert_eq!(closed.assignee, None);
-        // Idempotent for the same holder once custody is gone.
+        // Closed + unassigned is the idempotent convergence shape.
         let again = l.close_held_work_item("beads-held", "mine").unwrap();
         assert_eq!(again.status, WorkStatus::Closed);
+        // Unheld custody on a NON-closed item refuses — that refusal is what
+        // drives the landed pending → guarded-retake choreography.
+        l.create_work_item(item("beads-unheld", WorkStatus::Open))
+            .unwrap();
+        let err = l.close_held_work_item("beads-unheld", "mine").unwrap_err();
+        assert_eq!(err.code(), ErrorCode::BeadLeaseHeld);
     }
 
     #[test]

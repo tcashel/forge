@@ -33,10 +33,17 @@ pub fn issue_of(snapshot: &WorkItemSnapshot) -> IssueSummary {
         status: snapshot.status.as_str().to_string(),
         priority: snapshot.priority,
         assignee: snapshot.assignee.clone(),
-        issue_type: match snapshot.kind {
-            forged_ledger::WorkKind::Task => "task".to_string(),
-            forged_ledger::WorkKind::Epic => "epic".to_string(),
-        },
+        // A non-task/epic bd type survives import as provenance metadata;
+        // consumers routing on it (no-diff chore/decision/milestone holds)
+        // read it back here.
+        issue_type: snapshot
+            .metadata
+            .get("imported:issue-type")
+            .cloned()
+            .unwrap_or_else(|| match snapshot.kind {
+                forged_ledger::WorkKind::Task => "task".to_string(),
+                forged_ledger::WorkKind::Epic => "epic".to_string(),
+            }),
         acceptance_criteria: snapshot.spec.acceptance_criteria.clone(),
         design: snapshot.spec.design.clone(),
         notes: snapshot.spec.notes.clone(),

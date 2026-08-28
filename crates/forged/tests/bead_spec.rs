@@ -156,6 +156,13 @@ fn run_start_obeys_the_ready_frontier_and_routes_non_slice_beads_explicitly() {
     env.seed_bead_spec("blocked-target", DESCRIPTION, ACCEPTANCE);
     env.seed_bead_spec("ready-competitor", DESCRIPTION, ACCEPTANCE);
     env.seed_frontier("ready-competitor");
+    // Readiness is a query now: open + unassigned + no open `blocks` edge.
+    // The withheld bead must be withheld structurally.
+    env.set_bead_field(
+        "blocked-target",
+        "dependencies",
+        r#"[{"id":"blocker-open","dependency_type":"blocks","status":"open"}]"#,
+    );
     let (code, blocked) = env.forged(&[
         "run",
         "start",
@@ -466,6 +473,9 @@ fn an_adoption_that_finds_drift_settles_its_attempt_instead_of_looping() {
 #[test]
 fn a_file_sourced_run_still_works_and_is_recorded_as_deprecated() {
     let env = TestEnv::new("forged-bead-spec-file");
+    // The file route still binds to a real work item: `ready_slice_bead`
+    // runs before the spec source is chosen.
+    env.seed_frontier("bead-file");
     assert_eq!(env.forged(&["init"]).0, 0);
     let repo = env.repos.repo.to_string_lossy().into_owned();
     let spec = env.spec.to_string_lossy().into_owned();
@@ -769,6 +779,9 @@ fn a_spec_file_edited_under_an_open_packet_is_still_refused() {
     // downstream would catch it — `assert_pinned` returns early for a file
     // spec.
     let env = TestEnv::new("forged-bead-spec-file-edit");
+    // The file route still binds to a real work item: `ready_slice_bead`
+    // runs before the spec source is chosen.
+    env.seed_frontier("bead-file-edit");
     assert_eq!(env.forged(&["init"]).0, 0);
     let repo = env.repos.repo.to_string_lossy().into_owned();
     let spec = env.spec.to_string_lossy().into_owned();
@@ -814,19 +827,6 @@ fn a_spec_file_edited_under_an_open_packet_is_still_refused() {
     );
 }
 
-/// The packet's latest `proto.retry` grant: its failure count and deadline.
-fn latest_retry(env: &TestEnv, run: &str) -> Value {
-    let ledger = env.ledger();
-    let events = ledger.list_events(Some(run), 0, 4096).expect("events");
-    ledger.close().expect("close");
-    events
-        .iter()
-        .rev()
-        .find(|row| row.kind == "proto.retry")
-        .map(|row| serde_json::from_str::<Value>(&row.payload_json).expect("retry payload"))
-        .unwrap_or(Value::Null)
-}
-
 /// Bring a granted retry deadline forward so the next advance may claim,
 /// instead of sleeping through the production backoff.
 fn expire_retry_deadline(env: &TestEnv, run: &str) {
@@ -853,185 +853,11 @@ fn expire_retry_deadline(env: &TestEnv, run: &str) {
         .expect("advance retry clock");
 }
 
-#[test]
-fn an_unreachable_bd_at_claim_time_is_transport_and_is_charged_to_the_budget() {
-    let env = TestEnv::new("forged-bead-spec-outage");
-    assert_eq!(env.forged(&["init"]).0, 0);
-    // One free retry, so exhaustion is two grants away rather than four.
-    let config_path = env.anvil.join("config.json");
-    let mut config: Value =
-        serde_json::from_str(&std::fs::read_to_string(&config_path).expect("read config"))
-            .expect("config json");
-    config["transport_retry_budget"] = json!(1);
-    std::fs::write(
-        &config_path,
-        serde_json::to_string_pretty(&config).expect("config json"),
-    )
-    .expect("rewrite config");
-    env.seed_bead_spec("bead-outage", DESCRIPTION, ACCEPTANCE);
-    let repo = env.repos.repo.to_string_lossy().into_owned();
-    let (code, started) = env.forged(&[
-        "run",
-        "start",
-        "--bead",
-        "bead-outage",
-        "--repo",
-        &repo,
-        "--base-ref",
-        "main",
-    ]);
-    assert_eq!(code, 0, "run start: {started}");
-    env.authorize_run("bead-outage");
-    let packet = advance_to_open_packet(&env, "bead-outage");
-
-    // bd goes away. The claim cannot read the fence, which says NOTHING
-    // about whether the spec changed.
-    env.set_bd_spec_show_unreachable(true);
-    let (code, failed) = env.forged(&["packet", "claim", "--packet", &packet.packet_id]);
-    assert_ne!(code, 0, "an unreachable bd must fail the claim: {failed}");
-    assert_ne!(
-        failed["error"]["code"],
-        json!("SPEC_DRIFT"),
-        "an unreachable bd must never be reported as drift: {failed}"
-    );
-    assert_eq!(
-        failed["error"]["recoverable"],
-        json!(true),
-        "the claim must stay on the bounded-retry budget: {failed}"
-    );
-
-    // The driver's own claim-again path CHARGES that budget. The failure is
-    // pre-claim — no claim token exists to fence an attempt with — so the
-    // grant is the whole record of it, and no terminal attempt is invented.
-    let (code, first) = env.forged(&["run", "advance", "--run", "bead-outage"]);
-    assert_eq!(
-        code, 0,
-        "a transport failure is recorded, not raised: {first}"
-    );
-    assert_eq!(
-        latest_retry(&env, "bead-outage")["transportFailures"],
-        json!(1),
-        "the first pre-claim outage is charged to the budget"
-    );
-    let ledger = env.ledger();
-    assert!(
-        ledger
-            .list_live_attempts(Some("bead-outage"))
-            .expect("live attempts")
-            .is_empty(),
-        "a pre-claim failure leaves no attempt behind"
-    );
-    assert!(
-        ledger.get_attempt(1).is_err(),
-        "no attempt row is invented for work no seat ever held"
-    );
-    ledger.close().expect("close");
-
-    // The grant also holds the packet off until its backoff has passed.
-    let (code, waiting) = env.forged(&["run", "advance", "--run", "bead-outage"]);
-    assert_eq!(code, 0, "advance: {waiting}");
-    assert_eq!(
-        latest_retry(&env, "bead-outage")["transportFailures"],
-        json!(1),
-        "the granted deadline is honored rather than burned instantly"
-    );
-
-    // Past the deadline, the outage costs the second and last retry, and the
-    // budget is then spent.
-    expire_retry_deadline(&env, "bead-outage");
-    let (code, second) = env.forged(&["run", "advance", "--run", "bead-outage"]);
-    assert_eq!(code, 0, "advance: {second}");
-    assert_eq!(
-        latest_retry(&env, "bead-outage")["transportFailures"],
-        json!(2),
-        "an unreachable bd cannot repeat without limit"
-    );
-    let (code, exhausted) = env.forged(&["run", "advance", "--run", "bead-outage"]);
-    assert_eq!(code, 0, "advance: {exhausted}");
-    assert!(
-        exhausted["result"]["action"]["stop"]["providerUnavailable"].is_object(),
-        "a spent budget stops the run instead of retrying forever: {exhausted}"
-    );
-}
-
-#[test]
-fn a_bd_outage_that_clears_inside_the_budget_lets_the_packet_recover() {
-    // The other half of the budget's contract, and the one that says it is a
-    // BUDGET rather than a countdown to a stop: a bounded retry that only
-    // ever ends in exhaustion is indistinguishable from a hang. bd going away
-    // and coming back must leave the run exactly where it would have been.
-    let env = TestEnv::new("forged-bead-spec-recovers");
-    assert_eq!(env.forged(&["init"]).0, 0);
-    env.seed_bead_spec("bead-recovers", DESCRIPTION, ACCEPTANCE);
-    let repo = env.repos.repo.to_string_lossy().into_owned();
-    let (code, started) = env.forged(&[
-        "run",
-        "start",
-        "--bead",
-        "bead-recovers",
-        "--repo",
-        &repo,
-        "--base-ref",
-        "main",
-    ]);
-    assert_eq!(code, 0, "run start: {started}");
-    env.authorize_run("bead-recovers");
-    let packet = advance_to_open_packet(&env, "bead-recovers");
-
-    // One outage, charged: the budget of three is now one down.
-    env.set_bd_spec_show_unreachable(true);
-    let (code, charged) = env.forged(&["run", "advance", "--run", "bead-recovers"]);
-    assert_eq!(
-        code, 0,
-        "a transport failure is recorded, not raised: {charged}"
-    );
-    assert_eq!(
-        latest_retry(&env, "bead-recovers")["transportFailures"],
-        json!(1),
-        "the outage is charged"
-    );
-
-    // bd comes back well inside the budget.
-    env.set_bd_spec_show_unreachable(false);
-    expire_retry_deadline(&env, "bead-recovers");
-    let (code, recovered) = env.forged(&["run", "advance", "--run", "bead-recovers"]);
-    assert_eq!(
-        code, 0,
-        "the packet must claim once bd answers: {recovered}"
-    );
-
-    // The seat ran, at the body the packet pins, and the outage cost nothing
-    // beyond the one charge it earned.
-    let ledger = env.ledger();
-    let attempt = ledger.get_attempt(1).expect("the packet was claimed");
-    let row = ledger.get_packet(&packet.packet_id).expect("packet row");
-    ledger.close().expect("close");
-    assert_eq!(attempt.packet_id, packet.packet_id);
-    assert_eq!(
-        row.spec_sha256, packet.spec_sha256,
-        "a recovered claim pins the same body it opened at: {row:?}"
-    );
-    assert_eq!(
-        latest_retry(&env, "bead-recovers")["transportFailures"],
-        json!(1),
-        "a successful claim charges the budget nothing further"
-    );
-    let body = std::fs::read_to_string(&row.spec_path)
-        .unwrap_or_else(|e| panic!("seat spec at {}: {e}", row.spec_path));
-    assert!(
-        body.contains(ACCEPTANCE),
-        "the recovered seat reads the rendered body: {body}"
-    );
-
-    // And the run goes on to finish: the outage delayed it, nothing more.
-    let driven = wait_for(&env, &["run", "drive", "--run", "bead-recovers"], |value| {
-        value["ok"] == json!(true)
-    });
-    assert!(
-        driven["result"]["terminal"]["done"].is_object(),
-        "an outage inside the budget must not change where the run ends: {driven}"
-    );
-}
+// The bd-outage claim-time tests are retired: the work store is in-process,
+// so no transport failure mode exists on the spec path to charge the bounded
+// budget. The transport-retry budget itself stays covered by
+// `a_bead_edited_back_to_the_body_the_packet_opened_at_still_re_pins`, which
+// reaches it through a provider rate limit.
 
 #[test]
 fn an_epic_child_prefers_its_bead_fields_over_its_spec_pointer() {
@@ -1053,6 +879,10 @@ fn an_epic_child_prefers_its_bead_fields_over_its_spec_pointer() {
         &format!("spec: {}\\n{DESCRIPTION}", env.spec.display()),
     );
     env.set_bead_field("child-fields", "acceptance", ACCEPTANCE);
+    // The old `ready: false` flag is inert — readiness is a query. Withhold
+    // the pointer-only child structurally so the epic schedules the
+    // bead-sourced one.
+    env.set_bead_field("child-pointer", "status", "blocked");
 
     let repo = env.repos.repo.to_string_lossy().into_owned();
     let spec = env.spec.to_string_lossy().into_owned();
