@@ -784,13 +784,29 @@ fn three_submitted_rolling_epics_converge_below_capacity_with_one_isolated_crux(
         assert_eq!(code, 0, "epic submit {epic}: {submitted}");
         assert_eq!(submitted["result"]["submitted"], json!(true));
     }
+    // Two fence facts must become observable, not merely the first: the held
+    // review starting proves one epic won a slot, and a durable Deferred
+    // decision proves a sibling hit the capacity fence. The siblings'
+    // controllers can lag the winner on a slow host, so wait for each fact
+    // on its own clock instead of reading the decisions the instant the
+    // review starts.
     let mut review_started = false;
+    let mut deferred = 0_usize;
     for _ in 0..600 {
-        review_started = env
-            .provider_log()
-            .iter()
-            .any(|line| line.contains("/review-1/0 start "));
-        if review_started {
+        review_started = review_started
+            || env
+                .provider_log()
+                .iter()
+                .any(|line| line.contains("/review-1/0 start "));
+        let ledger = env.ledger();
+        deferred = ledger
+            .latest_admission_decisions(None, None)
+            .expect("admission decisions")
+            .into_iter()
+            .filter(|decision| decision.outcome == forged_types::AdmissionOutcome::Deferred)
+            .count();
+        ledger.close().expect("close ledger");
+        if review_started && deferred > 0 {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -799,14 +815,6 @@ fn three_submitted_rolling_epics_converge_below_capacity_with_one_isolated_crux(
         review_started,
         "one submitted epic reached assurance review"
     );
-    let ledger = env.ledger();
-    let deferred = ledger
-        .latest_admission_decisions(None, None)
-        .expect("admission decisions")
-        .into_iter()
-        .filter(|decision| decision.outcome == forged_types::AdmissionOutcome::Deferred)
-        .count();
-    ledger.close().expect("close ledger");
     assert!(
         deferred > 0,
         "the below-N workload must exercise the durable capacity fence"
