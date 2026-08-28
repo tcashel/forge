@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::path::Path;
 
 use forged_git::GhClient;
 use forged_ledger::{
@@ -20,6 +21,7 @@ use forged_types::{
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+use crate::adapters::ports::github_remote;
 use crate::config::now_iso;
 use crate::core::{
     derive_key, err_response, fenced, key_absent, ok_response, on_ledger, param_str, CoreResult,
@@ -42,6 +44,7 @@ struct ExactFinding {
 #[derive(Debug, Clone)]
 struct ReviewSnapshot {
     run_id: String,
+    repo: String,
     epoch: Option<ReviewEpochV1>,
     target: Option<ReviewPublicationTargetV1>,
     findings: Vec<ExactFinding>,
@@ -365,6 +368,7 @@ fn exact_findings(
 
 fn select_snapshot(
     run_id: &str,
+    repo: String,
     source: ReviewPublicationSource,
 ) -> Result<ReviewSnapshot, Failure> {
     let target = exact_pr_target(source.draft_pr_operation.as_ref())?;
@@ -380,6 +384,7 @@ fn select_snapshot(
         .map_err(|error| Failure::internal(format!("snapshot cannot canonicalize: {error}")))?;
     Ok(ReviewSnapshot {
         run_id: run_id.to_owned(),
+        repo,
         epoch,
         target,
         findings,
@@ -516,7 +521,10 @@ async fn publish_effect(
         .iter()
         .map(|finding| (finding.finding_id.as_str(), finding))
         .collect();
-    let gh = GhClient::new();
+    // Delivered and busy rows replay from the ledger alone; the origin
+    // remote is read only when a claimed row actually needs GitHub, so a
+    // fully-delivered batch reconstructs without the checkout.
+    let mut pinned_gh: Option<GhClient> = None;
     let mut outcomes = Vec::with_capacity(rows.len());
     let mut busy = false;
 
@@ -550,6 +558,15 @@ async fn publish_effect(
             .delivery_token
             .clone()
             .ok_or_else(|| Failure::internal("claimed review delivery has no token"))?;
+        let gh = match pinned_gh.as_ref() {
+            Some(gh) => gh,
+            None => {
+                let remote = github_remote(Path::new(&snapshot.repo))
+                    .await
+                    .map_err(Failure::from)?;
+                &*pinned_gh.insert(GhClient::new().with_host_opt(remote.gh_host()))
+            }
+        };
 
         failpoint::hit("review.publish.probe.before");
         let present = gh
@@ -740,8 +757,10 @@ pub async fn review_publish(ctx: &Ctx, req: &mut OperationRequest) -> OperationR
     req.run_id = Some(run_id.clone());
     let draft_key = machine_idempotency_key(&run_id, MachineStage::DraftPr, 0);
     let run_for_source = run_id.clone();
-    let source = match on_ledger(&ctx.ledger, move |ledger| {
-        ledger.review_publication_source(&run_for_source, &draft_key)
+    let (run, source) = match on_ledger(&ctx.ledger, move |ledger| {
+        let run = ledger.get_run(&run_for_source)?;
+        let source = ledger.review_publication_source(&run_for_source, &draft_key)?;
+        Ok((run, source))
     })
     .await
     {
@@ -753,7 +772,7 @@ pub async fn review_publish(ctx: &Ctx, req: &mut OperationRequest) -> OperationR
             )
         }
     };
-    let snapshot = match select_snapshot(&run_id, source) {
+    let snapshot = match select_snapshot(&run_id, run.repo, source) {
         Ok(snapshot) => snapshot,
         Err(error) => {
             return err_response(

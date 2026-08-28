@@ -120,6 +120,9 @@ pub fn enter_non_git_cwd() {
 }
 
 pub const SHIM_SCRIPT: &str = r#"#!/bin/sh
+if [ -n "${GH_SHIM_HOST_LOG:-}" ]; then
+  printf '%s' "${GH_HOST:-}" > "$GH_SHIM_HOST_LOG"
+fi
 {
   printf '%s\037' "$@"
   printf '\036'

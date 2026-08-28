@@ -43,6 +43,9 @@ pub enum ProtoError {
 /// Why a [`crate::ReconcilePorts`] method did not succeed.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum PortError {
+    /// GitHub routing or a gh call failed.
+    #[error("gh: {0}")]
+    Gh(String),
     /// The external system could not be reached.
     #[error("unavailable: {0}")]
     Unavailable(String),

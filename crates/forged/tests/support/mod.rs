@@ -331,6 +331,13 @@ pub fn setup_repos(root: &Path, base: &str) -> Repos {
             repo.to_str().expect("utf8 repo path"),
         ],
     );
+    // Production host derivation reads the raw origin URL. Keep that URL in
+    // a supported GitHub shape while a repository-local rewrite preserves
+    // hermetic fetch and push behavior against the local fixture.
+    let remote_url = "https://github.com/forged-test/repo.git";
+    git(&repo, &["remote", "set-url", "origin", remote_url]);
+    let rewrite_key = format!("url.{}.insteadOf", origin.display());
+    git(&repo, &["config", &rewrite_key, remote_url]);
     Repos {
         origin,
         repo,
