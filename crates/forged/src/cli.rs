@@ -352,6 +352,8 @@ pub enum EpicCmd {
     Resume(EpicReasonArgs),
     /// Resolve a held child after its spec/input was adjudicated.
     Resolve(EpicResolveArgs),
+    /// Abandon a started-but-doomed epic; a fresh start opens a clean epoch.
+    Abandon(EpicAbandonArgs),
     /// Append a roster revision for current and future child runs.
     ReviseRoster(EpicReviseRosterArgs),
 }
@@ -446,6 +448,20 @@ pub struct EpicReasonArgs {
     #[arg(long)]
     pub epic: String,
     /// Human-readable audit reason.
+    #[arg(long)]
+    pub reason: String,
+    /// Override the derived idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+/// `epic abandon` arguments.
+#[derive(Debug, Args)]
+pub struct EpicAbandonArgs {
+    /// The epic bead id.
+    #[arg(long)]
+    pub epic: String,
+    /// Why this epoch ends (recorded in the boundary event).
     #[arg(long)]
     pub reason: String,
     /// Override the derived idempotency key.
@@ -1606,6 +1622,7 @@ pub fn command_name(command: &Command) -> &'static str {
             EpicCmd::Pause(_) => "epic_pause",
             EpicCmd::Resume(_) => "epic_resume",
             EpicCmd::Resolve(_) => "epic_resolve",
+            EpicCmd::Abandon(_) => "epic_abandon",
             EpicCmd::ReviseRoster(_) => "epic_revise_roster",
         },
         Command::Packet { command } => match command {
@@ -1875,6 +1892,14 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
                 request(
                     a.idempotency_key,
                     Some(a.epic.clone()),
+                    json!({"epic": a.epic, "reason": a.reason}),
+                ),
+            ),
+            EpicCmd::Abandon(a) => (
+                "epic_abandon",
+                request(
+                    a.idempotency_key,
+                    None,
                     json!({"epic": a.epic, "reason": a.reason}),
                 ),
             ),

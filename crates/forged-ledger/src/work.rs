@@ -1121,7 +1121,10 @@ impl Ledger {
                  VALUES (?1, ?2, 'supersedes')",
                 rusqlite::params![successor_id, work_id],
             )?;
-            if before.status != WorkStatus::Closed {
+            // An already-closed target (importer residue can carry custody
+            // on closed rows) still clears custody and lease so the event's
+            // `assignee: {from, to: null}` never contradicts the row.
+            if before.status != WorkStatus::Closed || before.assignee.is_some() {
                 set_coordination_tx(&tx, &work_id, WorkStatus::Closed, None)?;
                 clear_lease_tx(&tx, &work_id)?;
             }
@@ -1266,6 +1269,105 @@ impl Ledger {
     /// priority never outranks a stated one), then id.
     pub fn ready_work_items(&self) -> Result<Vec<WorkItemSnapshot>, LedgerError> {
         self.submit(move |conn| ready_tx(conn))
+    }
+}
+
+/// One work-store integrity finding, with the typed repair that clears it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkStoreFinding {
+    /// The work item.
+    pub work_id: String,
+    /// A stable condition slug.
+    pub condition: String,
+    /// Human-readable detail.
+    pub detail: String,
+    /// The typed verb that repairs it.
+    pub repair: String,
+}
+
+impl Ledger {
+    /// Enumerate work-store invariant violations — checkable because the
+    /// invariants are ours. Ambiguous states are surfaced with their typed
+    /// repair, never auto-mutated.
+    pub fn work_store_findings(&self) -> Result<Vec<WorkStoreFinding>, LedgerError> {
+        self.submit(move |conn| {
+            let mut findings = Vec::new();
+            let mut stmt = conn.prepare(
+                "SELECT wl.work_id, wl.holder FROM work_leases wl \
+                 JOIN work_items wi ON wi.work_id = wl.work_id \
+                 WHERE wi.status = 'closed'",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (work_id, holder) = row?;
+                findings.push(WorkStoreFinding {
+                    detail: format!("closed item still holds a lease under {holder:?}"),
+                    repair: format!("work_release with actor {holder:?}"),
+                    condition: "closed-with-lease".to_owned(),
+                    work_id,
+                });
+            }
+            drop(stmt);
+            let mut stmt = conn.prepare(
+                "SELECT wi.work_id, wi.current_revision, MAX(wr.revision) \
+                 FROM work_items wi JOIN work_revisions wr ON wr.work_id = wi.work_id \
+                 GROUP BY wi.work_id HAVING wi.current_revision <> MAX(wr.revision)",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?;
+            for row in rows {
+                let (work_id, current, max) = row?;
+                findings.push(WorkStoreFinding {
+                    detail: format!(
+                        "current_revision {current} does not match the newest stored \
+                         revision {max}"
+                    ),
+                    repair: "storage corruption: restore from the latest snapshot".to_owned(),
+                    condition: "revision-pointer-drift".to_owned(),
+                    work_id,
+                });
+            }
+            drop(stmt);
+            let mut stmt = conn.prepare(
+                "SELECT wi.work_id, wi.assignee FROM work_items wi \
+                 WHERE wi.status = 'in_progress' AND wi.assignee IS NOT NULL \
+                   AND NOT EXISTS (SELECT 1 FROM work_leases wl \
+                                   WHERE wl.work_id = wi.work_id) \
+                   AND NOT EXISTS (SELECT 1 FROM runs r \
+                                   JOIN packets p ON p.run_id = r.run_id \
+                                   JOIN attempts a ON a.packet_id = p.packet_id \
+                                   WHERE r.bead_id = wi.work_id \
+                                     AND a.state IN ('running','revoking'))",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })?;
+            for row in rows {
+                let (work_id, assignee) = row?;
+                let holder = assignee.unwrap_or_default();
+                findings.push(WorkStoreFinding {
+                    detail: format!(
+                        "in_progress with custody {holder:?} but no lease row and no live \
+                         attempt — crash or import residue"
+                    ),
+                    repair: format!(
+                        "the scoped reclaim frees it (custody without a lease reads as \
+                         long-expired), or work_release with actor {holder:?}"
+                    ),
+                    condition: "custody-residue".to_owned(),
+                    work_id,
+                });
+            }
+            Ok(findings)
+        })
     }
 }
 

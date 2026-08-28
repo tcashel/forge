@@ -615,18 +615,50 @@ impl Ledger {
             }
 
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            // Herdr pane projections hold a non-deferrable FK onto this
+            // identity; the boundary re-capture below DELETEs and re-INSERTs
+            // the same primary key, so the FK check must be deferred to
+            // commit for any epic that ever ran under Herdr.
+            tx.execute_batch("PRAGMA defer_foreign_keys = ON")?;
+            // The start bundle is scoped to the current start-epoch: events
+            // after the latest `forged.epic.abandoned` boundary. A fresh
+            // epoch legitimately re-captures the epic's identity — the
+            // immutability trigger guards in-place mutation, and the
+            // epoch boundary is the one sanctioned replacement point.
+            let epoch_boundary: i64 = tx.query_row(
+                "SELECT COALESCE(MAX(event_id), 0) FROM events \
+                 WHERE run_id = ?1 AND kind = 'forged.epic.abandoned'",
+                [&epic_id],
+                |row| row.get(0),
+            )?;
             let standing_events = {
                 let mut statement = tx.prepare(
                     "SELECT payload_json FROM events WHERE run_id = ?1 \
-                     AND kind = 'forged.epic.started' ORDER BY event_id",
+                     AND kind = 'forged.epic.started' AND event_id > ?2 ORDER BY event_id",
                 )?;
-                let rows = statement.query_map([&epic_id], |row| row.get::<_, String>(0))?;
+                let rows = statement
+                    .query_map(rusqlite::params![epic_id, epoch_boundary], |row| {
+                        row.get::<_, String>(0)
+                    })?;
                 rows.collect::<Result<Vec<_>, _>>()?
             };
             let standing_identity =
                 get_work_identity_tx(&tx, WorkIdentitySubjectKind::Epic, &epic_id)?;
             match (standing_events.as_slice(), standing_identity) {
                 ([], None) => {
+                    append_event_tx(&tx, Some(&epic_id), "forged.epic.started", &event)?;
+                    insert_work_identity_tx(&tx, &identity)?;
+                    tx.commit()?;
+                    Ok(true)
+                }
+                ([], Some(_previous_epoch)) if epoch_boundary > 0 => {
+                    // A fresh epoch after an abandon: replace the captured
+                    // identity as part of the atomic start bundle.
+                    tx.execute(
+                        "DELETE FROM work_identities \
+                         WHERE subject_kind = 'epic' AND subject_id = ?1",
+                        [&epic_id],
+                    )?;
                     append_event_tx(&tx, Some(&epic_id), "forged.epic.started", &event)?;
                     insert_work_identity_tx(&tx, &identity)?;
                     tx.commit()?;

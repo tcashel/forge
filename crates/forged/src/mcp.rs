@@ -1319,6 +1319,18 @@ impl ForgedServer {
         self.call("events_tail", args.0).await
     }
 
+    /// Abandon a started-but-doomed epic.
+    #[tool(
+        name = "epic_abandon",
+        description = "Typed terminal exit for a started epic whose start was structurally \
+                       wrong. params: epic, reason. Refuses while a live controller holds \
+                       the driver slot (stop or pause first). A fresh epic_start then opens \
+                       a clean epoch; started children settle through their own runs."
+    )]
+    pub async fn epic_abandon(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
+        self.call("epic_abandon", args.0).await
+    }
+
     /// Typed work authoring: create.
     #[tool(
         name = "work_create",
