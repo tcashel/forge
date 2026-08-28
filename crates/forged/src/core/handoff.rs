@@ -25,6 +25,11 @@ use crate::core::{
 const CONTROLLER_STARTED: &str = "forged.controller.started";
 const CONTROLLER_FALLBACK: &str = "forged.controller.host.fallback";
 const CONTROLLER_RECOVERED: &str = "forged.controller.recovered";
+/// The marker a detached drive loop appends when it exits on a terminal
+/// failure. The supervisor joins it to tell a deterministic, nonrecoverable
+/// death — halted after one attempt — from a death a restart could outrun;
+/// the raw controller log stops being the only place the failure exists.
+pub(crate) const CONTROLLER_TERMINAL_EVENT: &str = "forged.controller.terminal";
 const RECORD_FILE: &str = "controller.json";
 const SUBMIT_LOCK_WAIT: Duration = Duration::from_secs(30);
 const CONTROLLER_AUTHORIZATION_WAIT: Duration = Duration::from_secs(30);
@@ -136,6 +141,35 @@ pub(crate) async fn record_driver_identity_from_env() -> Result<(), String> {
     std::fs::write(&pid_path, format!("{pid}\n"))
         .map_err(|error| format!("writing detached controller pid: {error}"))?;
     Ok(())
+}
+
+/// Record a drive loop's terminal failure durably, best-effort: the failure
+/// envelope stays the authority and a failed append never masks it. The
+/// generation is taken from the detached-controller environment; a
+/// foreground `drive` records the failure without one, and a
+/// generation-less marker never gates supervision.
+pub(crate) async fn record_controller_terminal(
+    ctx: &Ctx,
+    subject_id: &str,
+    error: &forged_types::OpError,
+) {
+    let generation = std::env::var(CONTROLLER_GENERATION_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| *value > 0);
+    let payload = json!({
+        "schemaVersion": 1,
+        "subjectId": subject_id,
+        "generation": generation,
+        "code": error.code,
+        "message": error.message,
+        "recoverable": error.recoverable,
+    });
+    let id = subject_id.to_owned();
+    let _ = on_ledger(&ctx.ledger, move |ledger| {
+        ledger.append_event(Some(&id), CONTROLLER_TERMINAL_EVENT, payload)
+    })
+    .await;
 }
 
 async fn await_lstart(pid: i32) -> Option<String> {

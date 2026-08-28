@@ -94,6 +94,26 @@ impl Ledger {
         })
     }
 
+    /// The newest event of one kind for one run, or `None`. The reader's
+    /// seam for per-subject marker events (a controller's terminal failure)
+    /// without paging the run's whole stream.
+    pub fn latest_event_of_kind(
+        &self,
+        run_id: &str,
+        kind: &str,
+    ) -> Result<Option<EventRow>, LedgerError> {
+        let run_id = run_id.to_owned();
+        let kind = kind.to_owned();
+        self.submit(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT event_id, ts, run_id, kind, payload_json FROM events
+                 WHERE run_id = ?1 AND kind = ?2 ORDER BY event_id DESC LIMIT 1",
+            )?;
+            let mut rows = stmt.query_map(rusqlite::params![run_id, kind], event_row)?;
+            Ok(rows.next().transpose()?)
+        })
+    }
+
     /// Append an event only when the same run/kind/payload tuple is absent.
     /// This is the crash-safe seam for deterministic protocol transitions
     /// whose operation wrapper may be retried after the event landed.
