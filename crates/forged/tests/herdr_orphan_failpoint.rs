@@ -51,6 +51,12 @@ impl PaneNotFoundServer {
                     }
                     Err(error) => panic!("accept Herdr fixture: {error}"),
                 };
+                // macOS accepted sockets inherit the listener's O_NONBLOCK
+                // (Linux clears it); reading before the client's bytes land
+                // would panic with WouldBlock under parallel test load.
+                stream
+                    .set_nonblocking(false)
+                    .expect("blocking Herdr stream");
                 let mut line = String::new();
                 BufReader::new(stream.try_clone().expect("clone fixture stream"))
                     .read_line(&mut line)
