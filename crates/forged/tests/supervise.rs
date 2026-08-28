@@ -1279,20 +1279,31 @@ fn nonrecoverable_terminal_halts_without_charging_the_budget() {
 
     // Kill confirmation DEFERS while the resubmitted controller's start
     // time is not yet recorded, so the cleanup stop retries until the
-    // identity is verifiable instead of racing it.
-    wait_until("halt fixture stop lands", || {
-        env.forged(&[
-            "run",
-            "stop",
-            "--run",
-            "run-halt",
-            "--outcome",
-            "cancelled",
-            "--reason",
-            "halt fixture cleanup",
-        ])
-        .0 == 0
-    });
+    // identity is verifiable instead of racing it. On timeout the last
+    // refusal names the wedge.
+    {
+        let started = Instant::now();
+        loop {
+            let (code, stop) = env.forged(&[
+                "run",
+                "stop",
+                "--run",
+                "run-halt",
+                "--outcome",
+                "cancelled",
+                "--reason",
+                "halt fixture cleanup",
+            ]);
+            if code == 0 {
+                break;
+            }
+            assert!(
+                started.elapsed() < WAIT,
+                "timed out waiting for halt fixture stop lands; last refusal: {stop}"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
     let record: Value = serde_json::from_slice(
         &std::fs::read(env.anvil.join("runs/run-halt/controller/controller.json"))
             .expect("controller record"),
