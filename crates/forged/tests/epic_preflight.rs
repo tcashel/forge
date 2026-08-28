@@ -130,3 +130,71 @@ fn preflight_names_a_missing_repository_and_unknown_profile() {
     assert_eq!(check(result, "epic-bead")["ok"], json!(true), "{preflight}");
     assert_nothing_durable(&env, "epic-pfr");
 }
+
+/// The admission contract, front-run: a child whose repository metadata
+/// differs from the target can never admit, so preflight fails the
+/// children check instead of passing an undispatchable inventory.
+#[test]
+fn preflight_names_a_child_assigned_to_another_repository() {
+    let env = TestEnv::new("forged-epic-preflight-repo-mismatch");
+    env.seed_epic("epic-pfr", &[("child-pfr", &env.spec, true)]);
+    assert_eq!(env.forged(&["init"]).0, 0);
+    env.set_bead_repository("child-pfr", "/somewhere/else");
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+
+    let (code, preflight) =
+        env.forged(&["epic", "preflight", "--epic", "epic-pfr", "--repo", &repo]);
+    assert_eq!(code, 0, "{preflight}");
+    let result = preflight["result"].clone();
+    assert_eq!(result["ok"], json!(false), "{preflight}");
+    let children = check(&result, "children");
+    assert_eq!(children["ok"], json!(false), "{children}");
+    let detail = children["detail"].as_str().expect("detail");
+    assert!(detail.contains("child-pfr"), "{detail}");
+    assert!(detail.contains("/somewhere/else"), "{detail}");
+    assert_nothing_durable(&env, "epic-pfr");
+}
+
+/// A no-diff child never launches a run — the scheduler raises the
+/// `non-code-child` hold instead — so its identity row advertises no run,
+/// branch, or worktree.
+#[test]
+fn preflight_reports_no_run_identity_for_a_no_diff_child() {
+    let env = TestEnv::new("forged-epic-preflight-no-diff");
+    env.seed_epic(
+        "epic-pfn",
+        &[
+            ("child-code", &env.spec, true),
+            ("child-chore", &env.spec, true),
+        ],
+    );
+    env.set_bead_field("child-chore", "type", "chore");
+    assert_eq!(env.forged(&["init"]).0, 0);
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+
+    let (code, preflight) =
+        env.forged(&["epic", "preflight", "--epic", "epic-pfn", "--repo", &repo]);
+    assert_eq!(code, 0, "{preflight}");
+    let result = preflight["result"].clone();
+    assert_eq!(result["ok"], json!(true), "{preflight}");
+    let children = result["identities"]["children"]
+        .as_array()
+        .expect("children identities")
+        .clone();
+    let identity = |id: &str| {
+        children
+            .iter()
+            .find(|child| child["id"] == json!(id))
+            .cloned()
+            .unwrap_or_else(|| panic!("identity for {id}: {result}"))
+    };
+    let chore = identity("child-chore");
+    assert_eq!(chore["noDiff"], json!(true), "{chore}");
+    assert!(chore["runId"].is_null(), "{chore}");
+    assert!(chore["branch"].is_null(), "{chore}");
+    assert!(chore["worktreePath"].is_null(), "{chore}");
+    let code_child = identity("child-code");
+    assert_eq!(code_child["noDiff"], json!(false), "{code_child}");
+    assert_eq!(code_child["runId"], json!("child-code"), "{code_child}");
+    assert_nothing_durable(&env, "epic-pfn");
+}

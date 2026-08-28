@@ -1929,6 +1929,29 @@ fn record_check(checks: &mut Vec<Value>, name: &str, outcome: Result<String, Fai
     checks.push(json!({"name": name, "ok": ok, "detail": detail}));
 }
 
+/// The admission contract, front-run: a bead admits only when its
+/// `metadata.repository` literally equals the canonical target path —
+/// absence is `BeadMalformed`, difference is `RepositoryMismatch` — so a
+/// preflight that skipped this would pass an inventory whose children can
+/// never admit.
+fn check_bead_repository(
+    issue: &forged_beads::IssueSummary,
+    repo: Option<&str>,
+) -> Result<(), Failure> {
+    let Some(repo) = repo else { return Ok(()) };
+    match issue.metadata.get("repository") {
+        None => Err(Failure::invalid(format!(
+            "{} carries no repository metadata; admission treats it as malformed",
+            issue.id
+        ))),
+        Some(actual) if actual != repo => Err(Failure::invalid(format!(
+            "{} repository {actual:?} does not match the target {repo:?}",
+            issue.id
+        ))),
+        Some(_) => Ok(()),
+    }
+}
+
 /// Read-only rehearsal of `epic_start`: the geometry, definition,
 /// inventory, and tooling checks the start enforces, plus the identity
 /// tuple a start would freeze — with nothing created. No event, no
@@ -2046,14 +2069,13 @@ pub async fn epic_preflight(ctx: &Ctx, req: &OperationRequest) -> OperationRespo
         };
 
         match forged_beads::show_issue(&ctx.config.bd_config(), &epic).await {
-            Ok(issue) if issue.issue_type == "epic" => match super::spec::resolve_issue(&issue) {
-                Ok(_) => record_check(
-                    &mut checks,
-                    "epic-bead",
-                    Ok(format!("epic {epic} {:?}", issue.title)),
-                ),
-                Err(error) => record_check(&mut checks, "epic-bead", Err(error)),
-            },
+            Ok(issue) if issue.issue_type == "epic" => {
+                let outcome = super::spec::resolve_issue(&issue)
+                    .map(|_| ())
+                    .and_then(|()| check_bead_repository(&issue, repo.as_deref()))
+                    .map(|()| format!("epic {epic} {:?}", issue.title));
+                record_check(&mut checks, "epic-bead", outcome);
+            }
             Ok(issue) => record_check(
                 &mut checks,
                 "epic-bead",
@@ -2083,15 +2105,33 @@ pub async fn epic_preflight(ctx: &Ctx, req: &OperationRequest) -> OperationRespo
                     if let Err(error) = resolve_child_spec(child, rolling) {
                         failures.push(error.message);
                     }
+                    if let Err(error) = check_bead_repository(child, repo.as_deref()) {
+                        failures.push(error.message);
+                    }
                     // Generation-1 identities, exactly as `start_child`
-                    // derives them.
-                    children_identity.push(json!({
-                        "id": child.id,
-                        "runId": child.id,
-                        "branch": format!("forged/{}", child.id),
-                        "worktreePath": ctx.config.worktree(&child.id),
-                        "planningStub": planning_stub,
-                    }));
+                    // derives them — except a no-diff child, which the
+                    // scheduler never launches (it raises the
+                    // `non-code-child` hold), so its tuple advertises no
+                    // run, branch, or worktree.
+                    children_identity.push(if is_no_diff(&child.issue_type) {
+                        json!({
+                            "id": child.id,
+                            "runId": Value::Null,
+                            "branch": Value::Null,
+                            "worktreePath": Value::Null,
+                            "noDiff": true,
+                            "planningStub": false,
+                        })
+                    } else {
+                        json!({
+                            "id": child.id,
+                            "runId": child.id,
+                            "branch": format!("forged/{}", child.id),
+                            "worktreePath": ctx.config.worktree(&child.id),
+                            "noDiff": false,
+                            "planningStub": planning_stub,
+                        })
+                    });
                 }
                 if failures.is_empty() {
                     record_check(
