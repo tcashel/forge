@@ -830,11 +830,41 @@ fn three_submitted_rolling_epics_converge_below_capacity_with_one_isolated_crux(
                 format!("{epic}: {status}")
             })
             .collect();
+        let mut evidence = String::new();
+        for (epic, _) in epics {
+            let controller = env
+                .anvil
+                .join("runs")
+                .join(epic)
+                .join("controller/controller-1.log");
+            let log = std::fs::read_to_string(&controller).unwrap_or_default();
+            let tail: Vec<&str> = log.lines().rev().take(30).collect();
+            evidence.push_str(&format!("--- {epic} controller tail ---\n"));
+            for line in tail.iter().rev() {
+                evidence.push_str(line);
+                evidence.push('\n');
+            }
+            let attempts = env
+                .anvil
+                .join("runs")
+                .join(format!("{epic}-epic-assurance"))
+                .join("packets/review-1/0/attempts");
+            if let Ok(entries) = std::fs::read_dir(&attempts) {
+                for entry in entries.flatten() {
+                    for file in ["result.json", ".provider-stream-status.json"] {
+                        let path = entry.path().join(file);
+                        if let Ok(body) = std::fs::read_to_string(&path) {
+                            evidence.push_str(&format!("--- {} ---\n{body}\n", path.display()));
+                        }
+                    }
+                }
+            }
+        }
         panic!(
             "the below-N workload must exercise the durable capacity fence\n\
              decisions: {decisions:?}\n\
              provider log: {:?}\n\
-             {}",
+             {}\n{evidence}",
             env.provider_log(),
             statuses.join("\n"),
         );
