@@ -85,16 +85,22 @@ pub async fn doctor(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
                 Ok(detail) | Err(detail) => detail,
             },
         }));
+        // The digest names the exact content being SERVED, not merely that a
+        // file parses: an operator comparing it against the file on disk can
+        // prove whether a long-lived surface is behind an edit.
         probes.push(json!({
             "name": "config-file",
             "ok": true,
-            "detail": if ctx.config.config_file_read {
-                format!("read {}", ctx.config.config_path.display())
-            } else {
-                format!(
+            "detail": match (&ctx.config.config_file_read, &ctx.config.config_sha256) {
+                (true, Some(sha)) => format!(
+                    "serving {} (sha256 {})",
+                    ctx.config.config_path.display(),
+                    sha
+                ),
+                _ => format!(
                     "{} absent; every key at its documented default",
                     ctx.config.config_path.display()
-                )
+                ),
             },
         }));
         let (service_ok, service_detail) = crate::runtime::doctor_probe(&ctx.config).await;
@@ -4389,15 +4395,40 @@ async fn control_attention(
     control: AttentionControl,
 ) -> OperationResponse {
     let name = control.name();
-    let subject = match req.run_id.as_deref().filter(|value| !value.is_empty()) {
-        Some(value) => value.to_owned(),
-        None => {
+    // The subject travels as the envelope `runId` (the CLI's `--subject`),
+    // and `params.subjectId` is accepted as an alias because attention_list
+    // hands the id back under that name. When both appear they must agree.
+    let envelope_subject = req.run_id.as_deref().filter(|value| !value.is_empty());
+    let params_subject = req
+        .params
+        .get("subjectId")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty());
+    let subject = match (envelope_subject, params_subject) {
+        (Some(envelope), Some(alias)) if envelope != alias => {
+            return err_response(
+                &derive_key(name, Some(envelope), None, None),
+                &Failure::invalid(format!(
+                    "envelope runId {envelope:?} conflicts with params.subjectId {alias:?}"
+                )),
+            )
+        }
+        (Some(value), _) | (None, Some(value)) => value.to_owned(),
+        (None, None) => {
             return err_response(
                 &derive_key(name, None, None, None),
-                &Failure::invalid("attention control requires a subject id"),
+                &Failure::invalid(
+                    "attention control requires a subject id: pass the item's \
+                     subjectId as the envelope runId or as params.subjectId",
+                ),
             )
         }
     };
+    req.run_id = Some(subject.clone());
+    // The alias is addressing, not payload: strip it after resolution so
+    // both documented request forms canonicalize to one idempotency
+    // identity — a retry that switches forms must replay, not conflict.
+    req.params.remove("subjectId");
     let attention_id = match param_str(&req.params, "attentionId") {
         Ok(value) => value.to_owned(),
         Err(error) => return err_response(&derive_key(name, Some(&subject), None, None), &error),

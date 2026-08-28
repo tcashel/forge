@@ -1697,6 +1697,17 @@ async fn advance_once(
 /// clear by waiting, and only the deferred admission decision carries an
 /// attention projection, so parking on anything else would starve silently.
 pub async fn run_drive(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
+    let response = run_drive_loop(ctx, req).await;
+    // Every terminal error exit of the loop, present and future, records
+    // durable evidence: the supervisor reads it instead of the controller's
+    // process-local log.
+    if let (Some(error), Ok(run_id)) = (response.error.as_ref(), param_str(&req.params, "run")) {
+        super::handoff::record_controller_terminal(ctx, run_id, error).await;
+    }
+    response
+}
+
+async fn run_drive_loop(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
     let echo = derive_key("run_drive", req.run_id.as_deref(), None, None);
     let run_id = match param_str(&req.params, "run") {
         Ok(r) => r.to_owned(),

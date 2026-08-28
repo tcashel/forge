@@ -39,7 +39,9 @@ use crate::failpoint;
 /// Everything a core function needs: the once-read config and the open
 /// ledger.
 pub struct Ctx {
-    /// The once-read config.
+    /// The config snapshot this dispatch serves. Single-shot CLI processes
+    /// read it once; the long-lived surfaces (MCP mount, supervise loop)
+    /// rebuild the snapshot when the config file changes on disk.
     pub config: ForgedConfig,
     /// The open ledger (a cloneable handle to the writer thread).
     pub ledger: Ledger,

@@ -135,7 +135,9 @@ pub(crate) fn policy(
             Severity::High,
             Owner::Human,
             Action::ReauthorizeWork,
-            "Create a new authorized control revision",
+            "Address the recorded failure first, then resubmit the same \
+             subject (run submit / epic submit) to authorize the next \
+             control revision with a fresh restart budget",
         ),
         Condition::FailedGate => (
             Severity::High,

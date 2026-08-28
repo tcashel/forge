@@ -323,10 +323,14 @@ fn parse_config(value: &Value, migration: Option<&Value>) -> Result<EpicConfig, 
             })?,
         rolling_authorized: rolling_authorized(value),
         legacy_membership_recorded,
-        root_revision: value
-            .get("specRevision")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
+        // Bead revisions are opaque strings end to end, but legacy events
+        // carried bd's raw numeric form; both must hydrate (the sibling
+        // readers in the ledger already accept both).
+        root_revision: value.get("specRevision").and_then(|value| match value {
+            Value::String(text) if !text.is_empty() => Some(text.clone()),
+            Value::Number(number) => Some(number.to_string()),
+            _ => None,
+        }),
         root_fields: value
             .get("rootFields")
             .filter(|value| !value.is_null())
@@ -1259,35 +1263,36 @@ fn normalize_base_ref(requested: &str) -> Option<&str> {
     (!bare.is_empty()).then_some(bare)
 }
 
-/// Validate an operator-supplied base ref against the repository's `origin`
-/// before any durable start state exists. Returns the normalized bare name,
-/// or `None` when the epic already started and the request replays durable
-/// bytes instead.
+/// Resolve an operator-supplied base ref to the normalized bare name the
+/// request hash and start event freeze. Normalization ALWAYS applies — a
+/// replay after `STARTED` must present the same canonical bytes the first
+/// invocation stored, or its idempotency hash (and crash recovery of an
+/// applied start) would refuse the identical command. Only the origin
+/// existence probe is gated on pre-durable state, so replays stay offline.
 async fn validate_requested_base_ref(
     ctx: &Ctx,
     epic: &str,
     params: &Map<String, Value>,
     requested: &str,
-) -> Result<Option<String>, Failure> {
-    let events = epic_events(ctx, epic).await?;
-    if events.iter().any(|row| row.kind == STARTED) {
-        return Ok(None);
-    }
-    let repo = super::work_identity::canonical_repository(param_str(params, "repo")?)?;
+) -> Result<String, Failure> {
     let Some(bare) = normalize_base_ref(requested) else {
         return Err(Failure::invalid(format!(
             "baseRef {requested:?} must be a bare branch name (e.g. \"main\")"
         )));
     };
-    forged_git::remote_branch_sha(Path::new(&repo), bare)
-        .await
-        .map_err(|error| {
-            Failure::invalid(format!(
-                "baseRef {requested:?} must name a branch that exists on origin \
-                 (pass the bare default branch name, e.g. \"main\"): {error}"
-            ))
-        })?;
-    Ok(Some(bare.to_owned()))
+    let events = epic_events(ctx, epic).await?;
+    if !events.iter().any(|row| row.kind == STARTED) {
+        let repo = super::work_identity::canonical_repository(param_str(params, "repo")?)?;
+        forged_git::remote_branch_sha(Path::new(&repo), bare)
+            .await
+            .map_err(|error| {
+                Failure::invalid(format!(
+                    "baseRef {requested:?} must name a branch that exists on origin \
+                     (pass the bare default branch name, e.g. \"main\"): {error}"
+                ))
+            })?;
+    }
+    Ok(bare.to_owned())
 }
 
 /// Freeze the Beads inventory and child execution defaults.
@@ -1316,13 +1321,13 @@ pub async fn epic_start(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespo
     };
     // Operator-supplied geometry is validated before the fenced request
     // event exists: a refused start leaves nothing behind to replay, and the
-    // normalized value is what the request hash and start event freeze.
+    // normalized value is what the request hash and start event freeze — on
+    // first start and on every replay alike.
     if let Some(requested) = param_opt_str(&req.params, "baseRef").map(str::to_owned) {
         match validate_requested_base_ref(ctx, &epic, &req.params, &requested).await {
-            Ok(Some(normalized)) => {
+            Ok(normalized) => {
                 req.params.insert("baseRef".to_owned(), json!(normalized));
             }
-            Ok(None) => {}
             Err(error) => return err_response(&req.idempotency_key, &error),
         }
     }
@@ -2291,10 +2296,22 @@ pub async fn epic_revise_roster(ctx: &Ctx, req: &mut OperationRequest) -> Operat
     let roster_name = match param_str(&req.params, "roster") {
         Ok(value) => value.to_owned(),
         Err(error) => {
+            // A revision names a catalog entry; the config file is where the
+            // roster's content lives. An inline object here reads as the
+            // generic missing-param refusal without this hint.
+            let error = if req.params.get("roster").is_some_and(Value::is_object) {
+                Failure::invalid(
+                    "params.roster must be a roster NAME from the config catalog, \
+                     not an inline roster object; edit the config file and revise \
+                     by name",
+                )
+            } else {
+                error
+            };
             return err_response(
                 &derive_key("epic_revise_roster", Some(&epic), None, None),
                 &error,
-            )
+            );
         }
     };
     let reason = match param_str(&req.params, "reason") {
@@ -5224,6 +5241,16 @@ pub async fn epic_advance(ctx: &Ctx, req: &OperationRequest) -> OperationRespons
 
 /// Drive an epic through child slices and waves until a durable human stop.
 pub async fn epic_drive(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
+    let response = epic_drive_loop(ctx, req).await;
+    // Every terminal error exit of the loop records durable evidence: the
+    // supervisor reads it instead of the controller's process-local log.
+    if let (Some(error), Ok(epic)) = (response.error.as_ref(), param_str(&req.params, "epic")) {
+        super::handoff::record_controller_terminal(ctx, epic, error).await;
+    }
+    response
+}
+
+async fn epic_drive_loop(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
     let epic = match param_str(&req.params, "epic") {
         Ok(value) => value.to_owned(),
         Err(error) => return err_response(&derive_key("epic_drive", None, None, None), &error),

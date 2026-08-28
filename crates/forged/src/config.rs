@@ -39,6 +39,10 @@ pub struct ForgedConfig {
     pub db_path: PathBuf,
     pub config_path: PathBuf,
     pub config_file_read: bool,
+    /// The sha256 of the config file bytes this snapshot resolved from;
+    /// `None` when no file was read. This is the reload fingerprint: a
+    /// long-lived surface refreshes only when the digest stops matching.
+    pub config_sha256: Option<String>,
     /// Legacy default projection retained for pre-definition test fixtures.
     pub roster: HashMap<Stage, ProviderHints>,
     pub profiles: BTreeMap<String, ProfileDefinitionV1>,
@@ -454,7 +458,11 @@ impl ForgedConfig {
     pub fn load() -> Result<ForgedConfig, String> {
         let anvil_home = anvil_home();
         let config_path = config_path(&anvil_home);
-        let (file, config_file_read) = match std::fs::read_to_string(&config_path) {
+        Self::load_at(anvil_home, config_path)
+    }
+
+    fn load_at(anvil_home: PathBuf, config_path: PathBuf) -> Result<ForgedConfig, String> {
+        let (file, config_file_read, config_sha256) = match std::fs::read_to_string(&config_path) {
             Ok(text) => {
                 let parsed = if config_path.extension().and_then(|v| v.to_str()) == Some("json") {
                     serde_json::from_str(&text).map_err(|e| e.to_string())
@@ -462,9 +470,11 @@ impl ForgedConfig {
                     serde_yaml::from_str(&text).map_err(|e| e.to_string())
                 }
                 .map_err(|e| format!("config {} does not parse: {e}", config_path.display()))?;
-                (parsed, true)
+                (parsed, true, Some(content_sha256(text.as_bytes())))
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (ConfigFile::default(), false),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                (ConfigFile::default(), false, None)
+            }
             Err(e) => return Err(format!("config {}: {e}", config_path.display())),
         };
 
@@ -509,6 +519,7 @@ impl ForgedConfig {
             db_path: forged_ledger::default_db_path(),
             config_path,
             config_file_read,
+            config_sha256,
             roster: legacy_roster,
             profiles,
             rosters,
@@ -532,6 +543,51 @@ impl ForgedConfig {
             admission,
             anvil_home,
         })
+    }
+
+    /// Re-resolve this snapshot's config, refreshing every file-derived
+    /// field. The file's IDENTITY is re-selected exactly as a fresh process
+    /// selects it (`FORGED_CONFIG`, then yaml-before-json under this home),
+    /// so a `config.yaml` created — or removed over a json fallback — while
+    /// a long-lived surface runs is honored, not pinned past. The identity
+    /// anchors — `db_path`, `runs_root`, `beads_dir` — are preserved from
+    /// this snapshot: a live config edit may retune rosters, profiles,
+    /// pricing, or admission, but it must never re-point durable state out
+    /// from under an open surface.
+    pub fn reload(&self) -> Result<ForgedConfig, String> {
+        let selected = config_path(&self.anvil_home);
+        let mut fresh = Self::load_at(self.anvil_home.clone(), selected)?;
+        fresh.db_path = self.db_path.clone();
+        fresh.runs_root = self.runs_root.clone();
+        fresh.beads_dir = self.beads_dir.clone();
+        Ok(fresh)
+    }
+
+    /// The reload gate for long-lived surfaces: `Ok(None)` when the
+    /// selected config file is still this snapshot's file with matching
+    /// fingerprint, `Ok(Some(fresh))` when the content changed (including
+    /// appearing or disappearing) or the SELECTION moved to a different
+    /// path. A snapshot that never read a file and still selects none is
+    /// unchanged by definition — a hand-built config with no backing file
+    /// never reloads over itself.
+    pub fn refreshed(&self) -> Result<Option<ForgedConfig>, String> {
+        if config_path(&self.anvil_home) != self.config_path {
+            return self.reload().map(Some);
+        }
+        match std::fs::read(&self.config_path) {
+            Ok(bytes) => {
+                if self.config_sha256.as_deref() == Some(content_sha256(&bytes).as_str()) {
+                    return Ok(None);
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if self.config_sha256.is_none() {
+                    return Ok(None);
+                }
+            }
+            Err(e) => return Err(format!("config {}: {e}", self.config_path.display())),
+        }
+        self.reload().map(Some)
     }
 
     /// Resolve, validate, canonicalize, and hash a selected definition.
@@ -567,6 +623,9 @@ impl ForgedConfig {
             }]);
         };
         let mut errors = Vec::new();
+        // Authoring boundary: effort rules apply to the roster being frozen
+        // NOW, never to already-frozen packages (see validate_efforts).
+        errors.extend(roster.validate_efforts());
         let mut profile_catalog = BTreeMap::new();
         let mut cursor = Some((profile_name.to_owned(), profile.clone()));
         let mut seen = BTreeSet::new();
@@ -694,6 +753,10 @@ impl ForgedConfig {
                 ),
             });
         }
+        // A revision mints NEW frozen state from the current config, so the
+        // authoring-time effort rules apply here exactly as in
+        // compile_definition.
+        errors.extend(roster.validate_efforts());
         if package.profile_catalog.is_empty() {
             errors.extend(roster.validate_for(&package.profile));
         } else {
@@ -1162,6 +1225,15 @@ fn compatibility_projection_resolved(
     )
 }
 
+fn content_sha256(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut hex = String::with_capacity(64);
+    for byte in digest {
+        let _ = write!(&mut hex, "{byte:02x}");
+    }
+    hex
+}
+
 fn digest_of<T: Serialize>(value: &T) -> Result<String, String> {
     let value = serde_json::to_value(value).map_err(|e| e.to_string())?;
     let bytes = canonical_json_bytes(&value).map_err(|e| e.to_string())?;
@@ -1206,6 +1278,7 @@ pub(crate) fn scratch_config(anvil_home: &std::path::Path) -> ForgedConfig {
         db_path: anvil_home.join("state.db"),
         config_path: anvil_home.join("config.yaml"),
         config_file_read: false,
+        config_sha256: None,
         roster: default_legacy_roster(),
         profiles: default_profiles(),
         rosters: default_rosters(),
@@ -1235,6 +1308,7 @@ mod tests {
             db_path: PathBuf::from("/tmp/anvil/state.db"),
             config_path: PathBuf::from("/tmp/anvil/config.yaml"),
             config_file_read: false,
+            config_sha256: None,
             roster: default_legacy_roster(),
             profiles: default_profiles(),
             rosters: default_rosters(),
@@ -1479,6 +1553,46 @@ mod tests {
         let recompiled = compile_frozen_package(package).expect("frozen compile");
         assert_eq!(recompiled.package.profile_ref.name, "lean");
         assert_eq!(recompiled.compatibility_roster.len(), 4);
+    }
+
+    #[test]
+    fn frozen_packages_with_historical_efforts_stay_loadable() {
+        // Pre-charset versions accepted (and the claude driver ignored) a
+        // claude candidate carrying an effort. The authoring boundary now
+        // refuses one, but the SAME bytes frozen into a durable package must
+        // keep recompiling: recovery never applies authoring-time effort
+        // rules to immutable state.
+        let mut cfg = config();
+        let roster = cfg.rosters.get_mut("default").expect("default roster");
+        for candidates in roster.roles.values_mut() {
+            for candidate in candidates.iter_mut() {
+                if candidate.provider == "claude" {
+                    candidate.effort = Some("high".to_owned());
+                }
+            }
+        }
+        let authoring = cfg.compile_definition(None, None);
+        let errors = authoring.expect_err("authoring refuses claude effort");
+        assert!(errors
+            .iter()
+            .any(|error| error.message.contains("claude candidates take no effort")));
+
+        let frozen_cfg = config();
+        let mut package = frozen_cfg
+            .compile_definition(None, None)
+            .expect("baseline compile")
+            .package;
+        for candidates in package.roster.roles.values_mut() {
+            for candidate in candidates.iter_mut() {
+                if candidate.provider == "claude" {
+                    candidate.effort = Some("high".to_owned());
+                }
+            }
+        }
+        // A real historical freeze computed its digest over these exact
+        // effort-carrying bytes; the fixture does the same.
+        package.roster_sha256 = digest_of(&package.roster).expect("roster digest");
+        compile_frozen_package(package).expect("frozen claude effort stays loadable");
     }
 
     #[test]
@@ -1921,5 +2035,83 @@ mod tests {
         for stage in [Stage::ReviewClaude, Stage::ReviewCodex, Stage::Fix] {
             assert_eq!(budgets[&stage], 1800, "missing {stage:?} keeps its default");
         }
+    }
+
+    #[test]
+    fn refreshed_reloads_only_when_the_file_content_changes() {
+        let dir = tempfile::tempdir().expect("scratch scope");
+        let path = dir.path().join("config.yaml");
+        std::fs::write(&path, "default_profile: standard\n").expect("write config");
+        let snapshot = ForgedConfig::load_at(dir.path().to_path_buf(), path.clone()).expect("load");
+        assert!(snapshot.config_sha256.is_some());
+        assert!(snapshot.refreshed().expect("unchanged gate").is_none());
+        std::fs::write(&path, "default_profile: high\n").expect("rewrite config");
+        let fresh = snapshot.refreshed().expect("changed gate").expect("reload");
+        assert_eq!(fresh.default_profile, "high");
+        // Identity anchors survive the reload.
+        assert_eq!(fresh.db_path, snapshot.db_path);
+        assert_eq!(fresh.runs_root, snapshot.runs_root);
+        assert_eq!(fresh.beads_dir, snapshot.beads_dir);
+        // A deleted file is a change too: every key back at its default.
+        std::fs::remove_file(&path).expect("remove config");
+        let defaulted = snapshot.refreshed().expect("removal gate").expect("reload");
+        assert!(!defaulted.config_file_read);
+        assert!(defaulted.config_sha256.is_none());
+    }
+
+    #[test]
+    fn a_hand_built_config_with_no_backing_file_never_reloads_over_itself() {
+        let dir = tempfile::tempdir().expect("scratch scope");
+        let snapshot = scratch_config(dir.path());
+        assert!(snapshot.refreshed().expect("absent gate").is_none());
+        // The file appearing IS a change, even for a hand-built snapshot.
+        std::fs::write(&snapshot.config_path, "default_profile: high\n").expect("write config");
+        let fresh = snapshot
+            .refreshed()
+            .expect("appearance gate")
+            .expect("reload");
+        assert_eq!(fresh.default_profile, "high");
+        assert_eq!(fresh.db_path, snapshot.db_path);
+    }
+
+    #[test]
+    fn refreshed_honors_a_selection_change_between_yaml_and_json() {
+        let dir = tempfile::tempdir().expect("scratch scope");
+        std::fs::write(
+            dir.path().join("config.json"),
+            "{\"default_profile\": \"jsonprofile\"}",
+        )
+        .expect("write json config");
+        let selected = config_path(dir.path());
+        let snapshot = ForgedConfig::load_at(dir.path().to_path_buf(), selected).expect("load");
+        assert_eq!(snapshot.default_profile, "jsonprofile");
+        assert!(snapshot.refreshed().expect("unchanged gate").is_none());
+        // A yaml appearing outranks the pinned json, exactly as a fresh
+        // process would select it.
+        let yaml = dir.path().join("config.yaml");
+        std::fs::write(&yaml, "default_profile: yamlprofile\n").expect("write yaml config");
+        let fresh = snapshot
+            .refreshed()
+            .expect("selection gate")
+            .expect("reload");
+        assert_eq!(fresh.default_profile, "yamlprofile");
+        assert!(fresh.config_path.ends_with("config.yaml"));
+        assert_eq!(fresh.db_path, snapshot.db_path);
+        // Removing the yaml falls back to the surviving json, not defaults.
+        std::fs::remove_file(&yaml).expect("remove yaml config");
+        let fallback = fresh.refreshed().expect("fallback gate").expect("reload");
+        assert_eq!(fallback.default_profile, "jsonprofile");
+        assert!(fallback.config_path.ends_with("config.json"));
+    }
+
+    #[test]
+    fn a_malformed_rewrite_is_a_reload_error() {
+        let dir = tempfile::tempdir().expect("scratch scope");
+        let path = dir.path().join("config.yaml");
+        std::fs::write(&path, "default_profile: standard\n").expect("write config");
+        let snapshot = ForgedConfig::load_at(dir.path().to_path_buf(), path.clone()).expect("load");
+        std::fs::write(&path, "default_profile: [broken").expect("break config");
+        let error = snapshot.refreshed().expect_err("malformed gate");
+        assert!(error.contains("does not parse"), "{error}");
     }
 }

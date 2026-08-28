@@ -71,6 +71,7 @@ const fixture = JSON.parse(fs.readFileSync(fixturePath, 'utf8'));
 const requiredSkillText = [
   'name: manage-work',
   '../plan/SKILL.md',
+  '../configure/SKILL.md',
   '../critique/SKILL.md',
   '../adjudicate/SKILL.md',
   '../dispatch/SKILL.md',
@@ -96,6 +97,7 @@ const expected = new Map(Object.entries({
   explore: ['explore', 'none', 'discuss'],
   plan: ['plan', 'plan', 'delegate'],
   revise: ['revise', 'plan', 'delegate'],
+  configure: ['configure', 'configure', 'delegate'],
   critique: ['critique', 'critique', 'delegate'],
   adjudicate: ['adjudicate', 'adjudicate', 'delegate'],
   'plan-approval': ['plan-approval', 'none', 'no-execution'],
@@ -387,6 +389,7 @@ function inventorySkills(skillsRoot) {
   const expectedEntrypoints = [
     'adjudicate/SKILL.md',
     'board/SKILL.md',
+    'configure/SKILL.md',
     'critique/SKILL.md',
     'dispatch/SKILL.md',
     'manage-work/SKILL.md',
@@ -680,7 +683,7 @@ function validateParityFixture(registration) {
       {
         path: 'intent-fixtures.json',
         schema: 'forged.manage-work-intent-fixtures/1',
-        caseCount: 14,
+        caseCount: 15,
         comparisonFields: ['decision', 'delegate', 'result', 'routerMutationBudget'],
       },
     ),
@@ -719,8 +722,8 @@ try {
 
   console.log(
     `HOST PARITY: claudeRoot=${claude.pluginRoot} codexRoot=${codex.pluginRoot} ` +
-      `version=${claude.manifest.version} skills=8 inventorySha256=${claude.inventory.digest} ` +
-      `cases=14+31 tools=46 surfaces=5 evidence=declarative-contract-only`,
+      `version=${claude.manifest.version} skills=9 inventorySha256=${claude.inventory.digest} ` +
+      `cases=15+31 tools=46 surfaces=5 evidence=declarative-contract-only`,
   );
 } catch (error) {
   console.error(`host parity validation failed: ${error.message}`);
@@ -815,7 +818,7 @@ const skills = fs.readdirSync('plugins/forged/skills', {withFileTypes: true})
   .map((entry) => entry.name)
   .sort();
 if (JSON.stringify(skills) !== JSON.stringify([
-  'adjudicate', 'board', 'critique', 'dispatch', 'manage-work', 'plan', 'run-epic', 'setup',
+  'adjudicate', 'board', 'configure', 'critique', 'dispatch', 'manage-work', 'plan', 'run-epic', 'setup',
 ])) process.exit(1);
 const extension = fs.readFileSync('plugins/forged/extensions/index.ts', 'utf8');
 for (const name of [
@@ -914,7 +917,7 @@ check "manage-work dual-host registration and contract parity" check_manage_work
   "$plugin/skills/manage-work/host-parity-fixtures.json"
 
 skill_files=("$plugin"/skills/*/SKILL.md)
-[[ ${#skill_files[@]} -eq 8 ]] && pass "exactly eight skills" || fail "exactly eight skills"
+[[ ${#skill_files[@]} -eq 9 ]] && pass "exactly nine skills" || fail "exactly nine skills"
 for path in "${skill_files[@]}"; do check "frontmatter $path" check_frontmatter "$path"; done
 check "critic frontmatter" check_frontmatter "$plugin/agents/critic.md"
 

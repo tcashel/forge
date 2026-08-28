@@ -1306,3 +1306,77 @@ fn attention_list_repo_scope_matches_the_durable_item_repository() {
     assert_eq!(foreign["totals"]["total"], json!(0), "{foreign}");
     assert_eq!(foreign["groups"], json!([]), "{foreign}");
 }
+
+/// The subject id travels as the envelope `runId` (the CLI's `--subject`),
+/// and `params.subjectId` — the name `attention_list` hands back — is an
+/// accepted alias. Absence names both forms; disagreement refuses.
+#[test]
+fn attention_controls_accept_the_subject_id_alias() {
+    let env = TestEnv::new("forged-attention-subject-alias");
+    env.forged(&["init"]);
+    fabricate_run(&env, "attention-run");
+    append(
+        &env,
+        "attention-run",
+        "proto.quarantine",
+        json!({
+            "packetId": "attention-run/implement/0",
+            "attemptId": 7,
+            "reason": "claim token is stale",
+        }),
+    );
+    let item = quarantine(&overview(&env));
+    let attention_id = item["attentionId"].as_str().expect("attention id");
+    let occurrence_id = item["occurrenceId"].as_str().expect("occurrence id");
+    let mut mcp = McpClient::new(&env);
+
+    let base = json!({
+        "attentionId": attention_id,
+        "occurrenceId": occurrence_id,
+        "actor": "operator",
+    });
+
+    let refused = mcp.call_tool(
+        "attention_acknowledge",
+        json!({"schemaVersion": 1, "params": base}),
+    );
+    assert_eq!(refused["ok"], json!(false), "{refused}");
+    let message = refused["error"]["message"].as_str().expect("message");
+    assert!(message.contains("params.subjectId"), "{message}");
+    assert!(message.contains("runId"), "{message}");
+
+    let mut conflicted = base.clone();
+    conflicted["subjectId"] = json!("attention-run");
+    let conflicted = mcp.call_tool(
+        "attention_acknowledge",
+        json!({"schemaVersion": 1, "runId": "another-run", "params": conflicted}),
+    );
+    assert_eq!(conflicted["ok"], json!(false), "{conflicted}");
+    assert!(
+        conflicted["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("conflicts"),
+        "{conflicted}"
+    );
+
+    let mut aliased = base.clone();
+    aliased["subjectId"] = json!("attention-run");
+    let acknowledged = mcp.call_tool(
+        "attention_acknowledge",
+        json!({"schemaVersion": 1, "params": aliased}),
+    );
+    assert_eq!(acknowledged["ok"], json!(true), "{acknowledged}");
+    assert_eq!(acknowledged["reused"], json!(false), "{acknowledged}");
+    assert_eq!(quarantine(&overview(&env))["state"], json!("acknowledged"));
+
+    // The two documented request forms share one idempotency identity: a
+    // retry that switches from the alias form to the envelope form replays
+    // the stored response instead of conflicting.
+    let replayed = mcp.call_tool(
+        "attention_acknowledge",
+        json!({"schemaVersion": 1, "runId": "attention-run", "params": base}),
+    );
+    assert_eq!(replayed["ok"], json!(true), "{replayed}");
+    assert_eq!(replayed["reused"], json!(true), "{replayed}");
+}
