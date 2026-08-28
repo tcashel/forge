@@ -32,8 +32,9 @@ Source: `crates/forged-gate/src/runner.rs`.
   `BEADS_DIR`). Repository gates still inherit ordinary host and toolchain
   environment such as `PATH` and `HOME`.
 - A `gate/<n>` entry in a run's settled operations means the gate was
-  attempted, not that it passed. Pass/fail lives in the work detail's
-  gate state.
+  attempted, not that it passed. `run status` reports the latest implementation
+  attempt as `gateState: passed|failed`; Work Detail retains the underlying
+  gate evidence.
 
 ## Environment contracts
 

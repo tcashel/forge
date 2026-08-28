@@ -8,7 +8,7 @@ use std::path::{Component, Path, PathBuf};
 use forged_gate::GateRequest;
 use forged_ledger::{
     EffectClass, InventorySnapshot, InventoryUsage, InventoryUsageSelection, NewRun,
-    NewRunDefinition, OperationState, RunState, WorkItemFilters, WorkStatus,
+    NewRunDefinition, OperationState, RevokeScope, RunState, WorkItemFilters, WorkStatus,
 };
 use forged_provider::{CodexDriver, PiDriver, ProviderDriver};
 use forged_types::{
@@ -806,13 +806,68 @@ pub(crate) async fn default_branch_of(repo: &str) -> String {
 
 // ------------------------------------------------------------ run status
 
+fn packet_stage<'a>(view: &'a forged_proto::RunView, packet_id: &str) -> Option<&'a str> {
+    view.packets
+        .iter()
+        .find(|packet| packet.packet_id == packet_id)
+        .map(|packet| stage_str(packet.stage))
+}
+
+fn run_status_position<'a>(
+    view: &'a forged_proto::RunView,
+    action: &'a forged_proto::NextAction,
+) -> (Option<&'a str>, Option<&'a str>) {
+    if let Some(attempt) = view
+        .live_attempts
+        .iter()
+        .max_by_key(|attempt| attempt.attempt_id)
+    {
+        return (
+            packet_stage(view, &attempt.packet_id),
+            Some(attempt.started_at.as_str()),
+        );
+    }
+    let stage = match action {
+        forged_proto::NextAction::RunMachine(step) => Some(step.as_str()),
+        forged_proto::NextAction::OpenPackets(intents) => {
+            intents.first().map(|intent| stage_str(intent.stage))
+        }
+        forged_proto::NextAction::AwaitPacket { packet_id, .. } => packet_stage(view, packet_id),
+        forged_proto::NextAction::EscalateProfile(_) | forged_proto::NextAction::Stop(_) => None,
+    };
+    (stage, None)
+}
+
+fn run_status_gate_state(view: &forged_proto::RunView) -> Option<&'static str> {
+    view.terminal_attempts
+        .values()
+        .flatten()
+        .filter_map(|attempt| {
+            let forged_types::Outcome::Implement {
+                gate_state: Some(state),
+                ..
+            } = attempt.outcome.as_ref()?
+            else {
+                return None;
+            };
+            let state = match state.as_str() {
+                "pass" => "passed",
+                "fail" => "failed",
+                _ => return None,
+            };
+            Some((attempt.attempt_id, state))
+        })
+        .max_by_key(|(attempt_id, _)| *attempt_id)
+        .map(|(_, state)| state)
+}
+
 /// `run status` — read-only projection of one run.
 pub async fn run_status(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
     read_only("run_status", req, || async {
         let run_id = param_str(&req.params, "run")?;
         let view = super::drive::project(ctx, run_id).await?;
         let run_id_owned = run_id.to_owned();
-        let (definition, revision, protocol_terminal, admission_decisions) =
+        let (definition, revision, protocol_terminal, admission_decisions, deadline_kills) =
             on_ledger(&ctx.ledger, move |ledger| {
                 let protocol_terminal = ledger
                     .list_events(Some(&run_id_owned), 0, 4096)?
@@ -842,10 +897,16 @@ pub async fn run_status(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
                     ledger.latest_roster_revision(&run_id_owned)?,
                     protocol_terminal,
                     admission_decisions,
+                    ledger.count_attempts_with_revoke_scope(
+                        &run_id_owned,
+                        RevokeScope::Deadline,
+                    )?,
                 ))
             })
             .await?;
         let action = forged_proto::advance(&view);
+        let (current_stage, started_at) = run_status_position(&view, &action);
+        let gate_state = run_status_gate_state(&view);
         let controller = super::handoff::controller_status(ctx, run_id).await?;
         let identity =
             super::work_identity::load(ctx, WorkIdentitySubjectKind::Run, run_id).await?;
@@ -997,8 +1058,7 @@ pub async fn run_status(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
                 "candidateSelections": candidates,
             })
         });
-        Ok(json!({
-            "run": {
+        let mut run = json!({
                 "runId": view.run.run_id,
                 "identity": identity,
                 "herdrLayout": herdr_layout,
@@ -1046,6 +1106,7 @@ pub async fn run_status(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
                     "name": o.name,
                     "idempotencyKey": o.idempotency_key,
                 })).collect::<Vec<_>>(),
+                "deadlineKills": deadline_kills,
                 "nextAction": match protocol_terminal {
                     Some(terminal) if view.accepted_risk.is_none() => json!({"stop": terminal}),
                     _ => match &action {
@@ -1067,8 +1128,29 @@ pub async fn run_status(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
                 },
                 "controller": controller,
                 "claimHealth": claim_health,
-            }
-        }))
+        });
+        let run = run
+            .as_object_mut()
+            .expect("run status projection is an object");
+        if let Some(current_stage) = current_stage {
+            run.insert(
+                "currentStage".to_owned(),
+                Value::String(current_stage.to_owned()),
+            );
+        }
+        if let Some(gate_state) = gate_state {
+            run.insert(
+                "gateState".to_owned(),
+                Value::String(gate_state.to_owned()),
+            );
+        }
+        if let Some(started_at) = started_at {
+            run.insert(
+                "startedAt".to_owned(),
+                Value::String(started_at.to_owned()),
+            );
+        }
+        Ok(json!({"run": run}))
     })
     .await
 }
