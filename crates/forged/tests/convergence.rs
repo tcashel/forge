@@ -1327,6 +1327,12 @@ fn convergence_crash_matrix_is_effect_exact() {
                 .find(|reservation| reservation.subject_id == run)
                 .expect("committed reservation survives crash");
             assert_eq!(reservation.owner_kind.as_deref(), owner, "{site}");
+            if site == "admission.reservation.transfer.after" {
+                assert_eq!(
+                    snapshot.capacity.total_active, 1,
+                    "controller transfer crash retains exactly one admission slot"
+                );
+            }
         } else {
             assert!(snapshot
                 .reservations
@@ -1391,6 +1397,16 @@ fn convergence_crash_matrix_is_effect_exact() {
             .list_live_attempts(Some(&run))
             .expect("live attempts");
         assert_eq!(!live.is_empty(), transferred, "packet {site}: {live:?}");
+        if transferred {
+            let snapshot = ledger.admission_snapshot(None).expect("admission snapshot");
+            assert_eq!(
+                snapshot.capacity.total_active, 1,
+                "packet transfer crash retains exactly one admission slot"
+            );
+            ledger
+                .assert_admitted_attempt_live(&live[0].claim_token)
+                .expect("transferred packet remains authorized before reconciliation");
+        }
         ledger.close().expect("close ledger");
         if transferred {
             let (code, reconciled) = env.forged(&["reconcile", "--run", &run]);
