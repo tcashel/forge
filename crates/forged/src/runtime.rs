@@ -2338,6 +2338,32 @@ async fn install_with_probe<H: ServiceHost, P: ControllerProcessProbe + ?Sized>(
     let target = copy_content_addressed(paths, &source, &source_identity)?;
     let previous = read_manifest(paths)?;
 
+    // A legacy beads store that has never been imported must not be
+    // silently orphaned: installing (or reconciling an existing install)
+    // without a resolvable bd would let the first native work item
+    // permanently close the one-shot import path. This sits ABOVE the
+    // same-install early return so a reconcile after the legacy store
+    // appears, or after the recorded bd disappears, is caught too. Fresh
+    // operators (no beads config) and already-imported stores are
+    // untouched — bd stays optional for them (ADR-0034).
+    if config.beads_dir.join("config.yaml").exists() && resolved_bd_bin(config).is_none() {
+        let ledger = forged_ledger::Ledger::open(&config.db_path).map_err(Failure::from)?;
+        let unimported = ledger.work_store_is_empty().map_err(Failure::from)?
+            && ledger
+                .list_events_by_kind("work.imported")
+                .map_err(Failure::from)?
+                .is_empty();
+        ledger.close().map_err(Failure::from)?;
+        if unimported {
+            return Err(Failure::invalid(format!(
+                "legacy beads store at {} is not yet imported and no bd \
+                 executable resolves; install bd (or set bd_path), run the \
+                 import, then rerun `forged service install`",
+                config.beads_dir.display()
+            )));
+        }
+    }
+
     let same_install = match previous.as_ref() {
         Some(value) => {
             value.binary.sha256 == source_identity.sha256 && manifest_matches_config(value, config)?
@@ -2379,28 +2405,6 @@ async fn install_with_probe<H: ServiceHost, P: ControllerProcessProbe + ?Sized>(
         return Err(blockers_failure(&scan.blockers));
     }
 
-    // A legacy beads store that has never been imported must not be
-    // silently orphaned: installing without a resolvable bd would let the
-    // first native work item permanently close the one-shot import path.
-    // Fresh operators (no beads config) and already-imported stores are
-    // untouched — bd stays optional for them (ADR-0034).
-    if config.beads_dir.join("config.yaml").exists() && resolved_bd_bin(config).is_none() {
-        let ledger = forged_ledger::Ledger::open(&config.db_path).map_err(Failure::from)?;
-        let unimported = ledger.work_store_is_empty().map_err(Failure::from)?
-            && ledger
-                .list_events_by_kind("work.imported")
-                .map_err(Failure::from)?
-                .is_empty();
-        ledger.close().map_err(Failure::from)?;
-        if unimported {
-            return Err(Failure::invalid(format!(
-                "legacy beads store at {} is not yet imported and no bd \
-                 executable resolves; install bd (or set bd_path), run the \
-                 import, then rerun `forged service install`",
-                config.beads_dir.display()
-            )));
-        }
-    }
     let previous_observation = host.inspect(paths).await?;
     let candidate = new_manifest(paths, config, source_identity)?;
     let id = Uuid::now_v7().to_string();
