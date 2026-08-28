@@ -2151,10 +2151,11 @@ async fn latest_attempt_per_packet(ctx: &Ctx, run_id: &str) -> BTreeMap<String, 
 const RUN_SETTLED: &str = "run.settled";
 const PROTO_PR: &str = "proto.pr";
 const CONTROLLER_STARTED: &str = "forged.controller.started";
-pub(super) const LIFECYCLE_KINDS: [&str; 8] = [
+pub(super) const LIFECYCLE_KINDS: [&str; 9] = [
     epic::STARTED,
     epic::PAUSED,
     epic::RESUMED,
+    epic::ABANDONED,
     epic::EPIC_PR,
     epic::ASSURANCE_COMPLETED,
     PROTO_PR,
@@ -2195,14 +2196,32 @@ fn epic_lifecycles(snapshot: &InventorySnapshot) -> BTreeMap<String, EpicLifecyc
         }
     };
     let mut control: BTreeMap<String, (i64, EpicLifecycle)> = BTreeMap::new();
-    for kind in [epic::PAUSED, epic::RESUMED] {
+    // Epoch boundaries (an abandon, or the start that opens the next
+    // epoch) are FACTS that supersede anything earlier — terminal folds
+    // included — while within one epoch the old precedence stands: a
+    // draft-PR terminal is never reopened by a later control event.
+    let mut boundaries: BTreeMap<String, i64> = BTreeMap::new();
+    // ABANDONED folds as stopped-with-reason and STARTED as active so a
+    // fresh epoch's start (a later event) supersedes the dead epoch's
+    // boundary — and every control event from an epoch that ended is
+    // superseded by that epoch's own ABANDONED, all by append position.
+    for kind in [epic::PAUSED, epic::RESUMED, epic::ABANDONED, epic::STARTED] {
         for event in snapshot.events(kind) {
             let Some(epic_id) = event.run_id.clone() else {
                 continue;
             };
+            if kind == epic::ABANDONED || kind == epic::STARTED {
+                let seen = boundaries.entry(epic_id.clone()).or_insert(0);
+                *seen = (*seen).max(event.event_id);
+            }
             let lifecycle = if kind == epic::PAUSED {
                 EpicLifecycle {
                     state: "paused",
+                    stop_reason: reason_of(&event.payload_json),
+                }
+            } else if kind == epic::ABANDONED {
+                EpicLifecycle {
+                    state: "stopped",
                     stop_reason: reason_of(&event.payload_json),
                 }
             } else {
@@ -2219,10 +2238,17 @@ fn epic_lifecycles(snapshot: &InventorySnapshot) -> BTreeMap<String, EpicLifecyc
             }
         }
     }
-    let mut lifecycles: BTreeMap<String, EpicLifecycle> = control
-        .into_iter()
-        .map(|(epic_id, (_, lifecycle))| (epic_id, lifecycle))
-        .collect();
+    // Terminal folds stay terminal over the CONTROL events of their own
+    // epoch, but an abandon boundary or a fresh start written AFTER them is
+    // a later fact.
+    let mut boundary_aware = |epic_id: String, event_id: i64, lifecycle: EpicLifecycle| {
+        let later_boundary = boundaries
+            .get(&epic_id)
+            .is_some_and(|boundary| *boundary > event_id);
+        if !later_boundary {
+            control.insert(epic_id, (event_id, lifecycle));
+        }
+    };
     for event in snapshot.events(epic::EPIC_PR) {
         let Some(epic_id) = event.run_id.clone() else {
             continue;
@@ -2234,8 +2260,9 @@ fn epic_lifecycles(snapshot: &InventorySnapshot) -> BTreeMap<String, EpicLifecyc
         if nonterminal {
             continue;
         }
-        lifecycles.insert(
+        boundary_aware(
             epic_id,
+            event.event_id,
             EpicLifecycle {
                 state: "submitted",
                 stop_reason: Value::Null,
@@ -2246,15 +2273,19 @@ fn epic_lifecycles(snapshot: &InventorySnapshot) -> BTreeMap<String, EpicLifecyc
         let Some(epic_id) = event.run_id.clone() else {
             continue;
         };
-        lifecycles.insert(
+        boundary_aware(
             epic_id,
+            event.event_id,
             EpicLifecycle {
                 state: "submitted",
                 stop_reason: Value::Null,
             },
         );
     }
-    lifecycles
+    control
+        .into_iter()
+        .map(|(epic_id, (_, lifecycle))| (epic_id, lifecycle))
+        .collect()
 }
 
 /// Whether inventory entries carry per-run spend.
@@ -2327,12 +2358,13 @@ pub(super) fn project_entries(
         let Some(epic_id) = event.run_id.clone() else {
             continue;
         };
-        epics.entry(epic_id).or_insert_with(|| {
-            (
-                event.ts.clone(),
-                serde_json::from_str(&event.payload_json).unwrap_or(Value::Null),
-            )
-        });
+        // The LATEST start's payload wins — a restarted epic reports the
+        // fresh epoch's geometry — while createdAt keeps the first start.
+        let payload = serde_json::from_str(&event.payload_json).unwrap_or(Value::Null);
+        epics
+            .entry(epic_id)
+            .and_modify(|(_, stored)| *stored = payload.clone())
+            .or_insert_with(|| (event.ts.clone(), payload));
     }
     let mut live_seats: BTreeMap<String, u64> = BTreeMap::new();
     let mut current: BTreeMap<String, (i64, String, String)> = BTreeMap::new();

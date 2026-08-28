@@ -239,6 +239,23 @@ fn abandoning_a_started_epic_opens_a_clean_epoch() {
     let (code, status) = env.forged(&["epic", "status", "--epic", "epic-doomed"]);
     assert_ne!(code, 0, "an abandoned epoch has no started state: {status}");
 
+    // ...the inventory folds the boundary as stopped-with-reason...
+    let listed = result(&env, &["work", "list"]);
+    let entry = listed["runs"]
+        .as_array()
+        .expect("inventory")
+        .iter()
+        .find(|entry| entry["id"] == json!("epic-doomed"))
+        .cloned()
+        .expect("abandoned epic stays discoverable");
+    assert_eq!(entry["state"], json!("stopped"), "{entry}");
+    assert!(
+        entry["stopReason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("base ref was wrong")),
+        "{entry}"
+    );
+
     // ...and a fresh start opens a clean epoch instead of replaying the old
     // one (the pxv rebuild-the-epic ritual, retired).
     let (code, restarted) = env.forged(&[
@@ -256,6 +273,18 @@ fn abandoning_a_started_epic_opens_a_clean_epoch() {
     assert_eq!(code, 0, "fresh epoch start: {restarted}");
     let (code, status) = env.forged(&["epic", "status", "--epic", "epic-doomed"]);
     assert_eq!(code, 0, "the new epoch projects: {status}");
+
+    // ...and the fresh epoch's start supersedes the boundary in the
+    // inventory fold.
+    let listed = result(&env, &["work", "list"]);
+    let entry = listed["runs"]
+        .as_array()
+        .expect("inventory")
+        .iter()
+        .find(|entry| entry["id"] == json!("epic-doomed"))
+        .cloned()
+        .expect("restarted epic listed");
+    assert_eq!(entry["state"], json!("active"), "{entry}");
 
     // A second abandon derives a fresh key (the epoch counter), so it ends
     // the SECOND epoch rather than replaying the first abandon's response.

@@ -283,6 +283,93 @@ fn epic_start_and_identity_commit_once_and_replay_together() {
 }
 
 #[test]
+fn a_fresh_epoch_recaptures_an_identity_a_pane_projection_references() {
+    // Herdr pane projections hold a non-deferrable FK onto work_identities;
+    // the abandon-boundary re-capture DELETEs and re-INSERTs the same
+    // identity primary key, which only commits under deferred FK checking.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("state.db");
+    let ledger = Ledger::open(&path).expect("ledger");
+    let event = json!({
+        "schema": "forged.epic/1",
+        "epicId": "epic-herdr",
+        "title": "Herdr epic",
+        "repo": "/Users/tripp/repositories/forge",
+        "specRevision": "opaque-revision"
+    });
+    let original = identity(
+        WorkIdentitySubjectKind::Epic,
+        "epic-herdr",
+        "epic-herdr",
+        Some("Herdr epic"),
+        "2026-08-14T20:00:00.000000000Z",
+        WorkIdentitySource::Durable,
+    );
+    assert!(ledger
+        .append_epic_started_with_identity("epic-herdr", event.clone(), original.clone())
+        .expect("first start"));
+    ledger
+        .append_event(
+            Some("epic-herdr"),
+            "forged.epic.abandoned",
+            json!({"reason": "bad base", "controlId": "op:epic_abandon:epic-herdr:-:0"}),
+        )
+        .expect("abandon boundary");
+    ledger.close().expect("close");
+    {
+        let conn = rusqlite::Connection::open(&path).expect("raw conn");
+        conn.execute_batch(
+            "PRAGMA foreign_keys=ON;
+             INSERT INTO owned_herdr_sessions (
+               ownership_id, schema, owner_kind, subject_kind, subject_id,
+               controller_generation, pane_id, socket_path, protocol,
+               sentinel_path, lifecycle_state, cleanup_state,
+               cleanup_retry_budget, cleanup_retry_used, registered_at,
+               command_started_at, updated_at
+             ) VALUES (
+               'fk-owned', 'forged.owned-herdr-session/1',
+               'controller', 'epic', 'epic-herdr', 1,
+               'fk-pane', '/tmp/fk-herdr.sock', 19,
+               '/tmp/fk-owned/status', 'command-started',
+               'not-requested', 8, 0, 't', 't', 't'
+             );
+             INSERT INTO herdr_pane_projections (
+               projection_id, schema, target_kind, subject_kind, subject_id,
+               ownership_id, pane_id, socket_path, protocol,
+               controller_generation, metadata_source, desired_revision,
+               desired_release, metadata_next_seq, metadata_state,
+               metadata_retry_budget, metadata_retry_used,
+               lifecycle_next_seq, lifecycle_state, lifecycle_retry_budget,
+               lifecycle_retry_used, created_at, updated_at
+             ) VALUES (
+               'fk-projection', 'forged.herdr-pane-projection/1',
+               'controller', 'epic', 'epic-herdr', 'fk-owned',
+               'fk-pane', '/tmp/fk-herdr.sock', 19, 1,
+               'forged:projection:metadata:fk', 1, 0, 0, 'pending',
+               8, 0, 0, 'not-requested', 8, 0, 't', 't'
+             );",
+        )
+        .expect("seed a projection referencing the identity");
+    }
+    let ledger = Ledger::open(&path).expect("reopen");
+    let mut fresh = original.clone();
+    fresh.captured_at = "2026-08-28T09:00:00.000000000Z".to_owned();
+    assert!(
+        ledger
+            .append_epic_started_with_identity("epic-herdr", event, fresh.clone())
+            .expect("fresh-epoch start with a referencing projection"),
+        "the fresh epoch appends"
+    );
+    assert_eq!(
+        ledger
+            .get_work_identity(WorkIdentitySubjectKind::Epic, "epic-herdr")
+            .expect("identity"),
+        Some(fresh),
+        "the boundary re-capture replaced the identity"
+    );
+}
+
+#[test]
 fn migration_015_uses_only_durable_events_and_child_epic_context() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("state.db");
