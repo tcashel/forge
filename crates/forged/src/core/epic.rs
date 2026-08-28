@@ -567,16 +567,22 @@ async fn project(ctx: &Ctx, epic: &str) -> Result<EpicView, Failure> {
     // id and run_start key), never re-derive generation 1 over the
     // abandoned epoch's stored run.
     let mut generation_floor: BTreeMap<String, u32> = BTreeMap::new();
+    let mut planning_floor: BTreeMap<String, u32> = BTreeMap::new();
     for row in &full {
-        if row.kind == CHILD_STARTED {
+        if row.kind == CHILD_STARTED || row.kind == PLAN_STARTED {
             let event = payload(row)?;
             let child = string(&event, "childId")?;
+            let floors = if row.kind == CHILD_STARTED {
+                &mut generation_floor
+            } else {
+                &mut planning_floor
+            };
             let generation = event
                 .get("generation")
                 .and_then(Value::as_u64)
                 .and_then(|value| u32::try_from(value).ok())
-                .unwrap_or_else(|| generation_floor.get(&child).copied().unwrap_or(0) + 1);
-            let floor = generation_floor.entry(child).or_insert(0);
+                .unwrap_or_else(|| floors.get(&child).copied().unwrap_or(0) + 1);
+            let floor = floors.entry(child).or_insert(0);
             *floor = (*floor).max(generation);
         }
     }
@@ -598,7 +604,7 @@ async fn project(ctx: &Ctx, epic: &str) -> Result<EpicView, Failure> {
         waves: Vec::new(),
         children: BTreeMap::new(),
         planning: BTreeMap::new(),
-        planning_generations: BTreeMap::new(),
+        planning_generations: planning_floor,
         planning_guidance: BTreeMap::new(),
         assurance: None,
         assurance_finalized: None,
