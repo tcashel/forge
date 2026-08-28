@@ -283,6 +283,58 @@ impl WorkListArgs {
     }
 }
 
+/// The only opt-in detail level accepted by `work_ready`.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(rename_all = "lowercase")]
+pub enum WorkReadyDetailParam {
+    Full,
+}
+
+/// Typed envelope for the bounded ready frontier.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkReadyArgs {
+    /// Envelope schema version; always 1.
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
+    /// The idempotency key; defaulted to `op:work_ready:read` when absent.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+    /// Ready-frontier projection parameters.
+    #[serde(default)]
+    pub params: WorkReadyParams,
+}
+
+/// Projection detail and collection bound accepted by `work_ready`.
+#[derive(Debug, Default, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars", inline)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkReadyParams {
+    /// Complete snapshots when full; omission returns summary rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<WorkReadyDetailParam>,
+    /// Maximum ready items, 1..=500 (default 100).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u64>,
+}
+
+impl WorkReadyArgs {
+    fn into_envelope(self) -> EnvelopeArgs {
+        let params = match serde_json::to_value(&self.params) {
+            Ok(Value::Object(map)) => map,
+            _ => serde_json::Map::new(),
+        };
+        EnvelopeArgs {
+            schema_version: self.schema_version,
+            idempotency_key: self.idempotency_key,
+            run_id: None,
+            params,
+        }
+    }
+}
+
 /// Closed attempt activity exposed in MCP discovery. These values are
 /// intentionally distinct from Herdr's `working`/`unknown` lifecycle.
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema)]
@@ -1431,11 +1483,13 @@ impl ForgedServer {
     /// Read the ready frontier.
     #[tool(
         name = "work_ready",
-        description = "The ready frontier: open, unassigned, unleased items whose blocks \
-                       targets are all closed, priority-ordered. Takes no params."
+        description = "The bounded ready frontier: open, unassigned, unleased items whose \
+                       blocks targets are all closed, priority-ordered. Returns summary rows \
+                       by default. params.detail=\"full\" restores complete snapshots; \
+                       params.limit is 1..=500 and defaults to 100."
     )]
-    pub async fn work_ready(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
-        self.call("work_ready", args.0).await
+    pub async fn work_ready(&self, args: Parameters<WorkReadyArgs>) -> CallToolResult {
+        self.call("work_ready", args.0.into_envelope()).await
     }
 
     /// The discovery surface — the one tool that needs no id.
