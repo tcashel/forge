@@ -1092,7 +1092,10 @@ impl ForgedServer {
     }
 
     /// Perform one epic scheduler action.
-    #[tool(name = "epic_advance", description = "Advance an epic by one action.")]
+    #[tool(
+        name = "epic_advance",
+        description = "Advance an epic by one action. Refuses with BEADS_CONTENTION while a live detached controller drives the epic; observe with epic_status or operations_overview instead."
+    )]
     pub async fn epic_advance(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
         self.call("epic_advance", args.0).await
     }
@@ -1368,7 +1371,7 @@ impl ForgedServer {
     /// Record custody of an exact active attention occurrence.
     #[tool(
         name = "attention_acknowledge",
-        description = "Acknowledge an exact attention occurrence without hiding it or changing domain state."
+        description = "Acknowledge an exact attention occurrence without hiding it or changing domain state. Required: the item's subjectId (as envelope runId or params.subjectId), params.attentionId, params.occurrenceId, params.actor."
     )]
     pub async fn attention_acknowledge(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
         self.call("attention_acknowledge", args.0).await
@@ -1377,7 +1380,7 @@ impl ForgedServer {
     /// Resolve one explicitly adjudicable attention occurrence.
     #[tool(
         name = "attention_resolve",
-        description = "Resolve an exact adjudicable attention occurrence; source-backed domain conditions refuse."
+        description = "Resolve an exact adjudicable attention occurrence; source-backed domain conditions refuse. Required: the item's subjectId (as envelope runId or params.subjectId), params.attentionId, params.occurrenceId, params.actor, params.disposition."
     )]
     pub async fn attention_resolve(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
         self.call("attention_resolve", args.0).await
@@ -1386,7 +1389,7 @@ impl ForgedServer {
     /// Reopen one exact resolved attention occurrence.
     #[tool(
         name = "attention_reopen",
-        description = "Reopen the exact current attention occurrence without changing domain state."
+        description = "Reopen the exact current attention occurrence without changing domain state. Required: the item's subjectId (as envelope runId or params.subjectId), params.attentionId, params.occurrenceId, params.actor."
     )]
     pub async fn attention_reopen(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
         self.call("attention_reopen", args.0).await

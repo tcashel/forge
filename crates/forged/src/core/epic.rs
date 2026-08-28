@@ -323,10 +323,14 @@ fn parse_config(value: &Value, migration: Option<&Value>) -> Result<EpicConfig, 
             })?,
         rolling_authorized: rolling_authorized(value),
         legacy_membership_recorded,
-        root_revision: value
-            .get("specRevision")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
+        // Bead revisions are opaque strings end to end, but legacy events
+        // carried bd's raw numeric form; both must hydrate (the sibling
+        // readers in the ledger already accept both).
+        root_revision: value.get("specRevision").and_then(|value| match value {
+            Value::String(text) if !text.is_empty() => Some(text.clone()),
+            Value::Number(number) => Some(number.to_string()),
+            _ => None,
+        }),
         root_fields: value
             .get("rootFields")
             .filter(|value| !value.is_null())
@@ -1878,10 +1882,22 @@ pub async fn epic_revise_roster(ctx: &Ctx, req: &mut OperationRequest) -> Operat
     let roster_name = match param_str(&req.params, "roster") {
         Ok(value) => value.to_owned(),
         Err(error) => {
+            // A revision names a catalog entry; the config file is where the
+            // roster's content lives. An inline object here reads as the
+            // generic missing-param refusal without this hint.
+            let error = if req.params.get("roster").is_some_and(Value::is_object) {
+                Failure::invalid(
+                    "params.roster must be a roster NAME from the config catalog, \
+                     not an inline roster object; edit the config file and revise \
+                     by name",
+                )
+            } else {
+                error
+            };
             return err_response(
                 &derive_key("epic_revise_roster", Some(&epic), None, None),
                 &error,
-            )
+            );
         }
     };
     let reason = match param_str(&req.params, "reason") {
