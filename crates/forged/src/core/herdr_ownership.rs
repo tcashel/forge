@@ -477,6 +477,7 @@ mod tests {
             db_path: root.join("state.db"),
             config_path: root.join("config.json"),
             config_file_read: false,
+            config_sha256: None,
             roster: HashMap::new(),
             profiles: BTreeMap::new(),
             rosters: BTreeMap::new(),

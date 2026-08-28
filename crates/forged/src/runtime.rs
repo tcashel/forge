@@ -3320,6 +3320,7 @@ mod tests {
             db_path: anvil.join("state.db"),
             config_path: anvil.join("config.yaml"),
             config_file_read: false,
+            config_sha256: None,
             roster: HashMap::new(),
             profiles: BTreeMap::new(),
             rosters: BTreeMap::new(),

@@ -26,6 +26,7 @@ execution, or an existing-work control become a new submission.
 | Explain one durable run or epic | Resolve one exact WorkIdentity, then `forged work detail` | Read only |
 | Explore | Discuss or research supplied context | Persist nothing |
 | Plan or revise | Read and follow `../plan/SKILL.md` | Native Bead writes only |
+| Configure profiles, rosters, role/model choices, or pricing | Read and follow `../configure/SKILL.md` | Operator authoring config only |
 | Critique | Read and follow `../critique/SKILL.md` | Its one bounded recommendation comment only |
 | Adjudicate | Read and follow `../adjudicate/SKILL.md` | Its intentional native-field update only |
 | Approve plan wording | Continue planning or adjudication | Never execution |

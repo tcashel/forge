@@ -133,31 +133,48 @@ fn codex_effort_none_omits_the_config_argument() {
 }
 
 #[test]
-fn codex_rejects_effort_outside_the_closed_set() {
-    for effort in ["bogus", "extreme", "xhigh\"'", "HIGH"] {
+fn codex_and_pi_reject_efforts_outside_the_embedding_charset() {
+    let long = "x".repeat(65);
+    for effort in [
+        "xhigh\"'",
+        "hi gh",
+        "x;rm -rf /",
+        "e$fort",
+        "",
+        long.as_str(),
+    ] {
         let mut packet = support::sample_packet();
         packet.provider_hints.effort = Some(effort.to_owned());
-        let err = CodexDriver
-            .invocation(&packet, &dirs(), CLAIM_TOKEN)
-            .expect_err("effort outside the closed set must be refused");
-        assert!(
-            matches!(err, ProviderError::UnsupportedEffort { .. }),
-            "{effort:?} gave {err}"
-        );
+        for driver in [&CodexDriver as &dyn ProviderDriver, &PiDriver] {
+            let err = driver
+                .invocation(&packet, &dirs(), CLAIM_TOKEN)
+                .expect_err("charset-unsafe effort must be refused");
+            assert!(
+                matches!(err, ProviderError::UnsupportedEffort { .. }),
+                "{} {effort:?} gave {err}",
+                driver.name()
+            );
+        }
     }
 }
 
 #[test]
-fn codex_accepts_every_effort_in_the_closed_set() {
-    for effort in ["minimal", "low", "medium", "high", "xhigh"] {
+fn codex_and_pi_pass_charset_safe_efforts_through_verbatim() {
+    // Vocabulary belongs to the provider CLI: values forged has never heard
+    // of embed unchanged and the CLI adjudicates them.
+    for effort in ["minimal", "high", "xhigh", "max", "ultra", "future.tier-2"] {
         let mut packet = support::sample_packet();
         packet.provider_hints.effort = Some(effort.to_owned());
-        let invocation = CodexDriver
+        let codex = CodexDriver
             .invocation(&packet, &dirs(), CLAIM_TOKEN)
-            .expect("closed-set effort builds");
-        assert!(invocation
+            .expect("charset-safe effort builds");
+        assert!(codex
             .shell_line
             .contains(&format!("-c 'model_reasoning_effort=\"{effort}\"'")));
+        let pi = PiDriver
+            .invocation(&packet, &dirs(), CLAIM_TOKEN)
+            .expect("charset-safe effort builds");
+        assert!(pi.shell_line.contains(&format!("--thinking {effort}")));
     }
 }
 

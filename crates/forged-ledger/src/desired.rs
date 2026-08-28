@@ -602,6 +602,7 @@ impl Ledger {
                             "subjectKind": kind.as_str(),
                             "subjectId": id,
                             "condition": "restart-budget-exhausted",
+                            "detail": row.last_error,
                             "restartBudget": row.restart_budget,
                             "restartUsed": row.restart_used,
                         }),
@@ -616,10 +617,14 @@ impl Ledger {
                 .controller_generation
                 .max(observed_generation)
                 .saturating_add(1);
+            // `last_error` survives the reservation: the previous death's
+            // evidence is what the exhaustion attention will surface, and
+            // nulling it here is how the incident record degraded to the
+            // bare literal "restart budget is exhausted".
             tx.execute(
                 "UPDATE desired_work SET controller_generation = ?1,
                    predecessor_generation = ?2, restart_used = restart_used + 1,
-                   last_outcome = 'restarting', last_error = NULL,
+                   last_outcome = 'restarting',
                    next_wake_at = reconcile_lease_until,
                    updated_at = ?3 WHERE subject_kind = ?4 AND subject_id = ?5
                    AND reconcile_token = ?6",

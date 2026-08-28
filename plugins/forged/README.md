@@ -197,6 +197,7 @@ Named skills remain available as explicit power-user and debugging surfaces:
 
 - `/forged:manage-work`
 - `/forged:board`
+- `/forged:configure`
 - `/forged:plan`
 - `/forged:critique`
 - `/forged:adjudicate`
