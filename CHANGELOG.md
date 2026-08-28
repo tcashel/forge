@@ -4,6 +4,56 @@ This file records user-visible changes to Forge.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-08-28
+
+The work graph moves into the Forge ledger (ADR-0034): work items,
+dependencies, readiness, and leases now live in `~/.anvil/state.db`
+alongside execution state, and nothing at runtime consults the external
+`bd` (Beads) binary. An existing Beads store is imported automatically,
+once, on the first daemon start after upgrading — with a pre-import
+snapshot of `state.db` written to `~/.anvil/backups/` first. Beads
+remains on disk as an archive; `bd` is only needed if a legacy store has
+not yet been imported.
+
+### Added
+
+- Ledger-native work store: append-only, CAS-guarded spec revisions;
+  custody and leases with a single reclaim door; the bd refusal
+  vocabulary preserved verbatim.
+- One-shot Beads import (`forged work import-beads` and automatic at
+  first daemon start), with byte-fidelity verification and a durable
+  completion marker.
+- Typed work authoring and repair verbs: `work create / update / link /
+  close / reopen / release / supersede / revert / show / ready`, on the
+  CLI and as MCP tools, with strict input validation and derived
+  idempotency keys that make keyless repetition safe.
+- `epic abandon`: ends a wedged epic's epoch durably; a fresh
+  `epic start` then opens a clean epoch — projections, setup, child
+  generations, and recovery are all epoch-aware.
+- Daily `state.db` snapshots (VACUUM INTO, pruned to seven) from the
+  supervisor.
+- A `work-store-integrity` doctor probe whose findings name their typed
+  repair verb; all external doctor probes are bounded at ten seconds.
+
+### Changed
+
+- The lease guardian process is gone: work-lease renewal rides the
+  attempt heartbeat, a refused renewal self-terminates the attempt and
+  durably fails the packet, and only typed refusals revoke — transient
+  ledger errors are never terminal.
+- An ordinary run refuses to spawn a provider when its work lease is
+  foreign or absent; internal planning and assurance runs claim no lease
+  by design.
+- The ready frontier claims only schedulable work: epics and imported
+  no-diff types (chore, decision, milestone) are never claimed under the
+  frontier holder.
+- `work list` and `overview` fold abandon boundaries: an abandoned epic
+  reports `stopped` with its reason; a restarted one reports the fresh
+  epoch's geometry.
+- Service install refuses when a legacy Beads store exists un-imported
+  and no `bd` resolves; otherwise `bd` is optional and ambient `bd`
+  drift never invalidates an installed service.
+
 ## [0.5.0] - 2026-08-26
 
 This is the first distribution of the provider-neutral Rust system. The
