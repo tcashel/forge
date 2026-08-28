@@ -5,11 +5,15 @@ description: "Deliberately open the Forged control plane: call operations_overvi
 
 # /forged:board
 
+Lifecycle position: any work state → one bounded observation. Next: answer the
+operator, or follow `../manage-work/SKILL.md` only when they explicitly request
+a control. The lead session owns the question, scope, and summary; Forged owns
+the ledger and structured projections. This skill is read-only — it never
+mutates, dispatches, or turns visible App state into a mutation selector.
+
 Open the control plane on purpose. This is the plugin's front door to the
 bounded operator portfolio: one read, one optional view, one honest line.
-The skill is read-only — it never mutates, never dispatches, and never turns
-visible App state into a mutation selector. Apps are views; for any control,
-follow `../manage-work/SKILL.md`.
+Apps are views; they are never another source of state.
 
 ## With native Forge tools in the session
 

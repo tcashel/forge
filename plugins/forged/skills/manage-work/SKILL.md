@@ -1,19 +1,22 @@
 ---
 name: manage-work
-description: "Automatically route ordinary requests to inspect, plan, critique, adjudicate, explicitly execute, or safely control Forge work through native operator-scoped Beads and typed Forged operations. Use whenever the operator discusses work without naming a Forged skill."
+description: "Automatically route ordinary requests to inspect, plan, critique, adjudicate, explicitly execute, or safely control ledger-native ore work through typed Forged operations. Use whenever the operator discusses work without naming a Forged skill."
 ---
 
 # Manage work conversationally
 
-This is the normal entrypoint for Forge. The operator can speak in ordinary
-language and should not need a skill name, machine id, pane, or attempt id.
-Classify the request, preserve its authority boundary, and use the smallest
-landed Beads or Forged operation that owns the requested result.
+Lifecycle position: conversational entrypoint → exactly one bounded read,
+planning stage, configuration stage, explicit execution handoff, or existing
+work control. Next: the named route in the table below. The lead session owns
+conversation, scope, approval, and judgment. Forged owns the ledger-native ore
+store, durable execution, controllers, and attempts; execution crosses that
+boundary only after explicit submission.
 
-The lead agent owns conversation and judgment. Beads owns the editable plan.
-Forged owns durable execution and lifecycle after explicit submission.
-Operations Overview and Work Detail project that truth; App resources are
-optional views, never another source of state.
+The operator can speak in ordinary language and should not need a skill name,
+machine id, pane, or attempt id. Classify the request, preserve its authority
+boundary, and use the smallest landed `forged work` or lifecycle operation
+that owns the requested result. Operations Overview and Work Detail project
+that truth; App resources are optional views, never another source of state.
 
 ## Route one intent
 
@@ -25,14 +28,14 @@ execution, or an existing-work control become a new submission.
 | Observe or explain the portfolio, queue, repository, or what needs attention | `forged operations overview` (deliberately opening the board view routes via `../board/SKILL.md`) | Read only |
 | Explain one durable run or epic | Resolve one exact WorkIdentity, then `forged work detail` | Read only |
 | Explore | Discuss or research supplied context | Persist nothing |
-| Plan or revise | Read and follow `../plan/SKILL.md` | Native Bead writes only |
+| Plan or revise | Read and follow `../plan/SKILL.md` | Ledger-native work-item writes only |
 | Configure profiles, rosters, role/model choices, or pricing | Read and follow `../configure/SKILL.md` | Operator authoring config only |
-| Critique | Read and follow `../critique/SKILL.md` | Its one bounded recommendation comment only |
+| Critique | Read and follow `../critique/SKILL.md` | One guarded recommendation notes revision only |
 | Adjudicate | Read and follow `../adjudicate/SKILL.md` | Its intentional native-field update only |
 | Approve plan wording | Continue planning or adjudication | Never execution |
 | Execute one ready slice | Apply the execution gate, then follow `../dispatch/SKILL.md` | One approved start and submit |
 | Execute one ready epic | Apply the execution gate, then follow `../run-epic/SKILL.md` | One approved start and submit |
-| Change native priority | One guarded `bd update` and readback | That Bead's priority only |
+| Change an existing priority | Read `forged work show --id`, then refuse | Current `work update` cannot mutate priority |
 | Pause or resume an existing epic | One typed epic control and readback | That already-started epic only |
 | Cancel an existing slice run | Confirm, then one `run stop` with `cancelled` | That run's terminal transition only |
 | Settle a run whose `run stop` refuses for missing durable driver identity | Confirm the evidence gap, then one `run adjudicate-settlement` | That run's terminal transition only |
@@ -46,24 +49,21 @@ epic; it never authorizes `epic start` or `epic submit`.
 
 ## Resolve operator and repository scope
 
-Resolve the operator store and canonical target repository once:
+Resolve the operator ledger and canonical target repository once:
 
 ```bash
 export ANVIL_HOME="${ANVIL_HOME:-$HOME/.anvil}"
-export BEADS_DIR="${BEADS_DIR:-$ANVIL_HOME/beads}"
-BD_BIN="${BD_BIN:-$(command -v bd)}"
 TARGET_REPO="$(cd "$(git rev-parse --show-toplevel)" && pwd -P)"
-env BEADS_DIR="$BEADS_DIR" "$BD_BIN" where --json
+forged work ready
 ```
 
-Honor an already-set `ANVIL_HOME` or `BEADS_DIR` instead of replacing it.
-Every Beads command must carry the explicit `BEADS_DIR`. Never initialize
-Beads in the target checkout, route creation through a repository option, or
-create a parallel specification file.
+Honor an already-set `ANVIL_HOME`. Every work-store read or write goes through
+a typed `forged work` verb. Never create a store in the target checkout or a
+parallel specification file.
 
 Repository language resolves first. Use only the exact canonical identity
-accepted by `metadata.repository` and the bounded repository selector. An
-unavailable authoritative repository read fails closed; unknown repository
+stored in `metadata.repository` and accepted by bounded repository selectors.
+An unavailable authoritative repository read fails closed; unknown repository
 identity must not widen to unrelated operator work.
 
 ## Observe from the headless projections
@@ -80,8 +80,9 @@ forged operations overview --group needs-me --limit 50
 The authoritative response schema is `forged.operations-overview/1`. Preserve
 its source health, capture times, coverage and truncation, stable queue groups,
 attention items, and known-versus-missing spend. A missing cost is unknown,
-never zero. A Beads outage may leave durable unscoped truth available, but a
-scoped query that cannot establish membership must fail closed.
+never zero. A degraded ledger source may leave some durable unscoped truth
+available, but a scoped query that cannot establish membership must fail
+closed.
 
 Summarize the stable Needs me, Ready to merge, Running, Stalled or recoverable,
 and Planned groups plus admitted, queued, live, review-ready, recent, and
@@ -108,9 +109,9 @@ do not infer missing evidence from a later page. Plan-only rows have no detail
 target until durable execution exists.
 
 Resolve human titles only inside one bounded Operations result. Match the
-`forged.work-identity/1` subject, Bead, repository, project, epic, and display
-context, but pass only its canonical subject kind and id to Work Detail or a
-control. Zero matches is not found. Multiple matches require one concise
+`forged.work-identity/1` subject, ore/work id, repository, project, epic, and
+display context, but pass only its canonical subject kind and id to Work Detail
+or a control. Zero matches is not found. Multiple matches require one concise
 disambiguation and no mutation. Titles, branch names, panes, process contents,
 and the currently visible App are never mutation selectors.
 
@@ -126,7 +127,7 @@ pause, resume, cancellation, attention resolution, or controller lifecycle.
 
 ## Distinguish discussion from durable work
 
-Observation and exploration are read-only. Do not create a Bead because a
+Observation and exploration are read-only. Do not create an ore because a
 conversation sounds useful. Create or revise durable work only when the
 operator clearly asks to capture, plan, or change it; then delegate to the plan
 skill and let its native-field and open-question gates decide readiness.
@@ -145,7 +146,7 @@ with the intended profile and roster to obtain their exact references. Present
 one bounded confirmation tuple:
 
 - slice or epic;
-- Bead id, title, and observed revision;
+- ore id, title, and observed revision;
 - canonical `metadata.repository`;
 - base branch;
 - resolved profile and roster;
@@ -155,14 +156,15 @@ A short reply such as “yes” or “do it” is valid only when it immediately
 unambiguously answers that one tuple. A later reply, general approval, different
 subject, or changed normative field requires a new tuple.
 
-After approval and before start, store exactly one JSON record in a Bead
-comment, fenced as `forged-execution-approval`:
+After approval and before start, append exactly one JSON record to the work
+item's `notes`, fenced as `forged-execution-approval`. The ledger has no
+comment verb, so this is one deliberate revision-CAS work update:
 
 ```forged-execution-approval
 {
   "schema": "forged-execution-approval/1",
   "subjectKind": "<slice|epic>",
-  "beadId": "<exact id>",
+  "workId": "<exact ore id>",
   "observedRevision": "<revision shown in the tuple>",
   "repository": "<canonical absolute root>",
   "baseRef": "<base>",
@@ -175,12 +177,30 @@ comment, fenced as `forged-execution-approval`:
 }
 ```
 
-Prepare the complete fenced comment in a scratch file outside the repository.
-Add it with pinned `bd comments add` and explicit `BEADS_DIR`, then read the
-Bead and comments back. Verify that title, description, design, acceptance
-criteria, notes, repository, parent, dependencies, issue type, readiness, and
-ready-frontier membership are unchanged. Retain the post-comment revision as
-the handoff snapshot. Normative drift requires fresh approval.
+Prepare the complete fenced block in a scratch file outside the repository.
+Read the ore, append the block to its existing notes, and perform exactly one
+guarded update:
+
+```bash
+CURRENT_JSON="$(forged work show --id "$ORE_ID")"
+OBSERVED_REVISION="$(
+  printf '%s' "$CURRENT_JSON" | jq -er '.result.work.revision'
+)"
+CURRENT_NOTES="$(
+  printf '%s' "$CURRENT_JSON" | jq -er '.result.work.spec.notes'
+)"
+UPDATED_NOTES="$(printf '%s\n\n%s\n' "$CURRENT_NOTES" "$APPROVAL_BLOCK")"
+forged work update --id "$ORE_ID" \
+  --expected-revision "$OBSERVED_REVISION" --notes="$UPDATED_NOTES"
+POST_APPROVAL_JSON="$(forged work show --id "$ORE_ID")"
+```
+
+Before updating, require `$OBSERVED_REVISION` to equal the revision in the
+operator-approved tuple; any drift invalidates that approval. Verify that the
+approval block is exact, the revision advanced once, and title,
+description, design, acceptance, repository, links, kind, status, priority,
+custody, and ready-frontier membership are unchanged. Retain the post-update
+revision as the handoff snapshot. Normative drift requires fresh approval.
 
 Before promising unattended continuation, run only the installed CLI's
 read-only `forged doctor` and `forged service status`. Do not install, start,
@@ -189,19 +209,20 @@ restart, or repair the service here.
 For a slice, follow `../dispatch/SKILL.md` and invoke exactly one typed start
 and one submit using the returned run id. For an epic, follow
 `../run-epic/SKILL.md`, verify the frozen inventory, and invoke exactly one
-typed start and submit. Perform no Bead or repository mutation between them.
+typed start and submit. Perform no work-item or repository mutation between
+them.
 Return the sibling skill's durable identifiers and reconnect commands, then
 stop without polling, watching, or resubmitting.
 
 ## Bind every existing-work control
 
 Before a mutation, read a fresh bounded Operations result, exact Work Detail,
-and the authoritative Bead or `forged.attention-item/1` when applicable. Bind
-one control tuple containing:
+and the authoritative ore via `forged work show --id` or
+`forged.attention-item/1` when applicable. Bind one control tuple containing:
 
 - subject kind and canonical id;
 - display title and canonical repository;
-- current lifecycle, Bead revision, or attention occurrence;
+- current lifecycle, work-item revision, or attention occurrence;
 - exact requested operation and material parameters;
 - durable effect and postcondition.
 
@@ -217,30 +238,24 @@ that states the durable effect. Confirmation for one subject or action never
 carries to another.
 
 Derive one operation identity from the exact control tuple and invoke the
-operation once. Then re-read Work Detail or Operations and the Bead when
+operation once. Then re-read Work Detail or Operations and the ore when
 relevant. The durable readback, not tool prose or App state, decides success.
 An ambiguous response, stale precondition, or failed postcondition is visible
 input-required evidence; do not retry, resubmit, or choose another action.
 
-## Change Bead priority
+## Existing priority changes are unsupported
 
-Read the exact Bead and retain its current status and assignee. Validate a
-numeric priority from 0 through 4; lower numbers win. Then perform one guarded
-update:
+`forged work create` accepts `--priority`, but current
+`forged work update` is revision-CAS over the five spec fields only. There is
+no typed ledger verb for mutating an existing ore's priority. Read the exact
+item with `forged work show --id "$ORE_ID"`, report its current priority, and
+refuse the requested write without substituting a legacy store, direct database
+edit, close/reopen dance, or another lifecycle effect.
 
-```bash
-env BEADS_DIR="$BEADS_DIR" "$BD_BIN" --actor "$OPERATOR_ACTOR" \
-  update "$BEAD_ID" --priority "$PRIORITY" \
-  --if-status "$OBSERVED_STATUS" --if-assignee "$OBSERVED_ASSIGNEE" --json
-env BEADS_DIR="$BEADS_DIR" "$BD_BIN" show "$BEAD_ID" --long --json
-```
-
-The exact id, requested priority, and observed guards form the idempotent
-operation tuple. If either guard loses, stop. Verify that priority changed and
-no status, assignee, dependency, metadata, or native specification field did.
-Explain that the new value affects a later admission decision. It never preempts active work.
-Represent an observed unassigned Bead with the empty `--if-assignee` value;
-never omit a guard merely because the field is empty.
+Priority is chosen when the work item is created. Lower numbers win later
+admission decisions, but priority never preempts active work. If changing
+existing priority becomes necessary, require a landed typed work operation
+before documenting or attempting it.
 
 ## Pause or resume an epic
 
@@ -277,7 +292,7 @@ forged work detail --subject-kind run --subject-id "$RUN_ID"
 ```
 
 Never infer `clean`, `blocked`, `input-required`, `superseded`, or `landed`
-from the word “stop.” Cancellation does not declare the Bead complete. Do not
+from the word “stop.” Cancellation does not declare the ore complete. Do not
 use attempt-level stop or several child mutations as a substitute. When
 `run stop` refuses with the typed code `ADJUDICATION_REQUIRED` — the run's
 controller record carries no durable driver identity — do not retry it or
@@ -313,7 +328,7 @@ operation refuses a run whose record the normal fence can settle — `run
 stop` stays the only path there — and refuses while any recorded machine
 effect lacks a confirmed-dead controller. Never use it to bypass a live
 fence, and never infer the outcome: it must come from durable evidence such
-as the Bead's recorded close reason.
+as the work item's recorded close reason.
 
 ## Accept review risk only as a human decision
 
@@ -407,7 +422,7 @@ service, direct provider, repository, or GitHub effects.
 - Never use a title, branch, pane, process, or visible App as a mutation
   selector.
 - Never store execution or control authority only in conversation state.
-- Never create repository-local Beads state or a sidecar specification.
+- Never create repository-local work-store state or a sidecar specification.
 - Never retrieve or synchronize an external tracker.
 - Never emulate a missing lifecycle operation with comments, UI state,
   sessions, signals, or child-by-child mutation.

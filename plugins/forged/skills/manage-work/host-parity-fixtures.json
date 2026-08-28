@@ -105,7 +105,7 @@
     "process-spawn",
     "network-access",
     "filesystem-write",
-    "beads-access",
+    "work-store-access",
     "ledger-access",
     "operator-state-access",
     "forged-cli-call",
@@ -127,6 +127,7 @@
     "claim_next",
     "definition_validate",
     "doctor",
+    "epic_abandon",
     "epic_advance",
     "epic_drive",
     "epic_pause",
@@ -160,10 +161,20 @@
     "session_stop",
     "usage_ingest",
     "usage_report",
+    "work_close",
+    "work_create",
     "work_detail",
     "work_history",
+    "work_link",
     "work_list",
-    "work_map"
+    "work_map",
+    "work_ready",
+    "work_release",
+    "work_reopen",
+    "work_revert",
+    "work_show",
+    "work_supersede",
+    "work_update"
   ],
   "surfaces": [
     {

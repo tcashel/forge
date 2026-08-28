@@ -1,13 +1,18 @@
 ---
 name: plan
-description: "Turn an approved idea or plan into one native operator-scoped Bead specification, or a native epic with reviewable child slices, without writing spec files into any repository. Use when the operator asks to plan work with Forged or invokes /forged:plan."
+description: "Turn an approved idea or plan into one ledger-native ore specification, or an epic with reviewable child work items, without writing spec files into any repository. Use when the operator asks to plan work with Forged or invokes /forged:plan."
 ---
 
 # /forged:plan
 
-Convert an idea into the durable specification that Forged will execute. The
-operator-scoped Beads database is the source of truth. A Bead's native fields,
-not a parallel Markdown file, carry the complete specification:
+Lifecycle position: approved idea → ledger-native ore. Next:
+`/forged:critique`. This stage runs in the lead session: the lead agent owns
+research, operator conversation, and every planning judgment. Forged owns the
+ledger that stores the result and owns execution only after an explicit
+dispatch; planning never launches a run.
+
+An ore's native fields, not a parallel Markdown file, are the complete
+specification:
 
 | Native field | Required content |
 | --- | --- |
@@ -18,126 +23,163 @@ not a parallel Markdown file, carry the complete specification:
 | `notes` | Agent instructions, decisions, and any unresolved questions |
 | `metadata.repository` | Canonical absolute target repository root |
 
-The lead agent owns the conversation and judgment. Forged owns durable
-execution after an explicit handoff. Planning must not launch a run.
+## Store and repository boundary
 
-## State boundary
-
-Resolve the operator paths once and pass `BEADS_DIR` on every command:
+The work store is the Forged ledger under `ANVIL_HOME`; access it only
+through typed `forged work` verbs. Resolve the canonical target once:
 
 ```bash
 export ANVIL_HOME="${ANVIL_HOME:-$HOME/.anvil}"
-export BEADS_DIR="${BEADS_DIR:-$ANVIL_HOME/beads}"
-BD_BIN="${BD_BIN:-$(command -v bd)}"
 TARGET_REPO="$(cd "$(git rev-parse --show-toplevel)" && pwd -P)"
-REPOSITORY_METADATA="$(jq -cn --arg repository "$TARGET_REPO" \
-  '{repository: $repository}')"
-env BEADS_DIR="$BEADS_DIR" "$BD_BIN" where --json
+forged work ready
 ```
 
-Do not initialize Beads from the target checkout. Do not use repository-routing
-flags on `bd create`. The one operator store holds work for many repositories;
-`metadata.repository` performs that association. Never add `.beads`, a spec
-file, agent instructions, hooks, or settings to the target repository while
-planning.
+Never create a repository-local work store. Never add a spec file, agent
+instructions, hooks, settings, or generated planning artifacts to the target
+repository. The `--repository` value on `work create` becomes
+`metadata.repository` and is the only planning-time repository association.
 
 ## Workflow
 
 1. **Research.** Read `research.md`, inspect the target repository read-only,
    and establish current behavior, constraints, tests, and unresolved choices.
-2. **Choose one slice or an epic.** Read `epic.md`. Prefer one reviewable slice
-   unless there are real dependency seams or independent delivery waves.
-3. **Draft native fields.** Read `schema.md`. Draft every field in the
-   conversation, make decisions at the lead-agent level, and let the operator
-   correct direction. Temporary scratch files are allowed only outside the
-   repository and are not authoritative.
+2. **Choose one slice or an epic.** Read `epic.md`. Prefer one reviewable
+   slice unless real dependency seams or independent delivery waves justify an
+   epic.
+3. **Draft native fields.** Read `schema.md`. Draft every field in the lead
+   conversation and let the operator correct direction. Scratch files are
+   allowed only outside the repository and are never authoritative.
 4. **Self-check.** Apply `checklist.md`. Assume the implementation agent sees
-   the native Bead and target checkout, not this conversation.
-5. **Lock the record.** Create or update the Bead with all native fields and
-   repository metadata. Then verify the stored record with `bd show`.
+   only the stored ore and target checkout, not this conversation.
+5. **Lock the record.** Mint a stable caller-supplied `ore-` id, create or
+   revision-CAS update the work item, add typed links, then verify it with
+   `forged work show --id` and `forged work ready`.
 
 ## Open-question gate
 
-An unresolved question is an unchecked `- [ ]` item in `notes`. A Bead with any
-such item must have status `blocked`; it must not appear on `bd ready`. Resolve
-the question with the operator, update the normative field, remove the item,
-and change the status to `open` before critique or dispatch.
+An unresolved question is an unchecked `- [ ]` item in `notes`. Create an
+ore containing one with `--status blocked`; it must not appear in
+`forged work ready`. Resolve the question with the operator, update the
+normative field, remove the checkbox, and use `forged work reopen --id` when
+the stored status is still blocked. Re-read the item and frontier before
+claiming it is ready.
 
 Do not hide uncertainty in prose and do not tell the implementation agent to
-choose a product or architecture direction. Make the decision here or hold the
-record blocked.
+choose a product or architecture direction. Make the decision in the lead
+session or keep the ore blocked.
 
 ## Single-slice lock
 
-Prepare the field bodies in temporary files outside the target repository so
-shell quoting cannot corrupt Markdown, then create the record. The exact files
-below are illustrative; delete them after verification.
+Prepare field bodies in temporary files outside the target repository, then
+create the record. `work create` takes the stable id from the caller; mint an
+unused `ore-` prefixed id before invoking it. Use attached
+`--flag=value` form for the four Markdown bodies because a body may begin
+with a bullet:
 
 ```bash
+ORE_ID="${ORE_ID:-ore-<x>}"
+DESCRIPTION="$(<"$DRAFT_DIR/description.md")"
+DESIGN="$(<"$DRAFT_DIR/design.md")"
 ACCEPTANCE="$(<"$DRAFT_DIR/acceptance.md")"
 NOTES="$(<"$DRAFT_DIR/notes.md")"
-ISSUE_JSON="$(env BEADS_DIR="$BEADS_DIR" "$BD_BIN" create "$TITLE" \
-  --type task \
-  --body-file "$DRAFT_DIR/description.md" \
-  --design-file "$DRAFT_DIR/design.md" \
-  --acceptance "$ACCEPTANCE" \
-  --notes "$NOTES" \
-  --metadata "$REPOSITORY_METADATA" \
-  --json)"
-ID="$(printf '%s' "$ISSUE_JSON" | jq -r '.id')"
-env BEADS_DIR="$BEADS_DIR" "$BD_BIN" show "$ID" --long --json
+
+CREATE_JSON="$(
+  forged work create --id "$ORE_ID" --title "$TITLE" \
+    --kind task --status "${STATUS:-open}" --priority "${PRIORITY:-2}" \
+    --repository "$TARGET_REPO" \
+    --description="$DESCRIPTION" --design="$DESIGN" \
+    --acceptance="$ACCEPTANCE" --notes="$NOTES"
+)"
+printf '%s' "$CREATE_JSON" |
+  jq -e --arg id "$ORE_ID" '.ok and .result.work.workId == $id'
+forged work show --id "$ORE_ID"
 ```
 
-The pinned CLI accepts description and design files as `--body-file` and
-`--design-file`; acceptance and notes use text flags. Inspect `bd create --help`
-first and do not silently drop a field. In JSON, confirm the result contains
-`acceptance_criteria`, the other native fields, and the exact repository value.
+For an existing ore, read its current revision and guard the full intended
+update with that exact value. Omitted fields retain their bytes, but planning
+should normally pass every reviewed body so the final contract is obvious:
+
+```bash
+CURRENT_JSON="$(forged work show --id "$ORE_ID")"
+REVISION="$(printf '%s' "$CURRENT_JSON" | jq -er '.result.work.revision')"
+forged work update --id "$ORE_ID" --expected-revision "$REVISION" \
+  --title "$TITLE" --description="$DESCRIPTION" --design="$DESIGN" \
+  --acceptance="$ACCEPTANCE" --notes="$NOTES"
+forged work show --id "$ORE_ID"
+```
+
+A moved revision is a contention stop: re-read, reconcile in the lead session,
+and apply one newly guarded update. Never retry stale field bodies blindly.
 
 ## Epic lock
 
-Use native issue types and parent-child edges:
+Use `--kind epic` and typed work links:
 
-1. Create the plan map as `--type epic` with complete native fields and
-   `metadata.repository`.
-2. Create each child with `--parent "$EPIC_ID"`. The native parent edge means
-   membership; do not add synthetic dependencies from the epic to every child.
-3. Fully specify wave-one children. Create downstream children as honest stubs
-   in status `blocked`, with their assumptions in `notes`.
-4. Add only useful `blocks` dependencies between children where one slice
-   consumes another slice's output. Independent siblings remain independent.
-5. At each wave boundary, re-read merged reality, replace a stub with complete
-   native fields, remove its assumption checkboxes, and open it only when its
-   dependencies and questions are resolved.
+1. Create the plan-map ore as an epic with complete native fields and the
+   canonical repository.
+2. Create each child as a task, then link child to epic with
+   `--kind parent-child`. Parent membership is structural, not a scheduling
+   dependency.
+3. Fully specify wave-one children. Create downstream children as honest
+   `--status blocked` stubs with assumptions in `notes`.
+4. Add a `blocks` link only when the `--from` child consumes the
+   `--to` prerequisite's output. Independent siblings remain independent.
+5. At each wave boundary, re-read merged reality, replace the stub fields,
+   remove resolved assumption checkboxes, and reopen it only when its
+   questions and intended hold are resolved.
 
-Example child creation:
+Example child creation and membership:
 
 ```bash
-env BEADS_DIR="$BEADS_DIR" "$BD_BIN" create "$CHILD_TITLE" \
-  --type task --parent "$EPIC_ID" \
-  --description "$DESCRIPTION" --design "$DESIGN" \
-  --acceptance "$ACCEPTANCE" --notes "$NOTES" \
-  --metadata "$REPOSITORY_METADATA" --json
+forged work create --id "$CHILD_ID" --title "$CHILD_TITLE" \
+  --kind task --status "$CHILD_STATUS" --priority "${PRIORITY:-2}" \
+  --repository "$TARGET_REPO" \
+  --description="$DESCRIPTION" --design="$DESIGN" \
+  --acceptance="$ACCEPTANCE" --notes="$NOTES"
+forged work link --from "$CHILD_ID" --to "$EPIC_ID" --kind parent-child
 ```
 
-After creation, query the epic's native children and dependency graph. Verify
-that every record has the same canonical repository metadata, no ready child
-has unresolved questions, and no false dependency serializes independent work.
-Use `bd ready --parent "$EPIC_ID" --metadata-field
-"repository=$TARGET_REPO" --json` with explicit `BEADS_DIR` to inspect the
-repository-scoped frontier.
+Example real dependency, where `$CONSUMER_ID` cannot run until
+`$PREREQUISITE_ID` closes:
+
+```bash
+forged work link --from "$CONSUMER_ID" --to "$PREREQUISITE_ID" --kind blocks
+```
+
+The allowed link kinds are `blocks`, `parent-child`, `related`,
+`discovered-from`, and `supersedes`. Read every child back. Because
+`work ready` returns the whole operator frontier, filter its response and
+then verify exact repository metadata:
+
+```bash
+forged work ready |
+  jq --arg repo "$TARGET_REPO" \
+    '.result.ready[] | select(.metadata.repository == $repo)'
+```
 
 ## Finish
 
-Report the single Bead id, or the epic id plus children grouped by wave; state
-which records are ready and which are blocked with the exact reason. The next
-step for a complete record is `/forged:critique`, not dispatch.
+Report the single ore id, or the epic id plus child work items grouped by wave.
+State which items are ready and which are blocked with the exact reason. The
+next step for a complete record is `/forged:critique`, not dispatch.
+
+If the operator explicitly abandons an unstarted plan, close only that exact
+ore and record the reason:
+
+```bash
+forged work close --id "$ORE_ID" --reason "$REASON"
+forged work show --id "$ORE_ID"
+```
+
+Closing is not part of normal planning and must never stand in for resolving a
+question, changing priority, or superseding work.
 
 ## Never
 
 - Do not create or maintain a second spec artifact.
-- Do not infer readiness from a status label alone; check questions and native
-  dependencies and confirm with `bd ready`.
-- Do not start Forged, install software, edit repository policy, or add another
-  work tracker.
-- Do not create ceremony-only micro-slices. One strong PR is preferred when it
-  has a coherent review and rollback boundary.
+- Do not infer readiness from status alone; check questions, typed links, and
+  the actual `forged work ready` frontier.
+- Do not start execution, install software, edit repository policy, or add
+  another work tracker.
+- Do not create ceremony-only micro-slices. Prefer one strong PR with a
+  coherent review and rollback boundary.

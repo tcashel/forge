@@ -80,9 +80,9 @@ const requiredSkillText = [
   'forged definition validate',
   'forged doctor',
   'forged service status',
-  'bd comments add',
+  'forged work update',
   'metadata.repository',
-  'BEADS_DIR',
+  'forged work show --id',
 ];
 if (!requiredSkillText.every((token) => skill.includes(token))) process.exit(1);
 
@@ -110,7 +110,7 @@ const expected = new Map(Object.entries({
   'external-context': ['external-context', 'none', 'discuss'],
 }));
 const effectKeys = [
-  'approvalComments', 'runStarts', 'runSubmits', 'epicStarts', 'epicSubmits',
+  'approvalNotesUpdates', 'runStarts', 'runSubmits', 'epicStarts', 'epicSubmits',
   'controlCalls', 'serviceMutations', 'providerCalls', 'githubWrites',
 ].sort();
 const seen = new Set();
@@ -127,9 +127,9 @@ for (const entry of fixture.cases) {
   if (!Object.values(budget).every((value) => Number.isInteger(value) && value >= 0)) process.exit(1);
 
   const expectedNonzero = entry.id === 'execute-slice'
-    ? {approvalComments: 1, runStarts: 1, runSubmits: 1}
+    ? {approvalNotesUpdates: 1, runStarts: 1, runSubmits: 1}
     : entry.id === 'execute-epic'
-      ? {approvalComments: 1, epicStarts: 1, epicSubmits: 1}
+      ? {approvalNotesUpdates: 1, epicStarts: 1, epicSubmits: 1}
       : {};
   for (const key of effectKeys) {
     if (budget[key] !== (expectedNonzero[key] || 0)) process.exit(1);
@@ -167,12 +167,12 @@ const requiredSkillText = [
   'forged attention acknowledge',
   'forged attention resolve',
   'forged attention reopen',
-  'bd update',
-  '--priority',
-  '--if-status',
-  '--if-assignee',
-  'lower numbers win',
-  'never preempts active work',
+  'forged work create',
+  'forged work update',
+  'forged work show --id',
+  '--expected-revision',
+  'Lower numbers win',
+  'Existing priority changes are unsupported',
   'accepted-unknown',
   'evidence-absent',
   'manifest-less attempt',
@@ -190,8 +190,8 @@ if (fixture.schema !== 'forged.manage-work-portfolio-control-fixtures/1' ||
       ['cases', 'isolation', 'purpose', 'schema', 'schemas'].join('\n')) process.exit(1);
 
 const expectedIsolation = {
-  requiredTemporaryEnv: ['HOME', 'ANVIL_HOME', 'BEADS_DIR'],
-  fakeBoundaries: ['bd', 'forged-cli', 'forged-mcp', 'service', 'provider', 'git', 'github', 'app-host'],
+  requiredTemporaryEnv: ['HOME', 'ANVIL_HOME'],
+  fakeBoundaries: ['forged-cli', 'forged-mcp', 'service', 'provider', 'git', 'github', 'app-host'],
   liveEffects: 'forbidden',
 };
 if (JSON.stringify(fixture.isolation) !== JSON.stringify(expectedIsolation)) process.exit(1);
@@ -218,8 +218,7 @@ const expected = new Map(Object.entries({
   'spend-known': ['work-detail', 'none', 'known-spend'],
   'spend-unknown': ['work-detail', 'none', 'unknown-not-zero'],
   'plan-only-detail': ['refuse', 'not-applicable', 'plan-summary-only'],
-  'priority-change': ['bd-priority', 'none', 'priority-only-lower-wins-later-no-preemption',
-    {beadPriorityUpdates: 1}],
+  'priority-change': ['refuse', 'not-applicable', 'priority-immutable-after-create'],
   'epic-pause': ['epic-pause', 'none', 'paused-readback', {epicPauses: 1}],
   'epic-resume': ['epic-resume', 'none', 'active-readback-no-submit', {epicResumes: 1}],
   'input-required-resume': ['work-detail', 'not-applicable', 'resolve-domain-first'],
@@ -251,7 +250,7 @@ const expected = new Map(Object.entries({
     'live-fence-run-stop-only'],
 }));
 const effectKeys = [
-  'beadClaims', 'beadPriorityUpdates', 'beadOtherWrites',
+  'workClaims', 'workPriorityUpdates', 'workOtherWrites',
   'epicPauses', 'epicResumes', 'runStops', 'runAdjudications',
   'riskAcceptances',
   'attentionAcknowledgements', 'attentionResolutions', 'attentionReopens',
@@ -259,7 +258,8 @@ const effectKeys = [
   'serviceMutations', 'providerCalls', 'repositoryWrites', 'githubWrites',
 ].sort();
 const alwaysZero = [
-  'beadClaims', 'beadOtherWrites', 'runStarts', 'runSubmits', 'epicStarts',
+  'workClaims', 'workPriorityUpdates', 'workOtherWrites',
+  'runStarts', 'runSubmits', 'epicStarts',
   'epicSubmits', 'sessionStops', 'serviceMutations', 'providerCalls',
   'repositoryWrites', 'githubWrites',
 ];
@@ -550,7 +550,7 @@ const expectedForbiddenEffects = [
   'process-spawn',
   'network-access',
   'filesystem-write',
-  'beads-access',
+  'work-store-access',
   'ledger-access',
   'operator-state-access',
   'forged-cli-call',
@@ -564,14 +564,16 @@ const expectedForbiddenEffects = [
 ];
 const expectedTools = [
   'artifact_compact', 'artifact_verify', 'attention_acknowledge', 'attention_list', 'attention_reopen',
-  'attention_resolve', 'claim_next', 'definition_validate', 'doctor', 'epic_advance',
+  'attention_resolve', 'claim_next', 'definition_validate', 'doctor', 'epic_abandon', 'epic_advance',
   'epic_drive', 'epic_pause', 'epic_preflight', 'epic_resolve', 'epic_resume', 'epic_revise_roster',
   'epic_start', 'epic_status', 'epic_submit', 'events_tail', 'operations_overview',
   'overview', 'packet_claim', 'packet_complete', 'packet_fail', 'reconcile',
   'review_publish', 'run_accept_risk', 'run_adjudicate_settlement', 'run_advance', 'run_revise_roster',
   'run_start', 'run_status', 'run_stop', 'run_submit', 'session_inventory', 'session_list',
   'session_message', 'session_read', 'session_stop', 'usage_ingest', 'usage_report',
-  'work_detail', 'work_history', 'work_list', 'work_map',
+  'work_close', 'work_create', 'work_detail', 'work_history', 'work_link', 'work_list', 'work_map',
+  'work_ready', 'work_release', 'work_reopen', 'work_revert', 'work_show', 'work_supersede',
+  'work_update',
 ];
 const surfaceShared = {
   structuredContent: 'required',
@@ -668,8 +670,8 @@ function validateParityFixture(registration) {
   invariant(stableJson(fixture.allowedHostDifferences) === stableJson(expectedAllowedDifferences), 'allowed host differences moved');
   invariant(stableJson(fixture.forbiddenHostDifferences) === stableJson(expectedForbiddenDifferences), 'forbidden host differences moved');
   invariant(stableJson(fixture.forbiddenEffects) === stableJson(expectedForbiddenEffects), 'forbidden validation effects moved');
-  invariant(stableJson(fixture.tools) === stableJson(expectedTools), 'exact 46-tool declaration moved');
-  invariant(fixture.tools.length === 46 && new Set(fixture.tools).size === 46, 'tool declaration must contain 46 unique tools');
+  invariant(stableJson(fixture.tools) === stableJson(expectedTools), 'exact 57-tool declaration moved');
+  invariant(fixture.tools.length === 57 && new Set(fixture.tools).size === 57, 'tool declaration must contain 57 unique tools');
   invariant(stableJson(fixture.surfaces) === stableJson(expectedSurfaces), 'exact five-surface declaration moved');
   invariant(fixture.surfaces.length === 5, 'surface declaration must contain five resources');
   exactKeys(fixture.contracts, ['intent', 'portfolioControl'], 'host parity contracts');
@@ -723,7 +725,7 @@ try {
   console.log(
     `HOST PARITY: claudeRoot=${claude.pluginRoot} codexRoot=${codex.pluginRoot} ` +
       `version=${claude.manifest.version} skills=9 inventorySha256=${claude.inventory.digest} ` +
-      `cases=15+31 tools=46 surfaces=5 evidence=declarative-contract-only`,
+      `cases=15+33 tools=57 surfaces=5 evidence=declarative-contract-only`,
   );
 } catch (error) {
   console.error(`host parity validation failed: ${error.message}`);
@@ -935,8 +937,17 @@ check "board skill contract" check_board_skill
 check "bootstrap shell syntax" bash -n "$plugin/bootstrap/install-beads.sh"
 grep -Fq '../../agents/critic.md' "$plugin/skills/critique/SKILL.md" \
   && pass "critique resolves the shared critic" || fail "critique resolves the shared critic"
-grep -Fq '../../bootstrap/install-beads.sh' "$plugin/skills/setup/SKILL.md" \
-  && pass "setup resolves the shared bootstrap" || fail "setup resolves the shared bootstrap"
+if grep -Fq '../../bootstrap/install-beads.sh' "$plugin/skills/setup/SKILL.md"; then
+  fail "setup does not route through the deleted work-store bootstrap"
+else
+  pass "setup does not route through the deleted work-store bootstrap"
+fi
+for path in "${skill_files[@]}"; do
+  check "lifecycle position $path" grep -Fq 'Lifecycle position:' "$path"
+  check "next lifecycle step $path" grep -Fq 'Next:' "$path"
+  check "lead-session boundary $path" grep -Eq 'lead session|lead agent' "$path"
+  check "Forged boundary $path" grep -Fq 'Forged' "$path"
+done
 
 legacy=(
   "$plugin/workflows/execute-review-fix.js"
@@ -967,11 +978,19 @@ check "epic reconnect and resume command surface" check_reconnect_surface \
   "forged epic submit --epic"
 
 if grep -Ern --include='*.md' --include='*.sh' \
-  '(\.anvil/specs|--spec([[:space:]]|`)|bd create --repo|--(description|acceptance|notes)-file|workflows/(execute-review-fix|run-epic|plan-critique-improve)\.js|watch-epic)' \
+  '(\.anvil/specs|--spec([[:space:]]|`)|--parent([[:space:]]|`)|--(description|acceptance|notes)-file|workflows/(execute-review-fix|run-epic|plan-critique-improve)\.js|watch-epic)' \
   "$plugin"; then
-  fail "no legacy spec-file, repo-routing, Workflow, or watch contract"
+  fail "no legacy spec-file, parent-flag, Workflow, or watch contract"
 else
-  pass "no legacy spec-file, repo-routing, Workflow, or watch contract"
+  pass "no legacy spec-file, parent-flag, Workflow, or watch contract"
+fi
+
+if grep -Ern --include='*.md' --include='*.json' --include='*.sh' \
+  '(BEADS_DIR|\.beads|(^|[^[:alnum:]_])bd([^[:alnum:]_]|$)|(^|[^[:alnum:]_])Beads?([^[:alnum:]_]|$)|beads-)' \
+  "$plugin/skills"; then
+  fail "skill tree forbids deleted work-store instructions and vocabulary"
+else
+  pass "skill tree forbids deleted work-store instructions and vocabulary"
 fi
 
 if grep -Erni --include='*.md' --include='*.json' --include='*.sh' \
@@ -981,13 +1000,69 @@ else
   pass "no external tracker client, instructions, or credentials"
 fi
 
-for needle in 'metadata.repository' 'description' 'design' 'acceptance_criteria' 'notes' '--parent'; do
+for needle in 'metadata.repository' 'description' 'design' 'acceptance_criteria' 'notes' \
+  'forged work create' 'forged work update' 'forged work link' \
+  'forged work close' 'forged work show' 'forged work ready' 'ore-'; do
   grep -Fq -- "$needle" "$plugin/skills/plan/SKILL.md" \
     && pass "native plan contract: $needle" || fail "native plan contract: $needle"
 done
-grep -Fq 'BEADS_DIR' "$plugin/skills/setup/SKILL.md" \
-  && pass "setup preserves BEADS_DIR" || fail "setup preserves BEADS_DIR"
+
+check_plan_work_surface() {
+  node - "$plugin/skills/plan/SKILL.md" "crates/forged/src/cli.rs" <<'NODE'
+const fs = require('fs');
+const [skillPath, cliPath] = process.argv.slice(2);
+const skill = fs.readFileSync(skillPath, 'utf8');
+const cli = fs.readFileSync(cliPath, 'utf8');
+const commands = [
+  'forged work create --id "$ORE_ID"',
+  'forged work update --id "$ORE_ID" --expected-revision "$REVISION"',
+  'forged work link --from "$CHILD_ID" --to "$EPIC_ID" --kind parent-child',
+  'forged work close --id "$ORE_ID" --reason "$REASON"',
+  'forged work show --id "$ORE_ID"',
+  'forged work ready',
+];
+const variants = [
+  'Create(WorkCreateArgs)',
+  'Update(WorkUpdateArgs)',
+  'Link(WorkLinkArgs)',
+  'Close(WorkCloseArgs)',
+  'Show(WorkIdArgs)',
+  'Ready(KeyOnly)',
+];
+const createFlags = [
+  'pub id: String',
+  'pub title: String',
+  'pub description: Option<String>',
+  'pub acceptance: Option<String>',
+  'pub design: Option<String>',
+  'pub notes: Option<String>',
+  'pub kind: Option<String>',
+  'pub status: Option<String>',
+  'pub priority: Option<i64>',
+  'pub repository: Option<String>',
+];
+if (!commands.every((token) => skill.includes(token))) process.exit(1);
+if (!variants.every((token) => cli.includes(token))) process.exit(1);
+if (!createFlags.every((token) => cli.includes(token))) process.exit(1);
+if (!skill.includes('--description="$DESCRIPTION"') ||
+    !skill.includes('--acceptance="$ACCEPTANCE"') ||
+    !skill.includes('--design="$DESIGN"') ||
+    !skill.includes('--notes="$NOTES"')) process.exit(1);
+if (skill.includes('--parent') || skill.includes('BEADS_DIR')) process.exit(1);
+NODE
+}
+check "plan dry-read uses current work CLI surface" check_plan_work_surface
+
+grep -Fq 'forged init' "$plugin/skills/setup/SKILL.md" \
+  && pass "setup initializes the Forged ledger" || fail "setup initializes the Forged ledger"
 grep -Fq 'ANVIL_HOME' "$plugin/skills/setup/SKILL.md" \
   && pass "setup preserves ANVIL_HOME" || fail "setup preserves ANVIL_HOME"
+grep -Fq 'Operator-supplied tool rates are optional' "$plugin/skills/configure/SKILL.md" \
+  && pass "configure makes operator tool rates optional" || fail "configure makes operator tool rates optional"
+grep -Fq 'default_rate_card' "$plugin/skills/configure/SKILL.md" \
+  && pass "configure names the default rate-card fallback" || fail "configure names the default rate-card fallback"
+grep -Fq 'capability implies server-side tool use' "$plugin/skills/configure/SKILL.md" \
+  && pass "configure asks for tool rates only when capability requires them" \
+  || fail "configure asks for tool rates only when capability requires them"
 
 if [[ $failures -gt 0 ]]; then exit 1; fi

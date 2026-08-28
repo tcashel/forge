@@ -1,33 +1,38 @@
 ---
 name: critique
-description: "Harden a complete native Bead specification with proportional, provider-neutral critique and persist one synthesized recommendation record for adjudication. Use after /forged:plan or when the operator invokes /forged:critique."
+description: "Harden a complete ledger-native ore specification with proportional, provider-neutral critique and persist one synthesized recommendation record for adjudication. Use after /forged:plan or when the operator invokes /forged:critique."
 ---
 
 # /forged:critique
 
-Critique the native Bead before execution. The goal is one useful adversarial
-pass proportional to risk, not a review treadmill. This skill reads and
-comments on operator-scoped Beads; it does not edit their normative spec fields
-and does not launch Forged.
+Lifecycle position: planned ore → reviewed recommendation record. Next:
+`/forged:adjudicate`. Critique runs in the lead session: the lead agent and
+any delegated critics read the ledger and repository, while Forged only serves
+typed work-store reads and the guarded notes update. This stage never launches
+or controls execution.
+
+The goal is one useful adversarial pass proportional to risk, not a review
+treadmill. Critique does not alter the normative description, design,
+acceptance criteria, graph, or lifecycle state. The ledger has no commentary
+verb, so its one allowed persistence effect is a revision-CAS update that
+appends the synthesized review record to `notes`.
 
 ## Load the authoritative record
 
 ```bash
 export ANVIL_HOME="${ANVIL_HOME:-$HOME/.anvil}"
-export BEADS_DIR="${BEADS_DIR:-$ANVIL_HOME/beads}"
-BD_BIN="${BD_BIN:-$(command -v bd)}"
-env BEADS_DIR="$BEADS_DIR" "$BD_BIN" show "$BEAD_ID" \
-  --long --include-comments --json
+CURRENT_JSON="$(forged work show --id "$ORE_ID")"
+printf '%s' "$CURRENT_JSON" | jq -e '.ok and .result.work.workId'
 ```
 
-Read title, `description`, `design`, `acceptance_criteria`, `notes`, type,
-status, `metadata.repository`, parent and dependency edges. Inspect the target
-repository named by the metadata read-only. Do not substitute a sidecar file,
-conversation summary, or repository-local Beads store.
+Read title, `description`, `design`, `acceptanceCriteria`, `notes`, kind,
+status, priority, revision, `metadata.repository`, and dependency edges.
+Inspect the named target repository read-only. Do not substitute a sidecar
+file, conversation summary, or repository-local store.
 
 If required native fields are absent, repository metadata is missing or wrong,
 or an unchecked question remains, report that blocking defect and stop. The
-record is not eligible for critique-as-approval.
+ore is not eligible for critique-as-approval.
 
 ## Choose the smallest useful topology
 
@@ -40,9 +45,9 @@ record is not eligible for critique-as-approval.
   perspectives.
 
 Use the host's native delegation when available. Parallelize genuinely
-independent perspectives. Critics are read-only and receive the rendered native
-Bead plus repository root; they do not mutate Beads or the checkout. More seats
-are not intrinsically better. Stop when the selected topology has completed one
+independent perspectives. Critics are read-only and receive the rendered ore
+plus repository root; they do not mutate the ledger or checkout. More seats
+are not intrinsically better. Stop when the selected topology completes one
 bounded pass.
 
 ## Adjudicate critic output before persisting it
@@ -53,13 +58,13 @@ duplicates, and separate:
 - **recommendations:** clear, evidence-backed corrections;
 - **CRUXes:** findings whose resolution requires lead/operator judgment;
 - **open questions:** facts that still need a decision or evidence;
-- **rejected findings:** concise reason a critic claim is inapplicable.
+- **rejected findings:** concise reasons critic claims are inapplicable.
 
 Do not silently modify the specification. Produce one exact fenced block:
 
 ````markdown
 ```forged-spec-recommendations
-bead: <id>
+work: <ore id>
 repository: <canonical absolute path>
 reviewed_at: <ISO-8601 UTC>
 topology: <low|normal|high and seats used>
@@ -85,19 +90,34 @@ topology: <low|normal|high and seats used>
 ```
 ````
 
-The block is the handoff contract for `/forged:adjudicate`. Save it as one Bead
-comment using `bd comments add <id> --file <scratch-file>` with explicit
-`BEADS_DIR`, then read the comments back and verify the block was stored intact.
-The scratch file must live outside the target repository and may be deleted
-after verification.
+If there are no findings, write `None` and no unresolved CRUX or checkbox.
+That completes critique but does not bypass adjudication's readiness checks.
 
-If there are no findings, persist a block that says `None` and has no unresolved
-CRUX. That is a completed critique, not permission to skip adjudication's
-readiness checks.
+## Persist the handoff in notes
+
+Append the complete block to the existing notes and guard the update with the
+revision just read. Use attached `--notes=value` form because the body may
+start with Markdown punctuation:
+
+```bash
+REVISION="$(printf '%s' "$CURRENT_JSON" | jq -er '.result.work.revision')"
+CURRENT_NOTES="$(printf '%s' "$CURRENT_JSON" | jq -er '.result.work.spec.notes')"
+UPDATED_NOTES="$(printf '%s\n\n%s\n' "$CURRENT_NOTES" "$RECOMMENDATION_BLOCK")"
+forged work update --id "$ORE_ID" --expected-revision "$REVISION" \
+  --notes="$UPDATED_NOTES"
+forged work show --id "$ORE_ID"
+```
+
+Verify the newest notes contain the exact complete block and that the update
+minted one revision while every other spec field, repository value, edge, and
+coordination field stayed unchanged. A moved revision is input-required: do
+not overwrite concurrent planning.
 
 ## Never
 
-- Do not write native spec fields, resolve CRUXes, or change Bead status here.
-- Do not run implementation, CI, installation, GitHub writes, or Forged.
-- Do not repeat critique because a critic could imagine more. One bounded
-  topology completes this stage; new evidence can justify a later explicit run.
+- Do not edit normative fields, resolve CRUXes, or change work-item status.
+- Do not invent a comment verb; critique persistence is the guarded notes
+  revision described above.
+- Do not run implementation, CI, installation, GitHub writes, or Forged
+  execution.
+- Do not repeat critique merely because another critic could imagine more.

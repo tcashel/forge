@@ -26,16 +26,18 @@ The epic's `acceptance_criteria` describes the integrated outcome, not merely
 completion of children. Its `notes` records operator decisions and unresolved
 epic-level questions.
 
-## Child records
+## Child work items
 
-- Every child uses a native `parent` edge to the epic.
+- Link each child to the epic with `forged work link --from "$CHILD_ID" --to
+  "$EPIC_ID" --kind parent-child`.
 - Wave-one children get complete native specifications.
 - Later-wave children begin as blocked stubs. A stub names its expected result,
   dependencies, and `- [ ] ASSUMES:` items, but must not pretend to be ready.
-- Dependency edges express actual production and consumption between children.
-  Parent membership is not a dependency and must not serialize the graph.
-- At a wave checkpoint, compare assumptions with merged code before promoting a
-  stub to a complete open Bead.
+- A `blocks` edge points from consumer to prerequisite. It expresses actual
+  production and consumption between children; parent membership never
+  serializes the graph.
+- At a wave checkpoint, compare assumptions with merged code before promoting
+  a stub to a complete open work item.
 
 The result should let independent children proceed in parallel while making
 every real integration seam visible.

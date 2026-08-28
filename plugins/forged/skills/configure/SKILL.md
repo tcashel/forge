@@ -5,6 +5,12 @@ description: "Guide the operator through Forged profile, roster, and pricing con
 
 # /forged:configure
 
+Lifecycle position: initialized control plane → validated authoring
+configuration. Next: `/forged:plan` for new work, or return to the pending
+dispatch after validation. Configuration runs in the lead session with
+operator consent; Forged validates it and freezes an immutable snapshot only
+when execution starts.
+
 Author the cognitive configuration Forged freezes into new work: which roles
 exist per assurance profile, and which provider/model answers each role. All
 edits target the operator authoring config; compiled snapshots in `state.db`
@@ -157,10 +163,18 @@ in `rowsMissingCost`, and raises `missing-cost` attention — that is honest,
 not broken; resolve it by adding real rates or explicitly accepting
 `accepted-unknown`.
 
-A `pricing` block **replaces** the built-in card wholesale — it is one
-complete document, never merged with the defaults. Carry forward entries
-for every token-only model the rosters still name, and include the required
-`tools` rates; omitting either loses pricing or fails the parse:
+Operator-supplied tool rates are optional. When the authoring config omits
+`pricing`, `config.rs` calls `default_rate_card`, whose complete built-in card
+already includes token and server-side tool rates. Do not ask the operator for
+tool pricing merely because they changed a roster model. Ask only when a
+selected roster/provider capability implies server-side tool use and the
+operator needs a rate different from the default card.
+
+A custom `pricing` block **replaces** `default_rate_card` wholesale — it is one
+complete document, never merged with the defaults. Carry forward entries for
+every token-only model the rosters still name. The replacement schema contains
+a `tools` object, so when a custom card is actually necessary retain the
+default tool rate unless the operator supplied a verified replacement:
 
 ```yaml
 pricing:
@@ -180,7 +194,8 @@ pricing:
 The context window is required — it is what makes the long-context tier
 decision provable. Transcribe rates from the provider's published pricing
 and record the date and source; the overview surfaces a stale card rather
-than hiding it.
+than hiding it. If defaults cover every selected model and tool, omit the
+custom `pricing` block and rely on `default_rate_card`.
 
 ## Apply and verify
 

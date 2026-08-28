@@ -1,14 +1,15 @@
-# Native Bead specification schema
+# Ledger-native ore specification schema
 
-The native Bead is the complete, durable execution contract. Keep it concise,
-but include every fact an implementation and review agent needs without access
-to the planning conversation.
+The ore stored in the Forged ledger is the complete durable execution
+contract. Keep it concise, but include every fact an implementation and review
+agent needs without access to the planning conversation.
 
 ## Title
 
-Use `<type>(<scope>): <imperative>`, lowercase, at most 70 characters. The title
-must be suitable as the pull request title. Use `feat`, `fix`, `refactor`,
-`docs`, `test`, `build`, or `chore` according to the actual change.
+Use `<type>(<scope>): <imperative>`, lowercase, at most 70 characters. The
+title must be suitable as the pull request title. Use `feat`, `fix`,
+`refactor`, `docs`, `test`, `build`, or `chore` according to the
+actual change.
 
 ## `description`
 
@@ -30,7 +31,7 @@ Record the decisions the implementation must preserve:
 - for an epic, cross-slice seam contracts and wave checkpoints.
 
 Do not write “decide X.” Make the decision or put the question in `notes` and
-hold the record blocked.
+hold the work item blocked.
 
 ## `acceptance_criteria`
 
@@ -51,12 +52,16 @@ Include:
 - non-goals and operational cautions worth making conspicuous;
 - unresolved questions only as `- [ ]` bullets.
 
-Any unchecked question makes the Bead blocked. When adjudicated, move the
+Any unchecked question makes the work item blocked. When adjudicated, move the
 answer into the normative field it changes and remove the checkbox. Keep only a
 short dated decision note when the history is useful.
 
+Critique and adjudication currently persist their review record in `notes`
+because the ledger has no separate commentary verb. Those guarded notes
+updates mint ordinary spec revisions; never pretend a comment surface exists.
+
 ## Repository metadata
 
-Set `metadata.repository` to `git rev-parse --show-toplevel` from the target
-checkout, resolved to a canonical absolute path. This metadata selects the
-repository while `BEADS_DIR` continues to select the operator's central store.
+Pass the canonical absolute target root as `--repository` to
+`forged work create`. The ledger stores it as `metadata.repository`, which
+selects repository-scoped work without placing state in the checkout.
