@@ -1522,6 +1522,9 @@ mod tests {
                 }
             }
         }
+        // A real historical freeze computed its digest over these exact
+        // effort-carrying bytes; the fixture does the same.
+        package.roster_sha256 = digest_of(&package.roster).expect("roster digest");
         compile_frozen_package(package).expect("frozen claude effort stays loadable");
     }
 
