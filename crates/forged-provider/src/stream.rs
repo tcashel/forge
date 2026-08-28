@@ -14,9 +14,9 @@ use nix::libc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::codex::EFFORTS;
-use crate::invocation::{validate_embedded_path, validate_model, Invocation, PacketDirs};
-use crate::pi::PI_EFFORTS;
+use crate::invocation::{
+    validate_effort, validate_embedded_path, validate_model, Invocation, PacketDirs,
+};
 use crate::ProviderError;
 
 /// Raw argv sentinel for the private provider-stream runner. It is deliberately
@@ -243,24 +243,9 @@ impl ProviderStreamRequestV1 {
         validate_context(&self.packet_id)?;
         validate_artifact_dir(&self.artifact_dir, self.attempt_id)?;
         match self.provider {
-            ProviderKindV1::Codex => {
+            ProviderKindV1::Codex | ProviderKindV1::Pi => {
                 if let Some(effort) = self.effort.as_deref() {
-                    if !EFFORTS.contains(&effort) {
-                        return Err(ProviderError::UnsupportedEffort {
-                            effort: effort.to_owned(),
-                        });
-                    }
-                }
-            }
-            ProviderKindV1::Pi => {
-                if self
-                    .effort
-                    .as_deref()
-                    .is_some_and(|effort| !PI_EFFORTS.contains(&effort))
-                {
-                    return Err(ProviderError::Malformed {
-                        message: "pi provider-stream request carries unsupported effort".to_owned(),
-                    });
+                    validate_effort(effort)?;
                 }
             }
             ProviderKindV1::Claude if self.effort.is_some() => {
