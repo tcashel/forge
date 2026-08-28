@@ -249,6 +249,43 @@ pub fn param_opt_str<'p>(params: &'p Map<String, Value>, key: &str) -> Option<&'
         .filter(|s| !s.is_empty())
 }
 
+/// Strict optional string read: absent and null read as `None`, an empty
+/// string reads as `None` (the MCP boundary's "unset"), and any OTHER type
+/// refuses — a present-but-malformed value must never silently take a
+/// default that mutates durable state.
+pub fn param_opt_str_strict<'p>(
+    params: &'p Map<String, Value>,
+    key: &str,
+) -> Result<Option<&'p str>, Failure> {
+    match params.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(text)) if text.is_empty() => Ok(None),
+        Some(Value::String(text)) => Ok(Some(text)),
+        Some(other) => Err(Failure::invalid(format!(
+            "{key} must be a string, got {other}"
+        ))),
+    }
+}
+
+/// Strict optional integer read, same contract as
+/// [`param_opt_str_strict`]: absent/null is `None`, an integer is itself,
+/// anything else refuses.
+pub fn param_opt_i64_strict(
+    params: &Map<String, Value>,
+    key: &str,
+) -> Result<Option<i64>, Failure> {
+    match params.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(number)) => number
+            .as_i64()
+            .map(Some)
+            .ok_or_else(|| Failure::invalid(format!("{key} must be an integer, got {number}"))),
+        Some(other) => Err(Failure::invalid(format!(
+            "{key} must be an integer, got {other}"
+        ))),
+    }
+}
+
 /// Read an optional string param that must NAME something: a
 /// whitespace-only value reads as absent, matching the MCP boundary's
 /// `named_string` refusal so both surfaces agree on what counts as a name.

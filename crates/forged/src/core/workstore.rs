@@ -298,9 +298,11 @@ pub async fn settlement_note_present(
     let run_id = run_id.to_owned();
     let marker = marker.to_owned();
     on_ledger(ledger, move |l| {
-        let events = l.list_events(Some(&run_id), 0, 10_000)?;
+        // By kind, not by run page: settled notes are globally rare, and a
+        // run past the first page of its own events must still converge.
+        let events = l.list_events_by_kind("work.settled.note")?;
         Ok(events.iter().any(|event| {
-            event.kind == "work.settled.note"
+            event.run_id.as_deref() == Some(run_id.as_str())
                 && serde_json::from_str::<serde_json::Value>(&event.payload_json)
                     .ok()
                     .and_then(|payload| {

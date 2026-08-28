@@ -1489,16 +1489,49 @@ async fn run_attempt(
         // Renewal targets the lease that is actually held — renewal is
         // owner-only, and a renewal under a second, derived identity would
         // be refused and let the run's own lease lapse under it. Internal
-        // runs (assurance) claim NO work lease by design, so an attempt
-        // renews only when the lease row is this run's at spawn: renewing
-        // unconditionally turns the very first beat of a lease-less run
-        // into a genuine "has no lease" refusal that kills the provider.
+        // runs (epic-plan / epic-assurance) claim NO work lease by design
+        // and never renew; an ORDINARY run must actually hold its lease at
+        // spawn — a foreign or absent row means the bead was reclaimed or
+        // released between Resolve and this attempt, and spawning a
+        // provider beside the new holder is exactly the double-writer the
+        // lease exists to prevent.
+        let internal_run = matches!(
+            exec.protocol.as_ref().map(|p| p.name.as_str()),
+            Some("epic-plan") | Some("epic-assurance")
+        );
         let holder = crate::core::lease_identity(&ctx.ledger, &packet.bead_id, &run_id).await?;
-        let lease_is_ours = {
-            let bead = packet.bead_id.clone();
-            on_ledger(&ctx.ledger, move |l| l.work_lease(&bead)).await?
-        }
-        .is_some_and(|row| row.holder == holder);
+        let lease_is_ours = if internal_run {
+            false
+        } else {
+            let row = {
+                let bead = packet.bead_id.clone();
+                on_ledger(&ctx.ledger, move |l| l.work_lease(&bead)).await?
+            };
+            match row {
+                Some(row) if row.holder == holder => true,
+                Some(row) => {
+                    return Err(Failure {
+                        code: ErrorCode::BeadLeaseHeld,
+                        message: format!(
+                            "work lease for {} is held by {:?}; refusing to spawn beside it",
+                            packet.bead_id, row.holder
+                        ),
+                        recoverable: true,
+                    })
+                }
+                None => {
+                    return Err(Failure {
+                        code: ErrorCode::BeadLeaseHeld,
+                        message: format!(
+                            "no work lease held for {}; the run's claim was released or \
+                             reclaimed — refusing to spawn unfenced",
+                            packet.bead_id
+                        ),
+                        recoverable: true,
+                    })
+                }
+            }
+        };
         let (stage_key, seq) = match &packet.execution {
             Some(execution) => (execution.stage_id.clone(), i64::from(execution.round)),
             None => {
@@ -2438,8 +2471,15 @@ async fn run_attempt(
                         // Our claim or our lease was taken out from under us:
                         // stop the provider and report. Its tokens were still
                         // spent; freeze this attempt's private capture before
-                        // any successor is allowed to proceed.
-                        let _ = host.kill_confirmed(&session).await;
+                        // any successor is allowed to proceed. The settle
+                        // below is fenced by CONFIRMED death: an unconfirmed
+                        // kill skips this beat and retries containment on the
+                        // next one rather than making the packet
+                        // successor-eligible while the provider may still be
+                        // writing.
+                        if host.kill_confirmed(&session).await.is_err() {
+                            continue;
+                        }
                         crate::core::artifacts::finalize_provider_files(&run_root, &dirs)?;
                         let out = crate::core::artifacts::read_output_text(&run_root, &dirs)?;
                         crate::core::usage::capture_attempt(
@@ -3494,6 +3534,16 @@ mod settle_tests {
                 cause: forged_ledger::WorkRevisionCause::Authored,
             })
             .expect("seed work item");
+        // An ordinary run must actually hold its work lease at attempt
+        // spawn — the fixture claims under the run's derived holder exactly
+        // as drive's worktree-prepare stage does.
+        ledger
+            .claim_specific_work(
+                RUN_ID,
+                &crate::core::run_holder(RUN_ID),
+                forged_ledger::WORK_LEASE_TTL_S,
+            )
+            .expect("claim work lease");
 
         let spec_path = root.join("spec.md");
         std::fs::write(&spec_path, "# spec\n").expect("spec");

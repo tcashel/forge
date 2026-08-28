@@ -174,6 +174,12 @@ fn recovered_live_attempt_persists_a_wake_no_later_than_its_deadline() {
 /// Retry a cleanup `run stop` until it lands, panicking with the LAST
 /// refusal envelope on timeout — a bare timeout hides the wedge.
 fn stop_until_lands(env: &TestEnv, run: &str, reason: &str, what: &str) {
+    // A stop can legitimately defer for the FULL identity grace window
+    // (ports.rs IDENTITY_GRACE_S = 60s): when the controller group dies
+    // before the provider's start stamp lands, kill confirmation refuses to
+    // signal the unverifiable pid until the grace adjudicates it a bounded
+    // orphan. The retry budget must outlive that window.
+    const STOP_WAIT: Duration = Duration::from_secs(90);
     let started = Instant::now();
     loop {
         let (code, stop) = env.forged(&[
@@ -190,7 +196,7 @@ fn stop_until_lands(env: &TestEnv, run: &str, reason: &str, what: &str) {
             break;
         }
         assert!(
-            started.elapsed() < WAIT,
+            started.elapsed() < STOP_WAIT,
             "timed out waiting for {what}; last refusal: {stop}"
         );
         std::thread::sleep(Duration::from_millis(25));
