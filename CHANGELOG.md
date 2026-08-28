@@ -4,6 +4,18 @@ This file records user-visible changes to Forge.
 
 ## [Unreleased]
 
+### Fixed
+
+- An epic that was abandoned and restarted while its base branch had not
+  moved never finished integration setup: the fresh epoch re-cut the
+  identical integration branch, the identical event was suppressed as a
+  duplicate of the abandoned epoch's, and the controller spun at full CPU
+  appending a request event every few milliseconds instead of proceeding.
+  Each epoch now records its own integration event, an epic already stuck
+  this way heals itself on the next tick after resuming, and a controller
+  step that keeps repeating itself unchanged is polled at the normal wait
+  cadence instead of spinning.
+
 ## [0.6.0] - 2026-08-28
 
 The work graph moves into the Forge ledger (ADR-0034): work items,

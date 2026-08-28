@@ -6,10 +6,38 @@ mod support;
 use serde_json::{json, Value};
 use support::TestEnv;
 
+const STARTED: &str = "forged.epic.started";
+const INTEGRATION_READY: &str = "forged.epic.integration.ready";
+
 fn result(env: &TestEnv, args: &[&str]) -> Value {
     let (code, envelope) = env.forged(args);
     assert_eq!(code, 0, "{args:?}: {envelope}");
     envelope["result"].clone()
+}
+
+/// One epic's whole event stream as (kind, payload), oldest first.
+fn epic_events(env: &TestEnv, epic: &str) -> Vec<(String, Value)> {
+    let ledger = env.ledger();
+    let rows = ledger
+        .list_events(Some(epic), 0, 65_536)
+        .expect("epic events");
+    ledger.close().expect("close test ledger");
+    rows.into_iter()
+        .map(|row| {
+            (
+                row.kind,
+                serde_json::from_str(&row.payload_json).expect("event payload"),
+            )
+        })
+        .collect()
+}
+
+fn events_of_kind(events: &[(String, Value)], kind: &str) -> Vec<Value> {
+    events
+        .iter()
+        .filter(|(row_kind, _)| row_kind == kind)
+        .map(|(_, payload)| payload.clone())
+        .collect()
 }
 
 #[test]
@@ -302,6 +330,195 @@ fn abandoning_a_started_epic_opens_a_clean_epoch() {
     assert_eq!(again["abandoned"], json!(true));
     let (code, _) = env.forged(&["epic", "status", "--epic", "epic-doomed"]);
     assert_ne!(code, 0, "the second epoch ended as well");
+}
+
+#[test]
+fn a_fresh_epoch_records_its_own_integration_event_with_the_base_unmoved() {
+    let env = TestEnv::new("forged-epic-epoch-unmoved");
+    env.enable_dynamic_gh();
+    env.seed_epic("epic-unmoved", &[("unmoved-child", &env.spec, true)]);
+    assert_eq!(env.forged(&["init"]).0, 0);
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let spec = env.spec.to_string_lossy().into_owned();
+    let start = [
+        "epic",
+        "start",
+        "--epic",
+        "epic-unmoved",
+        "--repo",
+        &repo,
+        "--spec",
+        &spec,
+        "--base-ref",
+        "main",
+    ];
+
+    let (code, first) = env.forged(&start);
+    assert_eq!(code, 0, "epoch 0 start: {first}");
+    let advanced = result(&env, &["epic", "advance", "--epic", "epic-unmoved"]);
+    assert_eq!(advanced["progress"]["epoch"], json!(0), "{advanced}");
+
+    result(
+        &env,
+        &[
+            "epic",
+            "abandon",
+            "--epic",
+            "epic-unmoved",
+            "--reason",
+            "ending this epoch without touching the base",
+        ],
+    );
+
+    // The trigger the old coverage missed: the base has NOT moved, so the
+    // fresh epoch re-cuts the identical branch/base/sha triple.
+    let (code, second) = env.forged(&start);
+    assert_eq!(code, 0, "epoch 1 start: {second}");
+    let advanced = result(&env, &["epic", "advance", "--epic", "epic-unmoved"]);
+    assert_eq!(advanced["progress"]["epoch"], json!(1), "{advanced}");
+
+    let events = epic_events(&env, "epic-unmoved");
+    let ready = events_of_kind(&events, INTEGRATION_READY);
+    assert_eq!(
+        ready.len(),
+        2,
+        "each epoch records its own integration event: {ready:?}"
+    );
+    assert_eq!(
+        ready[0]["cutSha"], ready[1]["cutSha"],
+        "the two epochs share a cut sha; only the epoch tag separates them"
+    );
+    assert_eq!(ready[0]["epoch"], json!(0));
+    assert_eq!(ready[1]["epoch"], json!(1));
+
+    let status = result(&env, &["epic", "status", "--epic", "epic-unmoved"]);
+    assert_eq!(
+        status["integration"]["epoch"],
+        json!(1),
+        "the fresh epoch projects its own integration: {status}"
+    );
+    assert!(
+        events.len() < 100,
+        "the controller never flooded the stream: {} events",
+        events.len()
+    );
+}
+
+#[test]
+fn a_replayed_setup_heals_an_epoch_whose_integration_event_was_swallowed() {
+    let env = TestEnv::new("forged-epic-epoch-heal");
+    env.enable_dynamic_gh();
+    env.seed_epic("epic-poisoned", &[("poisoned-child", &env.spec, true)]);
+    assert_eq!(env.forged(&["init"]).0, 0);
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let spec = env.spec.to_string_lossy().into_owned();
+    let start = [
+        "epic",
+        "start",
+        "--epic",
+        "epic-poisoned",
+        "--repo",
+        &repo,
+        "--spec",
+        &spec,
+        "--base-ref",
+        "main",
+    ];
+
+    assert_eq!(env.forged(&start).0, 0, "epoch 0 start");
+    result(&env, &["epic", "advance", "--epic", "epic-poisoned"]);
+    result(
+        &env,
+        &[
+            "epic",
+            "abandon",
+            "--epic",
+            "epic-poisoned",
+            "--reason",
+            "ending the first epoch",
+        ],
+    );
+    assert_eq!(env.forged(&start).0, 0, "epoch 1 start");
+
+    // Reproduce the state a shipped binary left behind: epoch 1's setup is
+    // stored terminal-OK carrying a payload that predates the epoch tag, and
+    // the event its projection needs was never appended. The effect closure
+    // will not run again, so only a land-or-verify outside it can heal this.
+    let events = epic_events(&env, "epic-poisoned");
+    let epoch_zero = events_of_kind(&events, INTEGRATION_READY)
+        .pop()
+        .expect("epoch 0 integration event");
+    let started = events_of_kind(&events, STARTED)
+        .pop()
+        .expect("epoch 1 start event");
+    let params = json!({
+        "repo": started["repo"],
+        "integrationBranch": started["integrationBranch"],
+        "baseRef": started["baseRef"],
+    });
+    let untagged = json!({
+        "branch": started["integrationBranch"],
+        "baseRef": started["baseRef"],
+        "cutSha": epoch_zero["cutSha"],
+    });
+    {
+        let ledger = env.ledger();
+        let request = forged_types::OperationRequest {
+            schema_version: 1,
+            idempotency_key: "op:epic_setup:epic-poisoned:e1:-".to_owned(),
+            run_id: Some("epic-poisoned".to_owned()),
+            params: match params {
+                Value::Object(map) => map,
+                other => panic!("setup params are an object: {other}"),
+            },
+        };
+        let ticket = match ledger
+            .begin_operation(
+                "epic_setup",
+                &request,
+                forged_ledger::EffectClass::SafeRetry,
+                None,
+            )
+            .expect("begin the poisoned setup")
+        {
+            forged_ledger::OperationOutcome::Fresh(ticket) => ticket,
+            other => panic!("epoch 1 setup must still be unclaimed: {other:?}"),
+        };
+        let stored = forged_types::OperationResponse {
+            ok: true,
+            operation_id: ticket.operation_id.clone(),
+            reused: false,
+            result: Some(untagged),
+            error: None,
+        };
+        ledger
+            .complete_operation(&ticket.operation_id, &stored)
+            .expect("store the untagged terminal response");
+        ledger.close().expect("close test ledger");
+    }
+
+    let status = result(&env, &["epic", "status", "--epic", "epic-poisoned"]);
+    assert!(
+        status["integration"].is_null(),
+        "the wedge starts with nothing the epoch can project: {status}"
+    );
+
+    let advanced = result(&env, &["epic", "advance", "--epic", "epic-poisoned"]);
+    assert_eq!(
+        advanced["progress"]["epoch"],
+        json!(1),
+        "one tick heals the replayed setup: {advanced}"
+    );
+    let ready = events_of_kind(&epic_events(&env, "epic-poisoned"), INTEGRATION_READY);
+    assert_eq!(ready.len(), 2, "the healing append lands: {ready:?}");
+    assert_eq!(ready[1]["epoch"], json!(1));
+    assert_eq!(ready[1]["cutSha"], epoch_zero["cutSha"]);
+    let status = result(&env, &["epic", "status", "--epic", "epic-poisoned"]);
+    assert_eq!(
+        status["integration"]["epoch"],
+        json!(1),
+        "the epoch unwedges: {status}"
+    );
 }
 
 #[test]
