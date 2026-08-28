@@ -5134,3 +5134,33 @@ fn reconcile_runs_the_ports_end_to_end_on_a_live_run() {
         ids.iter().map(std::string::ToString::to_string).collect();
     assert_eq!(unique.len(), ids.len(), "distinct operation ids: {ids:?}");
 }
+
+/// A replayed start must present the same canonical baseRef bytes the first
+/// invocation froze: normalization applies on every pass, and only the
+/// origin probe is skipped once durable state exists. Before this held, the
+/// identical command refused with IdempotencyConflict after STARTED.
+#[test]
+fn an_origin_prefixed_base_ref_start_replays_identically() {
+    let env = TestEnv::new("forged-epic-base-ref-replay");
+    env.seed_epic("epic-replay", &[("child-r1", &env.spec, true)]);
+    assert_eq!(env.forged(&["init"]).0, 0);
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let spec = env.spec.to_string_lossy().into_owned();
+    let args = [
+        "epic",
+        "start",
+        "--epic",
+        "epic-replay",
+        "--repo",
+        &repo,
+        "--spec",
+        &spec,
+        "--base-ref",
+        "origin/main",
+    ];
+    let (code, started) = env.forged(&args);
+    assert_eq!(code, 0, "first start: {started}");
+    assert_eq!(started["result"]["baseRef"], json!("main"));
+    let (code, replayed) = env.forged(&args);
+    assert_eq!(code, 0, "identical replay: {replayed}");
+}

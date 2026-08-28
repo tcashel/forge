@@ -1223,35 +1223,36 @@ fn normalize_base_ref(requested: &str) -> Option<&str> {
     (!bare.is_empty()).then_some(bare)
 }
 
-/// Validate an operator-supplied base ref against the repository's `origin`
-/// before any durable start state exists. Returns the normalized bare name,
-/// or `None` when the epic already started and the request replays durable
-/// bytes instead.
+/// Resolve an operator-supplied base ref to the normalized bare name the
+/// request hash and start event freeze. Normalization ALWAYS applies — a
+/// replay after `STARTED` must present the same canonical bytes the first
+/// invocation stored, or its idempotency hash (and crash recovery of an
+/// applied start) would refuse the identical command. Only the origin
+/// existence probe is gated on pre-durable state, so replays stay offline.
 async fn validate_requested_base_ref(
     ctx: &Ctx,
     epic: &str,
     params: &Map<String, Value>,
     requested: &str,
-) -> Result<Option<String>, Failure> {
-    let events = epic_events(ctx, epic).await?;
-    if events.iter().any(|row| row.kind == STARTED) {
-        return Ok(None);
-    }
-    let repo = super::work_identity::canonical_repository(param_str(params, "repo")?)?;
+) -> Result<String, Failure> {
     let Some(bare) = normalize_base_ref(requested) else {
         return Err(Failure::invalid(format!(
             "baseRef {requested:?} must be a bare branch name (e.g. \"main\")"
         )));
     };
-    forged_git::remote_branch_sha(Path::new(&repo), bare)
-        .await
-        .map_err(|error| {
-            Failure::invalid(format!(
-                "baseRef {requested:?} must name a branch that exists on origin \
-                 (pass the bare default branch name, e.g. \"main\"): {error}"
-            ))
-        })?;
-    Ok(Some(bare.to_owned()))
+    let events = epic_events(ctx, epic).await?;
+    if !events.iter().any(|row| row.kind == STARTED) {
+        let repo = super::work_identity::canonical_repository(param_str(params, "repo")?)?;
+        forged_git::remote_branch_sha(Path::new(&repo), bare)
+            .await
+            .map_err(|error| {
+                Failure::invalid(format!(
+                    "baseRef {requested:?} must name a branch that exists on origin \
+                     (pass the bare default branch name, e.g. \"main\"): {error}"
+                ))
+            })?;
+    }
+    Ok(bare.to_owned())
 }
 
 /// Freeze the Beads inventory and child execution defaults.
@@ -1280,13 +1281,13 @@ pub async fn epic_start(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespo
     };
     // Operator-supplied geometry is validated before the fenced request
     // event exists: a refused start leaves nothing behind to replay, and the
-    // normalized value is what the request hash and start event freeze.
+    // normalized value is what the request hash and start event freeze — on
+    // first start and on every replay alike.
     if let Some(requested) = param_opt_str(&req.params, "baseRef").map(str::to_owned) {
         match validate_requested_base_ref(ctx, &epic, &req.params, &requested).await {
-            Ok(Some(normalized)) => {
+            Ok(normalized) => {
                 req.params.insert("baseRef".to_owned(), json!(normalized));
             }
-            Ok(None) => {}
             Err(error) => return err_response(&req.idempotency_key, &error),
         }
     }
