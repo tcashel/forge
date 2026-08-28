@@ -82,6 +82,147 @@ fn seed_packet(env: &TestEnv, run_id: &str, seq: i64, stage: forged_types::Stage
     packet_id
 }
 
+fn settle_machine_operation(
+    ledger: &forged_ledger::Ledger,
+    run_id: &str,
+    step: forged_proto::MachineStage,
+    result: Value,
+) {
+    let key = forged_proto::machine_idempotency_key(run_id, step, 0);
+    let request = forged_types::OperationRequest {
+        schema_version: 1,
+        idempotency_key: key,
+        run_id: Some(run_id.to_owned()),
+        params: serde_json::Map::new(),
+    };
+    let ticket = match ledger
+        .begin_operation(
+            step.as_str(),
+            &request,
+            forged_ledger::EffectClass::SafeRetry,
+            None,
+        )
+        .expect("begin machine operation")
+    {
+        forged_ledger::OperationOutcome::Fresh(ticket) => ticket,
+        forged_ledger::OperationOutcome::Replayed(_) => panic!("machine fixture must be fresh"),
+    };
+    ledger
+        .complete_operation(
+            &ticket.operation_id,
+            &forged_types::OperationResponse {
+                ok: true,
+                operation_id: ticket.operation_id.clone(),
+                reused: false,
+                result: Some(result),
+                error: None,
+            },
+        )
+        .expect("settle machine operation");
+}
+
+#[test]
+fn run_status_projects_live_position_and_latest_gate_outcome() {
+    let env = TestEnv::new("forged-run-status-position");
+    env.forged(&["init"]);
+    let run_id = "status-position";
+    fabricate_run(&env, run_id);
+    let packet_id = seed_packet(&env, run_id, 1, forged_types::Stage::Implement);
+    let ledger = env.ledger();
+    settle_machine_operation(
+        &ledger,
+        run_id,
+        forged_proto::MachineStage::Resolve,
+        json!({"worktree": "fixture"}),
+    );
+    let claim = ledger
+        .claim_packet(
+            &packet_id,
+            "fixture-seat",
+            &forged_ledger::SpecFence::Revision {
+                revision: "fixture-revision".to_owned(),
+                body_sha256: "a".repeat(64),
+            },
+        )
+        .expect("claim implement packet");
+    let attempt = ledger
+        .get_attempt(claim.attempt_id)
+        .expect("live implement attempt");
+    ledger.close().expect("close ledger");
+
+    let (code, status) = env.forged(&["run", "status", "--run", run_id]);
+    assert_eq!(code, 0, "live run status: {status}");
+    let run = status["result"]["run"]
+        .as_object()
+        .expect("run status object");
+    assert_eq!(run["currentStage"], json!("implement"));
+    assert_eq!(run["startedAt"], json!(attempt.started_at));
+    run["startedAt"]
+        .as_str()
+        .expect("startedAt string")
+        .parse::<jiff::Timestamp>()
+        .expect("startedAt is RFC3339");
+    assert!(
+        !run.contains_key("gateState"),
+        "a run with no gate attempt must omit gateState: {status}"
+    );
+    assert_eq!(run["deadlineKills"], json!(0));
+
+    let ledger = env.ledger();
+    let result = forged_types::PacketResult {
+        schema: "forged.result/1".to_owned(),
+        packet_id: packet_id.clone(),
+        outcome: forged_types::Outcome::Implement {
+            implemented: true,
+            commits_ahead: 1,
+            summary: "implemented".to_owned(),
+            gate_state: Some("fail".to_owned()),
+            note: None,
+        },
+    };
+    ledger
+        .complete_packet(&packet_id, &claim.claim_token, &result)
+        .expect("complete implement packet");
+    settle_machine_operation(
+        &ledger,
+        run_id,
+        forged_proto::MachineStage::Gate,
+        json!({"passed": false}),
+    );
+    forged_proto::record(
+        &ledger,
+        run_id,
+        forged_proto::ProtoEvent::Gate {
+            phase: forged_proto::GatePhase::Gate,
+            seq: 0,
+            passed: false,
+            rows: Vec::new(),
+        },
+    )
+    .expect("record failed gate");
+    ledger.close().expect("close ledger");
+
+    let (code, status) = env.forged(&["run", "status", "--run", run_id]);
+    assert_eq!(code, 0, "failed-gate run status: {status}");
+    let run = status["result"]["run"]
+        .as_object()
+        .expect("run status object");
+    assert_eq!(run["gateState"], json!("failed"));
+    assert_eq!(run["currentStage"], json!("push"));
+    assert!(
+        !run.contains_key("startedAt"),
+        "a run between attempts must omit startedAt: {status}"
+    );
+    assert!(
+        run["settledOperations"]
+            .as_array()
+            .expect("settled operations")
+            .iter()
+            .any(|operation| operation["name"] == json!("gate")),
+        "gate settlement remains independently visible: {status}"
+    );
+}
+
 // The bd-binary plan-inventory bound is retired: production reads the
 // in-process store. The N+1 discovery contract survives at its operator
 // surface — see work_map's graph-cap refusal, which reports exactly the
