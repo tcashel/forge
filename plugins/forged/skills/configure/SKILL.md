@@ -1,17 +1,18 @@
 ---
 name: configure
-description: "Guide the operator through Forged profile, roster, and pricing configuration: choose a model and reasoning effort for each roster role, name custom or gateway-routed models correctly, price token-only models, and validate the result. Use when the operator asks which model belongs in a role, wants to change the roster or profile, uses a custom model name from an inference provider or AI gateway, or invokes /forged:configure."
+description: "Guide the operator through Forged profile, roster, and pricing configuration: choose a model and reasoning effort for each role, name custom or gateway-routed models correctly, optionally price token-only models and tools, and validate the result. Use when the operator asks which model belongs in a role, wants to change the roster or profile, uses a custom model name, or invokes /forged:configure."
 ---
 
 # /forged:configure
 
-Author the cognitive configuration Forged freezes into new work: which roles
-exist per assurance profile, and which provider/model answers each role. All
-edits target the operator authoring config; compiled snapshots in `state.db`
-are runtime truth, so a config change affects only work started after it.
-Changing the roster of already-running work is a typed lifecycle operation
-(`epic revise-roster` / `run revise-roster`) owned by `../manage-work/SKILL.md`,
-never a config edit.
+Position: initialized operator config -> validated authoring definitions for
+future work. Next: `forged definition validate`, then `/forged:plan` or an
+explicit dispatch of an already-ready item.
+
+Boundary: configuration judgment and file edits stay in the lead session.
+Forged freezes the resolved profile, roster, and rate card only when work is
+started; already-running work keeps its frozen snapshot and execution remains
+owned by Forged.
 
 ## Boundaries
 
@@ -20,12 +21,14 @@ never a config edit.
 - This skill edits profiles, rosters, defaults, and pricing in that file only.
   It never touches `state.db`, target repositories, provider credentials, or
   the service manifest.
-- `forged definition validate` is the acceptance gate; an edit is not done
-  until it passes.
-- Provider CLIs own routing and authentication. Pointing a provider at an
-  inference gateway happens in that provider's own configuration, not here.
-- Never invent a price. A model without a rate-card entry reports unknown
-  cost, which is correct until the operator supplies real rates.
+- Changing cognition for already-running work uses the typed
+  `epic revise-roster` or `run revise-roster` lifecycle operation through
+  `../manage-work/SKILL.md`, never an authoring-config edit.
+- `forged definition validate` is the acceptance gate.
+- Provider CLIs own routing and authentication. Configure an inference gateway
+  in the provider's settings, not here.
+- Never invent a price. An unpriced model reports unknown cost until the
+  operator supplies sourced rates.
 
 ## Inspect before editing
 
@@ -41,67 +44,40 @@ cat "$CONFIG"
 forged definition validate
 ```
 
-A set `FORGED_CONFIG` is authoritative even when the file it names does not
-exist yet — Forged never falls back past it, so neither may this skill: edit
-the named path, never a legacy `config.json` beside it.
+A set `FORGED_CONFIG` is authoritative even when its file does not exist. If no
+config exists, route to `../setup/SKILL.md`; this skill refines initialized
+operator state.
 
-If no config exists yet, route to `../setup/SKILL.md` first — `forged init`
-writes the commented default document; this skill refines it.
+## Profiles and rosters
 
-## The two documents, and which one the operator means
-
-**Profiles** describe cognitive topology — which seats exist and how many
-review rounds run. They never name a model. The defaults are `lean` (one
-review, zero fix rounds, escalates to `standard` on gate failure), `standard`
-(one review, one fix round), and `high` (three reviews plus synthesis, for
-consequential changes). Most operators keep these and only choose between
-them at dispatch time.
+**Profiles** describe cognitive topology: seats and bounded review rounds. They
+do not name models. The defaults are `lean`, `standard`, and `high`; most
+operators keep them and choose one at dispatch.
 
 **Rosters** map semantic roles to ordered provider candidates. This is where
-model names, reasoning effort, and budget live. "Use a cheaper model", "swap
-in my gateway model", and "which model should review?" are all roster edits.
-
-`default_profile` and `default_roster` select what dispatch uses when the
-operator names nothing.
-
-## Choose a model per role
-
-A roster must fill these roles. Match capability to what the seat actually
-does; the roster is the budget dial, so spend intelligence where it changes
-the outcome:
+model, reasoning effort, and budget live. `default_profile` and
+`default_roster` apply when dispatch names nothing.
 
 | Role | Sandbox | What it needs |
 | --- | --- | --- |
-| `implementation` | workspaceWrite | The strongest coding model affordable — it writes the change and consumes most tokens. |
-| `remediation` | workspaceWrite | Same tier as implementation, or one step down; it applies review findings, it does not redesign. |
-| `review.primary` | readOnly | Strong reasoning at high effort; finding real defects is the whole job. |
-| `review.secondary` | readOnly | A **different provider family** from primary — cross-family disagreement is the signal the profile pays for. |
-| `review.tertiary` | readOnly | Used by `high` only; a third perspective, commonly the primary family at high effort. |
-| `synthesis` | readOnly | Adjudicates conflicting findings; strong reasoning, low volume — effort matters more than speed. |
-| `assessment` | readOnly | Fast and cheap; it is the rolling-epic monitor that reads state between waves. Correctness of judgment, not depth. |
+| `implementation` | workspaceWrite | Strong coding capability; it writes the change and consumes most tokens. |
+| `remediation` | workspaceWrite | Same tier or one step down; it applies findings, not a redesign. |
+| `review.primary` | readOnly | Strong reasoning at high effort. |
+| `review.secondary` | readOnly | A different provider family from primary. |
+| `review.tertiary` | readOnly | A third high-assurance perspective. |
+| `synthesis` | readOnly | Strong reasoning for low-volume conflict adjudication. |
+| `assessment` | readOnly | Fast, inexpensive rolling-epic judgment between waves. |
 
-Two layers of hard rules apply, enforced at different moments — design to
-both rather than discovering them:
+`forged definition validate` proves shape: every profile role has candidates,
+identifiers are printable, and sandbox agrees with capabilities. Rolling-epic
+rules are checked only at start, so design for them upfront:
 
-**`forged definition validate` proves shape.** Every role a profile seat
-names must exist with a non-empty candidate list, identifiers must be
-printable, and sandbox must agree with capabilities: `readOnly` forbids
-`repositoryWrite`, `workspaceWrite` requires it. Ordering within a role is
-meaningful: earlier candidates are preferred.
+- a dedicated read-only `assessment` role using provider `claude`, `codex`, or
+  `pi`;
+- read-only critique candidates;
+- no assessment candidate overlapping a critique candidate.
 
-**Rolling-epic rules are enforced only when the epic starts.** A roster
-that passes validation can still be refused at submission, and no CLI
-probe checks these earlier — never tell the operator validation covered
-them. Design to them upfront:
-
-- A dedicated `assessment` role whose every candidate is read-only
-  (`readOnly` sandbox, `repositoryRead` + `structuredOutput`, no
-  `repositoryWrite`) with provider `claude`, `codex`, or `pi`.
-- Read-only critique candidates — review and synthesis roles.
-- No assessment candidate may overlap any critique candidate; reusing a
-  review model for assessment is rejected at epic start.
-
-Candidate shape (camelCase keys, unknown fields rejected):
+Candidate shape uses camelCase keys and rejects unknown fields:
 
 ```yaml
 rosters:
@@ -119,48 +95,40 @@ rosters:
 
 ## Reasoning effort per provider
 
-`effort` is optional and provider-specific; leave it absent where the
-provider does not accept one:
+`effort` is optional and provider-specific:
 
-- **codex** — passed as `model_reasoning_effort`. Use `xhigh` for review and
-  synthesis seats, lower tiers for cheap seats.
-- **pi** — passed as `--thinking`; the closed set is
-  `off|minimal|low|medium|high|xhigh|max`. Anything else fails the packet.
-- **claude** — the adapter passes no effort flag; the model name alone
-  selects capability. Omit `effort`.
+- **codex** — passed as `model_reasoning_effort`; use `xhigh` for review and
+  synthesis, lower tiers for cheap seats.
+- **pi** — passed as `--thinking`; allowed values are
+  `off|minimal|low|medium|high|xhigh|max`.
+- **claude** — the adapter passes no effort flag; omit it.
 
-## Custom model names, inference providers, and AI gateways
+## Custom model names and gateways
 
 The `model` string is passed verbatim to the provider CLI (`claude --model`,
-`codex -m`, `pi --model`). Forged validates only the charset
-(`^[A-Za-z0-9][A-Za-z0-9._:/-]*$` — gateway ids like `org/model:tag` and
-`us.anthropic.claude-...` pass) and never checks that the model exists.
-That split means:
+`codex -m`, `pi --model`). Forged validates its charset, not model existence.
 
-1. **Route in the provider, name in the roster.** The gateway or alternate
-   endpoint is configured where the provider CLI reads its own settings —
-   for codex that home directory is selected by the `codex_home` config key.
-   The roster then names whatever model id the gateway expects.
-2. **Prove the name before trusting a dispatch to it.** Run the provider CLI
-   once by hand with the exact string; a wrong model id should fail a
-   one-line probe, not the first packet of a run.
-3. **Keep the name stable.** The roster string keys usage rows and the rate
-   card; renaming a model orphans its pricing entry.
+1. Route in the provider, name the exact gateway model id in the roster.
+2. Prove the name with that provider CLI before trusting a dispatch.
+3. Keep the name stable because usage and pricing key on the exact string.
 
-## Price what the provider will not
+## Pricing and optional tool rates
 
-Claude reports billed `costUSD` and is stored verbatim — never add claude
-models to the card. Token-only providers (codex, gateway-routed models that
-report tokens) are imputed from `pricing.models`, keyed by the **exact
-roster model string**. A model with no entry keeps `cost_usd: null`, counts
-in `rowsMissingCost`, and raises `missing-cost` attention — that is honest,
-not broken; resolve it by adding real rates or explicitly accepting
-`accepted-unknown`.
+Claude-reported billed cost is stored verbatim. Token-only providers are
+imputed from `pricing.models`; an absent exact model entry remains honest
+unknown cost and raises missing-cost attention.
 
-A `pricing` block **replaces** the built-in card wholesale — it is one
-complete document, never merged with the defaults. Carry forward entries
-for every token-only model the rosters still name, and include the required
-`tools` rates; omitting either loses pricing or fails the parse:
+Tool rates are optional operator input. When `pricing` is omitted entirely,
+config resolution calls `default_rate_card`, which supplies the complete
+built-in model and tool card. Do not demand tool prices during ordinary roster
+configuration. Ask only when a selected roster capability and provider setup
+actually imply server-side tool use whose rate differs from that default.
+
+A custom `pricing` block replaces the built-in card wholesale. In that case the
+serialized `tools` object is required by the current config shape even when the
+operator did not customize it: carry forward the sourced default value, or ask
+for a different sourced value only when server-side tool use requires one.
+Carry forward every token-only model the rosters still name:
 
 ```yaml
 pricing:
@@ -173,36 +141,28 @@ pricing:
     "org/custom-model:tag":
       context_window: 200000
       short: { input: 3.00, cached_input: 0.30, cache_write: 3.75, output: 15.00 }
-      # long: only for models publishing a second tier
-    # ...plus an entry for every other token-only model the rosters name
+      # long: only for a model publishing a second tier
 ```
 
-The context window is required — it is what makes the long-context tier
-decision provable. Transcribe rates from the provider's published pricing
-and record the date and source; the overview surfaces a stale card rather
-than hiding it.
+The context window makes long-tier selection provable. Transcribe rates from a
+source the operator names and record date plus source; never fill a gap from
+memory.
 
 ## Apply and verify
-
-Edit the file, then:
 
 ```bash
 forged definition validate
 forged doctor
 ```
 
-Report the resolved defaults, each role's chosen candidate with one line of
-why, and any model left unpriced. State plainly that already-started work
-keeps its frozen snapshot and new starts pick up the change.
+Report resolved defaults, every role's selected candidate with a short reason,
+whether the built-in or a custom rate card applies, and every unpriced model.
+State that new starts pick up the change and already-started work does not.
 
 ## Never
 
-- Never edit `state.db` or a frozen package to change models; use the typed
-  roster-revision operations for live work.
-- Never put gateway URLs, API keys, or credentials in the Forged config.
-- Never claim a custom model works because validation passed — validation
-  proves shape, not that the provider can reach the model.
-- Never seed a rate card entry from memory of a price; only from a source
-  the operator names.
-- Never weaken a read-only role to workspaceWrite to satisfy a validator
-  error — the error means the role is on the wrong side of the boundary.
+- Do not edit `state.db` or a frozen package to change cognition.
+- Do not put gateway URLs, API keys, or credentials in Forged config.
+- Do not claim a custom model works because definition validation passed.
+- Do not invent model or tool pricing.
+- Do not weaken a read-only role to satisfy a validator error.

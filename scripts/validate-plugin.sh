@@ -70,6 +70,9 @@ const fixture = JSON.parse(fs.readFileSync(fixturePath, 'utf8'));
 
 const requiredSkillText = [
   'name: manage-work',
+  'Position:',
+  'Next:',
+  'Boundary:',
   '../plan/SKILL.md',
   '../configure/SKILL.md',
   '../critique/SKILL.md',
@@ -80,9 +83,11 @@ const requiredSkillText = [
   'forged definition validate',
   'forged doctor',
   'forged service status',
-  'bd comments add',
+  'forged work update',
+  'forged work show',
+  '--expected-revision',
+  'workItemId',
   'metadata.repository',
-  'BEADS_DIR',
 ];
 if (!requiredSkillText.every((token) => skill.includes(token))) process.exit(1);
 
@@ -167,10 +172,12 @@ const requiredSkillText = [
   'forged attention acknowledge',
   'forged attention resolve',
   'forged attention reopen',
-  'bd update',
-  '--priority',
-  '--if-status',
-  '--if-assignee',
+  'forged work update',
+  '--expected-revision',
+  'Current main does **not** expose priority mutation',
+  'Intended priority:',
+  'ore-063',
+  'top-level `priority` value is unchanged',
   'lower numbers win',
   'never preempts active work',
   'accepted-unknown',
@@ -190,8 +197,8 @@ if (fixture.schema !== 'forged.manage-work-portfolio-control-fixtures/1' ||
       ['cases', 'isolation', 'purpose', 'schema', 'schemas'].join('\n')) process.exit(1);
 
 const expectedIsolation = {
-  requiredTemporaryEnv: ['HOME', 'ANVIL_HOME', 'BEADS_DIR'],
-  fakeBoundaries: ['bd', 'forged-cli', 'forged-mcp', 'service', 'provider', 'git', 'github', 'app-host'],
+  requiredTemporaryEnv: ['HOME', 'ANVIL_HOME', 'FORGED_CONFIG'],
+  fakeBoundaries: ['forged-ledger', 'forged-cli', 'forged-mcp', 'service', 'provider', 'git', 'github', 'app-host'],
   liveEffects: 'forbidden',
 };
 if (JSON.stringify(fixture.isolation) !== JSON.stringify(expectedIsolation)) process.exit(1);
@@ -218,8 +225,8 @@ const expected = new Map(Object.entries({
   'spend-known': ['work-detail', 'none', 'known-spend'],
   'spend-unknown': ['work-detail', 'none', 'unknown-not-zero'],
   'plan-only-detail': ['refuse', 'not-applicable', 'plan-summary-only'],
-  'priority-change': ['bd-priority', 'none', 'priority-only-lower-wins-later-no-preemption',
-    {beadPriorityUpdates: 1}],
+  'priority-change': ['work-notes-priority-intent', 'none', 'priority-only-lower-wins-later-no-preemption',
+    {workItemNotesUpdates: 1}],
   'epic-pause': ['epic-pause', 'none', 'paused-readback', {epicPauses: 1}],
   'epic-resume': ['epic-resume', 'none', 'active-readback-no-submit', {epicResumes: 1}],
   'input-required-resume': ['work-detail', 'not-applicable', 'resolve-domain-first'],
@@ -251,7 +258,7 @@ const expected = new Map(Object.entries({
     'live-fence-run-stop-only'],
 }));
 const effectKeys = [
-  'beadClaims', 'beadPriorityUpdates', 'beadOtherWrites',
+  'workItemClaims', 'workItemNotesUpdates', 'workItemOtherWrites',
   'epicPauses', 'epicResumes', 'runStops', 'runAdjudications',
   'riskAcceptances',
   'attentionAcknowledgements', 'attentionResolutions', 'attentionReopens',
@@ -259,7 +266,7 @@ const effectKeys = [
   'serviceMutations', 'providerCalls', 'repositoryWrites', 'githubWrites',
 ].sort();
 const alwaysZero = [
-  'beadClaims', 'beadOtherWrites', 'runStarts', 'runSubmits', 'epicStarts',
+  'workItemClaims', 'workItemOtherWrites', 'runStarts', 'runSubmits', 'epicStarts',
   'epicSubmits', 'sessionStops', 'serviceMutations', 'providerCalls',
   'repositoryWrites', 'githubWrites',
 ];
@@ -550,7 +557,7 @@ const expectedForbiddenEffects = [
   'process-spawn',
   'network-access',
   'filesystem-write',
-  'beads-access',
+  'legacy-store-access',
   'ledger-access',
   'operator-state-access',
   'forged-cli-call',
@@ -935,8 +942,11 @@ check "board skill contract" check_board_skill
 check "bootstrap shell syntax" bash -n "$plugin/bootstrap/install-beads.sh"
 grep -Fq '../../agents/critic.md' "$plugin/skills/critique/SKILL.md" \
   && pass "critique resolves the shared critic" || fail "critique resolves the shared critic"
-grep -Fq '../../bootstrap/install-beads.sh' "$plugin/skills/setup/SKILL.md" \
-  && pass "setup resolves the shared bootstrap" || fail "setup resolves the shared bootstrap"
+if grep -Fq '../../bootstrap/install-beads.sh' "$plugin/skills/setup/SKILL.md"; then
+  fail "setup omits the deleted legacy-store bootstrap"
+else
+  pass "setup omits the deleted legacy-store bootstrap"
+fi
 
 legacy=(
   "$plugin/workflows/execute-review-fix.js"
@@ -967,7 +977,7 @@ check "epic reconnect and resume command surface" check_reconnect_surface \
   "forged epic submit --epic"
 
 if grep -Ern --include='*.md' --include='*.sh' \
-  '(\.anvil/specs|--spec([[:space:]]|`)|bd create --repo|--(description|acceptance|notes)-file|workflows/(execute-review-fix|run-epic|plan-critique-improve)\.js|watch-epic)' \
+  '(\.anvil/specs|--spec([[:space:]]|`)|--(description|acceptance|notes)-file|workflows/(execute-review-fix|run-epic|plan-critique-improve)\.js|watch-epic)' \
   "$plugin"; then
   fail "no legacy spec-file, repo-routing, Workflow, or watch contract"
 else
@@ -981,12 +991,49 @@ else
   pass "no external tracker client, instructions, or credentials"
 fi
 
-for needle in 'metadata.repository' 'description' 'design' 'acceptance_criteria' 'notes' '--parent'; do
+if grep -Ern --include='*.md' --include='*.json' \
+  'BEADS_DIR|\.beads|beads-|(^|[^[:alnum:]_-])bd[[:space:]]+(create|update|show|ready|comments|where|children|init)' \
+  "$plugin/skills"; then
+  fail "skills forbid legacy-store commands, paths, and ids"
+else
+  pass "skills forbid legacy-store commands, paths, and ids"
+fi
+
+for path in "${skill_files[@]}"; do
+  for needle in 'Position:' 'Next:' 'Boundary:'; do
+    grep -Fq -- "$needle" "$path" \
+      && pass "lifecycle contract $path: $needle" \
+      || fail "lifecycle contract $path: $needle"
+  done
+done
+
+for needle in 'WORK_ID="ore-' 'metadata.repository' 'description' 'design' \
+  'acceptanceCriteria' 'notes' '--id "$WORK_ID"' '--kind task' '--status open' \
+  '--repository "$TARGET_REPO"' '--description="$DESCRIPTION"' \
+  '--design="$DESIGN"' '--acceptance="$ACCEPTANCE"' '--notes="$NOTES"' \
+  'forged work create' 'forged work update' 'forged work link' \
+  'forged work reopen' 'forged work show' 'forged work ready' 'parent-child'; do
   grep -Fq -- "$needle" "$plugin/skills/plan/SKILL.md" \
     && pass "native plan contract: $needle" || fail "native plan contract: $needle"
 done
-grep -Fq 'BEADS_DIR' "$plugin/skills/setup/SKILL.md" \
-  && pass "setup preserves BEADS_DIR" || fail "setup preserves BEADS_DIR"
+for needle in 'forged work update' '--expected-revision' 'notes' \
+  'no separate ledger commentary operation'; do
+  grep -Fq -- "$needle" "$plugin/skills/critique/SKILL.md" \
+    && pass "ledger critique contract: $needle" || fail "ledger critique contract: $needle"
+done
+for needle in 'forged work update' 'forged work reopen' 'non-atomic' 'ore-063'; do
+  grep -Fq -- "$needle" "$plugin/skills/adjudicate/SKILL.md" \
+    && pass "ledger adjudication contract: $needle" || fail "ledger adjudication contract: $needle"
+done
+for needle in 'Tool rates are optional' 'default_rate_card' \
+  'server-side tool use' 'custom `pricing` block replaces'; do
+  grep -Fq -- "$needle" "$plugin/skills/configure/SKILL.md" \
+    && pass "optional pricing contract: $needle" || fail "optional pricing contract: $needle"
+done
+for needle in 'state.db' 'forged work create' 'Never create a repository-local work store'; do
+  grep -Fq -- "$needle" "$plugin/skills/setup/SKILL.md" \
+    && pass "ledger-native setup contract: $needle" || fail "ledger-native setup contract: $needle"
+done
 grep -Fq 'ANVIL_HOME' "$plugin/skills/setup/SKILL.md" \
   && pass "setup preserves ANVIL_HOME" || fail "setup preserves ANVIL_HOME"
 

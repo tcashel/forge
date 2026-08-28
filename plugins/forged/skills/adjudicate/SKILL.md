@@ -1,92 +1,112 @@
 ---
 name: adjudicate
-description: "Resolve every recommendation, CRUX, and open question from the latest Forged critique, write accepted decisions into the native Bead fields, and open the record only when its execution contract is complete. Use after /forged:critique or when the operator invokes /forged:adjudicate."
+description: "Resolve every recommendation, CRUX, and open question from the latest Forged critique, write accepted decisions into the ledger-native work-item fields, and make the record ready only when its execution contract is complete. Use after /forged:critique or when the operator invokes /forged:adjudicate."
 ---
 
 # /forged:adjudicate
 
-Turn critique into one coherent, executable native Bead. Walk judgment calls
-with the operator one at a time, decide routine corrections as the lead agent,
-and perform one intentional update after the complete result is known.
+Position: critiqued work item -> coherent ready record or explicit blocker.
+Next: `/forged:dispatch` for a slice or `/forged:run-epic` for an epic.
+
+Boundary: adjudication and every judgment call stay in the lead session. The
+lead reads and revision-CAS updates the ledger; Forged owns execution only after
+the later explicit handoff.
 
 ## Load the record and latest critique
 
 ```bash
-export ANVIL_HOME="${ANVIL_HOME:-$HOME/.anvil}"
-export BEADS_DIR="${BEADS_DIR:-$ANVIL_HOME/beads}"
-BD_BIN="${BD_BIN:-$(command -v bd)}"
-TARGET_REPO="$(cd "$(git rev-parse --show-toplevel)" && pwd -P)"
-env BEADS_DIR="$BEADS_DIR" "$BD_BIN" show "$BEAD_ID" \
-  --long --include-comments --json
+forged work show --id "$WORK_ID"
 ```
 
-Use the newest complete `forged-spec-recommendations` comment for this Bead.
-For migration compatibility only, accept the newest complete legacy
+Use the newest complete `forged-spec-recommendations` block in `notes` whose
+`workItem` and `repository` match the current record. For migration
+compatibility only, accept the newest complete legacy
 `anvil-spec-recommendations` block if no Forged-tagged block exists. Never use
 a recommendation for another id or repository.
 
 If no complete block exists, stop and direct the operator to
 `/forged:critique`; do not invent the critic's findings.
 
-## Resolve the ledger
+## Resolve the record
 
 1. Verify each recommendation against current repository evidence. Accept,
    adapt, or reject it with a reason.
 2. Present one unresolved CRUX at a time: evidence, bounded options,
    consequences, and a recommended choice. Capture the operator's decision.
-3. Resolve every open question. When normal engineering judgment is sufficient,
-   make the call; ask only when the choice changes product scope or external
-   authority.
-4. Reconcile the full Bead so fields do not contradict each other. For epics,
-   include parent links, dependencies, waves, and stub assumptions.
+3. Resolve every open question. Make routine engineering judgments in the lead
+   session; ask only when a choice changes product scope or external authority.
+4. Reconcile the full work item so fields do not contradict each other. For
+   epics, include parent-child links, blocking dependencies, waves, and stub
+   assumptions.
 
 There is no “defer to implementation” outcome. A CRUX is resolved, rejected as
 inapplicable with evidence, or remains blocking.
 
-## Update the authoritative native fields
+## Update the authoritative fields
 
 Integrate accepted resolutions into `description`, `design`,
-`acceptance_criteria`, and `notes` according to the plan schema. Remove resolved
-question checkboxes. Preserve only a concise dated adjudication summary in
-`notes`; the comment retains the detailed review history.
+`acceptanceCriteria`, and `notes` according to the plan schema. Remove resolved
+question checkboxes. Because current main has no commentary lane, retain the
+fully dispositioned recommendation block plus a concise dated adjudication
+summary in `notes`; do not pretend a separate comment was written.
 
-Use one intentional `bd update` with explicit `BEADS_DIR`. Pass complete field
-bodies via the supported pinned-bd flags, not a partial edit that loses existing
-content. Preserve `metadata.repository`, parent, dependencies, assignee, labels,
-and unrelated metadata. Read `bd update --help` before selecting flags.
+Prepare complete field bodies outside the repository and make one guarded
+update. Attached values protect bullet-led Markdown:
 
-Set status to `open` only when:
+```bash
+forged work update \
+  --id "$WORK_ID" \
+  --expected-revision "$OBSERVED_REVISION" \
+  --title "$TITLE" \
+  --description="$DESCRIPTION" \
+  --design="$DESIGN" \
+  --acceptance="$ACCEPTANCE" \
+  --notes="$NOTES"
+forged work show --id "$WORK_ID"
+```
+
+Preserve repository metadata, dependency edges, custody, kind, and unrelated
+state. A moved revision requires a fresh read and reconciliation.
+
+A blocked planning stub becomes open only after all normative fields and
+dispositions are complete. Current main exposes that promotion as two separate
+mutations: the revision-CAS `work update` above, then:
+
+```bash
+forged work reopen --id "$WORK_ID"
+forged work show --id "$WORK_ID"
+```
+
+This update-then-reopen sequence is non-atomic and safe only under one lead
+session. Stop if either step fails or the readback differs. ore-063 will add
+atomic stub promotion; never represent the current sequence as atomic.
+
+Reopen only when:
 
 - every native field is complete and consistent;
 - every recommendation and CRUX has a disposition;
 - no unchecked question remains;
-- the record is not deliberately held by a real dependency or later-wave
-  assumption.
+- the record is not deliberately held by a later-wave assumption.
 
-A dependency-blocked child can remain `open`; `bd ready` will withhold it until
-the dependency closes. A later-wave stub or unresolved-spec record stays
-`blocked` and must not be made superficially ready.
+A dependency-blocked child may be open; `forged work ready` withholds it until
+its `blocks` targets close. A later-wave stub remains blocked.
 
 ## Verify and report
 
-Read the Bead back:
-
 ```bash
-env BEADS_DIR="$BEADS_DIR" "$BD_BIN" show "$BEAD_ID" \
-  --long --include-comments --json
-env BEADS_DIR="$BEADS_DIR" "$BD_BIN" ready \
-  --metadata-field "repository=$TARGET_REPO" --json
+forged work show --id "$WORK_ID"
+forged work ready
 ```
 
-Check that every intended edit persisted, repository metadata and graph edges
-are unchanged unless explicitly adjudicated, and readiness matches reality.
-Report the decisions, exact native fields or edges changed, rejected findings,
-and whether the next valid action is `/forged:dispatch`,
-`/forged:run-epic`, or resolving a named blocker.
+Filter the frontier by exact `metadata.repository`. Check that every intended
+edit persisted, metadata and graph edges remained unchanged unless explicitly
+adjudicated, and readiness matches reality. Report decisions, exact fields or
+edges changed, rejected findings, and the next valid skill or named blocker.
 
 ## Never
 
 - Do not create or update a parallel spec file.
 - Do not conceal unresolved questions in prose or mark a stub ready.
-- Do not start Forged, change GitHub, install software, or edit the target repo.
+- Do not start Forged execution, change GitHub, install software, or edit the
+  target repository.
 - Do not rerun critics merely to seek unanimity. Adjudication owns judgment.

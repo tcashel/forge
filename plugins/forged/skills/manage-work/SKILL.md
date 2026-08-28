@@ -1,19 +1,19 @@
 ---
 name: manage-work
-description: "Automatically route ordinary requests to inspect, plan, critique, adjudicate, explicitly execute, or safely control Forge work through native operator-scoped Beads and typed Forged operations. Use whenever the operator discusses work without naming a Forged skill."
+description: "Automatically route ordinary requests to inspect, plan, critique, adjudicate, explicitly execute, or safely control Forge work through ledger-native ore work items and typed Forged operations. Use whenever the operator discusses work without naming a Forged skill."
 ---
 
 # Manage work conversationally
 
-This is the normal entrypoint for Forge. The operator can speak in ordinary
-language and should not need a skill name, machine id, pane, or attempt id.
-Classify the request, preserve its authority boundary, and use the smallest
-landed Beads or Forged operation that owns the requested result.
+Position: ordinary operator request -> the least-authorized lifecycle action.
+Next: the exact read, `forged work` verb, sibling skill, or existing-work
+control selected below.
 
-The lead agent owns conversation and judgment. Beads owns the editable plan.
-Forged owns durable execution and lifecycle after explicit submission.
-Operations Overview and Work Detail project that truth; App resources are
-optional views, never another source of state.
+Boundary: the lead agent owns conversation, planning, critique, adjudication,
+and operator judgment while reading or authoring the ledger. Forged owns
+provider attempts, controllers, gates, and execution evidence only after an
+explicit start/submit handoff. Apps are optional views, never state or
+authority.
 
 ## Route one intent
 
@@ -22,51 +22,47 @@ execution, or an existing-work control become a new submission.
 
 | Intent | Route | Authority |
 | --- | --- | --- |
-| Observe or explain the portfolio, queue, repository, or what needs attention | `forged operations overview` (deliberately opening the board view routes via `../board/SKILL.md`) | Read only |
+| Observe or explain the portfolio, queue, repository, or attention | `forged operations overview`; deliberate board opening uses `../board/SKILL.md` | Read only |
 | Explain one durable run or epic | Resolve one exact WorkIdentity, then `forged work detail` | Read only |
 | Explore | Discuss or research supplied context | Persist nothing |
-| Plan or revise | Read and follow `../plan/SKILL.md` | Native Bead writes only |
+| Plan or revise | Read and follow `../plan/SKILL.md` | Ledger work-item writes only |
 | Configure profiles, rosters, role/model choices, or pricing | Read and follow `../configure/SKILL.md` | Operator authoring config only |
-| Critique | Read and follow `../critique/SKILL.md` | Its one bounded recommendation comment only |
-| Adjudicate | Read and follow `../adjudicate/SKILL.md` | Its intentional native-field update only |
+| Critique | Read and follow `../critique/SKILL.md` | One guarded recommendation notes update |
+| Adjudicate | Read and follow `../adjudicate/SKILL.md` | One guarded native-field update, plus reopen only for a completed blocked stub |
 | Approve plan wording | Continue planning or adjudication | Never execution |
 | Execute one ready slice | Apply the execution gate, then follow `../dispatch/SKILL.md` | One approved start and submit |
 | Execute one ready epic | Apply the execution gate, then follow `../run-epic/SKILL.md` | One approved start and submit |
-| Change native priority | One guarded `bd update` and readback | That Bead's priority only |
+| Express intended priority for an existing item | Guarded notes update and readback | Records intent only; scheduling priority is unchanged |
 | Pause or resume an existing epic | One typed epic control and readback | That already-started epic only |
 | Cancel an existing slice run | Confirm, then one `run stop` with `cancelled` | That run's terminal transition only |
 | Settle a run whose `run stop` refuses for missing durable driver identity | Confirm the evidence gap, then one `run adjudicate-settlement` | That run's terminal transition only |
 | Acknowledge, resolve, or reopen attention | One occurrence-fenced attention control and readback | Custody only |
 | Inspect provider work | Agent Sessions, only when explicitly requested | Diagnostic only |
 
-When a request mixes intents, complete the least-authorized part first. A
-request to “plan and run this” authorizes planning, not execution. A request
-to “resume this epic” can authorize only a landed resume of that already-started
-epic; it never authorizes `epic start` or `epic submit`.
+When a request mixes intents, complete the least-authorized part first. “Plan
+and run this” authorizes planning, not execution. “Resume this epic” can
+authorize only the landed resume operation for that already-started epic; it
+never authorizes `epic start` or `epic submit`.
 
 ## Resolve operator and repository scope
 
-Resolve the operator store and canonical target repository once:
+Resolve the operator home and canonical target repository once:
 
 ```bash
 export ANVIL_HOME="${ANVIL_HOME:-$HOME/.anvil}"
-export BEADS_DIR="${BEADS_DIR:-$ANVIL_HOME/beads}"
-BD_BIN="${BD_BIN:-$(command -v bd)}"
 TARGET_REPO="$(cd "$(git rev-parse --show-toplevel)" && pwd -P)"
-env BEADS_DIR="$BEADS_DIR" "$BD_BIN" where --json
+forged work ready
 ```
 
-Honor an already-set `ANVIL_HOME` or `BEADS_DIR` instead of replacing it.
-Every Beads command must carry the explicit `BEADS_DIR`. Never initialize
-Beads in the target checkout, route creation through a repository option, or
+`forged work` addresses the operator ledger. Every authored item stores the
+exact canonical checkout in `metadata.repository`. Never create a
+repository-local work store, route creation through a repository database, or
 create a parallel specification file.
 
-Repository language resolves first. Use only the exact canonical identity
-accepted by `metadata.repository` and the bounded repository selector. An
-unavailable authoritative repository read fails closed; unknown repository
-identity must not widen to unrelated operator work.
+Repository language resolves first. An unavailable authoritative repository
+read fails closed; unknown identity must not widen to unrelated operator work.
 
-## Observe from the headless projections
+## Observe from headless projections
 
 Start portfolio, queue, repository, and “what needs me?” questions with the
 smallest matching read:
@@ -78,21 +74,20 @@ forged operations overview --group needs-me --limit 50
 ```
 
 The authoritative response schema is `forged.operations-overview/1`. Preserve
-its source health, capture times, coverage and truncation, stable queue groups,
-attention items, and known-versus-missing spend. A missing cost is unknown,
-never zero. A Beads outage may leave durable unscoped truth available, but a
-scoped query that cannot establish membership must fail closed.
+source health, capture times, coverage and truncation, stable queue groups,
+attention, and known-versus-missing spend. Missing cost is unknown, never zero.
+A degraded plan projection may leave durable unscoped truth available, but a
+scoped query unable to establish membership fails closed.
 
-Summarize the stable Needs me, Ready to merge, Running, Stalled or recoverable,
-and Planned groups plus admitted, queued, live, review-ready, recent, and
-attention counts. Do not infer a state from a process or pane.
+Summarize Needs me, Ready to merge, Running, Stalled or recoverable, and
+Planned plus admitted, queued, live, review-ready, recent, and attention counts.
+Do not infer state from a process or pane.
 
-The optional Operations view is
-`ui://forged/operations-overview.html`. Rendering it is not required to answer.
-Do not open several views, refresh by mutation, drill into every row, poll, or
-create a watcher.
+The optional Operations view is `ui://forged/operations-overview.html`.
+Rendering it is not required. Do not refresh by mutation, poll, or drill into
+every row.
 
-For one durable subject, take only an exact `detailTarget.subjectKind` and
+For one durable subject, use only an exact `detailTarget.subjectKind` and
 `detailTarget.subjectId` returned by Operations:
 
 ```bash
@@ -100,19 +95,18 @@ forged work detail --subject-kind "$SUBJECT_KIND" \
   --subject-id "$SUBJECT_ID" --limit 100
 ```
 
-The response is `forged.work-detail/1` and its optional view is
-`ui://forged/work-detail.html`. Use it for the exact blocker, next action,
-attempt and worker summary, gates, review evidence, effect custody, usage,
-attention, and bounded event history. Report incomplete coverage or truncation;
-do not infer missing evidence from a later page. Plan-only rows have no detail
-target until durable execution exists.
+The response is `forged.work-detail/1`; its optional view is
+`ui://forged/work-detail.html`. Use it for blockers, next action, attempts,
+workers, gates, reviews, effect custody, usage, attention, and bounded events.
+Report incomplete coverage or truncation. Plan-only rows have no detail target
+until durable execution exists.
 
 Resolve human titles only inside one bounded Operations result. Match the
-`forged.work-identity/1` subject, Bead, repository, project, epic, and display
-context, but pass only its canonical subject kind and id to Work Detail or a
-control. Zero matches is not found. Multiple matches require one concise
-disambiguation and no mutation. Titles, branch names, panes, process contents,
-and the currently visible App are never mutation selectors.
+`forged.work-identity/1` subject, stored work-item id, repository, project,
+epic, and display context, then pass only canonical subject kind and id to a
+detail read or control. Zero matches is not found; multiple matches require one
+concise disambiguation and no mutation. Titles, branches, panes, processes, and
+visible Apps are never mutation selectors.
 
 Agent Sessions is an explicitly requested diagnostic drill-down:
 
@@ -121,48 +115,47 @@ forged session list --run "$RUN_ID"
 forged session read --attempt "$ATTEMPT_ID" --lines 120
 ```
 
-Never substitute `session stop`, a process signal, or a pane action for work
-pause, resume, cancellation, attention resolution, or controller lifecycle.
+Never substitute `session stop`, a signal, or a pane action for lifecycle
+control.
 
 ## Distinguish discussion from durable work
 
-Observation and exploration are read-only. Do not create a Bead because a
-conversation sounds useful. Create or revise durable work only when the
-operator clearly asks to capture, plan, or change it; then delegate to the plan
-skill and let its native-field and open-question gates decide readiness.
+Observation and exploration are read-only. Do not create a work item because a
+conversation merely sounds useful. Create or revise durable work only when the
+operator clearly asks to capture, plan, or change it; then follow the plan
+skill and its native-field/open-question gates.
 
-External context already supplied by the operator or another host tool can
-inform research. This skill neither retrieves nor synchronizes an external
-tracker and never stores its credentials.
+External context supplied by the operator or another host tool may inform
+research. This skill neither retrieves nor synchronizes an external tracker
+and never stores its credentials.
 
 ## Require exact execution approval
 
-Approval of a plan, critique resolution, implementation direction, prior work,
-or a portfolio control is not execution approval.
+Approval of plan wording, critique resolution, implementation direction, prior
+work, or portfolio control is not execution approval.
 
 Before asking, resolve the base branch and use `forged definition validate`
-with the intended profile and roster to obtain their exact references. Present
-one bounded confirmation tuple:
+with the intended profile and roster. Present one bounded tuple:
 
 - slice or epic;
-- Bead id, title, and observed revision;
+- work-item id, title, and observed revision;
 - canonical `metadata.repository`;
 - base branch;
 - resolved profile and roster;
-- the exact start-then-submit action being authorized.
+- exact start-then-submit action.
 
-A short reply such as “yes” or “do it” is valid only when it immediately and
-unambiguously answers that one tuple. A later reply, general approval, different
-subject, or changed normative field requires a new tuple.
+A short “yes” is valid only when it immediately and unambiguously answers that
+tuple. A later reply, general approval, different subject, or changed normative
+field requires a new tuple.
 
-After approval and before start, store exactly one JSON record in a Bead
-comment, fenced as `forged-execution-approval`:
+After approval and before start, append exactly one fenced JSON record to the
+existing `notes` bytes:
 
 ```forged-execution-approval
 {
   "schema": "forged-execution-approval/1",
   "subjectKind": "<slice|epic>",
-  "beadId": "<exact id>",
+  "workItemId": "<exact ore id>",
   "observedRevision": "<revision shown in the tuple>",
   "repository": "<canonical absolute root>",
   "baseRef": "<base>",
@@ -175,72 +168,80 @@ comment, fenced as `forged-execution-approval`:
 }
 ```
 
-Prepare the complete fenced comment in a scratch file outside the repository.
-Add it with pinned `bd comments add` and explicit `BEADS_DIR`, then read the
-Bead and comments back. Verify that title, description, design, acceptance
-criteria, notes, repository, parent, dependencies, issue type, readiness, and
-ready-frontier membership are unchanged. Retain the post-comment revision as
-the handoff snapshot. Normative drift requires fresh approval.
+Current main has no separate ledger commentary verb, so preserve all existing
+notes and perform one guarded update:
 
-Before promising unattended continuation, run only the installed CLI's
-read-only `forged doctor` and `forged service status`. Do not install, start,
-restart, or repair the service here.
+```bash
+APPROVED_NOTES="$(<"$DRAFT_DIR/notes-with-approval.md")"
+forged work update \
+  --id "$WORK_ID" \
+  --expected-revision "$OBSERVED_REVISION" \
+  --notes="$APPROVED_NOTES"
+forged work show --id "$WORK_ID"
+```
 
-For a slice, follow `../dispatch/SKILL.md` and invoke exactly one typed start
-and one submit using the returned run id. For an epic, follow
-`../run-epic/SKILL.md`, verify the frozen inventory, and invoke exactly one
-typed start and submit. Perform no Bead or repository mutation between them.
-Return the sibling skill's durable identifiers and reconnect commands, then
-stop without polling, watching, or resubmitting.
+Verify only the intended notes append and revision changed; title, description,
+design, acceptance criteria, repository, edges, kind, and readiness must not.
+The post-update revision is the handoff snapshot. Any conflict or later
+normative drift requires fresh approval.
+
+Before promising unattended continuation, run only `forged doctor` and
+`forged service status`. Do not install, start, restart, or repair service here.
+
+For a slice, follow `../dispatch/SKILL.md` and invoke exactly one start and one
+submit. For an epic, follow `../run-epic/SKILL.md`, verify frozen inventory, and
+invoke exactly one start and submit. Perform no work-item or repository mutation
+between them. Return durable ids and reconnect commands, then stop without
+polling, watching, or resubmitting.
 
 ## Bind every existing-work control
 
-Before a mutation, read a fresh bounded Operations result, exact Work Detail,
-and the authoritative Bead or `forged.attention-item/1` when applicable. Bind
-one control tuple containing:
+Before mutation, read fresh bounded Operations, exact Work Detail, and
+`forged work show --id` or `forged.attention-item/1` when applicable. Bind one
+tuple containing:
 
 - subject kind and canonical id;
 - display title and canonical repository;
-- current lifecycle, Bead revision, or attention occurrence;
+- current lifecycle, work-item revision, or attention occurrence;
 - exact requested operation and material parameters;
 - durable effect and postcondition.
 
-Stale identity, repository mismatch, unsupported lifecycle, changed revision,
+Stale identity, repository mismatch, unsupported lifecycle, moved revision,
 incomplete target, or absent operation fails closed.
 
-A direct unambiguous imperative that already supplies an exact target and all
-non-destructive parameters authorizes that one operation; do not add a ritual
-confirmation. Ask one bounded confirmation only for ambiguity. Destructive
-slice cancellation, accepted-risk decisions, human-owned attention resolution,
-and any operation the landed schema marks destructive require a fresh tuple
-that states the durable effect. Confirmation for one subject or action never
-carries to another.
+A direct unambiguous imperative with exact target and all non-destructive
+parameters authorizes that operation. Ask one bounded confirmation only for
+ambiguity. Destructive cancellation, accepted-risk decisions, human-owned
+attention resolution, and operations marked destructive require a fresh tuple
+that states the durable effect.
 
-Derive one operation identity from the exact control tuple and invoke the
-operation once. Then re-read Work Detail or Operations and the Bead when
-relevant. The durable readback, not tool prose or App state, decides success.
-An ambiguous response, stale precondition, or failed postcondition is visible
-input-required evidence; do not retry, resubmit, or choose another action.
+Derive one operation identity from the tuple and invoke once. Re-read Work
+Detail or Operations and the work item when relevant. Durable readback decides
+success. An ambiguous response, stale precondition, or failed postcondition is
+visible input-required evidence; do not retry, resubmit, or choose another
+action.
 
-## Change Bead priority
+## Record intended priority for an existing item
 
-Read the exact Bead and retain its current status and assignee. Validate a
-numeric priority from 0 through 4; lower numbers win. Then perform one guarded
-update:
+Current main does **not** expose priority mutation for an existing work item.
+Do not reference a nonexistent flag or imply that scheduling changed. Validate
+the intended numeric priority from 0 through 4 (lower numbers win), append a
+dated `Intended priority: <n>; pending ore-063 typed priority operation` line to
+the existing notes, then make one revision-CAS update:
 
 ```bash
-env BEADS_DIR="$BEADS_DIR" "$BD_BIN" --actor "$OPERATOR_ACTOR" \
-  update "$BEAD_ID" --priority "$PRIORITY" \
-  --if-status "$OBSERVED_STATUS" --if-assignee "$OBSERVED_ASSIGNEE" --json
-env BEADS_DIR="$BEADS_DIR" "$BD_BIN" show "$BEAD_ID" --long --json
+UPDATED_NOTES="$(<"$DRAFT_DIR/notes-with-priority-intent.md")"
+forged work update \
+  --id "$WORK_ID" \
+  --expected-revision "$OBSERVED_REVISION" \
+  --notes="$UPDATED_NOTES"
+forged work show --id "$WORK_ID"
 ```
 
-The exact id, requested priority, and observed guards form the idempotent
-operation tuple. If either guard loses, stop. Verify that priority changed and
-no status, assignee, dependency, metadata, or native specification field did.
-Explain that the new value affects a later admission decision. It never preempts active work.
-Represent an observed unassigned Bead with the empty `--if-assignee` value;
-never omit a guard merely because the field is empty.
+Verify the note and new revision; the top-level `priority` value is unchanged.
+Explain that this records intent only: it does not affect admission,
+never preempts active work, and needs ore-063's typed priority operation before
+it changes scheduling.
 
 ## Pause or resume an epic
 
@@ -261,14 +262,14 @@ forged work detail --subject-kind epic --subject-id "$EPIC_ID"
 ```
 
 Pause takes effect at its landed durable boundary. Resume is not input
-resolution and does not authorize `epic submit`. An input-required or otherwise
-ineligible epic must first follow its exact domain and attention action. There
-is no inferred slice pause or generic epic stop.
+resolution and does not authorize `epic submit`. An ineligible epic must follow
+its exact domain and attention action. There is no inferred slice pause or
+generic epic stop.
 
 ## Cancel a slice run
 
-After a fresh destructive confirmation naming the exact run, current state,
-reason, `cancelled` outcome, and terminal effect, invoke:
+After fresh destructive confirmation naming exact run, current state, reason,
+`cancelled` outcome, and terminal effect:
 
 ```bash
 forged run stop --run "$RUN_ID" --outcome cancelled --reason "$REASON" \
@@ -276,24 +277,16 @@ forged run stop --run "$RUN_ID" --outcome cancelled --reason "$REASON" \
 forged work detail --subject-kind run --subject-id "$RUN_ID"
 ```
 
-Never infer `clean`, `blocked`, `input-required`, `superseded`, or `landed`
-from the word “stop.” Cancellation does not declare the Bead complete. Do not
-use attempt-level stop or several child mutations as a substitute. When
-`run stop` refuses with the typed code `ADJUDICATION_REQUIRED` — the run's
-controller record carries no durable driver identity — do not retry it or
-emulate settlement with child mutations: route exactly that refusal, and
-only that code, through the adjudication below.
+Never infer another outcome from “stop.” Cancellation does not declare the
+source work item complete. Do not substitute attempt-level stop or several
+child mutations. If `run stop` returns `ADJUDICATION_REQUIRED` because durable
+driver identity is missing, route only that exact refusal to settlement
+adjudication below.
 
 ## Adjudicate settlement of an unfenceable run
 
-`run stop` fails closed with `ADJUDICATION_REQUIRED` when a run's latest
-controller record lacks durable driver identity (a missing pid or a missing
-start identity), because no controller death can be verified. Only for that
-exact refusal, `run adjudicate-settlement` records an explicit operator
-adjudication of the evidence gap and settles the run. It is explicitly
-destructive: after a fresh confirmation naming the exact run, the observed
-refusal, the asserted terminal outcome, and the evidence gap being
-adjudicated, invoke:
+Only after the exact `ADJUDICATION_REQUIRED` refusal and fresh destructive
+confirmation:
 
 ```bash
 forged run adjudicate-settlement --run "$RUN_ID" --outcome "$OUTCOME" \
@@ -302,24 +295,17 @@ forged run adjudicate-settlement --run "$RUN_ID" --outcome "$OUTCOME" \
 forged work detail --subject-kind run --subject-id "$RUN_ID"
 ```
 
-Never pass `--idempotency-key` here: the operation derives ONE key per run,
-and that derived identity is the crash-recovery handle — an interrupted
-adjudication resumes only under it, so a custom key would strand the
-interrupted row behind a permanent conflict.
-
-The outcome set is `landed` (additionally requires `--pr` and the exact
-`--sha`), `superseded` (requires `--superseded-by`), and `cancelled`. The
-operation refuses a run whose record the normal fence can settle — `run
-stop` stays the only path there — and refuses while any recorded machine
-effect lacks a confirmed-dead controller. Never use it to bypass a live
-fence, and never infer the outcome: it must come from durable evidence such
-as the Bead's recorded close reason.
+Never pass `--idempotency-key`: this operation derives one key per run, which
+is its crash-recovery handle. Allowed outcomes are `landed` (also requires
+`--pr` and exact `--sha`), `superseded` (requires `--superseded-by`), and
+`cancelled`. It refuses runs the normal fence can settle and any recorded
+machine effect without a confirmed-dead controller. Never infer the outcome;
+derive it from durable evidence such as the work item's close reason.
 
 ## Accept review risk only as a human decision
 
-Reviewer disagreement and review-budget exhaustion remain human-owned. Present
-the exact deduplicated findings and consequence, then require a fresh operator
-decision, identity, and rationale:
+Present exact deduplicated findings and consequence, then require a fresh
+operator identity and rationale:
 
 ```bash
 forged run accept-risk --run "$RUN_ID" \
@@ -328,17 +314,14 @@ forged run accept-risk --run "$RUN_ID" \
 forged work detail --subject-kind run --subject-id "$RUN_ID"
 ```
 
-This is not a generic attention acknowledgement and never supplies merge
+This is not generic attention acknowledgement and never supplies merge
 approval. The plugin never merges the default branch.
 
 ## Control attention custody
 
-Use only the current item's closed fields: `attentionId`, `occurrenceId`,
-`subjectKind`, `subjectId`, repository, condition, severity, owner, state,
-evidence references, and `recommendedAction`. Acknowledgement is custody, not
-resolution. A stable attention id does not make an old occurrence current.
-
-Acknowledgement leaves the item active:
+Use only current closed fields: `attentionId`, `occurrenceId`, `subjectKind`,
+`subjectId`, repository, condition, severity, owner, state, evidence references,
+and `recommendedAction`. Acknowledgement is custody, not resolution.
 
 ```bash
 forged attention acknowledge --subject "$SUBJECT_ID" \
@@ -348,14 +331,11 @@ forged attention acknowledge --subject "$SUBJECT_ID" \
 
 Resolve only explicitly adjudicable custody conditions: `quarantined`,
 `missing-cost`, `retry-exhausted`, `reviewer-disagreement`, and
-`missing-evidence`. Missing cost accepts only `accepted-unknown` while
-pricing remains absent. Missing evidence accepts only `evidence-absent` —
-the explicit record, with a mandatory nonblank note, that the evidence was
-never captured and cannot be reconstructed — and only when every source in
-the occurrence is a manifest-less attempt. A clean or accepted-risk run
-whose delivery PR is missing or wrong-based raises the same condition but is
-repairable: record the exact-base PR instead of adjudicating absence. Every
-other condition clears only through the named domain transition:
+`missing-evidence`. Missing cost accepts only `accepted-unknown` while pricing
+is absent. Missing evidence accepts only `evidence-absent`, with a mandatory
+note, and only when every source is a manifest-less attempt. A clean or
+accepted-risk run with a missing/wrong-base delivery PR is repairable: record
+the exact-base PR instead of adjudicating absence.
 
 ```bash
 forged attention resolve --subject "$SUBJECT_ID" \
@@ -364,14 +344,12 @@ forged attention resolve --subject "$SUBJECT_ID" \
   --idempotency-key "$OPERATION_KEY"
 ```
 
-Lead-agent-owned routine items may be acknowledged or acted on within already
-granted authority. Every item whose owner is human—including input, blocker,
-quarantine, ambiguous-effect, restart, review-risk, missing-evidence, and merge
-decisions—requires the user's exact decision. Observe the relevant domain result before resolving
-custody. Merge approval remains a human/GitHub boundary outside this skill.
+Lead-owned routine items may be acknowledged or acted on within granted
+authority. Human-owned input, blocker, quarantine, ambiguous-effect, restart,
+review-risk, missing-evidence, and merge decisions require the user's exact
+decision. Observe the domain result before resolving custody.
 
-Reopen only the exact resolved occurrence named by prior durable transition
-evidence; a reopened item is active again and needs a new decision:
+Reopen only the exact resolved occurrence named by prior durable evidence:
 
 ```bash
 forged attention reopen --subject "$SUBJECT_ID" \
@@ -379,38 +357,34 @@ forged attention reopen --subject "$SUBJECT_ID" \
   --actor "$CONTROL_ACTOR" --idempotency-key "$OPERATION_KEY"
 ```
 
-After any attention control, re-read Operations and exact Work Detail. Preserve
+After control, re-read Operations and exact Work Detail. Preserve
 `forged.attention-transition/1` and
-`forged.attention-transition-result/1` evidence. If control coverage is
-incomplete, never infer that an absent item resolved. A stale occurrence,
-unsupported condition, or duplicate/ambiguous response is reported without a
-second invocation.
+`forged.attention-transition-result/1` evidence. Incomplete control coverage,
+stale occurrences, unsupported conditions, and duplicate responses never
+justify a second invocation.
 
 ## Validation and mutation budgets
 
 `intent-fixtures.json` keeps the base intent boundary.
 `portfolio-control-fixtures.json` closes portfolio selection, human reference
 resolution, confirmation, operation identity, readback, unsupported controls,
-attention ownership, and per-case mutation budgets.
+attention ownership, the priority-intent gap, and per-case mutation budgets.
 
-Both files are validation evidence, not runtime routing logic or a second
-workflow engine. Static validation is not native Claude or Codex behavior
-proof. Status and explanation cases have zero mutations. Each supported
-control permits at most one named effect and zero start, submit, session-stop,
-service, direct provider, repository, or GitHub effects.
+Both are validation evidence, not runtime routing logic. Status and explanation
+cases have zero mutations. Each supported control permits at most one named
+effect and zero start, submit, session-stop, service, direct provider,
+repository, or GitHub effects.
 
 ## Never
 
-- Never treat status or lifecycle language as authorization for initial
-  execution.
-- Never claim work merely to observe or reprioritize it.
-- Never use a title, branch, pane, process, or visible App as a mutation
-  selector.
+- Never treat status or lifecycle language as initial execution authority.
+- Never claim work merely to observe or record intended priority.
+- Never use title, branch, pane, process, or visible App as a mutation selector.
 - Never store execution or control authority only in conversation state.
-- Never create repository-local Beads state or a sidecar specification.
+- Never create a repository-local work store or sidecar specification.
 - Never retrieve or synchronize an external tracker.
-- Never emulate a missing lifecycle operation with comments, UI state,
-  sessions, signals, or child-by-child mutation.
-- Never install or mutate the service, invoke a provider for testing, or merge
-  the default branch.
+- Never emulate a missing lifecycle operation with UI state, sessions, signals,
+  or child-by-child mutation.
+- Never install or mutate service, invoke a provider for testing, or merge the
+  default branch.
 - Never add review rounds in search of unanimity.

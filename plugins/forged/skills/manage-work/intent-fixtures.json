@@ -29,7 +29,7 @@
     },
     {
       "id": "revise",
-      "request": "Revise the acceptance criteria on this Bead.",
+      "request": "Revise the acceptance criteria on this work item.",
       "decision": "revise",
       "delegate": "plan",
       "result": "delegate",
@@ -37,7 +37,7 @@
     },
     {
       "id": "critique",
-      "request": "Critique this Bead before anyone implements it.",
+      "request": "Critique this work item before anyone implements it.",
       "decision": "critique",
       "delegate": "critique",
       "result": "delegate",
@@ -45,7 +45,7 @@
     },
     {
       "id": "adjudicate",
-      "request": "Resolve the recorded critique findings for this Bead.",
+      "request": "Resolve the recorded critique findings for this work item.",
       "decision": "adjudicate",
       "delegate": "adjudicate",
       "result": "delegate",
@@ -85,7 +85,7 @@
     },
     {
       "id": "ambiguous-approval",
-      "request": "Do it, but there are two possible Beads in scope.",
+      "request": "Do it, but there are two possible work items in scope.",
       "decision": "ambiguous-approval",
       "delegate": "none",
       "result": "refuse",
@@ -93,7 +93,7 @@
     },
     {
       "id": "stale-approval",
-      "request": "Use my earlier approval after the Bead changed.",
+      "request": "Use my earlier approval after the work item changed.",
       "decision": "stale-approval",
       "delegate": "none",
       "result": "refuse",

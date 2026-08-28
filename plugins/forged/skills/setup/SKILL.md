@@ -1,124 +1,108 @@
 ---
 name: setup
-description: "Establish and verify operator-scoped Beads and Forged state for the Claude, Codex, and Pi Forge package without imposing files, hooks, or settings on a target repository. Use for first-time configuration, environment diagnosis, /forged:setup, or Pi /skill:setup."
+description: "Establish and verify operator-scoped Forged ledger and configuration state for the Claude, Codex, and Pi Forge package without imposing files, hooks, or settings on a target repository. Use for first-time configuration, environment diagnosis, /forged:setup, or Pi /skill:setup."
 ---
 
 # /forged:setup
 
-Configure the operator environment shared by lead agents and Forged. Setup is
-non-invasive: all durable state lives under `ANVIL_HOME` and `BEADS_DIR`, while
-target repositories are identified by native `metadata.repository`. Pi package
-installation provides only skills, extensions, and tools; it never installs the
-Forged binary.
+Position: missing or unverified operator environment -> validated Forged
+configuration and ledger. Next: `/forged:configure` to choose cognition, or
+`/forged:plan` when the defaults are already suitable.
+
+Boundary: setup runs in the lead session and may initialize operator-scoped
+Forged state only with explicit consent. Forged owns provider execution only
+after later dispatch; setup never creates work, starts a run, or mutates a
+target repository.
 
 ## Boundaries
 
 - Default `ANVIL_HOME` is `$HOME/.anvil`.
-- Default `BEADS_DIR` is `$ANVIL_HOME/beads`; an existing override wins.
-- Beads must report semver `>=1.2.1` and expose the required epic and lease
-  commands; behavioral and schema probes remain the compatibility authority.
-- Setup and the bundled bootstrap never install or upgrade `bd`.
-- Never initialize Beads from a target checkout or add `.beads`, hooks, agent
-  files, settings, or workflow files there.
+- Durable work items and execution evidence live in the Forged ledger at
+  `$ANVIL_HOME/state.db` unless configuration selects another operator path.
+- The authoring config is `$ANVIL_HOME/config.yaml`; an explicit
+  `FORGED_CONFIG` wins.
+- Setup and this plugin never install or upgrade the `forged` binary.
+- Never create a repository-local work store, hooks, agent files, settings, or
+  workflow files.
 - Never install or modify shell profiles without explicit operator consent.
-- Setup validates local tools and configuration only. It does not install the
-  Forged binary, create work, route work, start a run, or contact a separate
-  issue tracker.
+- Setup validates local tools and configuration only. It does not create work,
+  route work, start a run, or contact a separate issue tracker.
 - Rolling execution requires a dedicated read-only `assessment` roster role;
-  its selected provider/model must be independent of every critique candidate.
-
-## Locate this plugin portably
-
-Resolve the current skill's plugin root through the host's skill-relative
-resource mechanism. Do not hard-code a Claude cache, Codex cache, marketplace
-checkout, or Smithy path. The shared bootstrap is:
-
-```text
-../../bootstrap/install-beads.sh
-```
-
-Resolve that path relative to this `SKILL.md`; it names
-`<plugin-root>/bootstrap/install-beads.sh`. The same file is used by both host
-manifests.
+  its selected provider/model must be independent of critique candidates.
 
 ## Inspect before changing anything
 
 ```bash
 export ANVIL_HOME="${ANVIL_HOME:-$HOME/.anvil}"
-export BEADS_DIR="${BEADS_DIR:-$ANVIL_HOME/beads}"
-BD_REQUEST="${BD_BIN:-bd}"
-case "$BD_REQUEST" in
-  /*) export BD_BIN="$BD_REQUEST" ;;
-  */*) echo 'BD_BIN must be absolute or a command on PATH' >&2; exit 1 ;;
-  *) export BD_BIN="$(command -v "$BD_REQUEST" || true)" ;;
-esac
-printf 'ANVIL_HOME=%s\nBEADS_DIR=%s\nBD_BIN=%s\n' "$ANVIL_HOME" "$BEADS_DIR" "$BD_BIN"
-test -n "$BD_BIN" && test -x "$BD_BIN"
-"$BD_BIN" --version
+if [ -n "${FORGED_CONFIG:-}" ]; then
+  CONFIG="$FORGED_CONFIG"
+else
+  CONFIG="$ANVIL_HOME/config.yaml"
+fi
+printf 'ANVIL_HOME=%s\nCONFIG=%s\n' "$ANVIL_HOME" "$CONFIG"
 command -v forged
 forged --version
 git status --short
+test -f "$CONFIG" && sed -n '1,240p' "$CONFIG"
 ```
 
-Forged resolves `bd` from an explicit absolute config `bdPath`, then a nonempty
-`BD_BIN`, then the bare `bd` command on `PATH`. Preserve an existing compatible binary
-and healthy `BEADS_DIR`. If the operator store is missing, explain the exact
-change, obtain consent, then run the bundled
-`../../bootstrap/install-beads.sh`. The bootstrap honors the environment
-variables, validates the existing version floor and command capabilities,
-initializes only the out-of-repo operator store, and never installs or upgrades
-the binary.
+Preserve an existing healthy operator state. If the binary is absent, report
+that exact prerequisite and stop; package installation provides skills,
+extensions, and tools, not the binary.
 
-## Validate Forged after consent
+## Initialize or validate only after consent
 
-Before the first run, explain that these commands may create or migrate
-`$ANVIL_HOME/state.db`; `forged doctor` also creates and removes an isolated
-temporary Beads store. Obtain operator consent, then run:
+If configuration or the ledger is absent, inspect `forged init --help`, explain
+the exact files it will create or migrate under `ANVIL_HOME`, and obtain
+operator consent before running `forged init`. Never infer consent from
+invoking this skill.
+
+Before validation, explain that these commands may create or migrate
+`$ANVIL_HOME/state.db`, then obtain consent:
 
 ```bash
 forged doctor
 forged definition validate
 ```
 
-If initial Forged configuration is absent, inspect `forged init --help` and tell
-the operator exactly what it will create under `ANVIL_HOME` before requesting
-consent. Never infer permission from invoking this skill.
+Setup proves configuration shape, not that every provider/model is well chosen
+or reachable. Model, effort, gateway name, and pricing decisions belong to
+`../configure/SKILL.md`. Validate provider adapters and optional durable
+supervision with the commands reported by doctor. Distinguish configuration
+evidence from a live run; do not install a provider, alter credentials, or
+launch a test run without explicit authorization.
 
-Setup proves the configuration is valid, not that it is well chosen. Choosing
-a model and effort per roster role, naming custom or gateway-routed models,
-and pricing token-only models are owned by `../configure/SKILL.md`; route
-there when the operator asks which model belongs where.
+## Host registration migration
 
-Migration: the Claude plugin manifest now registers the `forged mcp` server
-itself. Operators with an existing user-scope entry migrate in this order:
-first open a fresh session and confirm the plugin-mounted forged tools are
-listed — the host skips the plugin registration silently, with no error, when
-the bare `forged` command does not resolve on the host's own PATH — and only
-after that proof run `claude mcp remove forged` once. Until then the two
-registrations spawn the same binary and tool-name precedence is host-defined.
-If the plugin mount never appears, keep the user-scope entry (restore it with
-`claude mcp add forged -- <absolute path to forged> mcp`) and diagnose PATH
-with the probes above.
+The Claude manifest registers the `forged mcp` server. Operators with an older
+user-scope entry migrate in this order: open a fresh session and confirm the
+plugin-mounted tools are listed; only after that proof run
+`claude mcp remove forged` once. The host skips plugin registration silently
+when bare `forged` is absent from its own `PATH`.
 
-Validate configured provider adapters and optional durable supervision with the
-commands reported by `forged doctor`. Distinguish source/config evidence from a
-live runtime proof. Do not install a provider, alter credentials, or launch a
-test run without explicit authorization.
+Until the plugin mount is proven, keep the user-scope entry. If needed, restore
+it with `claude mcp add forged -- <absolute path to forged> mcp` and diagnose
+`PATH` using the read-only probes above.
 
 On macOS, the installed supervisor includes `$HOME/.local/bin` and
-`$HOME/.cargo/bin` in its deterministic `PATH` when those directories exist,
-ahead of the available system binary directories. The service manifest freezes
-the absolute `BD_BIN` that setup resolved. After intentionally changing that
-binary, reinstall the service configuration before relying on the new path.
+`$HOME/.cargo/bin` in deterministic `PATH` when those directories exist. After
+intentionally changing the executable path, reinstall service configuration
+only with explicit authorization before relying on it.
 
 ## Prove zero repository imposition
 
 Capture target `git status --short` before and after setup and compare them.
-Confirm no repository-local Beads database, hook, policy file, instruction file,
-or generated artifact appeared. Resolve the target's canonical root and explain
-that new Beads records must store it in `metadata.repository`; the creation
-command itself never routes to a repository.
+Confirm no repository-local store, hook, policy, instruction file, or generated
+artifact appeared. Resolve the target's canonical root and explain that new
+work items store it in `metadata.repository` through `forged work create`.
 
-Finish with exact detected versions, resolved operator paths, doctor and
-definition results, adapter/supervision status, and repository cleanliness. Do
-not claim live execution readiness when only configuration was inspected.
+Finish with detected versions, resolved operator paths, doctor and definition
+results, adapter/supervision status, and repository cleanliness. Do not claim
+live execution readiness when only configuration was inspected.
+
+## Never
+
+- Do not create work items, dispatch execution, or mutate the target repository.
+- Do not install providers, rewrite credentials, or change shell profiles
+  without explicit authority.
+- Do not claim provider reachability from configuration validation alone.
