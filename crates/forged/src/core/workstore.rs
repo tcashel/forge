@@ -19,7 +19,8 @@ use crate::core::work_types::{
     PlanIssue, PlanReadiness,
 };
 use forged_ledger::{
-    Ledger, WorkDepKind, WorkItemSnapshot, WorkSpecFields, WorkStatus, WORK_LEASE_TTL_S,
+    Ledger, WorkDepKind, WorkItemFilters, WorkItemSnapshot, WorkSpecFields, WorkStatus,
+    WORK_LEASE_TTL_S,
 };
 
 use crate::core::{on_ledger, Failure};
@@ -87,6 +88,18 @@ pub async fn show_issue(ledger: &Ledger, id: &str) -> Result<IssueSummary, Failu
 pub async fn list_issues(ledger: &Ledger, ids: &[String]) -> Result<Vec<IssueSummary>, Failure> {
     let ids = ids.to_vec();
     let snapshots = on_ledger(ledger, move |l| l.work_items(&ids)).await?;
+    Ok(snapshots.iter().map(issue_of).collect())
+}
+
+/// Exact-id summaries matching every populated SQL predicate; absent and
+/// nonmatching ids are absent from the result.
+pub async fn list_issues_filtered(
+    ledger: &Ledger,
+    ids: &[String],
+    filters: WorkItemFilters,
+) -> Result<Vec<IssueSummary>, Failure> {
+    let ids = ids.to_vec();
+    let snapshots = on_ledger(ledger, move |l| l.filtered_work_items_by_id(&ids, filters)).await?;
     Ok(snapshots.iter().map(issue_of).collect())
 }
 
@@ -401,24 +414,17 @@ pub async fn reclaim(
 /// truncation flag — the bd N+1 discovery collapsed into one exact read.
 pub async fn plan_inventory(
     ledger: &Ledger,
-    repository: Option<&str>,
+    filters: WorkItemFilters,
     limit: usize,
 ) -> Result<crate::core::work_types::PlanInventory, Failure> {
     if limit == 0 {
         return Err(Failure::invalid("plan inventory limit must be positive"));
     }
-    let live = on_ledger(ledger, |l| l.nonterminal_work_items()).await?;
-    let matching: Vec<&forged_ledger::WorkItemSnapshot> = live
-        .iter()
-        .filter(|s| match repository {
-            Some(want) => s.metadata.get("repository").map(String::as_str) == Some(want),
-            None => true,
-        })
-        .collect();
+    let matching = on_ledger(ledger, move |l| l.nonterminal_work_items_filtered(filters)).await?;
     let discovered = matching.len().min(limit.saturating_add(1));
     let truncated = matching.len() > limit;
     let mut issues = Vec::new();
-    for snapshot in matching.into_iter().take(limit) {
+    for snapshot in matching.iter().take(limit) {
         issues.push(plan_issue(ledger, &snapshot.work_id).await?);
     }
     Ok(crate::core::work_types::PlanInventory {
@@ -531,17 +537,4 @@ pub async fn work_map_plan_inventory(
         truncated,
         discovered,
     })
-}
-
-/// Exact-id summaries whose `repository` metadata equals `repository`.
-pub async fn list_issues_for_repository(
-    ledger: &Ledger,
-    ids: &[String],
-    repository: &str,
-) -> Result<Vec<IssueSummary>, Failure> {
-    let all = list_issues(ledger, ids).await?;
-    Ok(all
-        .into_iter()
-        .filter(|issue| issue.metadata.get("repository").map(String::as_str) == Some(repository))
-        .collect())
 }

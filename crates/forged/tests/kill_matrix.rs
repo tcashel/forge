@@ -2578,10 +2578,13 @@ fn a_missing_adapter_settles_with_complete_zero_byte_evidence() {
 
 #[test]
 fn an_invalid_invocation_settles_with_complete_zero_byte_evidence() {
-    let env = TestEnv::new("km9f");
-    // The authoring contract permits provider-defined model identifiers;
-    // the shell adapter applies the stricter first-character rule.
-    start_bead_run_with_implementation_hint(&env, "bead-k9f", "claude", "_invalid-model");
+    // Model-charset parity (ore-062.10) closed the authoring/adapter gap a
+    // bad model used to slip through, so the surviving pre-spawn invalidity
+    // is an embedded path outside the shell charset: paths are derived at
+    // runtime from the operator root, which authoring never sees. The space
+    // in this environment's root makes every capture path unembeddable.
+    let env = TestEnv::new("km9f bad");
+    start_bead_run_with_implementation_hint(&env, "bead-k9f", "claude", "opus");
     advance_to_open_packet(&env, "bead-k9f");
     let (code, refused) = env.forged(&["run", "advance", "--run", "bead-k9f"]);
     assert_ne!(

@@ -18,7 +18,7 @@ pub enum ProviderError {
         reason: String,
     },
     /// A caller-controlled string would make the emitted shell line unsafe
-    /// (a model outside `^[A-Za-z0-9][A-Za-z0-9._:/-]*$`, or a rollout
+    /// (a model outside `^[A-Za-z0-9][A-Za-z0-9._:/\[\]-]*$`, or a rollout
     /// thread id outside `^[A-Za-z0-9-]+$`).
     #[error("unsafe shell value {value:?}: {reason}")]
     UnsafeShellLine {

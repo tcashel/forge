@@ -24,7 +24,7 @@ use forged_types::{new_claim_token, ErrorCode, PacketResult};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use serde_json::json;
 
-use crate::error::{column_decode_error, refused, LedgerError};
+use crate::error::{column_decode_error, internal, refused, LedgerError};
 use crate::events::append_event_tx;
 use crate::ledger::Ledger;
 use crate::time::now_iso;
@@ -610,6 +610,29 @@ impl Ledger {
     pub fn list_live_attempts(&self, run_id: Option<&str>) -> Result<Vec<AttemptRow>, LedgerError> {
         let run_id = run_id.map(str::to_owned);
         self.submit(move |conn| list_live_attempts_tx(conn, run_id.as_deref()))
+    }
+
+    /// Count one run's attempts carrying the exact stored revocation scope.
+    pub fn count_attempts_with_revoke_scope(
+        &self,
+        run_id: &str,
+        scope: RevokeScope,
+    ) -> Result<u64, LedgerError> {
+        let run_id = run_id.to_owned();
+        self.submit(move |conn| {
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM attempts a \
+                 JOIN packets p ON p.packet_id = a.packet_id \
+                 WHERE p.run_id = ?1 AND a.revoke_scope = ?2",
+                rusqlite::params![run_id, scope.as_str()],
+                |row| row.get(0),
+            )?;
+            u64::try_from(count).map_err(|error| {
+                internal(format!(
+                    "attempt revoke-scope count for run {run_id:?} is invalid: {count}: {error}"
+                ))
+            })
+        })
     }
 
     /// Attempts in exactly `state`, ordered by rowid ascending — the

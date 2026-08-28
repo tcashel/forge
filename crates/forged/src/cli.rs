@@ -5,6 +5,7 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use forged_types::OperationRequest;
 use serde_json::{json, Map, Value};
+use std::path::{Path, PathBuf};
 
 /// forged: the CLI and MCP binary over the forged core.
 #[derive(Debug, Parser)]
@@ -971,7 +972,7 @@ pub struct OperationsOverviewArgs {
 /// `work` subcommands.
 #[derive(Debug, Subcommand)]
 pub enum WorkCmd {
-    /// List slice runs and started epics, optionally scoped by repository.
+    /// List slice runs and started epics with composable work-store filters.
     List(WorkListArgs),
     /// Project bounded cross-run lifecycle, rework, and spend history.
     History(WorkHistoryArgs),
@@ -984,7 +985,7 @@ pub enum WorkCmd {
     /// One work item with its dependencies (read-only).
     Show(WorkIdArgs),
     /// The ready frontier (read-only).
-    Ready(KeyOnly),
+    Ready(WorkReadyArgs),
     /// Create a work item with its revision-1 spec.
     Create(WorkCreateArgs),
     /// Guarded spec update (revision CAS).
@@ -1014,6 +1015,23 @@ pub struct WorkIdArgs {
     pub idempotency_key: Option<String>,
 }
 
+/// `work ready` flags.
+#[derive(Debug, Args)]
+pub struct WorkReadyArgs {
+    /// Exact repository identity from work metadata.repository.
+    #[arg(long)]
+    pub repo: Option<String>,
+    /// Return complete work-item snapshots instead of summary rows.
+    #[arg(long)]
+    pub full: bool,
+    /// Maximum ready items, 1..=500 (default 100).
+    #[arg(long)]
+    pub limit: Option<u64>,
+    /// Override the read-only idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
 /// `work create` arguments.
 #[derive(Debug, Args)]
 pub struct WorkCreateArgs {
@@ -1024,17 +1042,29 @@ pub struct WorkCreateArgs {
     #[arg(long)]
     pub title: String,
     /// Context and exact outcome.
-    #[arg(long)]
+    #[arg(long, allow_hyphen_values = true, conflicts_with = "description_file")]
     pub description: Option<String>,
+    /// Read context and outcome verbatim from one UTF-8 file.
+    #[arg(long)]
+    pub description_file: Option<PathBuf>,
     /// Observable completion contract.
-    #[arg(long)]
+    #[arg(long, allow_hyphen_values = true, conflicts_with = "acceptance_file")]
     pub acceptance: Option<String>,
+    /// Read completion criteria verbatim from one UTF-8 file.
+    #[arg(long)]
+    pub acceptance_file: Option<PathBuf>,
     /// Implementation constraints.
-    #[arg(long)]
+    #[arg(long, allow_hyphen_values = true, conflicts_with = "design_file")]
     pub design: Option<String>,
-    /// Agent instructions and non-goals.
+    /// Read implementation constraints verbatim from one UTF-8 file.
     #[arg(long)]
+    pub design_file: Option<PathBuf>,
+    /// Agent instructions and non-goals.
+    #[arg(long, allow_hyphen_values = true, conflicts_with = "notes_file")]
     pub notes: Option<String>,
+    /// Read agent instructions verbatim from one UTF-8 file.
+    #[arg(long)]
+    pub notes_file: Option<PathBuf>,
     /// task or epic (default task).
     #[arg(long)]
     pub kind: Option<String>,
@@ -1065,17 +1095,29 @@ pub struct WorkUpdateArgs {
     #[arg(long)]
     pub title: Option<String>,
     /// New description.
-    #[arg(long)]
+    #[arg(long, allow_hyphen_values = true, conflicts_with = "description_file")]
     pub description: Option<String>,
+    /// Read the new description verbatim from one UTF-8 file.
+    #[arg(long)]
+    pub description_file: Option<PathBuf>,
     /// New acceptance criteria.
-    #[arg(long)]
+    #[arg(long, allow_hyphen_values = true, conflicts_with = "acceptance_file")]
     pub acceptance: Option<String>,
+    /// Read new acceptance criteria verbatim from one UTF-8 file.
+    #[arg(long)]
+    pub acceptance_file: Option<PathBuf>,
     /// New design notes.
-    #[arg(long)]
+    #[arg(long, allow_hyphen_values = true, conflicts_with = "design_file")]
     pub design: Option<String>,
-    /// New agent instructions.
+    /// Read new design notes verbatim from one UTF-8 file.
     #[arg(long)]
+    pub design_file: Option<PathBuf>,
+    /// New agent instructions.
+    #[arg(long, allow_hyphen_values = true, conflicts_with = "notes_file")]
     pub notes: Option<String>,
+    /// Read new agent instructions verbatim from one UTF-8 file.
+    #[arg(long)]
+    pub notes_file: Option<PathBuf>,
     /// Override the derived idempotency key.
     #[arg(long)]
     pub idempotency_key: Option<String>,
@@ -1281,9 +1323,15 @@ pub struct WorkMapArgs {
 /// `work list` flags.
 #[derive(Debug, Args)]
 pub struct WorkListArgs {
-    /// Exact repository identity from Bead metadata.repository.
+    /// Exact repository identity from work metadata.repository.
     #[arg(long)]
     pub repo: Option<String>,
+    /// Exact status: open, in_progress, blocked, deferred, or closed.
+    #[arg(long)]
+    pub status: Option<String>,
+    /// Exact custody holder.
+    #[arg(long)]
+    pub assignee: Option<String>,
     /// Override the read-only idempotency key.
     #[arg(long)]
     pub idempotency_key: Option<String>,
@@ -1590,9 +1638,25 @@ fn request(key: Option<String>, run_id: Option<String>, params: Value) -> Operat
     }
 }
 
+fn spec_field_input(
+    inline: Option<String>,
+    file: Option<&Path>,
+    inline_flag: &str,
+    file_flag: &str,
+) -> Result<Option<String>, String> {
+    match (inline, file) {
+        (Some(_), Some(_)) => Err(format!("{inline_flag} cannot be used with {file_flag}")),
+        (Some(value), None) => Ok(Some(value)),
+        (None, Some(path)) => std::fs::read_to_string(path)
+            .map(Some)
+            .map_err(|error| format!("reading {file_flag} {} as UTF-8: {error}", path.display())),
+        (None, None) => Ok(None),
+    }
+}
+
 /// The core name a parsed command routes to, WITHOUT consuming it — what a
 /// failure before request mapping (an unloadable config, an unopenable
-/// ledger, an unreadable `--result` file) needs in order to name the
+/// ledger, an unreadable CLI input file) needs in order to name the
 /// envelope it still owes stdout.
 pub fn command_name(command: &Command) -> &'static str {
     match command {
@@ -1692,8 +1756,9 @@ pub fn command_name(command: &Command) -> &'static str {
     }
 }
 
-/// Map a parsed command onto its core name and request. The only error is
-/// an unreadable `--result` file.
+/// Map a parsed command onto its core name and request. File-backed inputs
+/// are read here so the shared core receives the same field bytes as inline
+/// input without learning about caller-local paths.
 pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), String> {
     Ok(match command {
         Command::Doctor(a) => ("doctor", request(a.idempotency_key, None, json!({}))),
@@ -2182,8 +2247,14 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
         Command::Work { command } => match command {
             WorkCmd::List(a) => {
                 let mut params = Map::new();
-                if let Some(repo) = a.repo {
-                    params.insert("repo".to_owned(), json!(repo));
+                for (name, value) in [
+                    ("repo", a.repo),
+                    ("status", a.status),
+                    ("assignee", a.assignee),
+                ] {
+                    if let Some(value) = value {
+                        params.insert(name.to_owned(), json!(value));
+                    }
                 }
                 (
                     "work_list",
@@ -2290,16 +2361,51 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
                 "work_show",
                 request(a.idempotency_key, None, json!({"id": a.id})),
             ),
-            WorkCmd::Ready(a) => ("work_ready", request(a.idempotency_key, None, json!({}))),
+            WorkCmd::Ready(a) => {
+                let mut params = Map::new();
+                if let Some(repo) = a.repo {
+                    params.insert("repo".to_owned(), json!(repo));
+                }
+                if a.full {
+                    params.insert("detail".to_owned(), json!("full"));
+                }
+                if let Some(limit) = a.limit {
+                    params.insert("limit".to_owned(), json!(limit));
+                }
+                (
+                    "work_ready",
+                    request(a.idempotency_key, None, Value::Object(params)),
+                )
+            }
             WorkCmd::Create(a) => {
+                let description = spec_field_input(
+                    a.description,
+                    a.description_file.as_deref(),
+                    "--description",
+                    "--description-file",
+                )?;
+                let acceptance = spec_field_input(
+                    a.acceptance,
+                    a.acceptance_file.as_deref(),
+                    "--acceptance",
+                    "--acceptance-file",
+                )?;
+                let design = spec_field_input(
+                    a.design,
+                    a.design_file.as_deref(),
+                    "--design",
+                    "--design-file",
+                )?;
+                let notes =
+                    spec_field_input(a.notes, a.notes_file.as_deref(), "--notes", "--notes-file")?;
                 let mut params = Map::new();
                 params.insert("id".to_owned(), json!(a.id));
                 params.insert("title".to_owned(), json!(a.title));
                 for (name, value) in [
-                    ("description", a.description),
-                    ("acceptanceCriteria", a.acceptance),
-                    ("design", a.design),
-                    ("notes", a.notes),
+                    ("description", description),
+                    ("acceptanceCriteria", acceptance),
+                    ("design", design),
+                    ("notes", notes),
                     ("kind", a.kind),
                     ("status", a.status),
                 ] {
@@ -2319,15 +2425,35 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
                 )
             }
             WorkCmd::Update(a) => {
+                let description = spec_field_input(
+                    a.description,
+                    a.description_file.as_deref(),
+                    "--description",
+                    "--description-file",
+                )?;
+                let acceptance = spec_field_input(
+                    a.acceptance,
+                    a.acceptance_file.as_deref(),
+                    "--acceptance",
+                    "--acceptance-file",
+                )?;
+                let design = spec_field_input(
+                    a.design,
+                    a.design_file.as_deref(),
+                    "--design",
+                    "--design-file",
+                )?;
+                let notes =
+                    spec_field_input(a.notes, a.notes_file.as_deref(), "--notes", "--notes-file")?;
                 let mut params = Map::new();
                 params.insert("id".to_owned(), json!(a.id));
                 params.insert("expectedRevision".to_owned(), json!(a.expected_revision));
                 for (name, value) in [
                     ("title", a.title),
-                    ("description", a.description),
-                    ("acceptanceCriteria", a.acceptance),
-                    ("design", a.design),
-                    ("notes", a.notes),
+                    ("description", description),
+                    ("acceptanceCriteria", acceptance),
+                    ("design", design),
+                    ("notes", notes),
                 ] {
                     if let Some(value) = value {
                         params.insert(name.to_owned(), json!(value));
@@ -2487,4 +2613,77 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
         },
         Command::Mcp => unreachable!("mcp is handled before request mapping"),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BULLET: &str = "- bullet";
+    const LONG_TEXT_FIELDS: [(&str, &str); 4] = [
+        ("--description", "description"),
+        ("--acceptance", "acceptanceCriteria"),
+        ("--design", "design"),
+        ("--notes", "notes"),
+    ];
+
+    fn assert_long_text_forms(base: &[&str]) {
+        for (flag, param) in LONG_TEXT_FIELDS {
+            let mut spaced = base
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect::<Vec<_>>();
+            spaced.extend([flag.to_owned(), BULLET.to_owned()]);
+            let parsed = Cli::try_parse_from(spaced).expect("space-separated bullet value");
+            let (_, request) = to_request(parsed.command).expect("request");
+            assert_eq!(request.params[param], BULLET, "{flag} spaced");
+
+            let mut attached = base
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect::<Vec<_>>();
+            attached.push(format!("{flag}={BULLET}"));
+            let parsed = Cli::try_parse_from(attached).expect("attached bullet value");
+            let (_, request) = to_request(parsed.command).expect("request");
+            assert_eq!(request.params[param], BULLET, "{flag} attached");
+        }
+    }
+
+    #[test]
+    fn work_create_long_text_fields_accept_bullet_led_values_in_both_forms() {
+        assert_long_text_forms(&["forged", "work", "create", "--id", "x", "--title", "t"]);
+    }
+
+    #[test]
+    fn work_update_long_text_fields_accept_bullet_led_values_in_both_forms() {
+        assert_long_text_forms(&[
+            "forged",
+            "work",
+            "update",
+            "--id",
+            "x",
+            "--expected-revision",
+            "1",
+        ]);
+    }
+
+    #[test]
+    fn other_work_values_keep_their_hyphen_parsing() {
+        assert!(Cli::try_parse_from([
+            "forged", "work", "create", "--id", "x", "--title", "- title"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "forged",
+            "work",
+            "update",
+            "--id",
+            "x",
+            "--expected-revision",
+            "1",
+            "--title",
+            "- title",
+        ])
+        .is_err());
+    }
 }

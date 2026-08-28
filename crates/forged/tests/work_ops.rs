@@ -3,6 +3,9 @@
 
 mod support;
 
+use std::collections::{BTreeMap, BTreeSet};
+
+use forged_ledger::{NewWorkItem, WorkKind, WorkRevisionCause, WorkSpecFields, WorkStatus};
 use serde_json::{json, Value};
 use support::TestEnv;
 
@@ -13,6 +16,323 @@ fn result(env: &TestEnv, args: &[&str]) -> Value {
     let (code, envelope) = env.forged(args);
     assert_eq!(code, 0, "{args:?}: {envelope}");
     envelope["result"].clone()
+}
+
+fn seed_ready_items(env: &TestEnv, count: usize) {
+    let ledger = env.ledger();
+    for index in 0..count {
+        ledger
+            .create_work_item(NewWorkItem {
+                work_id: format!("ready-{index:03}"),
+                kind: WorkKind::Task,
+                status: WorkStatus::Open,
+                priority: Some(index as i64),
+                metadata: BTreeMap::from([("repository".to_owned(), "/tmp/ready-repo".to_owned())]),
+                spec: WorkSpecFields {
+                    title: format!("Ready item {index}"),
+                    description: format!("fat description {index}"),
+                    acceptance_criteria: format!("fat acceptance {index}"),
+                    design: format!("fat design {index}"),
+                    notes: format!("fat notes {index}"),
+                },
+                cause: WorkRevisionCause::Authored,
+            })
+            .expect("create ready work item");
+    }
+    ledger.close().expect("close test ledger");
+}
+
+#[test]
+fn work_ready_summarizes_by_default_and_full_round_trips_complete_rows() {
+    let env = TestEnv::new("forged-work-ready-detail");
+    assert_eq!(env.forged(&["init"]).0, 0);
+    let created = result(
+        &env,
+        &[
+            "work",
+            "create",
+            "--id",
+            "fat-ready",
+            "--title",
+            "Fat ready item",
+            "--description",
+            "description bytes that must stay out of summaries",
+            "--acceptance",
+            "acceptance bytes that must stay out of summaries",
+            "--design",
+            "design bytes that must stay out of summaries",
+            "--notes",
+            "notes bytes that must stay out of summaries",
+            "--priority",
+            "2",
+            "--repository",
+            "/tmp/fat-ready-repo",
+        ],
+    );
+
+    let summarized = result(&env, &["work", "ready"]);
+    assert_eq!(
+        summarized["filters"],
+        json!({"detail": "summary", "limit": 100})
+    );
+    assert_eq!(summarized["totals"], json!({"shown": 1, "total": 1}));
+    let row = &summarized["ready"][0];
+    let keys: BTreeSet<&str> = row
+        .as_object()
+        .expect("summary row")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        keys,
+        BTreeSet::from([
+            "id",
+            "kind",
+            "priority",
+            "repository",
+            "revision",
+            "status",
+            "title",
+        ])
+    );
+    assert_eq!(
+        row,
+        &json!({
+            "id": "fat-ready",
+            "title": "Fat ready item",
+            "kind": "task",
+            "status": "open",
+            "priority": 2,
+            "repository": "/tmp/fat-ready-repo",
+            "revision": 1,
+        })
+    );
+
+    let full = result(&env, &["work", "ready", "--full"]);
+    assert_eq!(full["filters"], json!({"detail": "full", "limit": 100}));
+    assert_eq!(
+        full["ready"][0], created["work"],
+        "--full preserves the complete pre-summary snapshot shape and bytes"
+    );
+}
+
+#[test]
+fn work_ready_reports_total_and_shown_across_the_default_bound() {
+    let env = TestEnv::new("forged-work-ready-bound");
+    assert_eq!(env.forged(&["init"]).0, 0);
+    seed_ready_items(&env, 101);
+
+    let bounded = result(&env, &["work", "ready"]);
+    assert_eq!(bounded["filters"]["limit"], json!(100));
+    assert_eq!(bounded["totals"], json!({"shown": 100, "total": 101}));
+    assert_eq!(bounded["ready"].as_array().expect("ready rows").len(), 100);
+
+    let raised = result(&env, &["work", "ready", "--limit", "101"]);
+    assert_eq!(raised["filters"]["limit"], json!(101));
+    assert_eq!(raised["totals"], json!({"shown": 101, "total": 101}));
+    assert_eq!(raised["ready"].as_array().expect("ready rows").len(), 101);
+}
+
+#[test]
+fn work_ready_repository_filter_composes_with_summary_bounds() {
+    let env = TestEnv::new("forged-work-ready-repository");
+    assert_eq!(env.forged(&["init"]).0, 0);
+    for (id, repository) in [
+        ("ready-a-1", "/repo/a"),
+        ("ready-a-2", "/repo/a"),
+        ("ready-b", "/repo/b"),
+    ] {
+        result(
+            &env,
+            &[
+                "work",
+                "create",
+                "--id",
+                id,
+                "--title",
+                id,
+                "--repository",
+                repository,
+            ],
+        );
+    }
+
+    let ready = result(
+        &env,
+        &["work", "ready", "--repo", "/repo/a", "--limit", "1"],
+    );
+    assert_eq!(
+        ready["filters"],
+        json!({"detail": "summary", "limit": 1, "repo": "/repo/a"})
+    );
+    assert_eq!(ready["totals"], json!({"shown": 1, "total": 2}));
+    assert_eq!(ready["ready"][0]["id"], json!("ready-a-1"));
+}
+
+#[test]
+fn work_spec_file_inputs_round_trip_verbatim_and_conflict_with_inline_forms() {
+    let env = TestEnv::new("forged-work-spec-files");
+    assert_eq!(env.forged(&["init"]).0, 0);
+    let description = "- first bullet\n- second bullet\n\nA multi-line body.\n";
+    let acceptance = "- preserves leading hyphens\n- preserves final newline\n";
+    let design = "line one\nline two\n";
+    let notes = "do not trim this body\n";
+    let description_path = env.root.join("description.md");
+    let acceptance_path = env.root.join("acceptance.md");
+    let design_path = env.root.join("design.md");
+    let notes_path = env.root.join("notes.md");
+    for (path, body) in [
+        (&description_path, description),
+        (&acceptance_path, acceptance),
+        (&design_path, design),
+        (&notes_path, notes),
+    ] {
+        std::fs::write(path, body).expect("write spec field fixture");
+    }
+
+    result(
+        &env,
+        &[
+            "work",
+            "create",
+            "--id",
+            "file-backed",
+            "--title",
+            "File-backed spec",
+            "--description-file",
+            description_path.to_str().expect("UTF-8 path"),
+            "--acceptance-file",
+            acceptance_path.to_str().expect("UTF-8 path"),
+            "--design-file",
+            design_path.to_str().expect("UTF-8 path"),
+            "--notes-file",
+            notes_path.to_str().expect("UTF-8 path"),
+        ],
+    );
+    let shown = result(&env, &["work", "show", "--id", "file-backed"]);
+    assert_eq!(shown["work"]["spec"]["description"], json!(description));
+    assert_eq!(
+        shown["work"]["spec"]["acceptanceCriteria"],
+        json!(acceptance)
+    );
+    assert_eq!(shown["work"]["spec"]["design"], json!(design));
+    assert_eq!(shown["work"]["spec"]["notes"], json!(notes));
+
+    let updated_bodies = [
+        (&description_path, "updated description\n"),
+        (&acceptance_path, "updated acceptance\n"),
+        (&design_path, "updated design\n"),
+        (&notes_path, "updated notes\n"),
+    ];
+    for (path, body) in updated_bodies {
+        std::fs::write(path, body).expect("update spec field fixture");
+    }
+    let updated = result(
+        &env,
+        &[
+            "work",
+            "update",
+            "--id",
+            "file-backed",
+            "--expected-revision",
+            "1",
+            "--description-file",
+            description_path.to_str().expect("UTF-8 path"),
+            "--acceptance-file",
+            acceptance_path.to_str().expect("UTF-8 path"),
+            "--design-file",
+            design_path.to_str().expect("UTF-8 path"),
+            "--notes-file",
+            notes_path.to_str().expect("UTF-8 path"),
+        ],
+    );
+    assert_eq!(updated["work"]["revision"], json!(2));
+    for (field, expected) in [
+        ("description", "updated description\n"),
+        ("acceptanceCriteria", "updated acceptance\n"),
+        ("design", "updated design\n"),
+        ("notes", "updated notes\n"),
+    ] {
+        assert_eq!(updated["work"]["spec"][field], json!(expected));
+    }
+
+    let conflict = env
+        .forged_cmd(&[
+            "work",
+            "create",
+            "--id",
+            "conflict",
+            "--title",
+            "Conflict",
+            "--description",
+            "inline",
+            "--description-file",
+            description_path.to_str().expect("UTF-8 path"),
+        ])
+        .output()
+        .expect("spawn conflicting create");
+    assert!(!conflict.status.success());
+    let stderr = String::from_utf8_lossy(&conflict.stderr);
+    assert!(
+        stderr.contains("--description") && stderr.contains("--description-file"),
+        "clear conflict error: {stderr}"
+    );
+
+    let update_conflict = env
+        .forged_cmd(&[
+            "work",
+            "update",
+            "--id",
+            "file-backed",
+            "--expected-revision",
+            "1",
+            "--notes",
+            "inline",
+            "--notes-file",
+            notes_path.to_str().expect("UTF-8 path"),
+        ])
+        .output()
+        .expect("spawn conflicting update");
+    assert!(!update_conflict.status.success());
+    let stderr = String::from_utf8_lossy(&update_conflict.stderr);
+    assert!(
+        stderr.contains("--notes") && stderr.contains("--notes-file"),
+        "clear conflict error: {stderr}"
+    );
+}
+
+#[test]
+fn work_ready_limits_equal_attention_list_limits() {
+    let env = TestEnv::new("forged-work-ready-limit-parity");
+    assert_eq!(env.forged(&["init"]).0, 0);
+
+    let ready_default = result(&env, &["work", "ready"]);
+    let attention_default = result(&env, &["attention", "list"]);
+    assert_eq!(
+        ready_default["filters"]["limit"], attention_default["filters"]["limit"],
+        "the default collection limits must remain equal"
+    );
+    assert_eq!(ready_default["filters"]["limit"], json!(100));
+
+    let ready_max = result(&env, &["work", "ready", "--limit", "500"]);
+    let attention_max = result(&env, &["attention", "list", "--limit", "500"]);
+    assert_eq!(
+        ready_max["filters"]["limit"], attention_max["filters"]["limit"],
+        "the maximum accepted collection limits must remain equal"
+    );
+    assert_eq!(ready_max["filters"]["limit"], json!(500));
+
+    let (ready_code, ready_over) = env.forged(&["work", "ready", "--limit", "501"]);
+    let (attention_code, attention_over) = env.forged(&["attention", "list", "--limit", "501"]);
+    assert_ne!(
+        ready_code, 0,
+        "work_ready accepted an over-cap limit: {ready_over}"
+    );
+    assert_ne!(
+        attention_code, 0,
+        "attention_list accepted an over-cap limit: {attention_over}"
+    );
+    assert_eq!(ready_over["error"]["code"], attention_over["error"]["code"]);
 }
 
 /// One epic's whole event stream as (kind, payload), oldest first.
@@ -132,7 +452,7 @@ fn authoring_and_repair_verbs_cover_the_lifecycle() {
         .as_array()
         .expect("ready")
         .iter()
-        .filter_map(|item| item["workId"].as_str())
+        .filter_map(|item| item["id"].as_str())
         .collect();
     assert!(
         ids.contains(&"ops-gate") && !ids.contains(&"ops-slice"),
@@ -155,7 +475,7 @@ fn authoring_and_repair_verbs_cover_the_lifecycle() {
             .as_array()
             .expect("ready")
             .iter()
-            .any(|item| item["workId"] == json!("ops-slice")),
+            .any(|item| item["id"] == json!("ops-slice")),
         "{ready}"
     );
 

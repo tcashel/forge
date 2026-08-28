@@ -57,13 +57,25 @@ impl PaneNotFoundServer {
                 stream
                     .set_nonblocking(false)
                     .expect("blocking Herdr stream");
+                // These tests crash the client ON PURPOSE (failpoint kills
+                // mid-exchange): a vanished peer — read error, EOF before a
+                // request, or a half-written line — is a dropped connection,
+                // never a fixture failure. Only a well-formed request that
+                // names an unexpected method stays fatal.
                 let mut line = String::new();
-                BufReader::new(stream.try_clone().expect("clone fixture stream"))
+                match BufReader::new(stream.try_clone().expect("clone fixture stream"))
                     .read_line(&mut line)
-                    .expect("read Herdr request");
-                let request: Value = serde_json::from_str(&line).expect("Herdr request JSON");
-                let id = request["id"].as_str().expect("request id");
-                let method = request["method"].as_str().expect("request method");
+                {
+                    Ok(0) | Err(_) => continue,
+                    Ok(_) => {}
+                }
+                let Ok(request) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                let (Some(id), Some(method)) = (request["id"].as_str(), request["method"].as_str())
+                else {
+                    continue;
+                };
                 recorded
                     .lock()
                     .expect("methods lock")
@@ -87,7 +99,9 @@ impl PaneNotFoundServer {
                     }
                     other => panic!("unexpected Herdr fixture method {other}"),
                 };
-                writeln!(stream, "{response}").expect("write Herdr response");
+                // The peer may crash between request and response; a failed
+                // write is the same dropped connection as a failed read.
+                let _ = writeln!(stream, "{response}");
             }
         });
         Self {

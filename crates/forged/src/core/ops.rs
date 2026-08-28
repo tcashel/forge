@@ -8,7 +8,7 @@ use std::path::{Component, Path, PathBuf};
 use forged_gate::GateRequest;
 use forged_ledger::{
     EffectClass, InventorySnapshot, InventoryUsage, InventoryUsageSelection, NewRun,
-    NewRunDefinition, OperationState, RunState,
+    NewRunDefinition, OperationState, RevokeScope, RunState, WorkItemFilters, WorkStatus,
 };
 use forged_provider::{CodexDriver, PiDriver, ProviderDriver};
 use forged_types::{
@@ -806,13 +806,68 @@ pub(crate) async fn default_branch_of(repo: &str) -> String {
 
 // ------------------------------------------------------------ run status
 
+fn packet_stage<'a>(view: &'a forged_proto::RunView, packet_id: &str) -> Option<&'a str> {
+    view.packets
+        .iter()
+        .find(|packet| packet.packet_id == packet_id)
+        .map(|packet| stage_str(packet.stage))
+}
+
+fn run_status_position<'a>(
+    view: &'a forged_proto::RunView,
+    action: &'a forged_proto::NextAction,
+) -> (Option<&'a str>, Option<&'a str>) {
+    if let Some(attempt) = view
+        .live_attempts
+        .iter()
+        .max_by_key(|attempt| attempt.attempt_id)
+    {
+        return (
+            packet_stage(view, &attempt.packet_id),
+            Some(attempt.started_at.as_str()),
+        );
+    }
+    let stage = match action {
+        forged_proto::NextAction::RunMachine(step) => Some(step.as_str()),
+        forged_proto::NextAction::OpenPackets(intents) => {
+            intents.first().map(|intent| stage_str(intent.stage))
+        }
+        forged_proto::NextAction::AwaitPacket { packet_id, .. } => packet_stage(view, packet_id),
+        forged_proto::NextAction::EscalateProfile(_) | forged_proto::NextAction::Stop(_) => None,
+    };
+    (stage, None)
+}
+
+fn run_status_gate_state(view: &forged_proto::RunView) -> Option<&'static str> {
+    view.terminal_attempts
+        .values()
+        .flatten()
+        .filter_map(|attempt| {
+            let forged_types::Outcome::Implement {
+                gate_state: Some(state),
+                ..
+            } = attempt.outcome.as_ref()?
+            else {
+                return None;
+            };
+            let state = match state.as_str() {
+                "pass" => "passed",
+                "fail" => "failed",
+                _ => return None,
+            };
+            Some((attempt.attempt_id, state))
+        })
+        .max_by_key(|(attempt_id, _)| *attempt_id)
+        .map(|(_, state)| state)
+}
+
 /// `run status` — read-only projection of one run.
 pub async fn run_status(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
     read_only("run_status", req, || async {
         let run_id = param_str(&req.params, "run")?;
         let view = super::drive::project(ctx, run_id).await?;
         let run_id_owned = run_id.to_owned();
-        let (definition, revision, protocol_terminal, admission_decisions) =
+        let (definition, revision, protocol_terminal, admission_decisions, deadline_kills) =
             on_ledger(&ctx.ledger, move |ledger| {
                 let protocol_terminal = ledger
                     .list_events(Some(&run_id_owned), 0, 4096)?
@@ -842,10 +897,16 @@ pub async fn run_status(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
                     ledger.latest_roster_revision(&run_id_owned)?,
                     protocol_terminal,
                     admission_decisions,
+                    ledger.count_attempts_with_revoke_scope(
+                        &run_id_owned,
+                        RevokeScope::Deadline,
+                    )?,
                 ))
             })
             .await?;
         let action = forged_proto::advance(&view);
+        let (current_stage, started_at) = run_status_position(&view, &action);
+        let gate_state = run_status_gate_state(&view);
         let controller = super::handoff::controller_status(ctx, run_id).await?;
         let identity =
             super::work_identity::load(ctx, WorkIdentitySubjectKind::Run, run_id).await?;
@@ -997,8 +1058,7 @@ pub async fn run_status(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
                 "candidateSelections": candidates,
             })
         });
-        Ok(json!({
-            "run": {
+        let mut run = json!({
                 "runId": view.run.run_id,
                 "identity": identity,
                 "herdrLayout": herdr_layout,
@@ -1046,6 +1106,7 @@ pub async fn run_status(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
                     "name": o.name,
                     "idempotencyKey": o.idempotency_key,
                 })).collect::<Vec<_>>(),
+                "deadlineKills": deadline_kills,
                 "nextAction": match protocol_terminal {
                     Some(terminal) if view.accepted_risk.is_none() => json!({"stop": terminal}),
                     _ => match &action {
@@ -1067,8 +1128,29 @@ pub async fn run_status(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
                 },
                 "controller": controller,
                 "claimHealth": claim_health,
-            }
-        }))
+        });
+        let run = run
+            .as_object_mut()
+            .expect("run status projection is an object");
+        if let Some(current_stage) = current_stage {
+            run.insert(
+                "currentStage".to_owned(),
+                Value::String(current_stage.to_owned()),
+            );
+        }
+        if let Some(gate_state) = gate_state {
+            run.insert(
+                "gateState".to_owned(),
+                Value::String(gate_state.to_owned()),
+            );
+        }
+        if let Some(started_at) = started_at {
+            run.insert(
+                "startedAt".to_owned(),
+                Value::String(started_at.to_owned()),
+            );
+        }
+        Ok(json!({"run": run}))
     })
     .await
 }
@@ -3288,7 +3370,10 @@ fn attention_rail(snapshot: &InventorySnapshot, entries: &[Value]) -> Vec<Value>
 /// must not silently turn a stored identity into another one. Non-path
 /// identities are retained as exact strings so a future remote identity can
 /// use this same public selector.
-fn repository_selector(req: &OperationRequest, operation: &str) -> Result<Option<String>, Failure> {
+pub(super) fn repository_selector(
+    req: &OperationRequest,
+    operation: &str,
+) -> Result<Option<String>, Failure> {
     let Some(value) = req.params.get("repo") else {
         return Ok(None);
     };
@@ -3324,21 +3409,58 @@ fn repository_selector(req: &OperationRequest, operation: &str) -> Result<Option
     Ok(Some(normalized.to_string_lossy().into_owned()))
 }
 
+fn work_status_selector(
+    req: &OperationRequest,
+    operation: &str,
+) -> Result<Option<WorkStatus>, Failure> {
+    let Some(value) = req.params.get("status") else {
+        return Ok(None);
+    };
+    let value = value
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            Failure::invalid(format!("{operation} status must be a non-empty string"))
+        })?;
+    WorkStatus::parse(value).map(Some).ok_or_else(|| {
+        Failure::invalid(format!(
+            "{operation} status {value:?} is not open, in_progress, blocked, deferred, or closed"
+        ))
+    })
+}
+
+fn assignee_selector(req: &OperationRequest, operation: &str) -> Result<Option<String>, Failure> {
+    let Some(value) = req.params.get("assignee") else {
+        return Ok(None);
+    };
+    let value = value
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            Failure::invalid(format!("{operation} assignee must be a non-empty string"))
+        })?;
+    Ok(Some(value.to_owned()))
+}
+
 /// `work list` — the discovery surface, serving [`inventory`] whole or the
-/// exact repository subset named by Bead metadata.
+/// exact subset selected from native work status, custody, and metadata.
 ///
 /// The one entry point that takes no id, so a caller with no prior knowledge
 /// can enumerate the inventory and then address any entry.
 pub async fn work_list(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
     read_only("work_list", req, || async {
         let projection = operations_projection(ctx, req).await?;
-        if req.params.contains_key("repo")
+        if ["repo", "status", "assignee"]
+            .iter()
+            .any(|key| req.params.contains_key(*key))
             && projection.pointer("/sourceHealth/beads/state").and_then(Value::as_str)
                 != Some("available")
         {
             return Err(Failure {
                 code: ErrorCode::BeadsError,
-                message: "work_list repository membership is unavailable".to_owned(),
+                message: "work_list filtered membership is unavailable".to_owned(),
                 recoverable: false,
             });
         }
@@ -3898,7 +4020,7 @@ impl OperationsUniverse {
 
 async fn collect_operations_universe(
     ctx: &Ctx,
-    repository: Option<String>,
+    filters: WorkItemFilters,
 ) -> Result<OperationsUniverse, Failure> {
     let kinds: Vec<&str> = LIFECYCLE_KINDS
         .iter()
@@ -3915,19 +4037,13 @@ async fn collect_operations_universe(
     decorate_durable_entries(&mut entries)?;
 
     let bead_ids = entry_bead_ids(&entries);
-    let plan_repository = repository.clone();
-    let claim_repository = repository.clone();
+    let filter_active =
+        filters.repository.is_some() || filters.status.is_some() || filters.assignee.is_some();
+    let plan_filters = filters.clone();
+    let claim_filters = filters;
     let (plan_read, claim_read) = tokio::join!(
-        super::workstore::plan_inventory(&ctx.ledger, plan_repository.as_deref(), LIVE_PLAN_LIMIT),
-        async {
-            match claim_repository.as_deref() {
-                Some(repository) => {
-                    super::workstore::list_issues_for_repository(&ctx.ledger, &bead_ids, repository)
-                        .await
-                }
-                None => super::workstore::list_issues(&ctx.ledger, &bead_ids).await,
-            }
-        }
+        super::workstore::plan_inventory(&ctx.ledger, plan_filters, LIVE_PLAN_LIMIT),
+        super::workstore::list_issues_filtered(&ctx.ledger, &bead_ids, claim_filters)
     );
     let beads_captured_at = now_iso();
     let (mut plans, plan_truncated, plan_discovered, mut plan_error) = match plan_read {
@@ -3943,7 +4059,7 @@ async fn collect_operations_universe(
         Ok(issues) => (issues, None),
         Err(error) => (Vec::new(), Some(error.to_string())),
     };
-    if repository.is_some() {
+    if filter_active {
         let matching_beads = claim_beads
             .iter()
             .map(|issue| issue.id.as_str())
@@ -4058,6 +4174,8 @@ async fn collect_operations_universe(
 pub async fn operations_overview(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
     read_only("operations_overview", req, || async {
         let repository = repository_selector(req, "operations_overview")?;
+        let status = work_status_selector(req, "work_list")?;
+        let assignee = assignee_selector(req, "work_list")?;
         let limit = req
             .params
             .get("limit")
@@ -4096,7 +4214,15 @@ pub async fn operations_overview(ctx: &Ctx, req: &OperationRequest) -> Operation
             )));
         }
 
-        let universe = collect_operations_universe(ctx, repository.clone()).await?;
+        let universe = collect_operations_universe(
+            ctx,
+            WorkItemFilters {
+                repository: repository.clone(),
+                status,
+                assignee,
+            },
+        )
+        .await?;
         let source_health = universe.source_health();
         let OperationsUniverse {
             snapshot,
@@ -4387,7 +4513,14 @@ pub async fn attention_list(ctx: &Ctx, req: &OperationRequest) -> OperationRespo
             )));
         }
 
-        let universe = collect_operations_universe(ctx, repo.clone()).await?;
+        let universe = collect_operations_universe(
+            ctx,
+            WorkItemFilters {
+                repository: repo.clone(),
+                ..WorkItemFilters::default()
+            },
+        )
+        .await?;
         let items = super::attention::project_all(
             &universe.snapshot,
             &universe.entries,

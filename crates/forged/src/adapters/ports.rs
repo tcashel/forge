@@ -620,42 +620,116 @@ fn read_routed_sentinel(route: &SentinelRoute, runtime_dir: &Path, attempt_id: i
     }
 }
 
-/// Derive the GitHub `owner/name` slug from a checkout's `origin` remote —
-/// a pure function of the stored absolute path; no sidecar file.
-pub async fn repo_slug(repo: &Path) -> Result<String, PortError> {
+/// The GitHub routing identity derived from one `origin` URL read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitHubRemote {
+    pub slug: String,
+    pub host: String,
+    /// Whether the authority is reached over ssh, where `~/.ssh/config`
+    /// aliasing applies to the hostname.
+    pub ssh: bool,
+}
+
+const ACCEPTED_GITHUB_REMOTES: &str = "git@host:owner/repo(.git), \
+ssh://user@host/owner/repo(.git), or https://host/owner/repo(.git)";
+
+impl GitHubRemote {
+    /// The host to pin gh children to. An https authority is a real
+    /// hostname and always pins, dotted or not. A dotless ssh authority
+    /// is an alias whose real API hostname only the operator's ssh config
+    /// knows; pinning `GH_HOST` to the alias would break gh on setups the
+    /// default-host resolution already serves, so it never pins.
+    pub fn gh_host(&self) -> Option<&str> {
+        (!self.ssh || self.host.contains('.')).then_some(self.host.as_str())
+    }
+}
+
+/// Derive the GitHub slug and host from one raw `origin` URL read.
+pub async fn github_remote(repo: &Path) -> Result<GitHubRemote, PortError> {
     let out = tokio::process::Command::new("git")
         .arg("-C")
         .arg(repo)
-        .args(["remote", "get-url", "origin"])
+        .args(["config", "--get", "remote.origin.url"])
         .stdin(std::process::Stdio::null())
         .output()
         .await
-        .map_err(|e| PortError::Unavailable(format!("git remote get-url: {e}")))?;
+        .map_err(|error| PortError::Gh(format!("reading origin remote URL: {error}")))?;
     if !out.status.success() {
-        return Err(PortError::Refused(format!(
-            "git remote get-url origin: {}",
+        return Err(PortError::Gh(format!(
+            "reading origin remote URL: {}",
             String::from_utf8_lossy(&out.stderr)
         )));
     }
     let url = String::from_utf8_lossy(&out.stdout).trim().to_owned();
-    Ok(slug_from_url(&url))
+    remote_from_url(&url)
 }
 
-/// Parse `owner/name` out of the known remote-url shapes, falling back to
-/// the last two path components so hermetic local-path remotes still
-/// resolve to a stable slug.
-pub fn slug_from_url(url: &str) -> String {
+/// Parse the GitHub `owner/name` slug from a supported remote URL.
+#[allow(dead_code)]
+pub fn slug_from_url(url: &str) -> Result<String, PortError> {
+    Ok(remote_from_url(url)?.slug)
+}
+
+/// Parse the bare GitHub hostname from a supported remote URL.
+#[allow(dead_code)]
+pub fn host_from_url(url: &str) -> Result<String, PortError> {
+    Ok(remote_from_url(url)?.host)
+}
+
+fn remote_from_url(url: &str) -> Result<GitHubRemote, PortError> {
     let trimmed = url.strip_suffix(".git").unwrap_or(url);
-    let after_colon = match trimmed.rsplit_once(':') {
-        Some((head, tail)) if !head.starts_with("http") => tail,
-        _ => trimmed,
+    let (host, path, ssh) = if let Some(rest) = trimmed.strip_prefix("ssh://") {
+        let (authority, path) = rest.split_once('/').ok_or_else(|| remote_error(url))?;
+        let (user, host) = authority
+            .rsplit_once('@')
+            .ok_or_else(|| remote_error(url))?;
+        if user.is_empty() {
+            return Err(remote_error(url));
+        }
+        (host, path, true)
+    } else if let Some(rest) = trimmed.strip_prefix("https://") {
+        let (host, path) = rest.split_once('/').ok_or_else(|| remote_error(url))?;
+        (host, path, false)
+    } else {
+        let (authority, path) = trimmed.split_once(':').ok_or_else(|| remote_error(url))?;
+        let (user, host) = authority
+            .rsplit_once('@')
+            .ok_or_else(|| remote_error(url))?;
+        if user.is_empty() || authority.contains('/') {
+            return Err(remote_error(url));
+        }
+        (host, path, true)
     };
-    let parts: Vec<&str> = after_colon.split('/').filter(|p| !p.is_empty()).collect();
-    match parts.as_slice() {
-        [.., owner, name] => format!("{owner}/{name}"),
-        [name] => (*name).to_owned(),
-        [] => trimmed.to_owned(),
+
+    if host.is_empty()
+        || host.contains(['/', ':', '@', '?', '#'])
+        || host.chars().any(char::is_whitespace)
+    {
+        return Err(remote_error(url));
     }
+    let mut parts = path.split('/');
+    let owner = parts.next().unwrap_or_default();
+    let name = parts.next().unwrap_or_default();
+    if owner.is_empty()
+        || name.is_empty()
+        || parts.next().is_some()
+        || owner.contains(['?', '#'])
+        || name.contains(['?', '#'])
+    {
+        return Err(remote_error(url));
+    }
+
+    Ok(GitHubRemote {
+        slug: format!("{owner}/{name}"),
+        host: host.to_owned(),
+        ssh,
+    })
+}
+
+fn remote_error(url: &str) -> PortError {
+    PortError::Gh(format!(
+        "origin remote URL {url:?} is unsupported; accepted forms: {ACCEPTED_GITHUB_REMOTES}"
+    ))
 }
 
 #[async_trait::async_trait]
@@ -806,13 +880,13 @@ impl ReconcilePorts for ForgedPorts {
         head: &str,
         base: &str,
     ) -> Result<Option<PrSnapshot>, PortError> {
-        let slug = repo_slug(Path::new(repo)).await?;
+        let remote = github_remote(Path::new(repo)).await?;
+        let gh = self.gh.clone().with_host_opt(remote.gh_host());
         failpoint::hit("gh.call.before");
-        let pr = self
-            .gh
-            .pr_list_head(&slug, head, base)
+        let pr = gh
+            .pr_list_head(&remote.slug, head, base)
             .await
-            .map_err(|e| PortError::Unavailable(e.to_string()))?;
+            .map_err(|error| PortError::Gh(error.to_string()))?;
         failpoint::hit("gh.call.after");
         Ok(pr.map(|p| PrSnapshot {
             number: p.number,
@@ -905,6 +979,7 @@ mod tests {
             runs_root: root.join("runs"),
             db_path: root.join("state.db"),
             config_path: root.join("config.json"),
+            config_path_override: None,
             config_file_read: false,
             config_sha256: None,
             roster: HashMap::new(),
@@ -1222,20 +1297,100 @@ mod tests {
     }
 
     #[test]
-    fn slug_parses_the_known_remote_shapes() {
-        assert_eq!(
-            slug_from_url("git@github.com:tcashel/forge.git"),
-            "tcashel/forge"
+    fn slug_and_host_parse_the_known_remote_shapes() {
+        for url in [
+            "git@github.com:tcashel/forge",
+            "git@github.com:tcashel/forge.git",
+            "ssh://git@github.com/tcashel/forge",
+            "ssh://git@github.com/tcashel/forge.git",
+            "https://github.com/tcashel/forge",
+            "https://github.com/tcashel/forge.git",
+        ] {
+            assert_eq!(slug_from_url(url).expect("slug"), "tcashel/forge");
+            assert_eq!(host_from_url(url).expect("host"), "github.com");
+        }
+
+        // An ssh-alias authority parses (the slug is real) but is not worth
+        // pinning: only the operator's ssh config knows the alias's API
+        // host, and GH_HOST=<alias> would break gh where the default host
+        // already works. Dotted hosts pin; dotless ones do not.
+        let alias = remote_from_url("git@work:org/repo.git").expect("alias parses");
+        assert_eq!(alias.slug, "org/repo");
+        assert_eq!(alias.host, "work");
+        assert_eq!(alias.gh_host(), None, "alias host is never pinned");
+        let dotted = remote_from_url("git@ghe.example.com:org/repo.git").expect("ghe parses");
+        assert_eq!(dotted.gh_host(), Some("ghe.example.com"));
+        // An https authority is a real hostname even without a dot — a
+        // single-label intranet GHE origin pins; ssh:// aliases do not.
+        let https = remote_from_url("https://github/acme/widget.git").expect("https parses");
+        assert_eq!(https.gh_host(), Some("github"));
+        let ssh_alias = remote_from_url("ssh://git@work/org/repo").expect("ssh alias parses");
+        assert_eq!(ssh_alias.gh_host(), None);
+
+        let url = "/tmp/root/origin";
+        let error = host_from_url(url).expect_err("local path has no GitHub host");
+        assert!(matches!(error, PortError::Gh(_)));
+        let message = error.to_string();
+        assert!(message.contains(url), "remote URL is named: {message}");
+        assert!(
+            message.contains(ACCEPTED_GITHUB_REMOTES),
+            "accepted forms are named: {message}"
         );
+        let failure = crate::core::Failure::from(error);
+        assert_eq!(failure.code, forged_types::ErrorCode::GhError);
+    }
+
+    #[test]
+    fn forged_ports_pins_gh_to_the_origin_host() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (config, ledger, _) = one_running_attempt(tmp.path());
+        let initialized = std::process::Command::new("git")
+            .arg("-C")
+            .arg(tmp.path())
+            .args(["init", "--quiet"])
+            .status()
+            .expect("git init spawns");
+        assert!(initialized.success(), "git init succeeds");
+        let remote = std::process::Command::new("git")
+            .arg("-C")
+            .arg(tmp.path())
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "git@ghe.example.com:org/repo.git",
+            ])
+            .status()
+            .expect("git remote add spawns");
+        assert!(remote.success(), "git remote add succeeds");
+
+        let host_log = tmp.path().join("gh-host.log");
+        let script = tmp.path().join("gh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nprintf '%s' \"$GH_HOST\" > \"$GH_HOST_LOG\"\nprintf '[{\"number\":9,\"state\":\"OPEN\",\"isDraft\":true,\"baseRefName\":\"main\",\"headRefName\":\"topic\",\"url\":\"https://ghe.example.com/org/repo/pull/9\"}]'\n",
+        )
+        .expect("write fake gh");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fake gh");
+
+        let mut ports = ForgedPorts::new(ledger.clone(), config);
+        ports.gh = GhClient::with_program(script)
+            .env("GH_HOST", "ambient.example.com")
+            .env("GH_HOST_LOG", &host_log);
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let pr = rt
+            .block_on(ports.pr_for_head(tmp.path().to_str().expect("repo path"), "topic", "main"))
+            .expect("GHE PR probe succeeds")
+            .expect("matching PR");
+
+        assert_eq!(pr.number, 9);
         assert_eq!(
-            slug_from_url("https://github.com/tcashel/forge"),
-            "tcashel/forge"
+            std::fs::read_to_string(host_log).expect("captured host"),
+            "ghe.example.com"
         );
-        assert_eq!(
-            slug_from_url("https://github.com/tcashel/forge.git"),
-            "tcashel/forge"
-        );
-        // Hermetic local-path remotes resolve to their last two components.
-        assert_eq!(slug_from_url("/tmp/root/origin"), "root/origin");
+        ledger.close().expect("close ledger");
     }
 }

@@ -187,18 +187,51 @@ fn all_fifty_seven_tools_match_their_cli_counterparts() {
         description.contains("Takes no id"),
         "work_list must state that it takes no id: {description}"
     );
-    assert!(
-        description.contains("params.repo"),
-        "work_list must describe its optional repository selector: {description}"
-    );
-    let repository_schema = work_list
-        .pointer("/inputSchema/properties/params/properties/repo")
+    for param in ["repo", "status", "assignee"] {
+        assert!(
+            description.contains(&format!("params.{param}")),
+            "work_list must describe params.{param}: {description}"
+        );
+        let schema = work_list
+            .pointer(&format!(
+                "/inputSchema/properties/params/properties/{param}"
+            ))
+            .cloned()
+            .unwrap_or(Value::Null);
+        assert!(
+            schema.to_string().contains("string"),
+            "work_list advertises params.{param} as a string: {schema}"
+        );
+    }
+    let work_ready = mcp.tool("work_ready");
+    let ready_schema = work_ready
+        .pointer("/inputSchema/properties/params/properties")
         .cloned()
         .unwrap_or(Value::Null);
+    for param in ["repo", "detail", "limit"] {
+        assert!(
+            ready_schema.get(param).is_some(),
+            "work_ready advertises params.{param}: {ready_schema}"
+        );
+    }
     assert!(
-        repository_schema.to_string().contains("string"),
-        "work_list advertises params.repo as a string: {repository_schema}"
+        ready_schema["detail"].to_string().contains("full"),
+        "work_ready advertises full detail: {ready_schema}"
     );
+    let description = work_ready["description"].as_str().unwrap_or_default();
+    for statement in [
+        "summary rows by default",
+        "params.repo",
+        "params.detail",
+        "params.limit",
+        "100",
+        "500",
+    ] {
+        assert!(
+            description.contains(statement),
+            "work_ready description states {statement:?}: {description}"
+        );
+    }
     let work_history = mcp.tool("work_history");
     let history_schema = work_history
         .pointer("/inputSchema")
@@ -1207,13 +1240,36 @@ fn all_fifty_seven_tools_match_their_cli_counterparts() {
     let tool = mcp.call_tool("work_list", envelope(json!({})));
     assert_eq!(tool["operationId"], json!("op:work_list:read"));
     assert_eq!(normalized(cli), normalized(tool), "work_list parity");
-    let cli = env.forged(&["work", "list", "--repo", &repository]).1;
-    let tool = mcp.call_tool("work_list", envelope(json!({"repo": repository})));
+    let cli = env
+        .forged(&["work", "list", "--repo", &repository, "--status", "open"])
+        .1;
+    let tool = mcp.call_tool(
+        "work_list",
+        envelope(json!({"repo": repository, "status": "open"})),
+    );
     assert_eq!(
         normalized(cli),
         normalized(tool),
-        "repository-scoped work_list parity"
+        "composed-filter work_list parity"
     );
+
+    let cli = env
+        .forged(&[
+            "work",
+            "ready",
+            "--repo",
+            &repository,
+            "--full",
+            "--limit",
+            "25",
+        ])
+        .1;
+    let tool = mcp.call_tool(
+        "work_ready",
+        envelope(json!({"repo": repository, "detail": "full", "limit": 25})),
+    );
+    assert_eq!(tool["operationId"], json!("op:work_ready:read"));
+    assert_eq!(normalized(cli), normalized(tool), "work_ready parity");
 
     let cli = env
         .forged(&[
@@ -1316,29 +1372,30 @@ fn overview_refuses_wrong_typed_paging_at_the_transport() {
 }
 
 #[test]
-fn work_list_refuses_present_non_string_repository_scopes() {
+fn work_filters_refuse_present_non_string_values() {
     let env = TestEnv::new("forged-work-list-mcp-params");
     env.forged(&["init"]);
     fabricate_run(&env, "mcp-repository-widening-guard");
     let mut mcp = McpClient::new(&env);
 
-    for repository in [Value::Null, json!(7), json!({"path": "/repo"})] {
-        let refusal = mcp.call_tool_error_result(
-            "work_list",
-            json!({"schemaVersion": 1, "params": {"repo": repository.clone()}}),
-        );
-        let text = refusal
-            .pointer("/content/0/text")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        assert!(
-            text.contains("failed to deserialize parameters"),
-            "present non-string repo is refused before dispatch: {repository}: {refusal}"
-        );
-        assert!(
-            serde_json::from_str::<Value>(text).is_err(),
-            "transport refusal is not an unfiltered operation envelope: {text}"
-        );
+    for field in ["repo", "status", "assignee"] {
+        for value in [Value::Null, json!(7), json!({"value": "wrong"})] {
+            let params = serde_json::Map::from_iter([(field.to_owned(), value.clone())]);
+            let refusal = mcp
+                .call_tool_error_result("work_list", json!({"schemaVersion": 1, "params": params}));
+            let text = refusal
+                .pointer("/content/0/text")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            assert!(
+                text.contains("failed to deserialize parameters"),
+                "present non-string {field} is refused before dispatch: {value}: {refusal}"
+            );
+            assert!(
+                serde_json::from_str::<Value>(text).is_err(),
+                "transport refusal is not an unfiltered operation envelope: {text}"
+            );
+        }
     }
 }
 

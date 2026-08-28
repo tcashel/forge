@@ -232,8 +232,7 @@ impl OverviewArgs {
     }
 }
 
-/// The `work_list` envelope: the shared envelope shape with the one typed
-/// repository selector this discovery operation accepts.
+/// The `work_list` envelope with its typed composable filters.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -252,18 +251,32 @@ pub struct WorkListArgs {
     pub params: WorkListParams,
 }
 
-/// Optional repository scope for `work_list`.
+/// Composable exact scopes for `work_list`.
 #[derive(Debug, Default, Deserialize, Serialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars", inline)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WorkListParams {
-    /// Exact repository identity from Bead `metadata.repository`.
+    /// Exact repository identity from work `metadata.repository`.
     #[serde(
         default,
         deserialize_with = "present_means_named",
         skip_serializing_if = "Option::is_none"
     )]
     pub repo: Option<String>,
+    /// Exact work status.
+    #[serde(
+        default,
+        deserialize_with = "present_means_named",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub status: Option<String>,
+    /// Exact custody holder.
+    #[serde(
+        default,
+        deserialize_with = "present_means_named",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub assignee: Option<String>,
 }
 
 impl WorkListArgs {
@@ -278,6 +291,65 @@ impl WorkListArgs {
             schema_version: self.schema_version,
             idempotency_key: self.idempotency_key,
             run_id: self.run_id,
+            params,
+        }
+    }
+}
+
+/// The only opt-in detail level accepted by `work_ready`.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(rename_all = "lowercase")]
+pub enum WorkReadyDetailParam {
+    Full,
+}
+
+/// Typed envelope for the bounded ready frontier.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkReadyArgs {
+    /// Envelope schema version; always 1.
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
+    /// The idempotency key; defaulted to `op:work_ready:read` when absent.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+    /// Ready-frontier projection parameters.
+    #[serde(default)]
+    pub params: WorkReadyParams,
+}
+
+/// Projection detail and collection bound accepted by `work_ready`.
+#[derive(Debug, Default, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars", inline)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkReadyParams {
+    /// Exact repository identity from work `metadata.repository`.
+    #[serde(
+        default,
+        deserialize_with = "present_means_named",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub repo: Option<String>,
+    /// Complete snapshots when full; omission returns summary rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<WorkReadyDetailParam>,
+    /// Maximum ready items, 1..=500 (default 100).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u64>,
+}
+
+impl WorkReadyArgs {
+    fn into_envelope(self) -> EnvelopeArgs {
+        let params = match serde_json::to_value(&self.params) {
+            Ok(Value::Object(map)) => map,
+            _ => serde_json::Map::new(),
+        };
+        EnvelopeArgs {
+            schema_version: self.schema_version,
+            idempotency_key: self.idempotency_key,
+            run_id: None,
             params,
         }
     }
@@ -1431,11 +1503,14 @@ impl ForgedServer {
     /// Read the ready frontier.
     #[tool(
         name = "work_ready",
-        description = "The ready frontier: open, unassigned, unleased items whose blocks \
-                       targets are all closed, priority-ordered. Takes no params."
+        description = "The bounded ready frontier: open, unassigned, unleased items whose \
+                       blocks targets are all closed, priority-ordered. Returns summary rows \
+                       by default. Optional params.repo filters exact work metadata.repository. \
+                       params.detail=\"full\" restores complete snapshots; params.limit is \
+                       1..=500 and defaults to 100."
     )]
-    pub async fn work_ready(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
-        self.call("work_ready", args.0).await
+    pub async fn work_ready(&self, args: Parameters<WorkReadyArgs>) -> CallToolResult {
+        self.call("work_ready", args.0.into_envelope()).await
     }
 
     /// The discovery surface — the one tool that needs no id.
@@ -1444,7 +1519,8 @@ impl ForgedServer {
         description = "List all forged work — every slice run and every started epic, live and \
                        historical, each labelled slice or epic. Takes no id: this is how a \
                        caller with no prior knowledge discovers the ids the other tools require. \
-                       Optional params.repo selects the exact Bead metadata.repository identity."
+                       Optional params.repo, params.status, and params.assignee are exact, \
+                       composable work-store filters."
     )]
     pub async fn work_list(&self, args: Parameters<WorkListArgs>) -> CallToolResult {
         self.call("work_list", args.0.into_envelope()).await
@@ -1641,6 +1717,9 @@ mod tests {
     use super::*;
 
     fn scratch_state(root: &std::path::Path) -> McpState {
+        // Each caller supplies its tempdir as ANVIL_HOME. scratch_config also
+        // carries no FORGED_CONFIG override, so MCP refreshes cannot escape
+        // into a populated ambient operator scope.
         McpState::new(crate::config::scratch_config(root))
     }
 

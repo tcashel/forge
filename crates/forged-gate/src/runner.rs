@@ -108,13 +108,19 @@ async fn run_one(req: &GateRequest, n: usize, command: &str) -> Result<GateRow, 
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    // A gate runs the repository's own commands. Inheriting the controller's
-    // ownership variables would let those commands read an attempt claim the
-    // controller holds and they do not, so a repository test that asserts
-    // ownership fencing fails against a claim it never made.
+    // A gate runs the repository's own commands. It must observe neither the
+    // controller's ownership claim nor the operator's forged state.
     for name in forged_types::CONTROLLER_ENV {
         cmd.env_remove(name);
     }
+    for name in forged_types::OPERATOR_STATE_ENV {
+        cmd.env_remove(name);
+    }
+    // Removing ANVIL_HOME alone is not enough: forged-state readers fall
+    // back to `$HOME/.anvil`, and the gate deliberately keeps HOME. Point
+    // ANVIL_HOME at a scratch path under this gate's own artifacts so the
+    // fallback can never resolve the operator's live state.
+    cmd.env("ANVIL_HOME", req.artifacts_dir.join("anvil-scratch"));
     {
         // Own process group, so a timeout can kill every descendant.
         use std::os::unix::process::CommandExt;
@@ -372,39 +378,60 @@ mod tests {
         assert!(kill_group(None).is_ok());
     }
 
-    /// A gate child must not inherit the controller's ownership variables.
+    /// A gate child must not inherit forged-owned state.
     ///
-    /// The controller sets them to fence its own attempt claim. A gate runs
-    /// the repository's commands, so a child that inherits them reads an
-    /// ownership claim it never made — which is how a repository's own
-    /// fencing tests fail against a live controller and pass everywhere else.
+    /// Controller identity would give repository code an ownership claim it
+    /// never made; operator-state variables would redirect its tests into the
+    /// operator's live config and Beads store. Ordinary host and toolchain
+    /// environment remains available.
     #[tokio::test]
-    async fn a_gate_child_does_not_inherit_the_controller_environment() {
+    async fn a_gate_child_strips_forged_state_and_keeps_host_environment() {
         let root = tempfile::tempdir().expect("tempdir");
         let cwd = root.path().join("cwd");
         let artifacts = root.path().join("artifacts");
         std::fs::create_dir_all(&cwd).expect("cwd");
 
-        // The parent holds every controller variable, exactly as a detached
-        // controller does when it reaches its gate. The guard restores the
-        // process on every exit path: a leaked variable would silently change
-        // what a sibling test observes.
-        struct ControllerEnvGuard;
-        impl Drop for ControllerEnvGuard {
+        // The parent holds every forged variable, exactly as a detached
+        // controller does when it reaches its gate. Preserve any launching
+        // values so this test is hermetic under an operator environment too.
+        struct ForgedEnvGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for ForgedEnvGuard {
             fn drop(&mut self) {
-                for name in forged_types::CONTROLLER_ENV {
-                    std::env::remove_var(name);
+                for (name, value) in self.0.drain(..) {
+                    match value {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
                 }
             }
         }
-        let _guard = ControllerEnvGuard;
+        let names = forged_types::CONTROLLER_ENV
+            .into_iter()
+            .chain(forged_types::OPERATOR_STATE_ENV)
+            .collect::<Vec<_>>();
+        let _guard = ForgedEnvGuard(
+            names
+                .iter()
+                .map(|name| (*name, std::env::var_os(name)))
+                .collect(),
+        );
         for name in forged_types::CONTROLLER_ENV {
             std::env::set_var(name, "set-by-the-controller");
         }
+        for name in forged_types::OPERATOR_STATE_ENV {
+            std::env::set_var(name, "set-by-the-controller");
+        }
 
-        let printed = forged_types::CONTROLLER_ENV
+        assert!(std::env::var_os("PATH").is_some(), "test parent needs PATH");
+        assert!(std::env::var_os("HOME").is_some(), "test parent needs HOME");
+
+        let printed = names
             .iter()
             .map(|name| format!("printf '%s=[%s]\\n' {name} \"${{{name}-}}\""))
+            .chain([
+                "printf 'PATH_PRESENT=[%s]\\n' \"${PATH+x}\"".to_owned(),
+                "printf 'HOME_PRESENT=[%s]\\n' \"${HOME+x}\"".to_owned(),
+            ])
             .collect::<Vec<_>>()
             .join("; ");
         let request = GateRequest {
@@ -419,11 +446,30 @@ mod tests {
         assert_eq!(outcome.rows.len(), 1, "one command, one row");
         let stdout = std::fs::read_to_string(artifacts.join("gate-1-stdout.log"))
             .expect("gate stdout artifact");
-        for name in forged_types::CONTROLLER_ENV {
+        for name in names {
+            if name == "ANVIL_HOME" {
+                continue;
+            }
             assert!(
                 stdout.contains(&format!("{name}=[]")),
                 "{name} leaked into the gate child; stdout was:\n{stdout}"
             );
         }
+        // ANVIL_HOME is not merely removed — HOME survives, and forged-state
+        // readers fall back to `$HOME/.anvil`, so the runner re-points it at
+        // a scratch path under this gate's own artifacts.
+        let scratch = artifacts.join("anvil-scratch");
+        assert!(
+            stdout.contains(&format!("ANVIL_HOME=[{}]", scratch.display())),
+            "ANVIL_HOME must point at the gate-local scratch:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("PATH_PRESENT=[x]"),
+            "PATH was removed:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("HOME_PRESENT=[x]"),
+            "HOME was removed:\n{stdout}"
+        );
     }
 }

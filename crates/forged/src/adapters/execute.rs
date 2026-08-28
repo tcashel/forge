@@ -3460,6 +3460,7 @@ mod settle_tests {
             runs_root: root.join("runs"),
             db_path: root.join("state.db"),
             config_path: root.join("config.json"),
+            config_path_override: None,
             config_file_read: false,
             config_sha256: None,
             roster: HashMap::new(),

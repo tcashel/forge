@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
-use forged_types::WorkPacket;
+use forged_types::{validate_model_value, WorkPacket};
 
 use crate::command::ProviderArgv;
 use crate::error::ProviderError;
@@ -218,26 +218,41 @@ pub(crate) fn validate_effort(effort: &str) -> Result<(), ProviderError> {
 }
 
 /// Validate a model string before embedding it: non-empty and matching
-/// `^[A-Za-z0-9][A-Za-z0-9._:/-]*$`, else `UnsafeShellLine` naming the
+/// `^[A-Za-z0-9][A-Za-z0-9._:/\[\]-]*$`, else `UnsafeShellLine` naming the
 /// offending value.
 pub(crate) fn validate_model(model: &str) -> Result<(), ProviderError> {
-    let mut chars = model.chars();
-    let head_ok = chars.next().is_some_and(|c| c.is_ascii_alphanumeric());
-    let rest_ok =
-        chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '/' | '-'));
-    if head_ok && rest_ok {
-        Ok(())
-    } else {
-        Err(ProviderError::UnsafeShellLine {
-            value: model.to_owned(),
-            reason: "model must be non-empty and match ^[A-Za-z0-9][A-Za-z0-9._:/-]*$".to_owned(),
-        })
-    }
+    validate_model_value(model).map_err(|reason| ProviderError::UnsafeShellLine {
+        value: model.to_owned(),
+        reason: reason.to_owned(),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
+
+    use forged_types::{
+        ProviderCandidateV1, RoleId, RosterDefinitionV1, Sandbox, ROSTER_SCHEMA_V1,
+    };
+
+    fn authoring_model_errors(model: &str) -> Vec<forged_types::DefinitionError> {
+        RosterDefinitionV1 {
+            schema: ROSTER_SCHEMA_V1.to_owned(),
+            name: "default".to_owned(),
+            roles: BTreeMap::from([(
+                RoleId::new("implementation").expect("role"),
+                vec![ProviderCandidateV1 {
+                    provider: "claude".to_owned(),
+                    model: model.to_owned(),
+                    effort: None,
+                    sandbox: Sandbox::ReadOnly,
+                    capabilities: Default::default(),
+                }],
+            )]),
+        }
+        .validate_models()
+    }
 
     #[test]
     fn packet_dirs_is_pure_path_arithmetic() {
@@ -299,24 +314,35 @@ mod tests {
     }
 
     #[test]
-    fn model_charset_rule() {
+    fn model_charset_rule_has_definition_parity() {
         for ok in [
             "opus",
             "gpt-5.6-sol",
             "a",
             "claude-fable-5",
             "org/model:tag",
+            "claude-sonnet-4[1m]",
         ] {
+            assert!(authoring_model_errors(ok).is_empty(), "{ok} should author");
             assert!(validate_model(ok).is_ok(), "{ok} should be safe");
         }
-        for bad in ["", "x; rm -rf /", "-model", ".hidden", "mo del", "m\nodel"] {
-            assert!(
-                matches!(
-                    validate_model(bad),
-                    Err(ProviderError::UnsafeShellLine { .. })
-                ),
-                "{bad:?} should be unsafe"
-            );
+        for bad in [
+            "",
+            "x; rm -rf /",
+            "-model",
+            ".hidden",
+            "mo del",
+            "m{odel",
+            "m\nodel",
+        ] {
+            let definition_errors = authoring_model_errors(bad);
+            assert_eq!(definition_errors.len(), 1, "{bad:?} authoring errors");
+            let definition_message = &definition_errors[0].message;
+            let provider_error = validate_model(bad).expect_err("provider refusal");
+            let ProviderError::UnsafeShellLine { reason, .. } = provider_error else {
+                panic!("{bad:?} returned the wrong provider error")
+            };
+            assert_eq!(&reason, definition_message, "{bad:?} parity");
         }
     }
 }

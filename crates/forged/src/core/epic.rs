@@ -19,7 +19,7 @@ use forged_types::{
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
-use crate::adapters::ports::repo_slug;
+use crate::adapters::ports::github_remote;
 use crate::core::{
     default_key, derive_key, err_response, fenced, ok_response, on_ledger, param_opt_str,
     param_str, read_only, Ctx, Failure,
@@ -3822,16 +3822,17 @@ async fn merge_child(
         .await?;
         return Ok(Step::Stop(input));
     };
-    let slug = repo_slug(Path::new(&config.repo))
+    let remote = github_remote(Path::new(&config.repo))
         .await
-        .map_err(|error| Failure::internal(error.to_string()))?;
+        .map_err(Failure::from)?;
+    let gh = forged_git::GhClient::new().with_host_opt(remote.gh_host());
+    let slug = remote.slug.clone();
     let ready_key = derive_key(
         "epic_child_ready",
         Some(&config.epic_id),
         Some(&child.id),
         Some(pr_number as i64),
     );
-    let gh = forged_git::GhClient::new();
     let ready = safe_effect(
         ctx,
         "epic_child_ready",
@@ -3854,7 +3855,7 @@ async fn merge_child(
         Some(&child.id),
         Some(pr_number as i64),
     );
-    let gh = forged_git::GhClient::new();
+    let gh = forged_git::GhClient::new().with_host_opt(remote.gh_host());
     let merged = safe_effect(
         ctx,
         "epic_child_merge",
@@ -3911,9 +3912,11 @@ async fn merge_child(
 }
 
 async fn final_pr(ctx: &Ctx, view: &EpicView) -> Result<Step, Failure> {
-    let slug = repo_slug(Path::new(&view.config.repo))
+    let remote = github_remote(Path::new(&view.config.repo))
         .await
-        .map_err(|error| Failure::internal(error.to_string()))?;
+        .map_err(Failure::from)?;
+    let gh = forged_git::GhClient::new().with_host_opt(remote.gh_host());
+    let slug = remote.slug;
     let key = derive_key("epic_pr", Some(&view.config.epic_id), None, None);
     let config = view.config.clone();
     let assurance_enabled = config.assurance_package.is_some();
@@ -3931,7 +3934,6 @@ async fn final_pr(ctx: &Ctx, view: &EpicView) -> Result<Step, Failure> {
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let gh = forged_git::GhClient::new();
     let value = safe_effect(
         ctx,
         "epic_pr",
@@ -4135,13 +4137,13 @@ async fn start_assurance(ctx: &Ctx, view: &EpicView, pr: &Value) -> Result<Step,
         let integration_sha =
             forged_git::remote_branch_sha(Path::new(&config.repo), &config.integration_branch)
                 .await?;
-        let slug = repo_slug(Path::new(&config.repo))
+        let remote = github_remote(Path::new(&config.repo))
             .await
-            .map_err(|error| Failure::internal(error.to_string()))?;
+            .map_err(Failure::from)?;
         let number = final_pr_number(pr)?;
-        let gh = forged_git::GhClient::new();
-        let fresh_pr = gh.pr_view(&slug, number).await?;
-        let fresh_pr_sha = gh.pr_head_sha(&slug, number).await?;
+        let gh = forged_git::GhClient::new().with_host_opt(remote.gh_host());
+        let fresh_pr = gh.pr_view(&remote.slug, number).await?;
+        let fresh_pr_sha = gh.pr_head_sha(&remote.slug, number).await?;
         Ok((integration_sha, fresh_pr, fresh_pr_sha))
     }
     .await;
@@ -4337,12 +4339,13 @@ async fn complete_assurance(
             "Epic {} has not completed integrated assurance.\n\n## Assurance status\n\nFinal binding verification is pending. Do not treat this pull request as assured.\n\nExpected candidate SHA: `{expected_sha}`.",
             config.epic_id,
         );
+        let remote = github_remote(Path::new(&config.repo))
+            .await
+            .map_err(Failure::from)?;
         if replaying_finalization {
-            let slug = repo_slug(Path::new(&config.repo))
-                .await
-                .map_err(|error| Failure::internal(error.to_string()))?;
             forged_git::GhClient::new()
-                .update_pr_body(&slug, number, &pending_body)
+                .with_host_opt(remote.gh_host())
+                .update_pr_body(&remote.slug, number, &pending_body)
                 .await?;
         }
         Ok((
@@ -4352,10 +4355,12 @@ async fn complete_assurance(
             key,
             pending_body,
             replaying_finalization,
+            remote,
         ))
     }
     .await;
-    let (gate, gate_sha, number, key, pending_body, replaying_finalization) = match prepared {
+    let (gate, gate_sha, number, key, pending_body, replaying_finalization, remote) = match prepared
+    {
         Ok(prepared) => prepared,
         Err(error) => {
             let stopped = require_input_with_evidence(
@@ -4381,10 +4386,8 @@ async fn complete_assurance(
         let remote_sha =
             forged_git::remote_branch_sha(Path::new(&config.repo), &config.integration_branch)
                 .await?;
-        let slug = repo_slug(Path::new(&config.repo))
-            .await
-            .map_err(|error| Failure::internal(error.to_string()))?;
-        let gh = forged_git::GhClient::new();
+        let slug = remote.slug.clone();
+        let gh = forged_git::GhClient::new().with_host_opt(remote.gh_host());
         let pr = gh.pr_view(&slug, number).await?;
         let pr_sha = gh.pr_head_sha(&slug, number).await?;
         Ok(AssuranceFinalInspection {
@@ -4477,6 +4480,7 @@ async fn complete_assurance(
                     .map_err(|error| Failure::internal(error.to_string()))?,
             );
             forged_git::GhClient::new()
+                .with_host_opt(remote.gh_host())
                 .update_pr_body(&slug, number, &drift_body)
                 .await?;
         }
@@ -4557,6 +4561,7 @@ async fn complete_assurance(
     let repo_for_effect = config.repo.clone();
     let branch_for_effect = config.integration_branch.clone();
     let base_for_effect = config.base_ref.clone();
+    let host_for_effect = remote.gh_host().map(str::to_owned);
     let expected_sha = local_sha.clone();
     let worktree_for_effect = ctx.config.worktree(&state.run_id);
     let finalized = safe_effect(
@@ -4566,7 +4571,7 @@ async fn complete_assurance(
         &config.epic_id,
         json!({"pr": number, "headSha": local_sha, "bodySha256": bytes_digest(body.as_bytes())}),
         move |operation| async move {
-            let gh = forged_git::GhClient::new();
+            let gh = forged_git::GhClient::new().with_host_opt(host_for_effect);
             // A prior process may have crashed after publishing approval but
             // before sealing ASSURANCE_COMPLETED. Clear that claim before
             // every replayable binding check so drift can never strand stale
