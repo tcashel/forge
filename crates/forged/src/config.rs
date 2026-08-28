@@ -545,26 +545,35 @@ impl ForgedConfig {
         })
     }
 
-    /// Re-resolve this snapshot's config file, refreshing every
-    /// file-derived field. The identity anchors — `db_path`, `runs_root`,
-    /// `beads_dir` — are preserved from this snapshot: a live config edit
-    /// may retune rosters, profiles, pricing, or admission, but it must
-    /// never re-point durable state out from under an open surface.
+    /// Re-resolve this snapshot's config, refreshing every file-derived
+    /// field. The file's IDENTITY is re-selected exactly as a fresh process
+    /// selects it (`FORGED_CONFIG`, then yaml-before-json under this home),
+    /// so a `config.yaml` created — or removed over a json fallback — while
+    /// a long-lived surface runs is honored, not pinned past. The identity
+    /// anchors — `db_path`, `runs_root`, `beads_dir` — are preserved from
+    /// this snapshot: a live config edit may retune rosters, profiles,
+    /// pricing, or admission, but it must never re-point durable state out
+    /// from under an open surface.
     pub fn reload(&self) -> Result<ForgedConfig, String> {
-        let mut fresh = Self::load_at(self.anvil_home.clone(), self.config_path.clone())?;
+        let selected = config_path(&self.anvil_home);
+        let mut fresh = Self::load_at(self.anvil_home.clone(), selected)?;
         fresh.db_path = self.db_path.clone();
         fresh.runs_root = self.runs_root.clone();
         fresh.beads_dir = self.beads_dir.clone();
         Ok(fresh)
     }
 
-    /// The reload gate for long-lived surfaces: `Ok(None)` when the config
-    /// file still matches this snapshot's fingerprint, `Ok(Some(fresh))`
-    /// when it changed (including appearing or disappearing). A snapshot
-    /// that never read a file and still finds none is unchanged by
-    /// definition — a hand-built config with no backing file never
-    /// reloads over itself.
+    /// The reload gate for long-lived surfaces: `Ok(None)` when the
+    /// selected config file is still this snapshot's file with matching
+    /// fingerprint, `Ok(Some(fresh))` when the content changed (including
+    /// appearing or disappearing) or the SELECTION moved to a different
+    /// path. A snapshot that never read a file and still selects none is
+    /// unchanged by definition — a hand-built config with no backing file
+    /// never reloads over itself.
     pub fn refreshed(&self) -> Result<Option<ForgedConfig>, String> {
+        if config_path(&self.anvil_home) != self.config_path {
+            return self.reload().map(Some);
+        }
         match std::fs::read(&self.config_path) {
             Ok(bytes) => {
                 if self.config_sha256.as_deref() == Some(content_sha256(&bytes).as_str()) {
@@ -2016,6 +2025,36 @@ mod tests {
             .expect("reload");
         assert_eq!(fresh.default_profile, "high");
         assert_eq!(fresh.db_path, snapshot.db_path);
+    }
+
+    #[test]
+    fn refreshed_honors_a_selection_change_between_yaml_and_json() {
+        let dir = tempfile::tempdir().expect("scratch scope");
+        std::fs::write(
+            dir.path().join("config.json"),
+            "{\"default_profile\": \"jsonprofile\"}",
+        )
+        .expect("write json config");
+        let selected = config_path(dir.path());
+        let snapshot = ForgedConfig::load_at(dir.path().to_path_buf(), selected).expect("load");
+        assert_eq!(snapshot.default_profile, "jsonprofile");
+        assert!(snapshot.refreshed().expect("unchanged gate").is_none());
+        // A yaml appearing outranks the pinned json, exactly as a fresh
+        // process would select it.
+        let yaml = dir.path().join("config.yaml");
+        std::fs::write(&yaml, "default_profile: yamlprofile\n").expect("write yaml config");
+        let fresh = snapshot
+            .refreshed()
+            .expect("selection gate")
+            .expect("reload");
+        assert_eq!(fresh.default_profile, "yamlprofile");
+        assert!(fresh.config_path.ends_with("config.yaml"));
+        assert_eq!(fresh.db_path, snapshot.db_path);
+        // Removing the yaml falls back to the surviving json, not defaults.
+        std::fs::remove_file(&yaml).expect("remove yaml config");
+        let fallback = fresh.refreshed().expect("fallback gate").expect("reload");
+        assert_eq!(fallback.default_profile, "jsonprofile");
+        assert!(fallback.config_path.ends_with("config.json"));
     }
 
     #[test]
