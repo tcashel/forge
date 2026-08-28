@@ -229,7 +229,17 @@ fn landed_predecessor_leaves_successor_ownership_unchanged_and_visible() {
     );
     ledger.close().expect("close ledger");
 
-    let calls_before_replay = env.bd_calls().len();
+    let writes_before_replay = {
+        let ledger = env.ledger();
+        let count = ledger
+            .list_events(None, 0, 65_536)
+            .expect("events")
+            .into_iter()
+            .filter(|event| event.kind == "work.updated")
+            .count();
+        ledger.close().expect("close");
+        count
+    };
     let (code, replay) = env.forged(&[
         "run",
         "stop",
@@ -246,7 +256,21 @@ fn landed_predecessor_leaves_successor_ownership_unchanged_and_visible() {
     ]);
     assert_eq!(code, 0, "{replay}");
     assert_eq!(replay["reused"], json!(true), "{replay}");
-    assert_eq!(env.bd_calls().len(), calls_before_replay);
+    assert_eq!(
+        {
+            let ledger = env.ledger();
+            let count = ledger
+                .list_events(None, 0, 65_536)
+                .expect("events")
+                .into_iter()
+                .filter(|event| event.kind == "work.updated")
+                .count();
+            ledger.close().expect("close");
+            count
+        },
+        writes_before_replay,
+        "replay fires no work write"
+    );
     assert_eq!(env.assignee(&bead).as_deref(), Some(successor));
 }
 

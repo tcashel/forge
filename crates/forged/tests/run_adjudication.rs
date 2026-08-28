@@ -289,7 +289,17 @@ fn replay_reuses_the_stored_response_and_a_different_assertion_conflicts() {
     assert_eq!(code, 0, "{first}");
     assert_eq!(first["ok"], json!(true), "{first}");
 
-    let before = env.bd_calls().len();
+    let writes_before_replay = {
+        let ledger = env.ledger();
+        let count = ledger
+            .list_events(None, 0, 65_536)
+            .expect("events")
+            .into_iter()
+            .filter(|event| event.kind == "work.updated")
+            .count();
+        ledger.close().expect("close");
+        count
+    };
     let (code, replay) = env.forged(&adjudicate_args(run, "cancelled", "legacy run"));
     assert_eq!(code, 0, "{replay}");
     assert_eq!(replay["reused"], json!(true), "{replay}");
@@ -297,7 +307,21 @@ fn replay_reuses_the_stored_response_and_a_different_assertion_conflicts() {
         replay["result"], first["result"],
         "stored response, verbatim"
     );
-    assert_eq!(env.bd_calls().len(), before, "replay fires no Beads write");
+    assert_eq!(
+        {
+            let ledger = env.ledger();
+            let count = ledger
+                .list_events(None, 0, 65_536)
+                .expect("events")
+                .into_iter()
+                .filter(|event| event.kind == "work.updated")
+                .count();
+            ledger.close().expect("close");
+            count
+        },
+        writes_before_replay,
+        "replay fires no work write"
+    );
 
     // Same derived key, different rationale: the stored request wins.
     let (_, conflict) = env.forged(&adjudicate_args(run, "cancelled", "a different rationale"));

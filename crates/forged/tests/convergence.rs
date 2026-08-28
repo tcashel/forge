@@ -22,6 +22,8 @@ use nix::errno::Errno;
 use nix::sys::signal::{kill, killpg, Signal};
 #[cfg(feature = "failpoints")]
 use nix::unistd::Pid;
+// The malformed-facts injection freezes the controller without the
+// failpoints feature; it uses fully qualified nix paths.
 use serde_json::{json, Value};
 use support::TestEnv;
 
@@ -408,7 +410,6 @@ fn show_hydrated_revision_admits_controller_and_packet() {
     let env = TestEnv::new("adm-show");
     let run = "adm-show";
     start_run(&env, run);
-    let calls_before = env.bd_calls().len();
     env.set_scenario("implement", "hang", 1);
 
     let (code, submitted) = env.forged(&[
@@ -444,40 +445,26 @@ fn show_hydrated_revision_admits_controller_and_packet() {
     }));
     ledger.close().expect("close ledger");
 
-    let calls = &env.bd_calls()[calls_before..];
-    assert!(
-        calls
-            .iter()
-            .filter(|call| call.starts_with(&format!("show {run} ")))
-            .all(|call| {
-                call == &format!("show {run} --json")
-                    || call == &format!("show {run} --brief-deps --json")
-            }),
-        "every exact read is a bounded one-id show: {calls:?}"
-    );
-    assert!(
-        !calls.iter().any(|call| call.starts_with("list --id ")),
-        "controller and packet admission must not use revision-less brief list: {calls:?}"
-    );
+    // The bounded exact-read contract died with the transport: admission
+    // reads are in-process snapshots carrying the revision by construction.
 
     stop_run(&env, run);
     no_live_reservations(&env);
 }
 
 #[test]
-fn custom_status_defers_only_that_row_in_a_mixed_admission_batch() {
+fn non_runnable_status_defers_only_that_row_in_a_mixed_admission_batch() {
     let env = TestEnv::new("adm-custom-status");
-    let custom = "adm-awaiting-review";
+    let custom = "adm-deferred";
     let open = "adm-open";
     start_run(&env, custom);
     start_run(&env, open);
-    env.set_bead_field(custom, "status", "awaiting_review");
+    env.set_bead_field(custom, "status", "deferred");
     env.set_bead_field(custom, "priority", "0");
     env.set_bead_field(open, "priority", "1");
     env.authorize_run(custom);
     env.authorize_run(open);
     env.set_scenario("implement", "hang", 1);
-    let calls_before = env.bd_calls().len();
 
     let (code, tick) = env.forged(&["supervise", "--once"]);
     assert_eq!(code, 0, "mixed admission tick: {tick}");
@@ -519,13 +506,8 @@ fn custom_status_defers_only_that_row_in_a_mixed_admission_batch() {
             .all(|start| start.starts_with(&format!("{open}/"))),
         "the custom-status row is retained but never runnable: {starts:?}"
     );
-    let calls = &env.bd_calls()[calls_before..];
-    assert!(
-        calls
-            .iter()
-            .any(|call| { call == &format!("show {custom} {open} --brief-deps --json") }),
-        "the mixed batch must use one native exact hydrate: {calls:?}"
-    );
+    // Batch identity above (`custom_decision.batch_id == open_decision.
+    // batch_id`) is the real proof of one exact hydration batch.
 
     stop_run(&env, open);
     stop_run(&env, custom);
@@ -533,14 +515,15 @@ fn custom_status_defers_only_that_row_in_a_mixed_admission_batch() {
 }
 
 #[test]
-fn missing_packet_revision_defers_without_reservation_or_provider_effect() {
+fn malformed_packet_facts_defer_without_reservation_or_provider_effect() {
     let env = TestEnv::new("adm-null");
     let run = "adm-null";
     start_run(&env, run);
-    // Controller admission consumes the armed full row. Every later show is
-    // revision-less, including the packet's exact admission read.
-    env.null_revision_after_next_show(run);
 
+    // Controller admission consumes the healthy row; the packet's own exact
+    // admission read then finds it malformed (a NULL priority is the
+    // BeadMalformed arm). The controller is frozen across the injection so
+    // the two admissions cannot race.
     let (code, submitted) = env.forged(&[
         "run",
         "submit",
@@ -552,8 +535,23 @@ fn missing_packet_revision_defers_without_reservation_or_provider_effect() {
     assert_eq!(code, 0, "submit: {submitted}");
     assert!(
         submitted["result"]["controller"].is_object(),
-        "the initial full row admits the controller: {submitted}"
+        "the healthy full row admits the controller: {submitted}"
     );
+    let frozen = submitted["result"]["controller"]["pid"]
+        .as_i64()
+        .and_then(|pid| i32::try_from(pid).ok())
+        .expect("controller pid");
+    nix::sys::signal::killpg(
+        nix::unistd::Pid::from_raw(frozen),
+        nix::sys::signal::Signal::SIGSTOP,
+    )
+    .expect("freeze the controller before injecting malformed facts");
+    env.set_bead_field(run, "priority", "");
+    nix::sys::signal::killpg(
+        nix::unistd::Pid::from_raw(frozen),
+        nix::sys::signal::Signal::SIGCONT,
+    )
+    .expect("resume the controller");
     wait_until("packet BeadMalformed decision", || {
         let ledger = env.ledger();
         let found = ledger
@@ -836,6 +834,7 @@ fn capacity_deferral_parks_while_a_sibling_seat_runs() {
     let env = TestEnv::new("adm-park-fan");
     set_admission(&env, 1, 1, 3);
     let run = "adm-park-fan";
+    env.seed_frontier(run);
     assert_eq!(env.forged(&["init"]).0, 0);
     let repo = env.repos.repo.to_string_lossy().into_owned();
     let spec = env.spec.to_string_lossy().into_owned();
@@ -1109,6 +1108,13 @@ fn convergence_authorization_admission_and_fanout() {
     fanout.set_bead_field("conv-child-a", "priority", "0");
     fanout.set_bead_field("conv-child-b", "priority", "1");
     fanout.set_bead_field("conv-child-c", "priority", "9");
+    // Readiness is a store query now: the dependent child is withheld by a
+    // real open blocker, not the retired `ready: false` flag.
+    fanout.set_bead_field(
+        "conv-child-dependent",
+        "dependencies",
+        r#"[{"id":"conv-fanout-blocker","dependency_type":"blocks","status":"open"}]"#,
+    );
     park_direct_epic(&fanout, "conv-fanout");
     fanout.set_scenario("implement", "hang", 3);
     let driver = fanout
@@ -1934,6 +1940,7 @@ fn convergence_review_and_attention_are_bounded() {
     reviews.set_scenario("reviewclaude", "request-changes", 3);
     let repo = reviews.repos.repo.to_string_lossy().into_owned();
     let spec = reviews.spec.to_string_lossy().into_owned();
+    reviews.seed_frontier("conv-review-budget");
     let (code, started) = reviews.forged(&[
         "run",
         "start",

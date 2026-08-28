@@ -81,15 +81,26 @@ fn event_count(env: &TestEnv, run: &str, kind: &str) -> usize {
     count
 }
 
-fn mutation_calls(env: &TestEnv, bead: &str) -> Vec<String> {
-    env.bd_calls()
+/// Every `work.updated` payload for one item, oldest first (coordination
+/// events carry no run id, so the scan is over the whole stream).
+fn work_updates(env: &TestEnv, bead: &str) -> Vec<Value> {
+    let ledger = env.ledger();
+    let events = ledger.list_events(None, 0, 65_536).expect("events");
+    ledger.close().expect("close");
+    events
         .into_iter()
-        .filter(|call| {
-            call.starts_with(&format!("update {bead} "))
-                || call.starts_with(&format!("close {bead} "))
-                || call.starts_with(&format!("comment {bead} "))
-        })
+        .filter(|event| event.kind == "work.updated")
+        .map(|event| serde_json::from_str::<Value>(&event.payload_json).expect("payload"))
+        .filter(|payload| payload["workId"] == json!(bead))
         .collect()
+}
+
+/// Closes recorded for one item (status moved to closed).
+fn close_writes(env: &TestEnv, bead: &str) -> usize {
+    work_updates(env, bead)
+        .into_iter()
+        .filter(|update| update["status"]["to"] == json!("closed"))
+        .count()
 }
 
 fn used(env: &TestEnv, run: &str) -> Option<u32> {
@@ -146,7 +157,7 @@ fn a_crash_between_the_convergence_read_and_the_append_charges_nothing() {
         0,
         "the crash lost the append: the run still projects pending"
     );
-    assert!(mutation_calls(&env, &bead).is_empty());
+    assert!(work_updates(&env, &bead).is_empty());
     assert_eq!(used(&env, run), None, "a read-only pass charges nothing");
 
     let report = supervise_once(&env);
@@ -156,8 +167,8 @@ fn a_crash_between_the_convergence_read_and_the_append_charges_nothing() {
     );
     assert_eq!(event_count(&env, run, "run.bead-settlement.succeeded"), 1);
     assert!(
-        mutation_calls(&env, &bead).is_empty(),
-        "recovery converges with no bd mutation or comment"
+        work_updates(&env, &bead).is_empty(),
+        "recovery converges with no work mutation or note"
     );
 }
 
@@ -246,40 +257,30 @@ fn a_reopen_between_the_charge_and_the_release_fails_the_attempt_not_the_promise
     rewind_wakes(&env);
     supervise_once(&env);
     assert_eq!(event_count(&env, run, "run.bead-settlement.succeeded"), 1);
-    let closes: Vec<String> = mutation_calls(&env, &bead)
-        .into_iter()
-        .filter(|call| call.contains("--status closed"))
-        .collect();
     assert_eq!(
-        closes.len(),
+        close_writes(&env, &bead),
         1,
-        "the recovery attempt performs the one real close: {closes:?}"
+        "the recovery attempt performs the one real close"
     );
     assert_eq!(env.assignee(&bead), None);
 }
 
-fn show_calls(env: &TestEnv, bead: &str) -> usize {
-    env.bd_calls()
-        .iter()
-        .filter(|call| call.starts_with("show ") && call.contains(bead))
-        .count()
-}
-
+/// Settlement notes recorded for one item (the bd comment's replacement).
 fn comment_calls(env: &TestEnv, bead: &str) -> usize {
-    env.bd_calls()
-        .iter()
-        .filter(|call| call.starts_with(&format!("comment {bead} ")))
+    let ledger = env.ledger();
+    let events = ledger.list_events(None, 0, 65_536).expect("events");
+    ledger.close().expect("close");
+    events
+        .into_iter()
+        .filter(|event| event.kind == "work.settled.note" && event.payload_json.contains(bead))
         .count()
 }
 
+/// Guarded custody takes recorded for one item.
 fn custody_calls(env: &TestEnv, bead: &str) -> usize {
-    env.bd_calls()
-        .iter()
-        .filter(|call| {
-            call.starts_with(&format!("update {bead} "))
-                && call.contains("--status in_progress")
-                && call.contains("--if-assignee")
-        })
+    work_updates(env, bead)
+        .into_iter()
+        .filter(|update| update["verb"] == json!("assign-unassigned"))
         .count()
 }
 
@@ -415,11 +416,11 @@ fn every_failure_after_a_successful_claim_releases_the_claim_token() {
         .expect("an action for the foreign-held run");
     assert_eq!(refused["action"], json!("retry-failed"), "{report}");
     assert_eq!(event_count(&env, run_a, "run.bead-settlement.succeeded"), 1);
-    let closes = mutation_calls(&env, &bead_a)
-        .into_iter()
-        .filter(|call| call.contains("--status closed"))
-        .count();
-    assert_eq!(closes, 1, "recovery never repeats the delivered close");
+    assert_eq!(
+        close_writes(&env, &bead_a),
+        1,
+        "recovery never repeats the delivered close"
+    );
 }
 
 /// Amendment 4: the settlement pass never delays due-work claiming, on any
@@ -482,9 +483,9 @@ fn a_wedged_settlement_pass_never_delays_due_work_claiming_or_doubles() {
         },
     );
     assert_eq!(
-        show_calls(&env, &bead),
-        1,
-        "no second settlement pass spawns while one runs"
+        event_count(&env, run, "run.bead-settlement.succeeded"),
+        0,
+        "no second settlement pass settles while one is wedged open"
     );
 
     // Release the wedge: the pass completes and converges the closed bead.
@@ -493,7 +494,7 @@ fn a_wedged_settlement_pass_never_delays_due_work_claiming_or_doubles() {
         event_count(&env, run, "run.bead-settlement.succeeded") == 1
     });
     assert!(
-        mutation_calls(&env, &bead).is_empty(),
+        work_updates(&env, &bead).is_empty(),
         "the wedged-then-released pass converged read-only"
     );
     supervisor.kill().expect("stop supervisor");
@@ -513,7 +514,7 @@ fn a_crash_after_the_charged_mutation_converges_without_repeating_it() {
 
     crash_supervise_at(&env, "bead-settlement.mutate.after");
     assert_eq!(
-        mutation_calls(&env, &bead).len(),
+        work_updates(&env, &bead).len(),
         1,
         "the guarded release fired before the crash"
     );
@@ -537,7 +538,7 @@ fn a_crash_after_the_charged_mutation_converges_without_repeating_it() {
     );
     assert_eq!(event_count(&env, run, "run.bead-settlement.succeeded"), 1);
     assert_eq!(
-        mutation_calls(&env, &bead).len(),
+        work_updates(&env, &bead).len(),
         1,
         "recovery never repeats the bd mutation"
     );

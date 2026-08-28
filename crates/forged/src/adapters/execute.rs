@@ -2414,10 +2414,10 @@ async fn run_attempt(
                         .await
                     };
                     if renewed.is_err() || lease_renewed.is_err() {
-                        // Our attempt was revoked out from under us: stop the
-                        // provider and report. Its tokens were still spent;
-                        // freeze this attempt's private capture before any
-                        // successor is allowed to proceed.
+                        // Our claim or our lease was taken out from under us:
+                        // stop the provider and report. Its tokens were still
+                        // spent; freeze this attempt's private capture before
+                        // any successor is allowed to proceed.
                         let _ = host.kill_confirmed(&session).await;
                         crate::core::artifacts::finalize_provider_files(&run_root, &dirs)?;
                         let out = crate::core::artifacts::read_output_text(&run_root, &dirs)?;
@@ -2436,10 +2436,31 @@ async fn run_attempt(
                             &packet,
                             attempt_id,
                             "revoked",
-                            &json!({"note": "attempt claim was revoked while provider was running"}),
+                            &json!({"note": "attempt claim or work lease was lost while provider was running"}),
                             &session_evidence,
                         )
                         .await?;
+                        if renewed.is_ok() {
+                            // Lease-loss alone: the ATTEMPT is still live in
+                            // the ledger (no revoker touched it), so it must
+                            // settle durably here or the packet strands with
+                            // a live attempt nothing will ever finish. A
+                            // refused renewal is terminal for this attempt,
+                            // never transport.
+                            let packet_for_fail = packet_id.clone();
+                            let token = claim_token.clone();
+                            let note = format!(
+                                "work lease lost: {}",
+                                lease_renewed
+                                    .err()
+                                    .map(|failure| failure.message)
+                                    .unwrap_or_default()
+                            );
+                            on_ledger(&ctx.ledger, move |l| {
+                                l.fail_packet(&packet_for_fail, &token, &note)
+                            })
+                            .await?;
+                        }
                         return Ok(PacketOutcome::Revoked);
                     }
                 }
@@ -3112,7 +3133,6 @@ mod settle_tests {
     //! Herdr refusal must never rewrite the result that already settled.
 
     use std::collections::BTreeMap;
-    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;

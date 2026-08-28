@@ -65,9 +65,12 @@ fn process_history_is_bounded_filterable_and_independent_of_live_plan() {
     ]);
     assert_eq!(queued["ok"], json!(true), "queue after drive: {queued}");
 
-    let calls_before = env.bd_calls().len();
-    env.set_bd_list_unreachable(true);
-    env.set_bd_show_unreachable(true);
+    let events_before = {
+        let ledger = env.ledger();
+        let count = ledger.list_events(None, 0, 65_536).expect("events").len();
+        ledger.close().expect("close");
+        count
+    };
     let (code, history) = env.forged(&[
         "session",
         "inventory",
@@ -83,9 +86,14 @@ fn process_history_is_bounded_filterable_and_independent_of_live_plan() {
         json!("forged.provider-session-inventory/1")
     );
     assert_eq!(
-        env.bd_calls().len(),
-        calls_before,
-        "inventory performs no Beads read"
+        {
+            let ledger = env.ledger();
+            let count = ledger.list_events(None, 0, 65_536).expect("events").len();
+            ledger.close().expect("close");
+            count
+        },
+        events_before,
+        "the inventory is a pure projection: no work event is appended"
     );
     assert!(!history
         .to_string()
