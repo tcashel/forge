@@ -1432,17 +1432,22 @@ fn recoverable_terminal_restarts_with_evidence_and_backoff() {
         .as_i64()
         .and_then(|pid| i32::try_from(pid).ok())
         .expect("third controller pid");
-    let (code, cleanup) = env.forged(&[
-        "run",
-        "stop",
-        "--run",
-        "run-backoff",
-        "--outcome",
-        "cancelled",
-        "--reason",
-        "backoff fixture cleanup",
-    ]);
-    assert_eq!(code, 0, "stop backoff fixture: {cleanup}");
+    // Kill confirmation DEFERS while the fresh generation's start time is
+    // not yet recorded, so the cleanup stop retries until the identity is
+    // verifiable instead of racing it.
+    wait_until("backoff fixture stop lands", || {
+        env.forged(&[
+            "run",
+            "stop",
+            "--run",
+            "run-backoff",
+            "--outcome",
+            "cancelled",
+            "--reason",
+            "backoff fixture cleanup",
+        ])
+        .0 == 0
+    });
     wait_until("third controller group death", || {
         !process_group_alive(third_pid)
     });
