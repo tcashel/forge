@@ -70,6 +70,9 @@
 //! `controller.orphaned-submit.probe.after` sits after the recorded Herdr
 //! socket returned exact `pane_not_found` and before any cleanup request is
 //! durable; a crash there must leave the row fenced for the next tick.
+//! `controller.bootstrap.refuse` injects a deterministic controller-local
+//! refusal after process identity publication but before the submitter can
+//! persist controller.json, pinning the pre-identity terminal-death seam.
 //!
 //! `fail`-mode sites are separate, and exist for the seams whose OWN failure
 //! is the contract and which no external condition can provoke:
