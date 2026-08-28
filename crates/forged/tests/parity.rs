@@ -832,7 +832,10 @@ fn all_forty_six_tools_match_their_cli_counterparts() {
     );
     assert_eq!(normalized(cli), normalized(tool), "epic_preflight parity");
 
-    // Epic lifecycle and control refusals have identical envelopes.
+    // Epic lifecycle and control refusals have identical envelopes. The
+    // start carries an explicit key: its DEFAULT key folds in the released
+    // count, so two sequential released failures legitimately differ there
+    // (the released-epoch regression test owns that contract).
     let cli = env
         .forged(&[
             "epic",
@@ -843,12 +846,15 @@ fn all_forty_six_tools_match_their_cli_counterparts() {
             "relative",
             "--spec",
             "relative",
+            "--idempotency-key",
+            "parity-epic-start",
         ])
         .1;
     let tool = mcp.call_tool(
         "epic_start",
         json!({
             "schemaVersion": 1,
+            "idempotencyKey": "parity-epic-start",
             "runId": "absent-epic",
             "params": {
                 "epic": "absent-epic", "repo": "relative", "spec": "relative",

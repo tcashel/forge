@@ -1373,7 +1373,16 @@ pub async fn epic_start(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespo
             )
         }
     };
-    default_key(req, derive_key("epic_start", Some(&epic), None, None));
+    // The key's sequence segment is the released-attempt epoch: a corrected
+    // start after a released failure must never reuse a key whose request
+    // event already carries a different payload.
+    let epoch = match super::released_retry_seq(ctx, &epic, "epic_start").await {
+        Ok(epoch) => epoch,
+        Err(error) => {
+            return err_response(&derive_key("epic_start", Some(&epic), None, None), &error)
+        }
+    };
+    default_key(req, derive_key("epic_start", Some(&epic), None, epoch));
     if req.run_id.is_none() {
         req.run_id = Some(epic.clone());
     }

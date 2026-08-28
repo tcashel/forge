@@ -327,9 +327,21 @@ pub(crate) async fn run_start_with_definition(
             )
         }
     };
+    // The key's sequence segment is the released-attempt epoch: a corrected
+    // start after a released failure must never reuse a key whose request
+    // event already carries a different payload.
+    let epoch = match super::released_retry_seq(ctx, run_id.as_str(), "run_start").await {
+        Ok(epoch) => epoch,
+        Err(error) => {
+            return err_response(
+                &derive_key("run_start", Some(run_id.as_str()), None, None),
+                &error,
+            )
+        }
+    };
     default_key(
         req,
-        derive_key("run_start", Some(run_id.as_str()), None, None),
+        derive_key("run_start", Some(run_id.as_str()), None, epoch),
     );
     if req.run_id.is_none() {
         req.run_id = Some(run_id.as_str().to_owned());

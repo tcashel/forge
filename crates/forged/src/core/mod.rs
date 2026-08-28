@@ -762,6 +762,48 @@ async fn release_if(ctx: &Ctx, on_error: OnEffectError, operation_id: &str) {
     }
 }
 
+/// The released-retry sequence segment for a subject-scoped default key. A
+/// release frees the operations row while its `proto.operation.request`
+/// event survives, so a default key that never varies would let a corrected
+/// retry append a second, differing request payload under the released key —
+/// the exact ambiguity the pre-record probe exists to refuse. Every retry
+/// after a DERIVED-key release advances to that release count, so a derived
+/// key carries at most one payload across releases, not only across live
+/// rows. Only the derived series counts: an explicitly keyed attempt that
+/// releases occupies its own key, and letting it advance this epoch would
+/// strand a terminal derived-key success behind a key that no keyless
+/// replay derives again. `None` is the historical bare `-` segment, keeping
+/// first-start keys byte-identical to every ledger written before this
+/// fence.
+pub(crate) async fn released_retry_seq(
+    ctx: &Ctx,
+    subject: &str,
+    name: &str,
+) -> Result<Option<i64>, Failure> {
+    let owned_subject = subject.to_owned();
+    let rows = on_ledger(&ctx.ledger, move |ledger| {
+        ledger.list_events(Some(&owned_subject), 0, 65_536)
+    })
+    .await?;
+    let series_prefix = format!("op:{name}:{subject}:-:");
+    let released = rows
+        .iter()
+        .filter(|row| row.kind == "operation.released")
+        .filter(|row| {
+            serde_json::from_str::<Value>(&row.payload_json)
+                .ok()
+                .is_some_and(|payload| {
+                    payload.get("name").and_then(Value::as_str) == Some(name)
+                        && payload
+                            .get("idempotencyKey")
+                            .and_then(Value::as_str)
+                            .is_some_and(|key| key.starts_with(&series_prefix))
+                })
+        })
+        .count() as i64;
+    Ok((released > 0).then_some(released))
+}
+
 /// Dispatch one named command to its core function. Both surfaces call
 /// exactly this, so their envelopes are identical by construction.
 pub async fn dispatch(ctx: &Ctx, name: &str, mut req: OperationRequest) -> OperationResponse {

@@ -5325,3 +5325,133 @@ fn execution_health_and_deferrals_read_from_every_surface() {
         let _ = nix::sys::signal::kill(group, nix::sys::signal::Signal::SIGKILL);
     }
 }
+
+/// A released start attempt frees its operations row while the recorded
+/// `proto.operation.request` event survives. The corrected retry must take
+/// the next released-epoch key instead of appending a second, differing
+/// payload under the released one.
+#[test]
+fn a_released_epic_start_never_reuses_its_request_key() {
+    let env = TestEnv::new("forged-epic-start-release-epoch");
+    env.seed_epic("epic-epoch", &[("child-one", &env.spec, true)]);
+    assert_eq!(env.forged(&["init"]).0, 0);
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let spec = env.spec.to_string_lossy().into_owned();
+
+    // An unknown profile fails INSIDE the fenced effect: the request event
+    // is durable and the operation releases.
+    let (code, failed) = env.forged(&[
+        "epic",
+        "start",
+        "--epic",
+        "epic-epoch",
+        "--repo",
+        &repo,
+        "--spec",
+        &spec,
+        "--profile",
+        "nonexistent-profile",
+    ]);
+    assert_ne!(code, 0, "{failed}");
+
+    let (code, started) = env.forged(&[
+        "epic",
+        "start",
+        "--epic",
+        "epic-epoch",
+        "--repo",
+        &repo,
+        "--spec",
+        &spec,
+    ]);
+    assert_eq!(code, 0, "corrected start: {started}");
+    assert_eq!(started["result"]["schema"], json!("forged.epic/1"));
+
+    let ledger = env.ledger();
+    let events = ledger
+        .list_events(Some("epic-epoch"), 0, 65_536)
+        .expect("epic events");
+    let request_keys: Vec<String> = events
+        .iter()
+        .filter(|row| row.kind == "proto.operation.request")
+        .filter_map(|row| serde_json::from_str::<serde_json::Value>(&row.payload_json).ok())
+        .filter(|payload| payload["name"] == json!("epic_start"))
+        .filter_map(|payload| payload["idempotencyKey"].as_str().map(str::to_owned))
+        .collect();
+    let released = events
+        .iter()
+        .filter(|row| row.kind == "operation.released")
+        .count();
+    ledger.close().expect("close");
+    assert_eq!(released, 1, "{request_keys:?}");
+    assert_eq!(request_keys.len(), 2, "{request_keys:?}");
+    assert_ne!(request_keys[0], request_keys[1], "{request_keys:?}");
+    assert!(
+        request_keys[1].ends_with(":1"),
+        "the corrected start takes the next released epoch: {request_keys:?}"
+    );
+}
+
+/// An explicitly keyed attempt that releases occupies its own key. Only the
+/// derived series advances the default start epoch — otherwise one explicit
+/// release would strand every future keyless replay past its stored row.
+#[test]
+fn explicit_key_releases_never_advance_the_default_start_epoch() {
+    let env = TestEnv::new("forged-epic-start-explicit-epoch");
+    env.seed_epic("epic-noise", &[("child-one", &env.spec, true)]);
+    assert_eq!(env.forged(&["init"]).0, 0);
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let spec = env.spec.to_string_lossy().into_owned();
+
+    let ledger = env.ledger();
+    ledger
+        .append_event(
+            Some("epic-noise"),
+            "operation.released",
+            json!({
+                "operationId": "operator-custom-key",
+                "name": "epic_start",
+                "idempotencyKey": "operator-custom-key",
+            }),
+        )
+        .expect("seed explicit-key release");
+    ledger.close().expect("close");
+
+    // The keyless failing start still takes the bare historical key.
+    let (code, failed) = env.forged(&[
+        "epic",
+        "start",
+        "--epic",
+        "epic-noise",
+        "--repo",
+        &repo,
+        "--spec",
+        &spec,
+        "--profile",
+        "nonexistent-profile",
+    ]);
+    assert_ne!(code, 0, "{failed}");
+    assert_eq!(
+        failed["operationId"],
+        json!("op:epic_start:epic-noise:-:-"),
+        "{failed}"
+    );
+
+    // The corrected keyless retry counts ONLY the derived release.
+    let (code, started) = env.forged(&[
+        "epic",
+        "start",
+        "--epic",
+        "epic-noise",
+        "--repo",
+        &repo,
+        "--spec",
+        &spec,
+    ]);
+    assert_eq!(code, 0, "{started}");
+    assert_eq!(
+        started["operationId"],
+        json!("op:epic_start:epic-noise:-:1"),
+        "{started}"
+    );
+}
