@@ -521,10 +521,10 @@ async fn publish_effect(
         .iter()
         .map(|finding| (finding.finding_id.as_str(), finding))
         .collect();
-    let remote = github_remote(Path::new(&snapshot.repo))
-        .await
-        .map_err(Failure::from)?;
-    let gh = GhClient::new().with_host_opt(remote.gh_host());
+    // Delivered and busy rows replay from the ledger alone; the origin
+    // remote is read only when a claimed row actually needs GitHub, so a
+    // fully-delivered batch reconstructs without the checkout.
+    let mut pinned_gh: Option<GhClient> = None;
     let mut outcomes = Vec::with_capacity(rows.len());
     let mut busy = false;
 
@@ -558,6 +558,15 @@ async fn publish_effect(
             .delivery_token
             .clone()
             .ok_or_else(|| Failure::internal("claimed review delivery has no token"))?;
+        let gh = match pinned_gh.as_ref() {
+            Some(gh) => gh,
+            None => {
+                let remote = github_remote(Path::new(&snapshot.repo))
+                    .await
+                    .map_err(Failure::from)?;
+                &*pinned_gh.insert(GhClient::new().with_host_opt(remote.gh_host()))
+            }
+        };
 
         failpoint::hit("review.publish.probe.before");
         let present = gh

@@ -625,18 +625,22 @@ fn read_routed_sentinel(route: &SentinelRoute, runtime_dir: &Path, attempt_id: i
 pub struct GitHubRemote {
     pub slug: String,
     pub host: String,
+    /// Whether the authority is reached over ssh, where `~/.ssh/config`
+    /// aliasing applies to the hostname.
+    pub ssh: bool,
 }
 
 const ACCEPTED_GITHUB_REMOTES: &str = "git@host:owner/repo(.git), \
 ssh://user@host/owner/repo(.git), or https://host/owner/repo(.git)";
 
 impl GitHubRemote {
-    /// The host to pin gh children to, or `None` for a dotless authority.
-    /// A dotless host is an ssh alias whose real API hostname only the
-    /// operator's ssh config knows; pinning `GH_HOST` to the alias would
-    /// break gh on setups the default-host resolution already serves.
+    /// The host to pin gh children to. An https authority is a real
+    /// hostname and always pins, dotted or not. A dotless ssh authority
+    /// is an alias whose real API hostname only the operator's ssh config
+    /// knows; pinning `GH_HOST` to the alias would break gh on setups the
+    /// default-host resolution already serves, so it never pins.
     pub fn gh_host(&self) -> Option<&str> {
-        self.host.contains('.').then_some(self.host.as_str())
+        (!self.ssh || self.host.contains('.')).then_some(self.host.as_str())
     }
 }
 
@@ -674,7 +678,7 @@ pub fn host_from_url(url: &str) -> Result<String, PortError> {
 
 fn remote_from_url(url: &str) -> Result<GitHubRemote, PortError> {
     let trimmed = url.strip_suffix(".git").unwrap_or(url);
-    let (host, path) = if let Some(rest) = trimmed.strip_prefix("ssh://") {
+    let (host, path, ssh) = if let Some(rest) = trimmed.strip_prefix("ssh://") {
         let (authority, path) = rest.split_once('/').ok_or_else(|| remote_error(url))?;
         let (user, host) = authority
             .rsplit_once('@')
@@ -682,9 +686,10 @@ fn remote_from_url(url: &str) -> Result<GitHubRemote, PortError> {
         if user.is_empty() {
             return Err(remote_error(url));
         }
-        (host, path)
+        (host, path, true)
     } else if let Some(rest) = trimmed.strip_prefix("https://") {
-        rest.split_once('/').ok_or_else(|| remote_error(url))?
+        let (host, path) = rest.split_once('/').ok_or_else(|| remote_error(url))?;
+        (host, path, false)
     } else {
         let (authority, path) = trimmed.split_once(':').ok_or_else(|| remote_error(url))?;
         let (user, host) = authority
@@ -693,7 +698,7 @@ fn remote_from_url(url: &str) -> Result<GitHubRemote, PortError> {
         if user.is_empty() || authority.contains('/') {
             return Err(remote_error(url));
         }
-        (host, path)
+        (host, path, true)
     };
 
     if host.is_empty()
@@ -717,6 +722,7 @@ fn remote_from_url(url: &str) -> Result<GitHubRemote, PortError> {
     Ok(GitHubRemote {
         slug: format!("{owner}/{name}"),
         host: host.to_owned(),
+        ssh,
     })
 }
 
@@ -1313,6 +1319,12 @@ mod tests {
         assert_eq!(alias.gh_host(), None, "alias host is never pinned");
         let dotted = remote_from_url("git@ghe.example.com:org/repo.git").expect("ghe parses");
         assert_eq!(dotted.gh_host(), Some("ghe.example.com"));
+        // An https authority is a real hostname even without a dot — a
+        // single-label intranet GHE origin pins; ssh:// aliases do not.
+        let https = remote_from_url("https://github/acme/widget.git").expect("https parses");
+        assert_eq!(https.gh_host(), Some("github"));
+        let ssh_alias = remote_from_url("ssh://git@work/org/repo").expect("ssh alias parses");
+        assert_eq!(ssh_alias.gh_host(), None);
 
         let url = "/tmp/root/origin";
         let error = host_from_url(url).expect_err("local path has no GitHub host");
