@@ -441,6 +441,83 @@ fn repository_scope_uses_exact_bead_metadata_for_slices_epics_and_renamed_checko
     );
 }
 
+#[test]
+fn repository_status_and_assignee_filters_compose_over_a_mixed_store() {
+    let env = TestEnv::new("forged-work-list-composed-filters");
+    env.forged(&["init"]);
+    let fixtures = [
+        ("a-open-alice", "/repo/a", "open", "alice"),
+        ("a-blocked-alice", "/repo/a", "blocked", "alice"),
+        ("a-blocked-bob", "/repo/a", "blocked", "bob"),
+        ("b-blocked-alice", "/repo/b", "blocked", "alice"),
+    ];
+    for (run, repository, status, assignee) in fixtures {
+        fabricate_run_in_repository(&env, run, repository);
+        let bead = format!("bead-{run}");
+        env.set_bead_repository(&bead, repository);
+        env.set_bead_field(&bead, "status", status);
+        env.set_assignee(&bead, assignee);
+    }
+    let revisions = fixtures
+        .iter()
+        .map(|(run, _, _, _)| {
+            let bead = format!("bead-{run}");
+            (bead.clone(), env.bead_revision(&bead))
+        })
+        .collect::<Vec<_>>();
+
+    let filtered = |args: &[&str]| {
+        let (code, response) = env.forged(args);
+        assert_eq!(code, 0, "{args:?}: {response}");
+        assert_eq!(run_ids(&response), queue_ids(&response), "queue parity");
+        run_ids(&response)
+    };
+    assert_eq!(
+        filtered(&["work", "list", "--repo", "/repo/a"]),
+        BTreeSet::from([
+            "a-open-alice".to_owned(),
+            "a-blocked-alice".to_owned(),
+            "a-blocked-bob".to_owned(),
+        ])
+    );
+    assert_eq!(
+        filtered(&["work", "list", "--status", "blocked"]),
+        BTreeSet::from([
+            "a-blocked-alice".to_owned(),
+            "a-blocked-bob".to_owned(),
+            "b-blocked-alice".to_owned(),
+        ])
+    );
+    assert_eq!(
+        filtered(&["work", "list", "--assignee", "alice"]),
+        BTreeSet::from([
+            "a-open-alice".to_owned(),
+            "a-blocked-alice".to_owned(),
+            "b-blocked-alice".to_owned(),
+        ])
+    );
+    assert_eq!(
+        filtered(&[
+            "work",
+            "list",
+            "--repo",
+            "/repo/a",
+            "--status",
+            "blocked",
+            "--assignee",
+            "alice",
+        ]),
+        BTreeSet::from(["a-blocked-alice".to_owned()])
+    );
+    for (bead, revision) in revisions {
+        assert_eq!(
+            env.bead_revision(&bead),
+            revision,
+            "read filters must not mint work revisions"
+        );
+    }
+}
+
 // The bd-era scoped-membership outage has no ledger analogue; the widening
 // guard it protected is now structural (an in-process membership read
 // cannot fail partway).

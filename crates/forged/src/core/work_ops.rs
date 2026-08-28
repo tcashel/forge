@@ -9,8 +9,8 @@
 use std::collections::BTreeMap;
 
 use forged_ledger::{
-    EffectClass, NewWorkItem, WorkDepKind, WorkItemSnapshot, WorkKind, WorkRevisionCause,
-    WorkSpecFields, WorkStatus,
+    EffectClass, NewWorkItem, WorkDepKind, WorkItemFilters, WorkItemSnapshot, WorkKind,
+    WorkRevisionCause, WorkSpecFields, WorkStatus,
 };
 use forged_types::{ErrorCode, OperationRequest, OperationResponse};
 use serde_json::{json, Value};
@@ -586,7 +586,13 @@ pub async fn work_ready(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
             )));
         }
 
-        let ready = on_ledger(&ctx.ledger, |l| l.ready_work_items()).await?;
+        let repository = super::ops::repository_selector(req, "work_ready")?;
+
+        let filters = WorkItemFilters {
+            repository: repository.clone(),
+            ..WorkItemFilters::default()
+        };
+        let ready = on_ledger(&ctx.ledger, move |l| l.ready_work_items_filtered(filters)).await?;
         let total = ready.len();
         let ready = match detail {
             WorkReadyDetail::Summary => ready
@@ -610,11 +616,15 @@ pub async fn work_ready(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
                 .map(|item| json!(item))
                 .collect::<Vec<_>>(),
         };
+        let mut applied_filters = json!({
+            "detail": detail.as_str(),
+            "limit": limit,
+        });
+        if let Some(repository) = repository {
+            applied_filters["repo"] = json!(repository);
+        }
         Ok(json!({
-            "filters": {
-                "detail": detail.as_str(),
-                "limit": limit,
-            },
+            "filters": applied_filters,
             "totals": {
                 "shown": ready.len(),
                 "total": total,
