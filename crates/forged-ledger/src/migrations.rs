@@ -1451,6 +1451,84 @@ mod tests {
     }
 
     #[test]
+    fn migration_013_admission_custody_opens_without_backfill() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state-v13.db");
+        {
+            let conn = rusqlite::Connection::open(&path).expect("raw database");
+            for migration in MIGRATIONS.iter().take(13) {
+                conn.execute_batch(migration).expect("seed migration");
+            }
+            conn.execute_batch(
+                "INSERT INTO admission_batches (
+                   batch_id, schema, policy_revision, ledger_revision, inputs_sha256,
+                   inputs_json, as_of, created_at
+                 ) VALUES (
+                   'batch-v13', 'forged.admission-inputs/1', 'policy-v1', 'ledger-v1',
+                   '0000000000000000000000000000000000000000000000000000000000000000',
+                   '{}', 'created', 'created'
+                 );
+                 INSERT INTO admission_decisions (
+                   decision_id, batch_id, subject_kind, subject_id, control_revision,
+                   outcome, reason, decision_json, created_at
+                 ) VALUES
+                   ('decision-ownerless', 'batch-v13', 'run', 'run-ownerless', 1,
+                    'admitted', 'capacity-available', '{}', 'created'),
+                   ('decision-owned', 'batch-v13', 'run', 'run-owned', 1,
+                    'admitted', 'capacity-available', '{}', 'created');
+                 INSERT INTO admission_reservations (
+                   reservation_id, decision_id, work_key, subject_kind, subject_id,
+                   control_revision, repository, provider, model, resource_class, state,
+                   owner_kind, owner_id, recovery_deadline, last_error, created_at, updated_at
+                 ) VALUES
+                   ('reservation-ownerless', 'decision-ownerless', 'run:run-ownerless:1',
+                    'run', 'run-ownerless', 1, 'example/repo', 'codex', 'gpt-test',
+                    'repository-write', 'reserved', NULL, NULL, 'deadline-ownerless',
+                    'ownerless-detail', 'created-ownerless', 'updated-ownerless'),
+                   ('reservation-owned', 'decision-owned', 'run:run-owned:1',
+                    'run', 'run-owned', 1, 'example/repo', 'codex', 'gpt-test',
+                    'repository-write', 'active', 'controller', 'run:run-owned:1',
+                    'deadline-owned', 'owned-detail', 'created-owned', 'updated-owned');
+                 PRAGMA user_version=13;",
+            )
+            .expect("seed migration-013 admission custody");
+        }
+
+        let ledger = Ledger::open(&path).expect("open migration-013 database");
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 22);
+        ledger.close().expect("close");
+
+        let conn = rusqlite::Connection::open(&path).expect("open upgraded database");
+        let rows = crate::admission::live_reservations(&conn).expect("decode reservations");
+        assert_eq!(rows.len(), 2);
+        let ownerless = rows
+            .iter()
+            .find(|row| row.reservation_id == "reservation-ownerless")
+            .expect("ownerless row");
+        assert_eq!(ownerless.state.as_str(), "reserved");
+        assert_eq!(
+            (
+                ownerless.owner_kind.as_deref(),
+                ownerless.owner_id.as_deref()
+            ),
+            (None, None)
+        );
+        assert_eq!(ownerless.last_error.as_deref(), Some("ownerless-detail"));
+        assert_eq!(ownerless.updated_at, "updated-ownerless");
+        assert!(ownerless.released_at.is_none());
+        let owned = rows
+            .iter()
+            .find(|row| row.reservation_id == "reservation-owned")
+            .expect("owned row");
+        assert_eq!(owned.state.as_str(), "active");
+        assert_eq!(owned.owner_kind.as_deref(), Some("controller"));
+        assert_eq!(owned.owner_id.as_deref(), Some("run:run-owned:1"));
+        assert_eq!(owned.last_error.as_deref(), Some("owned-detail"));
+        assert_eq!(owned.updated_at, "updated-owned");
+        assert!(owned.released_at.is_none());
+    }
+
+    #[test]
     fn representative_v10_v12_v15_v16_v17_v18_v19_v20_upgrades_preserve_rows_and_reach_v21() {
         for version in [10usize, 12, 15, 16, 17, 18, 19, 20] {
             let dir = tempfile::tempdir().expect("tempdir");

@@ -51,6 +51,9 @@ const PACKAGE_MIGRATION: &str = "forged.epic.execution-package/1";
 const PLAN_STARTED: &str = "forged.epic.plan.started";
 const PLAN_APPLIED: &str = "forged.epic.plan.applied";
 const EPIC_POLL: Duration = Duration::from_millis(250);
+/// Consecutive identical `Step::Progress` payloads that demote the drive
+/// loop to the poll cadence. Real progress changes the payload every tick.
+const PROGRESS_REPEAT_LIMIT: usize = 8;
 
 #[derive(Debug, Clone)]
 struct FrozenChild {
@@ -2827,10 +2830,56 @@ enum Step {
     Stop(Value),
 }
 
+/// The drive loop's spin brake.
+///
+/// `Step::Progress` is the only step that loops without sleeping, so a step
+/// that repeats without moving the projection forward burns a core and floods
+/// the epic's stream with one operation-request event per iteration. An
+/// IDENTICAL payload is that signature; ordinary dispatch changes it, so
+/// distinct values reset the run.
+///
+/// It is a brake, never a stop: the planning and assurance relays hand
+/// `run_advance`'s response back verbatim, and a child awaiting a live
+/// provider yields the same `awaitPacket` payload on every tick for as long
+/// as that provider runs. An identical run is therefore a WAIT and must be
+/// polled at the wait cadence, never parked as input-required.
+#[derive(Default)]
+struct ProgressRepeat {
+    last: Option<Value>,
+    run: usize,
+}
+
+impl ProgressRepeat {
+    /// Record one progress payload; `true` once the identical run reaches
+    /// `PROGRESS_REPEAT_LIMIT`.
+    fn stalled(&mut self, value: &Value) -> bool {
+        if self.last.as_ref() == Some(value) {
+            self.run += 1;
+        } else {
+            self.last = Some(value.clone());
+            self.run = 1;
+        }
+        self.run >= PROGRESS_REPEAT_LIMIT
+    }
+}
+
 struct PendingWave {
     number: u32,
     members: BTreeSet<String>,
     launch_order: BTreeMap<String, usize>,
+}
+
+/// The INTEGRATION_READY payload for ONE epoch.
+///
+/// The epoch tag is load-bearing, not decoration: `append_event_once` dedupes
+/// on (run, kind, payload) across the FULL stream while `project` reads only
+/// the events after the last ABANDONED row. Without the tag, a fresh epoch
+/// whose base has not moved re-derives the dead epoch's byte-identical payload
+/// and the insert its projection requires is silently skipped. Because the tag
+/// makes cross-epoch payloads distinct, a `false` return from the append can
+/// only be a same-epoch retry, which is legitimately idempotent.
+fn integration_ready_event(branch: &str, base: &str, cut_sha: &str, epoch: usize) -> Value {
+    json!({"branch": branch, "baseRef": base, "cutSha": cut_sha, "epoch": epoch})
 }
 
 async fn ensure_integration(
@@ -2858,7 +2907,7 @@ async fn ensure_integration(
         .config
         .run_dir(&config.epic_id)
         .join("integration-setup");
-    safe_effect(
+    let ready = safe_effect(
         ctx,
         "epic_setup",
         key,
@@ -2868,12 +2917,28 @@ async fn ensure_integration(
             let sha =
                 forged_git::ensure_integration_branch(Path::new(&repo), &branch, &base, &scratch)
                     .await?;
-            let event = json!({"branch": branch, "baseRef": base, "cutSha": sha});
+            let event = integration_ready_event(&branch, &base, &sha, start_epoch);
             append(ctx, &event_epic, INTEGRATION_READY, event.clone()).await?;
             Ok(event)
         },
     )
-    .await
+    .await?;
+    // Land-or-verify OUTSIDE the effect. A replayed setup never re-runs the
+    // closure, so an epic already wedged by an untagged stored response —
+    // terminal-OK with no event its epoch can see — heals here on the next
+    // tick. Within an epoch the append is an idempotent no-op.
+    match (
+        ready.get("branch").and_then(Value::as_str),
+        ready.get("baseRef").and_then(Value::as_str),
+        ready.get("cutSha").and_then(Value::as_str),
+    ) {
+        (Some(branch), Some(base), Some(sha)) => {
+            let event = integration_ready_event(branch, base, sha, start_epoch);
+            append(ctx, &config.epic_id, INTEGRATION_READY, event.clone()).await?;
+            Ok(event)
+        }
+        _ => Ok(ready),
+    }
 }
 
 async fn start_child(
@@ -5543,6 +5608,7 @@ async fn epic_drive_loop(ctx: &Ctx, req: &OperationRequest) -> OperationResponse
         Err(error) => return err_response(&derive_key("epic_drive", None, None, None), &error),
     };
     let key = derive_key("epic_drive", Some(&epic), None, None);
+    let mut repeat = ProgressRepeat::default();
     loop {
         // Ownership covers one bounded reconciliation tick only. In
         // particular, no merge slot or SQLite transaction survives the
@@ -5555,7 +5621,18 @@ async fn epic_drive_loop(ctx: &Ctx, req: &OperationRequest) -> OperationResponse
             advance_once(ctx, &epic).await
         };
         match step {
-            Ok(Step::Progress(_)) => continue,
+            // Defense in depth: a step that keeps repeating itself has moved
+            // nothing, so it earns the wait cadence rather than a hot loop.
+            Ok(Step::Progress(value)) => {
+                if repeat.stalled(&value) {
+                    tracing::warn!(
+                        epic,
+                        repeats = PROGRESS_REPEAT_LIMIT,
+                        "identical epic progress step repeated; polling instead of spinning"
+                    );
+                    tokio::time::sleep(EPIC_POLL).await;
+                }
+            }
             Ok(Step::Wait(_)) => tokio::time::sleep(EPIC_POLL).await,
             Ok(Step::Stop(value)) => {
                 if let Err(error) = record_desired_stop(ctx, &epic, &value).await {
@@ -6117,5 +6194,41 @@ mod tests {
         assert!(state.root_snapshot.is_none());
         assert!(state.target_snapshot.is_none());
         assert!(state.input_body.is_none());
+    }
+
+    #[test]
+    fn the_spin_brake_engages_only_on_an_identical_repeated_step() {
+        let repeated = json!({"branch": "forged/epic-x", "epoch": 1});
+        let mut repeat = ProgressRepeat::default();
+        for tick in 1..PROGRESS_REPEAT_LIMIT {
+            assert!(!repeat.stalled(&repeated), "engaged early at tick {tick}");
+        }
+        assert!(repeat.stalled(&repeated), "the stall signature must engage");
+
+        // Ordinary dispatch alternates payloads; it must never engage, and one
+        // distinct step must clear an almost-engaged run.
+        let mut repeat = ProgressRepeat::default();
+        for tick in 0..PROGRESS_REPEAT_LIMIT * 4 {
+            assert!(!repeat.stalled(&json!({"child": tick % 2})), "tick {tick}");
+        }
+        let mut repeat = ProgressRepeat::default();
+        for _ in 1..PROGRESS_REPEAT_LIMIT {
+            assert!(!repeat.stalled(&repeated));
+        }
+        assert!(!repeat.stalled(&json!({"child": "other"})));
+        assert!(!repeat.stalled(&repeated), "a distinct step resets the run");
+    }
+
+    #[test]
+    fn the_integration_event_carries_its_epoch() {
+        assert_eq!(
+            integration_ready_event("forged/epic-x", "main", "abc", 1),
+            json!({"branch": "forged/epic-x", "baseRef": "main", "cutSha": "abc", "epoch": 1})
+        );
+        assert_ne!(
+            integration_ready_event("forged/epic-x", "main", "abc", 0),
+            integration_ready_event("forged/epic-x", "main", "abc", 1),
+            "an unmoved base must still yield distinct per-epoch payloads"
+        );
     }
 }

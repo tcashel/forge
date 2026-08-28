@@ -319,4 +319,40 @@ mod tests {
             "latest-event grouping still materializes a temporary B-tree: {details:?}"
         );
     }
+
+    #[test]
+    fn append_event_once_admits_a_payload_that_differs_only_by_epoch() {
+        // The epic scheduler's cross-epoch contract: a projection that reads
+        // only the current epoch needs its OWN event, so an epoch-tagged
+        // payload must insert even when every other field repeats a dead
+        // epoch's byte-identical one.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ledger = Ledger::open(&dir.path().join("state.db")).expect("migrate");
+        let kind = "forged.epic.integration.ready";
+        let ready = |epoch: u64| {
+            serde_json::json!({
+                "branch": "forged/epic-x",
+                "baseRef": "main",
+                "cutSha": "a".repeat(40),
+                "epoch": epoch,
+            })
+        };
+        assert!(ledger
+            .append_event_once("epic-x", kind, ready(0))
+            .expect("first epoch inserts"));
+        assert!(!ledger
+            .append_event_once("epic-x", kind, ready(0))
+            .expect("a same-epoch retry is idempotent"));
+        assert!(ledger
+            .append_event_once("epic-x", kind, ready(1))
+            .expect("a fresh epoch inserts its own event"));
+        assert_eq!(
+            ledger
+                .list_events(Some("epic-x"), 0, 16)
+                .expect("events")
+                .len(),
+            2
+        );
+        ledger.close().expect("close");
+    }
 }
