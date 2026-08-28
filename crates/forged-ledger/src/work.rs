@@ -1230,7 +1230,8 @@ impl Ledger {
         self.submit(move |conn| {
             let mut stmt = conn.prepare(&format!(
                 "{SNAPSHOT_SQL} JOIN work_deps d ON d.from_id = wi.work_id \
-                 WHERE d.to_id = ?1 AND d.kind = 'parent-child' ORDER BY wi.work_id"
+                 WHERE d.to_id = ?1 AND d.kind = 'parent-child' \
+                 ORDER BY wi.priority IS NULL, wi.priority, wi.work_id"
             ))?;
             let rows = stmt.query_map([&epic_id], snapshot_from_row)?;
             let mut out = Vec::new();

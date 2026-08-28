@@ -16,8 +16,8 @@ use forged_types::{ErrorCode, OperationRequest, OperationResponse};
 use serde_json::{json, Value};
 
 use crate::core::{
-    default_key, derive_key, err_response, fenced, on_ledger, param_opt_str, param_str, Ctx,
-    Failure,
+    default_key, derive_key, err_response, fenced, on_ledger, param_opt_i64_strict, param_opt_str,
+    param_opt_str_strict, param_str, Ctx, Failure,
 };
 
 fn snapshot_json(snapshot: &WorkItemSnapshot, next_steps: &[&str]) -> Value {
@@ -65,11 +65,11 @@ fn expected_revision_of(params: &serde_json::Map<String, Value>) -> Result<i64, 
     }
 }
 
-fn actor_of(params: &serde_json::Map<String, Value>) -> String {
-    param_opt_str(params, "actor")
+fn actor_of(params: &serde_json::Map<String, Value>) -> Result<String, Failure> {
+    Ok(param_opt_str_strict(params, "actor")?
         .filter(|value| !value.trim().is_empty())
         .unwrap_or("operator")
-        .to_owned()
+        .to_owned())
 }
 
 /// `work_create` — author a new work item with its revision-1 spec.
@@ -100,7 +100,7 @@ pub async fn work_create(ctx: &Ctx, req: &mut OperationRequest) -> OperationResp
         req,
         None,
         |_op| async {
-            let kind = match param_opt_str(&req.params, "kind").unwrap_or("task") {
+            let kind = match param_opt_str_strict(&req.params, "kind")?.unwrap_or("task") {
                 "task" => WorkKind::Task,
                 "epic" => WorkKind::Epic,
                 other => {
@@ -109,7 +109,7 @@ pub async fn work_create(ctx: &Ctx, req: &mut OperationRequest) -> OperationResp
                     )))
                 }
             };
-            let status = match param_opt_str(&req.params, "status").unwrap_or("open") {
+            let status = match param_opt_str_strict(&req.params, "status")?.unwrap_or("open") {
                 "open" => WorkStatus::Open,
                 "blocked" => WorkStatus::Blocked,
                 other => {
@@ -119,7 +119,7 @@ pub async fn work_create(ctx: &Ctx, req: &mut OperationRequest) -> OperationResp
                     )))
                 }
             };
-            let priority = req.params.get("priority").and_then(Value::as_i64);
+            let priority = param_opt_i64_strict(&req.params, "priority")?;
             let metadata = metadata_of(&req.params)?;
             let new = NewWorkItem {
                 work_id: id.clone(),
@@ -170,7 +170,20 @@ pub async fn work_update(ctx: &Ctx, req: &mut OperationRequest) -> OperationResp
             )
         }
     };
-    default_key(req, derive_key("work_update", Some(&id), None, None));
+    // The expected revision is part of the derived key: without it a
+    // second keyless update of the same item either conflicts on the fence
+    // or replays the first response verbatim — multi-revision authoring is
+    // the NORMAL path for a keyless agent.
+    let expected = match expected_revision_of(&req.params) {
+        Ok(expected) => expected,
+        Err(error) => {
+            return err_response(&derive_key("work_update", Some(&id), None, None), &error)
+        }
+    };
+    default_key(
+        req,
+        derive_key("work_update", Some(&id), None, Some(expected)),
+    );
     fenced(
         ctx,
         "work_update",
@@ -178,23 +191,25 @@ pub async fn work_update(ctx: &Ctx, req: &mut OperationRequest) -> OperationResp
         req,
         None,
         |_op| async {
-            let expected = expected_revision_of(&req.params)?;
             let current = {
                 let id = id.clone();
                 on_ledger(&ctx.ledger, move |l| l.work_item(&id)).await?
             }
             .ok_or_else(|| Failure::invalid(format!("work item {id:?} does not exist")))?;
-            let field = |name: &str, fallback: &str| {
-                param_opt_str(&req.params, name)
+            let field = |name: &str, fallback: &str| -> Result<String, Failure> {
+                Ok(param_opt_str_strict(&req.params, name)?
                     .map(str::to_owned)
-                    .unwrap_or_else(|| fallback.to_owned())
+                    .unwrap_or_else(|| fallback.to_owned()))
             };
             let spec = WorkSpecFields {
-                title: field("title", &current.spec.title),
-                description: field("description", &current.spec.description),
-                acceptance_criteria: field("acceptanceCriteria", &current.spec.acceptance_criteria),
-                design: field("design", &current.spec.design),
-                notes: field("notes", &current.spec.notes),
+                title: field("title", &current.spec.title)?,
+                description: field("description", &current.spec.description)?,
+                acceptance_criteria: field(
+                    "acceptanceCriteria",
+                    &current.spec.acceptance_criteria,
+                )?,
+                design: field("design", &current.spec.design)?,
+                notes: field("notes", &current.spec.notes)?,
             };
             let id_owned = id.clone();
             let snapshot = on_ledger(&ctx.ledger, move |l| {
@@ -230,7 +245,16 @@ pub async fn work_link(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespon
             )
         }
     };
-    let kind = match param_opt_str(&req.params, "kind").unwrap_or("blocks") {
+    let kind_text = match param_opt_str_strict(&req.params, "kind") {
+        Ok(value) => value.unwrap_or("blocks"),
+        Err(error) => {
+            return err_response(
+                &derive_key("work_link", Some(&from), Some(&to), None),
+                &error,
+            )
+        }
+    };
+    let kind = match kind_text {
         "blocks" => WorkDepKind::Blocks,
         "parent-child" => WorkDepKind::ParentChild,
         "related" => WorkDepKind::Related,
@@ -246,7 +270,10 @@ pub async fn work_link(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespon
             )
         }
     };
-    default_key(req, derive_key("work_link", Some(&from), Some(&to), None));
+    // The edge kind is part of the derived key: work_deps rows are keyed by
+    // (from, to, kind), so two keyless links of different kinds on one pair
+    // are distinct effects.
+    default_key(req, format!("op:work_link:{from}:{to}:{}", kind.as_str()));
     fenced(
         ctx,
         "work_link",
@@ -286,12 +313,42 @@ async fn one_id_verb(
             )
         }
     };
-    let actor = actor_of(&req.params);
+    let actor = match actor_of(&req.params) {
+        Ok(actor) => actor,
+        Err(error) => return err_response(&derive_key(name, Some(&id), None, None), &error),
+    };
     let verb = match run(id.clone(), actor, req.params.clone()) {
         Ok(verb) => verb,
         Err(error) => return err_response(&derive_key(name, Some(&id), None, None), &error),
     };
-    default_key(req, derive_key(name, Some(&id), None, None));
+    // The derived key carries the item's PRE-STATE and the request digest:
+    // coordination verbs never mint revisions, so the pre-state (status +
+    // revision) plus the params fully determine the transition — a retry of
+    // the same intent replays a correct-shaped response, while a genuinely
+    // new pass over the same state (close -> reopen -> close with a new
+    // reason) derives a fresh key and executes. A missing item keeps the
+    // bare key and falls through to the verb's own refusal.
+    let salted = {
+        let id_owned = id.clone();
+        on_ledger(&ctx.ledger, move |l| l.work_item(&id_owned))
+            .await
+            .ok()
+            .flatten()
+            .map(|item| {
+                let digest = forged_types::request_sha256(req)
+                    .map(|hex| hex[..12].to_owned())
+                    .unwrap_or_else(|_| "malformed".to_owned());
+                format!(
+                    "op:{name}:{id}:{}r{}:{digest}",
+                    item.status.as_str(),
+                    item.revision
+                )
+            })
+    };
+    default_key(
+        req,
+        salted.unwrap_or_else(|| derive_key(name, Some(&id), None, None)),
+    );
     fenced(ctx, name, EffectClass::SafeRetry, req, None, |_op| async {
         let (snapshot, next) = verb.apply(ctx).await?;
         Ok(snapshot_json(&snapshot, &[next]))

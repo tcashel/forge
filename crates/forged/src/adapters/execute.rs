@@ -2439,8 +2439,15 @@ async fn run_attempt(
                         // Our claim or our lease was taken out from under us:
                         // stop the provider and report. Its tokens were still
                         // spent; freeze this attempt's private capture before
-                        // any successor is allowed to proceed.
-                        let _ = host.kill_confirmed(&session).await;
+                        // any successor is allowed to proceed. The settle
+                        // below is fenced by CONFIRMED death: an unconfirmed
+                        // kill skips this beat and retries containment on the
+                        // next one rather than making the packet
+                        // successor-eligible while the provider may still be
+                        // writing.
+                        if host.kill_confirmed(&session).await.is_err() {
+                            continue;
+                        }
                         crate::core::artifacts::finalize_provider_files(&run_root, &dirs)?;
                         let out = crate::core::artifacts::read_output_text(&run_root, &dirs)?;
                         crate::core::usage::capture_attempt(

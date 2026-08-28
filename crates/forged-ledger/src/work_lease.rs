@@ -18,6 +18,7 @@ use crate::error::{refused, LedgerError};
 use crate::events::append_event_tx;
 use crate::ledger::Ledger;
 use crate::time::{now_iso, now_plus_secs_iso};
+use crate::work::WorkKind;
 use crate::work::{
     clear_lease_tx, ready_tx, snapshot_tx, WorkItemSnapshot, WorkStatus,
     WORK_BLOCKED_CLAIM_REFUSAL, WORK_CLAIM_REFUSAL_PREFIX,
@@ -174,7 +175,13 @@ impl Ledger {
         let holder = holder.to_owned();
         self.submit(move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let Some(item) = ready_tx(&tx)?.into_iter().next() else {
+            // Only tasks are claimable work: an epic in the frontier (no
+            // outgoing blocks edges) must never be claimed under the
+            // frontier holder — no run can execute it and the lease strands.
+            let Some(item) = ready_tx(&tx)?
+                .into_iter()
+                .find(|item| item.kind == WorkKind::Task)
+            else {
                 tx.commit()?;
                 return Ok(None);
             };
@@ -318,6 +325,38 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let ledger = Ledger::open(&dir.path().join("state.db")).expect("ledger");
         (dir, ledger)
+    }
+
+    #[test]
+    fn the_frontier_claim_skips_epics_for_the_first_ready_task() {
+        let (_dir, l) = ledger();
+        l.create_work_item(NewWorkItem {
+            work_id: "epic-frontier".to_string(),
+            kind: WorkKind::Epic,
+            status: WorkStatus::Open,
+            priority: Some(0),
+            metadata: BTreeMap::new(),
+            spec: WorkSpecFields {
+                title: "an open unassigned epic".to_string(),
+                description: String::new(),
+                acceptance_criteria: String::new(),
+                design: String::new(),
+                notes: String::new(),
+            },
+            cause: WorkRevisionCause::Authored,
+        })
+        .unwrap();
+        assert_eq!(
+            l.claim_ready_work("forged:frontier:0", 300).unwrap(),
+            None,
+            "an epic alone in the frontier is never claimed"
+        );
+        seed(&l, "task-frontier", WorkStatus::Open, Some(5));
+        let claimed = l
+            .claim_ready_work("forged:frontier:0", 300)
+            .unwrap()
+            .expect("the task claims");
+        assert_eq!(claimed.work_id, "task-frontier");
     }
 
     fn seed(l: &Ledger, id: &str, status: WorkStatus, priority: Option<i64>) {
