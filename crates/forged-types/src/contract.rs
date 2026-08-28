@@ -520,6 +520,25 @@ impl RosterDefinitionV1 {
         errors
     }
 
+    /// Authoring-time model validation, deliberately OUTSIDE
+    /// [`RosterDefinitionV1::validate_for`]: frozen execution packages are
+    /// durable state and must remain loadable across upgrades, so recovery
+    /// recompiles (`compile_frozen_package`) never apply these rules.
+    pub fn validate_models(&self) -> Vec<DefinitionError> {
+        let mut errors = Vec::new();
+        for (role, candidates) in &self.roles {
+            for (index, candidate) in candidates.iter().enumerate() {
+                if let Err(message) = validate_model_value(&candidate.model) {
+                    errors.push(DefinitionError::at(
+                        format!("$.roster.roles.{}[{index}].model", role.as_str()),
+                        message,
+                    ));
+                }
+            }
+        }
+        errors
+    }
+
     /// Authoring-time effort validation, deliberately OUTSIDE
     /// [`RosterDefinitionV1::validate_for`]: frozen execution packages are
     /// durable state and must remain loadable across upgrades, so recovery
@@ -569,6 +588,26 @@ fn valid_provider_value(value: &str) -> bool {
     !value.trim().is_empty()
         && value.len() <= 128
         && value.chars().all(|c| !c.is_control() && !c.is_whitespace())
+}
+
+/// The exact provider model charset failure shared by authoring validation
+/// and attempt-time invocation construction.
+pub const MODEL_VALUE_CHARSET_ERROR: &str =
+    r"model must be non-empty and match ^[A-Za-z0-9][A-Za-z0-9._:/\[\]-]*$";
+
+/// Validate the model charset used at every provider shell/argv boundary.
+/// Brackets are allowed after the leading alphanumeric for provider model
+/// variants; all other characters retain the prior fence.
+pub fn validate_model_value(value: &str) -> Result<(), &'static str> {
+    let mut chars = value.chars();
+    let head_ok = chars.next().is_some_and(|c| c.is_ascii_alphanumeric());
+    let rest_ok = chars
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '/' | '-' | '[' | ']'));
+    if head_ok && rest_ok {
+        Ok(())
+    } else {
+        Err(MODEL_VALUE_CHARSET_ERROR)
+    }
 }
 
 /// The shell/TOML-embedding charset the provider drivers enforce for
@@ -822,6 +861,42 @@ mod tests {
             .validate_for(&profile)
             .iter()
             .any(|error| error.path.ends_with(".effort")));
+    }
+
+    #[test]
+    fn authoring_model_validation_accepts_brackets_and_preserves_frozen_structure() {
+        let profile = standard_profile();
+        let mut roster = RosterDefinitionV1 {
+            schema: ROSTER_SCHEMA_V1.to_owned(),
+            name: "default".to_owned(),
+            roles: profile
+                .seats
+                .iter()
+                .map(|seat| (seat.role.clone(), vec![candidate(Sandbox::ReadOnly, false)]))
+                .collect(),
+        };
+        roster
+            .roles
+            .get_mut(&RoleId::new("implementation").expect("role"))
+            .expect("candidate")[0]
+            .model = "claude-sonnet-4[1m]".to_owned();
+        assert!(roster.validate_models().is_empty());
+
+        roster
+            .roles
+            .get_mut(&RoleId::new("implementation").expect("role"))
+            .expect("candidate")[0]
+            .model = "claude-sonnet-4{1m}".to_owned();
+        let errors = roster.validate_models();
+        assert!(errors.iter().any(|error| {
+            error.path.ends_with(".model") && error.message == MODEL_VALUE_CHARSET_ERROR
+        }));
+        // Frozen-safety: structural validation remains independent from the
+        // current authoring charset.
+        assert!(!roster
+            .validate_for(&profile)
+            .iter()
+            .any(|error| error.path.ends_with(".model")));
     }
 
     fn execution_policy(stage_budget_s: u64, termination_grace_s: u64) -> ExecutionPolicyV1 {

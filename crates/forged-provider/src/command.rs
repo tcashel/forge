@@ -200,11 +200,121 @@ fn shell_quote(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    const BRACKETED_MODEL: &str = "claude-sonnet-4[1m]";
+
+    fn args(argv: &ProviderArgv) -> Vec<String> {
+        argv.command(None)
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
 
     #[test]
     fn shell_quote_preserves_bare_arguments_and_escapes_apostrophes() {
         assert_eq!(shell_quote("Read,Grep,Glob"), "Read,Grep,Glob");
         assert_eq!(shell_quote("model-1/path"), "model-1/path");
+        assert_eq!(shell_quote(BRACKETED_MODEL), "'claude-sonnet-4[1m]'");
         assert_eq!(shell_quote("a b's"), "'a b'\"'\"'s'");
+    }
+
+    #[test]
+    fn bracketed_model_reaches_claude_and_codex_argv_byte_identically() {
+        let claude = provider_argv(
+            ProviderKindV1::Claude,
+            Sandbox::WorkspaceWrite,
+            BRACKETED_MODEL,
+            None,
+            Some("session-1"),
+            None,
+        );
+        assert!(args(&claude)
+            .windows(2)
+            .any(|pair| pair == ["--model", BRACKETED_MODEL]));
+
+        let codex = provider_argv(
+            ProviderKindV1::Codex,
+            Sandbox::WorkspaceWrite,
+            BRACKETED_MODEL,
+            Some("high"),
+            None,
+            Some(Path::new("/tmp/last.txt")),
+        );
+        let codex_args = args(&codex);
+        assert!(codex_args
+            .windows(2)
+            .any(|pair| pair == ["-m", BRACKETED_MODEL]));
+        assert!(codex_args
+            .windows(2)
+            .any(|pair| pair == ["-c", "model_reasoning_effort=\"high\""]));
+    }
+
+    #[test]
+    fn bracketed_model_is_single_quoted_and_cannot_glob_expand() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bin = temp.path().join("bin");
+        std::fs::create_dir(&bin).expect("bin");
+        for program in ["claude", "codex"] {
+            let shim = bin.join(program);
+            std::fs::write(&shim, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n").expect("shim");
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
+                .expect("shim mode");
+        }
+        for glob_match in ["claude-sonnet-41", "claude-sonnet-4m"] {
+            std::fs::write(temp.path().join(glob_match), "match").expect("glob fixture");
+        }
+        let prompt = temp.path().join("prompt.md");
+        std::fs::write(&prompt, "prompt").expect("prompt");
+
+        let cases = [
+            (
+                ProviderKindV1::Claude,
+                "--model",
+                provider_argv(
+                    ProviderKindV1::Claude,
+                    Sandbox::WorkspaceWrite,
+                    BRACKETED_MODEL,
+                    None,
+                    Some("session-1"),
+                    None,
+                ),
+            ),
+            (
+                ProviderKindV1::Codex,
+                "-m",
+                provider_argv(
+                    ProviderKindV1::Codex,
+                    Sandbox::WorkspaceWrite,
+                    BRACKETED_MODEL,
+                    Some("high"),
+                    None,
+                    Some(Path::new("/tmp/last.txt")),
+                ),
+            ),
+        ];
+        for (provider, model_flag, argv) in cases {
+            let stdout = temp.path().join(format!("{:?}.out", provider));
+            let line = argv.shell_line(&prompt, &stdout).expect("shell line");
+            assert!(
+                line.contains(&format!("{model_flag} '{BRACKETED_MODEL}'")),
+                "{line}"
+            );
+            let status = Command::new("/bin/sh")
+                .arg("-c")
+                .arg(&line)
+                .current_dir(temp.path())
+                .env("PATH", &bin)
+                .status()
+                .expect("shell");
+            assert!(status.success(), "{provider:?} shell status {status}");
+            let emitted = std::fs::read_to_string(&stdout).expect("captured argv");
+            let emitted = emitted.lines().collect::<Vec<_>>();
+            assert!(emitted
+                .windows(2)
+                .any(|pair| pair == [model_flag, BRACKETED_MODEL]));
+            assert!(!emitted.contains(&"claude-sonnet-41"));
+            assert!(!emitted.contains(&"claude-sonnet-4m"));
+        }
     }
 }

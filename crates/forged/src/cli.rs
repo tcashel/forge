@@ -1024,16 +1024,16 @@ pub struct WorkCreateArgs {
     #[arg(long)]
     pub title: String,
     /// Context and exact outcome.
-    #[arg(long)]
+    #[arg(long, allow_hyphen_values = true)]
     pub description: Option<String>,
     /// Observable completion contract.
-    #[arg(long)]
+    #[arg(long, allow_hyphen_values = true)]
     pub acceptance: Option<String>,
     /// Implementation constraints.
-    #[arg(long)]
+    #[arg(long, allow_hyphen_values = true)]
     pub design: Option<String>,
     /// Agent instructions and non-goals.
-    #[arg(long)]
+    #[arg(long, allow_hyphen_values = true)]
     pub notes: Option<String>,
     /// task or epic (default task).
     #[arg(long)]
@@ -1065,16 +1065,16 @@ pub struct WorkUpdateArgs {
     #[arg(long)]
     pub title: Option<String>,
     /// New description.
-    #[arg(long)]
+    #[arg(long, allow_hyphen_values = true)]
     pub description: Option<String>,
     /// New acceptance criteria.
-    #[arg(long)]
+    #[arg(long, allow_hyphen_values = true)]
     pub acceptance: Option<String>,
     /// New design notes.
-    #[arg(long)]
+    #[arg(long, allow_hyphen_values = true)]
     pub design: Option<String>,
     /// New agent instructions.
-    #[arg(long)]
+    #[arg(long, allow_hyphen_values = true)]
     pub notes: Option<String>,
     /// Override the derived idempotency key.
     #[arg(long)]
@@ -2487,4 +2487,77 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
         },
         Command::Mcp => unreachable!("mcp is handled before request mapping"),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BULLET: &str = "- bullet";
+    const LONG_TEXT_FIELDS: [(&str, &str); 4] = [
+        ("--description", "description"),
+        ("--acceptance", "acceptanceCriteria"),
+        ("--design", "design"),
+        ("--notes", "notes"),
+    ];
+
+    fn assert_long_text_forms(base: &[&str]) {
+        for (flag, param) in LONG_TEXT_FIELDS {
+            let mut spaced = base
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect::<Vec<_>>();
+            spaced.extend([flag.to_owned(), BULLET.to_owned()]);
+            let parsed = Cli::try_parse_from(spaced).expect("space-separated bullet value");
+            let (_, request) = to_request(parsed.command).expect("request");
+            assert_eq!(request.params[param], BULLET, "{flag} spaced");
+
+            let mut attached = base
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect::<Vec<_>>();
+            attached.push(format!("{flag}={BULLET}"));
+            let parsed = Cli::try_parse_from(attached).expect("attached bullet value");
+            let (_, request) = to_request(parsed.command).expect("request");
+            assert_eq!(request.params[param], BULLET, "{flag} attached");
+        }
+    }
+
+    #[test]
+    fn work_create_long_text_fields_accept_bullet_led_values_in_both_forms() {
+        assert_long_text_forms(&["forged", "work", "create", "--id", "x", "--title", "t"]);
+    }
+
+    #[test]
+    fn work_update_long_text_fields_accept_bullet_led_values_in_both_forms() {
+        assert_long_text_forms(&[
+            "forged",
+            "work",
+            "update",
+            "--id",
+            "x",
+            "--expected-revision",
+            "1",
+        ]);
+    }
+
+    #[test]
+    fn other_work_values_keep_their_hyphen_parsing() {
+        assert!(Cli::try_parse_from([
+            "forged", "work", "create", "--id", "x", "--title", "- title"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "forged",
+            "work",
+            "update",
+            "--id",
+            "x",
+            "--expected-revision",
+            "1",
+            "--title",
+            "- title",
+        ])
+        .is_err());
+    }
 }
