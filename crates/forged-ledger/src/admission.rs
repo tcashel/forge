@@ -104,6 +104,7 @@ pub(crate) fn reservation_row(
 ) -> rusqlite::Result<AdmissionReservationRow> {
     let state_raw: String = row.get(10)?;
     let owner_kind: Option<String> = row.get(11)?;
+    let owner_id: Option<String> = row.get(12)?;
     if owner_kind
         .as_deref()
         .is_some_and(|value| !matches!(value, "controller" | "attempt"))
@@ -112,6 +113,13 @@ pub(crate) fn reservation_row(
             11,
             "admission reservation owner kind",
             owner_kind.as_deref().unwrap_or_default(),
+        ));
+    }
+    if owner_kind.is_some() != owner_id.is_some() {
+        return Err(column_decode_error(
+            11,
+            "admission reservation owner pair",
+            &format!("{owner_kind:?}/{owner_id:?}"),
         ));
     }
     Ok(AdmissionReservationRow {
@@ -134,7 +142,7 @@ pub(crate) fn reservation_row(
         state: AdmissionReservationState::try_from(state_raw.as_str())
             .map_err(|_| column_decode_error(10, "admission reservation state", &state_raw))?,
         owner_kind,
-        owner_id: row.get(12)?,
+        owner_id,
         recovery_deadline: row.get(13)?,
         last_error: row.get(14)?,
         created_at: row.get(15)?,
@@ -1289,6 +1297,12 @@ impl Ledger {
             if !matches!(owner_kind.as_str(), "controller" | "attempt") {
                 return Err(refused(ErrorCode::InvalidRequest, "unknown reservation owner kind"));
             }
+            if owner_id.is_empty() {
+                return Err(refused(
+                    ErrorCode::InvalidRequest,
+                    "reservation owner id must not be empty",
+                ));
+            }
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let sql = format!(
                 "SELECT {RESERVATION_COLUMNS} FROM admission_reservations WHERE reservation_id = ?1"
@@ -1297,50 +1311,129 @@ impl Ledger {
                 .query_row(&sql, [&reservation_id], reservation_row)
                 .optional()?
                 .ok_or_else(|| refused(ErrorCode::InvalidRequest, "admission reservation missing"))?;
-            if before.state == AdmissionReservationState::Released {
-                return Err(refused(ErrorCode::OperationInProgress, "reservation is released"));
-            }
-            if before.owner_kind.is_some()
-                && (before.owner_kind.as_deref() != Some(owner_kind.as_str())
-                    || before.owner_id.as_deref() != Some(owner_id.as_str()))
-            {
-                return Err(refused(ErrorCode::IdempotencyConflict, "reservation owner changed"));
+            match before.state {
+                AdmissionReservationState::Released => {
+                    return Err(refused(
+                        ErrorCode::OperationInProgress,
+                        "reservation is released",
+                    ));
+                }
+                AdmissionReservationState::Orphaned => {
+                    return Err(refused(
+                        ErrorCode::OperationInProgress,
+                        "orphaned reservation cannot be reactivated",
+                    ));
+                }
+                AdmissionReservationState::Active => {
+                    if before.owner_kind.as_deref() == Some(owner_kind.as_str())
+                        && before.owner_id.as_deref() == Some(owner_id.as_str())
+                    {
+                        tx.commit()?;
+                        return Ok(before);
+                    }
+                    return Err(refused(
+                        ErrorCode::IdempotencyConflict,
+                        "reservation owner changed",
+                    ));
+                }
+                AdmissionReservationState::Reserved => {
+                    if before.owner_kind.is_some() || before.owner_id.is_some() {
+                        return Err(refused(
+                            ErrorCode::OperationInProgress,
+                            "reserved reservation is already owned",
+                        ));
+                    }
+                }
             }
             let now = now_iso();
-            tx.execute(
+            let affected = tx.execute(
                 "UPDATE admission_reservations SET state = 'active', owner_kind = ?1, owner_id = ?2, \
-                 last_error = NULL, updated_at = ?3 WHERE reservation_id = ?4",
+                 last_error = NULL, updated_at = ?3 WHERE reservation_id = ?4 \
+                   AND state = 'reserved' AND owner_kind IS NULL AND owner_id IS NULL",
                 rusqlite::params![owner_kind, owner_id, now, reservation_id],
             )?;
+            if affected != 1 {
+                return Err(refused(
+                    ErrorCode::OperationInProgress,
+                    "reservation custody changed before activation",
+                ));
+            }
             let row = tx.query_row(&sql, [&reservation_id], reservation_row)?;
             tx.commit()?;
             Ok(row)
         })
     }
 
-    /// Confirmed settlement/absence is the sole capacity-release operation.
+    /// Release only the exact custody tuple the caller observed. A terminal
+    /// reread is immutable and safe to return after a response-lost release.
     pub fn release_admission_reservation(
         &self,
-        reservation_id: &str,
+        observed: &AdmissionReservationRow,
         detail: Option<&str>,
     ) -> Result<AdmissionReservationRow, LedgerError> {
-        let reservation_id = reservation_id.to_owned();
+        if observed.owner_kind.is_some() != observed.owner_id.is_some() {
+            return Err(refused(
+                ErrorCode::InvalidRequest,
+                "admission reservation observation has a malformed owner pair",
+            ));
+        }
+        if observed
+            .owner_kind
+            .as_deref()
+            .is_some_and(|kind| !matches!(kind, "controller" | "attempt"))
+        {
+            return Err(refused(
+                ErrorCode::InvalidRequest,
+                "admission reservation observation has an unknown owner kind",
+            ));
+        }
+        let reservation_id = observed.reservation_id.clone();
+        let observed_state = observed.state;
+        let owner_kind = observed.owner_kind.clone();
+        let owner_id = observed.owner_id.clone();
         let detail = detail.map(str::to_owned);
         self.submit(move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let now = now_iso();
-            tx.execute(
-                "UPDATE admission_reservations SET state = 'released', last_error = ?1, \
-                 updated_at = ?2, released_at = COALESCE(released_at, ?2) WHERE reservation_id = ?3",
-                rusqlite::params![detail, now, reservation_id],
-            )?;
+            let affected = if observed_state == AdmissionReservationState::Released {
+                0
+            } else {
+                let now = now_iso();
+                tx.execute(
+                    "UPDATE admission_reservations SET state = 'released', last_error = ?1, \
+                     updated_at = ?2, released_at = ?2 WHERE reservation_id = ?3 AND state = ?4 \
+                       AND owner_kind IS ?5 AND owner_id IS ?6",
+                    rusqlite::params![
+                        detail,
+                        now,
+                        reservation_id,
+                        observed_state.as_str(),
+                        owner_kind,
+                        owner_id,
+                    ],
+                )?
+            };
             let sql = format!(
                 "SELECT {RESERVATION_COLUMNS} FROM admission_reservations WHERE reservation_id = ?1"
             );
-            let row = tx
+            let current = tx
                 .query_row(&sql, [&reservation_id], reservation_row)
-                .optional()?
-                .ok_or_else(|| refused(ErrorCode::InvalidRequest, "admission reservation missing"))?;
+                .optional()?;
+            let Some(row) = current else {
+                return Err(refused(
+                    ErrorCode::OperationInProgress,
+                    "admission reservation custody changed",
+                ));
+            };
+            if affected == 0
+                && !(row.state == AdmissionReservationState::Released
+                    && row.owner_kind == owner_kind
+                    && row.owner_id == owner_id)
+            {
+                return Err(refused(
+                    ErrorCode::OperationInProgress,
+                    "admission reservation custody changed",
+                ));
+            }
             tx.commit()?;
             Ok(row)
         })
@@ -1642,6 +1735,369 @@ mod tests {
         assert!(subject_kind(0, "portfolio").is_err());
         assert!(resource_class(0, "root").is_err());
         assert!(AdmissionReservationState::try_from("expired").is_err());
+    }
+
+    #[test]
+    fn stale_release_cannot_steal_controller_or_attempt_custody() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ledger = Ledger::open(&dir.path().join("state.db")).expect("ledger");
+        let (run_id, packet_id) = seed_packet(&ledger, "stale-release");
+
+        let stale_controller = reserve(
+            &ledger,
+            AdmissionSubjectKind::Run,
+            &run_id,
+            "batch-stale-controller",
+            "9999-01-01T00:00:00.000000000Z",
+        );
+        let active_controller = ledger
+            .activate_admission_reservation(
+                &stale_controller.reservation_id,
+                "controller",
+                &format!("run:{run_id}:1"),
+            )
+            .expect("activate controller");
+        let error = ledger
+            .release_admission_reservation(&stale_controller, Some("stale ownerless release"))
+            .expect_err("stale ownerless observation must not release controller custody");
+        assert_eq!(error.code(), ErrorCode::OperationInProgress);
+        let snapshot = ledger
+            .admission_snapshot(None)
+            .expect("controller snapshot");
+        assert_eq!(snapshot.capacity.total_active, 1);
+        assert_eq!(snapshot.reservations, vec![active_controller.clone()]);
+        ledger
+            .release_admission_reservation(&active_controller, Some("controller reconciled"))
+            .expect("release exact controller custody");
+
+        let stale_packet = reserve(
+            &ledger,
+            AdmissionSubjectKind::Packet,
+            &packet_id,
+            "batch-stale-packet",
+            "9999-01-01T00:00:00.000000000Z",
+        );
+        let attempt = ledger
+            .claim_packet_with_admission(
+                &packet_id,
+                "codex:test:stale",
+                &SpecFence::Sha256("feed".to_owned()),
+                &stale_packet.reservation_id,
+            )
+            .expect("claim packet");
+        let error = ledger
+            .release_admission_reservation(&stale_packet, Some("stale packet release"))
+            .expect_err("stale ownerless observation must not release attempt custody");
+        assert_eq!(error.code(), ErrorCode::OperationInProgress);
+        ledger
+            .assert_admitted_attempt_live(&attempt.claim_token)
+            .expect("attempt custody remains live");
+        let snapshot = ledger.admission_snapshot(None).expect("attempt snapshot");
+        assert_eq!(snapshot.capacity.total_active, 1);
+        assert_eq!(snapshot.reservations.len(), 1);
+        assert_eq!(
+            snapshot.reservations[0].owner_kind.as_deref(),
+            Some("attempt")
+        );
+        assert_eq!(
+            snapshot.reservations[0].owner_id.as_deref(),
+            Some(attempt.attempt_id.to_string().as_str())
+        );
+        ledger
+            .fail_packet(&packet_id, &attempt.claim_token, "test cleanup")
+            .expect("release attempt custody");
+        assert_eq!(
+            ledger
+                .admission_snapshot(None)
+                .expect("final snapshot")
+                .capacity
+                .total_active,
+            0
+        );
+    }
+
+    #[test]
+    fn exact_release_replays_immutably_and_release_first_fences_transfer() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ledger = Ledger::open(&dir.path().join("state.db")).expect("ledger");
+        let (run_id, packet_id) = seed_packet(&ledger, "release-first");
+
+        let ownerless = reserve(
+            &ledger,
+            AdmissionSubjectKind::Run,
+            &run_id,
+            "batch-ownerless-release",
+            "9999-01-01T00:00:00.000000000Z",
+        );
+        let released = ledger
+            .release_admission_reservation(&ownerless, Some("first release"))
+            .expect("release exact ownerless custody");
+        assert_eq!(released.state, AdmissionReservationState::Released);
+        assert_eq!(released.last_error.as_deref(), Some("first release"));
+        assert_eq!(
+            ledger
+                .release_admission_reservation(&ownerless, Some("replayed predecessor"))
+                .expect("predecessor replay"),
+            released
+        );
+        assert_eq!(
+            ledger
+                .release_admission_reservation(&released, Some("released replay"))
+                .expect("terminal replay"),
+            released
+        );
+        let error = ledger
+            .activate_admission_reservation(
+                &ownerless.reservation_id,
+                "controller",
+                &format!("run:{run_id}:1"),
+            )
+            .expect_err("released custody cannot activate");
+        assert_eq!(error.code(), ErrorCode::OperationInProgress);
+
+        let packet = reserve(
+            &ledger,
+            AdmissionSubjectKind::Packet,
+            &packet_id,
+            "batch-packet-release-first",
+            "9999-01-01T00:00:00.000000000Z",
+        );
+        ledger
+            .release_admission_reservation(&packet, Some("packet release wins"))
+            .expect("release packet before claim");
+        let error = ledger
+            .claim_packet_with_admission(
+                &packet_id,
+                "codex:test:release-first",
+                &SpecFence::Sha256("feed".to_owned()),
+                &packet.reservation_id,
+            )
+            .expect_err("released packet custody cannot transfer");
+        assert_eq!(error.code(), ErrorCode::OperationInProgress);
+        assert!(ledger
+            .list_live_attempts(Some(&run_id))
+            .expect("attempts")
+            .is_empty());
+
+        let ownerless = reserve(
+            &ledger,
+            AdmissionSubjectKind::Run,
+            &run_id,
+            "batch-owned-release",
+            "9999-01-01T00:00:00.000000000Z",
+        );
+        let active = ledger
+            .activate_admission_reservation(
+                &ownerless.reservation_id,
+                "controller",
+                &format!("run:{run_id}:2"),
+            )
+            .expect("activate exact owner");
+        let mut wrong_owner = active.clone();
+        wrong_owner.owner_id = Some(format!("run:{run_id}:3"));
+        let error = ledger
+            .release_admission_reservation(&wrong_owner, Some("wrong owner"))
+            .expect_err("different owner must refuse");
+        assert_eq!(error.code(), ErrorCode::OperationInProgress);
+        let mut wrong_state = active.clone();
+        wrong_state.state = AdmissionReservationState::Orphaned;
+        let error = ledger
+            .release_admission_reservation(&wrong_state, Some("wrong state"))
+            .expect_err("different state must refuse");
+        assert_eq!(error.code(), ErrorCode::OperationInProgress);
+        let released = ledger
+            .release_admission_reservation(&active, Some("owned release"))
+            .expect("release exact owner");
+        assert_eq!(released.owner_kind, active.owner_kind);
+        assert_eq!(released.owner_id, active.owner_id);
+        assert_eq!(
+            ledger
+                .release_admission_reservation(&active, Some("owned replay"))
+                .expect("owned predecessor replay"),
+            released
+        );
+        assert_eq!(
+            ledger
+                .admission_snapshot(None)
+                .expect("zero capacity")
+                .capacity
+                .total_active,
+            0
+        );
+    }
+
+    #[test]
+    fn orphaned_custody_cannot_aba_to_active() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ledger = Ledger::open(&dir.path().join("state.db")).expect("ledger");
+        let (run_id, _) = seed_packet(&ledger, "custody-aba");
+        let reservation = reserve(
+            &ledger,
+            AdmissionSubjectKind::Run,
+            &run_id,
+            "batch-custody-aba",
+            "2000-01-01T00:00:00.000000000Z",
+        );
+        let owner_id = format!("run:{run_id}:1");
+        let active = ledger
+            .activate_admission_reservation(&reservation.reservation_id, "controller", &owner_id)
+            .expect("activate");
+        assert_eq!(
+            ledger
+                .activate_admission_reservation(
+                    &reservation.reservation_id,
+                    "controller",
+                    &owner_id,
+                )
+                .expect("active activation replay"),
+            active,
+            "an exact active replay must not rewrite audit fields"
+        );
+        let orphaned = ledger
+            .mark_expired_admission_orphaned("2030-01-01T00:00:00.000000000Z")
+            .expect("orphan expired custody")
+            .into_iter()
+            .next()
+            .expect("orphan row");
+        let error = ledger
+            .activate_admission_reservation(&reservation.reservation_id, "controller", &owner_id)
+            .expect_err("orphan must not reactivate to the same owner");
+        assert_eq!(error.code(), ErrorCode::OperationInProgress);
+        let error = ledger
+            .release_admission_reservation(&active, Some("stale active release"))
+            .expect_err("stale active tuple must not release orphan custody");
+        assert_eq!(error.code(), ErrorCode::OperationInProgress);
+        let snapshot = ledger.admission_snapshot(None).expect("orphan snapshot");
+        assert_eq!(snapshot.capacity.total_active, 1);
+        assert_eq!(snapshot.reservations, vec![orphaned.clone()]);
+        let released = ledger
+            .release_admission_reservation(&orphaned, Some("orphan reconciled"))
+            .expect("release exact orphan custody");
+        assert_eq!(released.state, AdmissionReservationState::Released);
+        assert_eq!(released.owner_kind, orphaned.owner_kind);
+        assert_eq!(released.owner_id, orphaned.owner_id);
+    }
+
+    #[test]
+    fn malformed_owner_pairs_and_nonreserved_packet_custody_fail_closed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ledger = Ledger::open(&dir.path().join("state.db")).expect("ledger");
+        let (run_id, _) = seed_packet(&ledger, "malformed-observation");
+        let reserved = reserve(
+            &ledger,
+            AdmissionSubjectKind::Run,
+            &run_id,
+            "batch-malformed-observation",
+            "9999-01-01T00:00:00.000000000Z",
+        );
+        for malformed in [
+            AdmissionReservationRow {
+                owner_kind: Some("controller".to_owned()),
+                ..reserved.clone()
+            },
+            AdmissionReservationRow {
+                owner_id: Some("run:malformed:1".to_owned()),
+                ..reserved.clone()
+            },
+        ] {
+            let error = ledger
+                .release_admission_reservation(&malformed, Some("must fail closed"))
+                .expect_err("half-owned observation");
+            assert_eq!(error.code(), ErrorCode::InvalidRequest);
+        }
+        assert_eq!(
+            ledger
+                .admission_snapshot(None)
+                .expect("unchanged observation row")
+                .reservations,
+            vec![reserved]
+        );
+
+        for (suffix, owner_kind, owner_id) in [
+            ("kind", Some("controller"), None),
+            ("id", None, Some("run:malformed:1")),
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("state.db");
+            let ledger = Ledger::open(&path).expect("ledger");
+            let (run_id, _) = seed_packet(&ledger, suffix);
+            let reserved = reserve(
+                &ledger,
+                AdmissionSubjectKind::Run,
+                &run_id,
+                &format!("batch-malformed-stored-{suffix}"),
+                "9999-01-01T00:00:00.000000000Z",
+            );
+            let connection = rusqlite::Connection::open(&path).expect("second connection");
+            connection
+                .execute(
+                    "UPDATE admission_reservations SET owner_kind = ?1, owner_id = ?2 \
+                     WHERE reservation_id = ?3",
+                    rusqlite::params![owner_kind, owner_id, reserved.reservation_id],
+                )
+                .expect("inject malformed stored pair");
+            let error = ledger
+                .release_admission_reservation(&reserved, Some("must not mutate malformed row"))
+                .expect_err("malformed stored row");
+            assert_eq!(error.code(), ErrorCode::Internal);
+            let state: String = connection
+                .query_row(
+                    "SELECT state FROM admission_reservations WHERE reservation_id = ?1",
+                    [&reserved.reservation_id],
+                    |row| row.get(0),
+                )
+                .expect("stored state");
+            assert_eq!(state, "reserved");
+        }
+
+        for custody in ["orphaned", "owned"] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let ledger = Ledger::open(&dir.path().join("state.db")).expect("ledger");
+            let (run_id, packet_id) = seed_packet(&ledger, custody);
+            let reserved = reserve(
+                &ledger,
+                AdmissionSubjectKind::Packet,
+                &packet_id,
+                &format!("batch-packet-{custody}"),
+                if custody == "orphaned" {
+                    "2000-01-01T00:00:00.000000000Z"
+                } else {
+                    "9999-01-01T00:00:00.000000000Z"
+                },
+            );
+            let exact = if custody == "orphaned" {
+                ledger
+                    .mark_expired_admission_orphaned("2030-01-01T00:00:00.000000000Z")
+                    .expect("orphan packet custody")
+                    .into_iter()
+                    .next()
+                    .expect("orphan row")
+            } else {
+                ledger
+                    .activate_admission_reservation(
+                        &reserved.reservation_id,
+                        "controller",
+                        &format!("run:{run_id}:1"),
+                    )
+                    .expect("own packet custody")
+            };
+            let error = ledger
+                .claim_packet_with_admission(
+                    &packet_id,
+                    "codex:test:nonreserved",
+                    &SpecFence::Sha256("feed".to_owned()),
+                    &reserved.reservation_id,
+                )
+                .expect_err("only exact reserved ownerless custody transfers");
+            assert_eq!(error.code(), ErrorCode::OperationInProgress);
+            assert!(ledger
+                .list_live_attempts(Some(&run_id))
+                .expect("attempts")
+                .is_empty());
+            ledger
+                .release_admission_reservation(&exact, Some("test cleanup"))
+                .expect("release exact nonreserved custody");
+        }
     }
 
     #[test]
