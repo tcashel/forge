@@ -1,8 +1,8 @@
-# Native Bead specification schema
+# Ledger-native work-item specification schema
 
-The native Bead is the complete, durable execution contract. Keep it concise,
-but include every fact an implementation and review agent needs without access
-to the planning conversation.
+The work item is the complete, durable execution contract. Keep it concise, but
+include every fact an implementation and review agent needs without access to
+the planning conversation.
 
 ## Title
 
@@ -32,7 +32,7 @@ Record the decisions the implementation must preserve:
 Do not write “decide X.” Make the decision or put the question in `notes` and
 hold the record blocked.
 
-## `acceptance_criteria`
+## `acceptanceCriteria`
 
 Use checkable bullets that describe observable behavior. Include exact quality
 gates: named test targets, format or lint commands, compatibility checks, and
@@ -51,12 +51,19 @@ Include:
 - non-goals and operational cautions worth making conspicuous;
 - unresolved questions only as `- [ ]` bullets.
 
-Any unchecked question makes the Bead blocked. When adjudicated, move the
+Any unchecked question makes the work item blocked. When adjudicated, move the
 answer into the normative field it changes and remove the checkbox. Keep only a
 short dated decision note when the history is useful.
+
+Critique and execution-approval records also live in `notes` on current main
+because there is no separate ledger commentary operation. Preserve those
+fenced records during later spec updates.
 
 ## Repository metadata
 
 Set `metadata.repository` to `git rev-parse --show-toplevel` from the target
-checkout, resolved to a canonical absolute path. This metadata selects the
-repository while `BEADS_DIR` continues to select the operator's central store.
+checkout, resolved to a canonical absolute path. Verify the stored bytes with:
+
+```bash
+forged work show --id "$WORK_ID"
+```

@@ -1,143 +1,214 @@
 ---
 name: plan
-description: "Turn an approved idea or plan into one native operator-scoped Bead specification, or a native epic with reviewable child slices, without writing spec files into any repository. Use when the operator asks to plan work with Forged or invokes /forged:plan."
+description: "Turn an approved idea or plan into one ledger-native ore work-item specification, or an epic with reviewable child slices, without writing spec files into a repository. Use when the operator asks to plan work with Forged or invokes /forged:plan."
 ---
 
 # /forged:plan
 
-Convert an idea into the durable specification that Forged will execute. The
-operator-scoped Beads database is the source of truth. A Bead's native fields,
-not a parallel Markdown file, carry the complete specification:
+Position: approved idea -> authored ore work item or epic. Next:
+`/forged:critique` for every complete record.
+
+Boundary: planning and all judgment stay in the lead session, which reads and
+writes the Forged ledger through typed `forged work` verbs. Forged owns provider
+execution only after an explicit dispatch; this skill never starts a run.
+
+The ledger work item is the complete specification:
 
 | Native field | Required content |
 | --- | --- |
 | `title` | Conventional-commit PR title, lowercase and at most 70 characters |
 | `description` | Context and the concrete behavior being built |
 | `design` | Implementation constraints, seam contracts, and non-goals |
-| `acceptance_criteria` | Observable acceptance criteria and exact quality gates |
+| `acceptanceCriteria` | Observable acceptance criteria and exact quality gates |
 | `notes` | Agent instructions, decisions, and any unresolved questions |
 | `metadata.repository` | Canonical absolute target repository root |
 
-The lead agent owns the conversation and judgment. Forged owns durable
-execution after an explicit handoff. Planning must not launch a run.
-
 ## State boundary
 
-Resolve the operator paths once and pass `BEADS_DIR` on every command:
+Resolve the canonical target repository once. `forged work` always addresses
+the operator ledger; repository metadata associates an item with its checkout:
 
 ```bash
 export ANVIL_HOME="${ANVIL_HOME:-$HOME/.anvil}"
-export BEADS_DIR="${BEADS_DIR:-$ANVIL_HOME/beads}"
-BD_BIN="${BD_BIN:-$(command -v bd)}"
 TARGET_REPO="$(cd "$(git rev-parse --show-toplevel)" && pwd -P)"
-REPOSITORY_METADATA="$(jq -cn --arg repository "$TARGET_REPO" \
-  '{repository: $repository}')"
-env BEADS_DIR="$BEADS_DIR" "$BD_BIN" where --json
 ```
 
-Do not initialize Beads from the target checkout. Do not use repository-routing
-flags on `bd create`. The one operator store holds work for many repositories;
-`metadata.repository` performs that association. Never add `.beads`, a spec
-file, agent instructions, hooks, or settings to the target repository while
-planning.
+Do not create a repository-local work store, a parallel spec file, agent
+instructions, hooks, or settings while planning. Never use a repository path
+as a substitute for `metadata.repository`.
 
 ## Workflow
 
 1. **Research.** Read `research.md`, inspect the target repository read-only,
    and establish current behavior, constraints, tests, and unresolved choices.
 2. **Choose one slice or an epic.** Read `epic.md`. Prefer one reviewable slice
-   unless there are real dependency seams or independent delivery waves.
-3. **Draft native fields.** Read `schema.md`. Draft every field in the
-   conversation, make decisions at the lead-agent level, and let the operator
-   correct direction. Temporary scratch files are allowed only outside the
-   repository and are not authoritative.
+   unless real dependency seams or independent delivery waves require an epic.
+3. **Draft native fields.** Read `schema.md`. Draft every field in the lead
+   conversation and let the operator correct direction. Scratch files are
+   allowed only outside the repository and are never authoritative.
 4. **Self-check.** Apply `checklist.md`. Assume the implementation agent sees
-   the native Bead and target checkout, not this conversation.
-5. **Lock the record.** Create or update the Bead with all native fields and
-   repository metadata. Then verify the stored record with `bd show`.
+   only the stored work item and the target checkout.
+5. **Lock the record.** Create or revision-CAS update the work item, then verify
+   it with `forged work show --id` and the ready frontier.
 
 ## Open-question gate
 
-An unresolved question is an unchecked `- [ ]` item in `notes`. A Bead with any
-such item must have status `blocked`; it must not appear on `bd ready`. Resolve
-the question with the operator, update the normative field, remove the item,
-and change the status to `open` before critique or dispatch.
+An unresolved question is an unchecked `- [ ]` item in `notes`. Create a work
+item containing one as `blocked`; it must not appear on the repository-scoped
+ready frontier.
+Resolve the question in the lead session, update the normative field, remove
+the checkbox, and reopen the item before critique or dispatch.
 
-Do not hide uncertainty in prose and do not tell the implementation agent to
-choose a product or architecture direction. Make the decision here or hold the
-record blocked.
+Do not write a new unresolved checkbox into an already-open item: current main
+has no typed open-to-blocked transition. Resolve it before the guarded write or
+leave the existing record unchanged and report the blocker. Do not hide
+uncertainty in prose or delegate a product or architecture decision to the
+implementation agent.
 
 ## Single-slice lock
 
-Prepare the field bodies in temporary files outside the target repository so
-shell quoting cannot corrupt Markdown, then create the record. The exact files
-below are illustrative; delete them after verification.
+The caller supplies a stable `ore-` id. Prepare field bodies in temporary files
+outside the target repository and pass their paths directly to the CLI. A
+missing, unreadable, or non-UTF-8 draft file makes the CLI refuse before it
+creates or updates a record. Each file flag conflicts with its corresponding
+inline flag; never pass both. An empty readable file is valid CLI input and
+would still produce an empty field, so the skill must reject every empty draft
+with `-s` before creation or update.
 
 ```bash
-ACCEPTANCE="$(<"$DRAFT_DIR/acceptance.md")"
-NOTES="$(<"$DRAFT_DIR/notes.md")"
-ISSUE_JSON="$(env BEADS_DIR="$BEADS_DIR" "$BD_BIN" create "$TITLE" \
-  --type task \
-  --body-file "$DRAFT_DIR/description.md" \
-  --design-file "$DRAFT_DIR/design.md" \
-  --acceptance "$ACCEPTANCE" \
-  --notes "$NOTES" \
-  --metadata "$REPOSITORY_METADATA" \
-  --json)"
-ID="$(printf '%s' "$ISSUE_JSON" | jq -r '.id')"
-env BEADS_DIR="$BEADS_DIR" "$BD_BIN" show "$ID" --long --json
+WORK_ID="ore-<short-stable-id>"
+TITLE="<conventional-commit title>"
+: "${DRAFT_DIR:?set DRAFT_DIR to the planning scratch directory}"
+DESCRIPTION_PATH="$DRAFT_DIR/description.md"
+DESIGN_PATH="$DRAFT_DIR/design.md"
+ACCEPTANCE_PATH="$DRAFT_DIR/acceptance.md"
+NOTES_PATH="$DRAFT_DIR/notes.md"
+for DRAFT_PATH in "$DESCRIPTION_PATH" "$DESIGN_PATH" \
+  "$ACCEPTANCE_PATH" "$NOTES_PATH"; do
+  if [ ! -s "$DRAFT_PATH" ]; then
+    printf 'missing or empty planning draft: %s\n' "$DRAFT_PATH" >&2
+    exit 1
+  fi
+done
+
+forged work create \
+  --id "$WORK_ID" \
+  --title "$TITLE" \
+  --kind task \
+  --status open \
+  --repository "$TARGET_REPO" \
+  --description-file "$DESCRIPTION_PATH" \
+  --design-file "$DESIGN_PATH" \
+  --acceptance-file "$ACCEPTANCE_PATH" \
+  --notes-file "$NOTES_PATH"
+forged work show --id "$WORK_ID"
 ```
 
-The pinned CLI accepts description and design files as `--body-file` and
-`--design-file`; acceptance and notes use text flags. Inspect `bd create --help`
-first and do not silently drop a field. In JSON, confirm the result contains
-`acceptance_criteria`, the other native fields, and the exact repository value.
+Use `--status blocked` instead when `notes` contains an unresolved question.
+At creation only, `--priority <0-4>` may set scheduling priority. Current main
+cannot mutate priority on an existing item; record the intended value in
+`notes` until ore-063 adds the typed priority operation.
+
+For an existing item, read its current `revision`, prepare the complete new
+field bodies, and use the exact revision as the CAS guard:
+
+```bash
+forged work update \
+  --id "$WORK_ID" \
+  --expected-revision "$OBSERVED_REVISION" \
+  --title "$TITLE" \
+  --description-file "$DESCRIPTION_PATH" \
+  --design-file "$DESIGN_PATH" \
+  --acceptance-file "$ACCEPTANCE_PATH" \
+  --notes-file "$NOTES_PATH"
+forged work show --id "$WORK_ID"
+```
+
+Omitted fields keep their bytes, but planning should pass every reviewed spec
+field so the stored contract is obvious. A moved revision fails closed: re-read,
+reconcile the operator's newer content, and apply one fresh intentional update.
 
 ## Epic lock
 
-Use native issue types and parent-child edges:
+Use native item kinds and dependency edges:
 
-1. Create the plan map as `--type epic` with complete native fields and
-   `metadata.repository`.
-2. Create each child with `--parent "$EPIC_ID"`. The native parent edge means
-   membership; do not add synthetic dependencies from the epic to every child.
-3. Fully specify wave-one children. Create downstream children as honest stubs
-   in status `blocked`, with their assumptions in `notes`.
-4. Add only useful `blocks` dependencies between children where one slice
-   consumes another slice's output. Independent siblings remain independent.
-5. At each wave boundary, re-read merged reality, replace a stub with complete
-   native fields, remove its assumption checkboxes, and open it only when its
-   dependencies and questions are resolved.
+1. Create the plan map with `--kind epic`, complete native fields, and the
+   canonical repository metadata.
+2. Create each child with `--kind task`, then add its membership edge with
+   `forged work link --from "$CHILD_ID" --to "$EPIC_ID" --kind parent-child`.
+3. Fully specify wave-one children. Create downstream children as honest
+   `blocked` stubs, with assumptions in `notes`.
+4. Add only real `blocks` edges from the consuming child to the work it needs.
+   Use `related`, `discovered-from`, and `supersedes` only for those exact
+   relationships. Independent siblings remain independent.
+5. At each wave boundary, re-read merged reality before promoting a stub.
 
-Example child creation:
+Example child creation and linkage:
 
 ```bash
-env BEADS_DIR="$BEADS_DIR" "$BD_BIN" create "$CHILD_TITLE" \
-  --type task --parent "$EPIC_ID" \
-  --description "$DESCRIPTION" --design "$DESIGN" \
-  --acceptance "$ACCEPTANCE" --notes "$NOTES" \
-  --metadata "$REPOSITORY_METADATA" --json
+forged work create \
+  --id "$CHILD_ID" \
+  --title "$CHILD_TITLE" \
+  --kind task \
+  --status blocked \
+  --repository "$TARGET_REPO" \
+  --description-file "$DESCRIPTION_PATH" \
+  --design-file "$DESIGN_PATH" \
+  --acceptance-file "$ACCEPTANCE_PATH" \
+  --notes-file "$NOTES_PATH"
+forged work link --from "$CHILD_ID" --to "$EPIC_ID" --kind parent-child
+forged work link --from "$CHILD_ID" --to "$BLOCKER_ID" --kind blocks
+forged work show --id "$CHILD_ID"
 ```
 
-After creation, query the epic's native children and dependency graph. Verify
-that every record has the same canonical repository metadata, no ready child
-has unresolved questions, and no false dependency serializes independent work.
-Use `bd ready --parent "$EPIC_ID" --metadata-field
-"repository=$TARGET_REPO" --json` with explicit `BEADS_DIR` to inspect the
-repository-scoped frontier.
+Stub promotion on current main is deliberately non-atomic: first use
+`forged work update --expected-revision` to write the complete spec, then run
+`forged work reopen --id`, then re-read with `forged work show --id`. This is
+safe only under one lead session with no concurrent planner. Stop on any failed
+step or moved revision. Ore-063 will replace this gap with atomic stub
+promotion; never pretend the current pair is atomic.
+
+Query the exact repository frontier. The default limit is 100 and the maximum is 500.
+Its `result.ready` entries are summary rows containing only `id`,
+`title`, `kind`, `status`, `priority`, `repository`, and `revision`; they do not
+contain specification bodies. Compare `result.totals.shown` with
+`result.totals.total`, raise `--limit` to the reported total when truncated,
+and fail closed if the total exceeds 500. Fetch each complete record by id:
+
+```bash
+READY_LIMIT=100
+while :; do
+  READY_JSON="$(forged work ready --repo "$TARGET_REPO" --limit "$READY_LIMIT")" || exit 1
+  READY_SHOWN="$(printf '%s' "$READY_JSON" | jq -er '.result.totals.shown')" || exit 1
+  READY_TOTAL="$(printf '%s' "$READY_JSON" | jq -er '.result.totals.total')" || exit 1
+  [ "$READY_SHOWN" -eq "$READY_TOTAL" ] && break
+  if [ "$READY_TOTAL" -gt 500 ]; then
+    printf 'ready frontier exceeds maximum limit: %s\n' "$READY_TOTAL" >&2
+    exit 1
+  fi
+  READY_LIMIT="$READY_TOTAL"
+done
+while IFS= read -r READY_ID; do
+  forged work show --id "$READY_ID"
+done < <(printf '%s' "$READY_JSON" | jq -r '.result.ready[].id')
+```
+
+Verify from those full snapshots that every ready record has the exact
+canonical `metadata.repository`, no unresolved question, and no blocking
+dependency. Do not infer readiness from `status` alone.
 
 ## Finish
 
-Report the single Bead id, or the epic id plus children grouped by wave; state
+Report the work-item id, or the epic id plus children grouped by wave. State
 which records are ready and which are blocked with the exact reason. The next
-step for a complete record is `/forged:critique`, not dispatch.
+step for every complete record is `/forged:critique`, never direct dispatch.
 
 ## Never
 
 - Do not create or maintain a second spec artifact.
-- Do not infer readiness from a status label alone; check questions and native
-  dependencies and confirm with `bd ready`.
-- Do not start Forged, install software, edit repository policy, or add another
-  work tracker.
-- Do not create ceremony-only micro-slices. One strong PR is preferred when it
-  has a coherent review and rollback boundary.
+- Do not infer readiness from status alone; inspect questions, dependencies,
+  and the complete repository-scoped ready frontier.
+- Do not start Forged execution, install software, edit repository policy, or
+  add another work tracker.
+- Do not create ceremony-only micro-slices. Prefer one coherent PR when it has
+  one review and rollback boundary.

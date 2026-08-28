@@ -1,33 +1,31 @@
 ---
 name: critique
-description: "Harden a complete native Bead specification with proportional, provider-neutral critique and persist one synthesized recommendation record for adjudication. Use after /forged:plan or when the operator invokes /forged:critique."
+description: "Harden a complete ledger-native ore work-item specification with proportional, provider-neutral critique and persist one synthesized recommendation record for adjudication. Use after /forged:plan or when the operator invokes /forged:critique."
 ---
 
 # /forged:critique
 
-Critique the native Bead before execution. The goal is one useful adversarial
-pass proportional to risk, not a review treadmill. This skill reads and
-comments on operator-scoped Beads; it does not edit their normative spec fields
-and does not launch Forged.
+Position: complete work item -> one bounded critique record. Next:
+`/forged:adjudicate`.
+
+Boundary: critique runs in the lead session. The lead reads the ledger,
+delegates only read-only critic perspectives, verifies their evidence, and
+stores the synthesized record in `notes`. Forged does not execute a run here.
 
 ## Load the authoritative record
 
 ```bash
-export ANVIL_HOME="${ANVIL_HOME:-$HOME/.anvil}"
-export BEADS_DIR="${BEADS_DIR:-$ANVIL_HOME/beads}"
-BD_BIN="${BD_BIN:-$(command -v bd)}"
-env BEADS_DIR="$BEADS_DIR" "$BD_BIN" show "$BEAD_ID" \
-  --long --include-comments --json
+forged work show --id "$WORK_ID"
 ```
 
-Read title, `description`, `design`, `acceptance_criteria`, `notes`, type,
-status, `metadata.repository`, parent and dependency edges. Inspect the target
-repository named by the metadata read-only. Do not substitute a sidecar file,
-conversation summary, or repository-local Beads store.
+Read `title`, `description`, `design`, `acceptanceCriteria`, `notes`, kind,
+status, revision, `metadata.repository`, and dependency edges. Inspect the
+named target repository read-only. Do not substitute a sidecar file,
+conversation summary, or another work store.
 
-If required native fields are absent, repository metadata is missing or wrong,
-or an unchecked question remains, report that blocking defect and stop. The
-record is not eligible for critique-as-approval.
+If required fields are absent, repository metadata is missing or wrong, an
+unchecked question remains, or the record is a later-wave stub, report that
+blocking defect and stop. The record is not eligible for critique-as-approval.
 
 ## Choose the smallest useful topology
 
@@ -40,10 +38,9 @@ record is not eligible for critique-as-approval.
   perspectives.
 
 Use the host's native delegation when available. Parallelize genuinely
-independent perspectives. Critics are read-only and receive the rendered native
-Bead plus repository root; they do not mutate Beads or the checkout. More seats
-are not intrinsically better. Stop when the selected topology has completed one
-bounded pass.
+independent perspectives. Critics are read-only and receive the rendered work
+item plus repository root; they do not mutate the ledger or checkout. Stop when
+the selected topology has completed one bounded pass.
 
 ## Adjudicate critic output before persisting it
 
@@ -53,19 +50,21 @@ duplicates, and separate:
 - **recommendations:** clear, evidence-backed corrections;
 - **CRUXes:** findings whose resolution requires lead/operator judgment;
 - **open questions:** facts that still need a decision or evidence;
-- **rejected findings:** concise reason a critic claim is inapplicable.
+- **rejected findings:** concise reasons critic claims are inapplicable.
 
-Do not silently modify the specification. Produce one exact fenced block:
+Do not silently modify the specification. Produce one exact fenced block. The
+block deliberately avoids unchecked Markdown checkboxes: the plan gate reserves
+those for questions that make an item ledger-blocked.
 
 ````markdown
 ```forged-spec-recommendations
-bead: <id>
+workItem: <ore-id>
 repository: <canonical absolute path>
-reviewed_at: <ISO-8601 UTC>
+reviewedAt: <ISO-8601 UTC>
 topology: <low|normal|high and seats used>
 
 ## Recommendations
-- [ ] <field or edge>: <specific correction and evidence>
+1. <field or edge>: <specific correction and evidence>
 
 ## CRUXes
 ### CRUX-1: <decision>
@@ -75,7 +74,7 @@ topology: <low|normal|high and seats used>
 - Resolution: UNRESOLVED
 
 ## Open Questions
-- [ ] <question, or "None">
+- <question, or "None">
 
 ## Rejected Findings
 - <finding and reason, or "None">
@@ -85,19 +84,44 @@ topology: <low|normal|high and seats used>
 ```
 ````
 
-The block is the handoff contract for `/forged:adjudicate`. Save it as one Bead
-comment using `bd comments add <id> --file <scratch-file>` with explicit
-`BEADS_DIR`, then read the comments back and verify the block was stored intact.
-The scratch file must live outside the target repository and may be deleted
-after verification.
+Current main has no separate ledger commentary operation. Construct one
+combined notes file from the exact existing `notes` bytes plus the complete
+block, preserving everything already there. Fail closed before the update if
+the combined file cannot be read, is empty, or cannot be loaded:
+
+```bash
+: "${DRAFT_DIR:?set DRAFT_DIR to the critique scratch directory}"
+UPDATED_NOTES_PATH="$DRAFT_DIR/notes-with-critique.md"
+if [[ ! -r "$UPDATED_NOTES_PATH" || ! -s "$UPDATED_NOTES_PATH" ]]; then
+  printf 'missing or empty combined critique notes: %s\n' \
+    "$UPDATED_NOTES_PATH" >&2
+  exit 1
+fi
+UPDATED_NOTES="$(<"$UPDATED_NOTES_PATH")" || exit 1
+if [[ -z "$UPDATED_NOTES" ]]; then
+  printf 'combined critique notes must be nonempty\n' >&2
+  exit 1
+fi
+forged work update \
+  --id "$WORK_ID" \
+  --expected-revision "$OBSERVED_REVISION" \
+  --notes="$UPDATED_NOTES"
+forged work show --id "$WORK_ID"
+```
+
+The update mints a spec revision. This is a known temporary gap, so only one
+lead session may write the record during critique. A moved revision fails
+closed: re-read and reconcile; never overwrite another planner's notes.
 
 If there are no findings, persist a block that says `None` and has no unresolved
-CRUX. That is a completed critique, not permission to skip adjudication's
-readiness checks.
+CRUX. That completes critique but does not bypass adjudication's readiness
+checks.
 
 ## Never
 
-- Do not write native spec fields, resolve CRUXes, or change Bead status here.
-- Do not run implementation, CI, installation, GitHub writes, or Forged.
-- Do not repeat critique because a critic could imagine more. One bounded
-  topology completes this stage; new evidence can justify a later explicit run.
+- Do not change `description`, `design`, `acceptanceCriteria`, title, edges, or
+  work-item status here.
+- Do not resolve CRUXes during critique or invent a nonexistent comment verb.
+- Do not run implementation, CI, installation, GitHub writes, or Forged
+  execution.
+- Do not repeat critique merely because another critic could imagine more.
