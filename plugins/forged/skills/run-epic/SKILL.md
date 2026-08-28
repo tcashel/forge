@@ -51,6 +51,15 @@ inventory, intended waves, and ordering; a missing, extra, or contradictory
 edge fails closed before approval or execution. Use the frozen child inventory
 instead of recursive expansions that exceed host output budgets.
 
+For the epic and every frozen child, critique output in `notes` must explicitly
+disposition every finding, recommendation, CRUX, and open question. Each
+accepted item must be folded into the normative fields; each rejected item must
+retain its reason. Checkbox-free critique prose is not evidence of
+adjudication. If any critique output lacks those dispositions, the epic is not
+dispatchable: return the affected record to `/forged:adjudicate` before any
+epic start. Keep the unchecked-checkbox gate in addition to this disposition
+check.
+
 ## Freeze a proportional profile
 
 Use standard assurance for ordinary code slices: deterministic gates, one
@@ -105,8 +114,11 @@ forged session read --attempt "$ATTEMPT_ID" --lines 120
 - `restart-budget-exhausted`: read the recorded failure, fix that cause, then
   resubmit the same epic id. Resubmission mints the next controller revision;
   resubmitting without fixing the cause repeats it.
-- Contention from `epic advance` means a live detached controller already owns
-  the epic. Observe with `epic status`; do not drive it concurrently.
+- The exact error code `BEADS_CONTENTION` from `epic advance` selects the
+  contention retry/backoff path: a live detached controller still owns the
+  singular epic driver slot. Back off and observe with `epic status`; do not
+  drive it concurrently. Retry only after durable status shows that controller
+  no longer owns the epic; other error codes require their own typed remedy.
 
 When `inputRequired.childId` names a child, first adjudicate that child's native
 work-item fields through the lead session. Then clear only that recorded hold

@@ -16,14 +16,35 @@ merges the default branch.
 ## Select and verify
 
 Resolve the canonical target repository. If the operator did not name an id,
-read the complete native frontier and select only an exact repository match:
+read the complete native frontier and select only from that exact repository.
+The default limit is 100 and the maximum is 500. Each `result.ready` entry is a
+summary row containing only `id`, `title`, `kind`, `status`, `priority`,
+`repository`, and `revision`, never specification bodies. Compare
+`result.totals.shown` with `result.totals.total`, raise `--limit` to the reported
+total when truncated, and fail closed if the total exceeds 500. Fetch each
+candidate's full specification by id:
 
 ```bash
 TARGET_REPO="$(cd "$(git rev-parse --show-toplevel)" && pwd -P)"
-forged work ready
+READY_LIMIT=100
+while :; do
+  READY_JSON="$(forged work ready --repo "$TARGET_REPO" --limit "$READY_LIMIT")" || exit 1
+  READY_SHOWN="$(printf '%s' "$READY_JSON" | jq -er '.result.totals.shown')" || exit 1
+  READY_TOTAL="$(printf '%s' "$READY_JSON" | jq -er '.result.totals.total')" || exit 1
+  [ "$READY_SHOWN" -eq "$READY_TOTAL" ] && break
+  if [ "$READY_TOTAL" -gt 500 ]; then
+    printf 'ready frontier exceeds maximum limit: %s\n' "$READY_TOTAL" >&2
+    exit 1
+  fi
+  READY_LIMIT="$READY_TOTAL"
+done
+while IFS= read -r READY_ID; do
+  forged work show --id "$READY_ID"
+done < <(printf '%s' "$READY_JSON" | jq -r '.result.ready[].id')
 ```
 
-Read the selected record and its outgoing dependencies:
+Read the selected record and its outgoing dependencies again immediately before
+the execution gate:
 
 ```bash
 forged work show --id "$WORK_ID"
@@ -37,6 +58,14 @@ Verify:
 - no unmet `blocks` edge and actual presence on the ready frontier;
 - kind is a reviewable task, not an epic or no-diff coordination record;
 - working-tree safety and the repository's configured base branch.
+
+If `notes` contains critique output, every finding, recommendation, CRUX, and
+open question must have an explicit disposition. Each accepted item must be
+folded into the normative fields; each rejected item must retain its reason.
+Checkbox-free critique prose is not evidence of adjudication. Any critique
+output without those dispositions makes the record nondispatchable: return it
+to `/forged:adjudicate` before any run start. Keep the unchecked-checkbox gate
+in addition to this disposition check.
 
 Do not dispatch a record merely because its status text says open.
 

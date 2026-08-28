@@ -31,7 +31,6 @@ the operator ledger; repository metadata associates an item with its checkout:
 ```bash
 export ANVIL_HOME="${ANVIL_HOME:-$HOME/.anvil}"
 TARGET_REPO="$(cd "$(git rev-parse --show-toplevel)" && pwd -P)"
-forged work ready
 ```
 
 Do not create a repository-local work store, a parallel spec file, agent
@@ -55,7 +54,8 @@ as a substitute for `metadata.repository`.
 ## Open-question gate
 
 An unresolved question is an unchecked `- [ ]` item in `notes`. Create a work
-item containing one as `blocked`; it must not appear on `forged work ready`.
+item containing one as `blocked`; it must not appear on the repository-scoped
+ready frontier.
 Resolve the question in the lead session, update the normative field, remove
 the checkbox, and reopen the item before critique or dispatch.
 
@@ -68,17 +68,28 @@ implementation agent.
 ## Single-slice lock
 
 The caller supplies a stable `ore-` id. Prepare field bodies in temporary files
-outside the target repository. Use attached `--flag=value` spelling for every
-body that may begin with a Markdown bullet; separated values beginning with
-`-` can be parsed as flags.
+outside the target repository and pass their paths directly to the CLI. A
+missing, unreadable, or non-UTF-8 draft file makes the CLI refuse before it
+creates or updates a record. Each file flag conflicts with its corresponding
+inline flag; never pass both. An empty readable file is valid CLI input and
+would still produce an empty field, so the skill must reject every empty draft
+with `-s` before creation or update.
 
 ```bash
 WORK_ID="ore-<short-stable-id>"
 TITLE="<conventional-commit title>"
-DESCRIPTION="$(<"$DRAFT_DIR/description.md")"
-DESIGN="$(<"$DRAFT_DIR/design.md")"
-ACCEPTANCE="$(<"$DRAFT_DIR/acceptance.md")"
-NOTES="$(<"$DRAFT_DIR/notes.md")"
+: "${DRAFT_DIR:?set DRAFT_DIR to the planning scratch directory}"
+DESCRIPTION_PATH="$DRAFT_DIR/description.md"
+DESIGN_PATH="$DRAFT_DIR/design.md"
+ACCEPTANCE_PATH="$DRAFT_DIR/acceptance.md"
+NOTES_PATH="$DRAFT_DIR/notes.md"
+for DRAFT_PATH in "$DESCRIPTION_PATH" "$DESIGN_PATH" \
+  "$ACCEPTANCE_PATH" "$NOTES_PATH"; do
+  if [ ! -s "$DRAFT_PATH" ]; then
+    printf 'missing or empty planning draft: %s\n' "$DRAFT_PATH" >&2
+    exit 1
+  fi
+done
 
 forged work create \
   --id "$WORK_ID" \
@@ -86,10 +97,10 @@ forged work create \
   --kind task \
   --status open \
   --repository "$TARGET_REPO" \
-  --description="$DESCRIPTION" \
-  --design="$DESIGN" \
-  --acceptance="$ACCEPTANCE" \
-  --notes="$NOTES"
+  --description-file "$DESCRIPTION_PATH" \
+  --design-file "$DESIGN_PATH" \
+  --acceptance-file "$ACCEPTANCE_PATH" \
+  --notes-file "$NOTES_PATH"
 forged work show --id "$WORK_ID"
 ```
 
@@ -106,10 +117,10 @@ forged work update \
   --id "$WORK_ID" \
   --expected-revision "$OBSERVED_REVISION" \
   --title "$TITLE" \
-  --description="$DESCRIPTION" \
-  --design="$DESIGN" \
-  --acceptance="$ACCEPTANCE" \
-  --notes="$NOTES"
+  --description-file "$DESCRIPTION_PATH" \
+  --design-file "$DESIGN_PATH" \
+  --acceptance-file "$ACCEPTANCE_PATH" \
+  --notes-file "$NOTES_PATH"
 forged work show --id "$WORK_ID"
 ```
 
@@ -141,10 +152,10 @@ forged work create \
   --kind task \
   --status blocked \
   --repository "$TARGET_REPO" \
-  --description="$DESCRIPTION" \
-  --design="$DESIGN" \
-  --acceptance="$ACCEPTANCE" \
-  --notes="$NOTES"
+  --description-file "$DESCRIPTION_PATH" \
+  --design-file "$DESIGN_PATH" \
+  --acceptance-file "$ACCEPTANCE_PATH" \
+  --notes-file "$NOTES_PATH"
 forged work link --from "$CHILD_ID" --to "$EPIC_ID" --kind parent-child
 forged work link --from "$CHILD_ID" --to "$BLOCKER_ID" --kind blocks
 forged work show --id "$CHILD_ID"
@@ -157,10 +168,34 @@ safe only under one lead session with no concurrent planner. Stop on any failed
 step or moved revision. Ore-063 will replace this gap with atomic stub
 promotion; never pretend the current pair is atomic.
 
-Query `forged work ready`, filter returned items by the exact canonical
-`metadata.repository`, and verify that every ready record has no unresolved
-question and no blocking dependency. Do not infer readiness from `status`
-alone.
+Query the exact repository frontier. The default limit is 100 and the maximum is 500.
+Its `result.ready` entries are summary rows containing only `id`,
+`title`, `kind`, `status`, `priority`, `repository`, and `revision`; they do not
+contain specification bodies. Compare `result.totals.shown` with
+`result.totals.total`, raise `--limit` to the reported total when truncated,
+and fail closed if the total exceeds 500. Fetch each complete record by id:
+
+```bash
+READY_LIMIT=100
+while :; do
+  READY_JSON="$(forged work ready --repo "$TARGET_REPO" --limit "$READY_LIMIT")" || exit 1
+  READY_SHOWN="$(printf '%s' "$READY_JSON" | jq -er '.result.totals.shown')" || exit 1
+  READY_TOTAL="$(printf '%s' "$READY_JSON" | jq -er '.result.totals.total')" || exit 1
+  [ "$READY_SHOWN" -eq "$READY_TOTAL" ] && break
+  if [ "$READY_TOTAL" -gt 500 ]; then
+    printf 'ready frontier exceeds maximum limit: %s\n' "$READY_TOTAL" >&2
+    exit 1
+  fi
+  READY_LIMIT="$READY_TOTAL"
+done
+while IFS= read -r READY_ID; do
+  forged work show --id "$READY_ID"
+done < <(printf '%s' "$READY_JSON" | jq -r '.result.ready[].id')
+```
+
+Verify from those full snapshots that every ready record has the exact
+canonical `metadata.repository`, no unresolved question, and no blocking
+dependency. Do not infer readiness from `status` alone.
 
 ## Finish
 
@@ -172,7 +207,7 @@ step for every complete record is `/forged:critique`, never direct dispatch.
 
 - Do not create or maintain a second spec artifact.
 - Do not infer readiness from status alone; inspect questions, dependencies,
-  and `forged work ready`.
+  and the complete repository-scoped ready frontier.
 - Do not start Forged execution, install software, edit repository policy, or
   add another work tracker.
 - Do not create ceremony-only micro-slices. Prefer one coherent PR when it has

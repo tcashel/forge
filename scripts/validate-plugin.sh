@@ -893,6 +893,59 @@ check_reconnect_surface() {
   done
 }
 
+check_ready_frontier_contract() {
+  node - "$@" <<'NODE'
+const fs = require('fs');
+const paths = process.argv.slice(2);
+let callCount = 0;
+for (const path of paths) {
+  const skill = fs.readFileSync(path, 'utf8');
+  const calls = skill.split('\n').filter((line) => line.includes('forged work ready'));
+  if (!calls.length) continue;
+  callCount += calls.length;
+  if (calls.some((line) =>
+    !line.includes('--repo "$TARGET_REPO"') || !line.includes('--limit "$READY_LIMIT"'))) {
+    console.error(`${path}: every ready call must carry the exact repo and bounded limit`);
+    process.exit(1);
+  }
+  for (const token of [
+    'result.ready', 'result.totals.shown', 'result.totals.total',
+    'forged work show --id "$READY_ID"', 'maximum is 500',
+    '`id`', '`title`', '`kind`', '`status`', '`priority`', '`repository`', '`revision`',
+  ]) {
+    if (!skill.includes(token)) {
+      console.error(`${path}: missing ready-frontier contract ${token}`);
+      process.exit(1);
+    }
+  }
+  if (!/default(?: ready)? limit is 100/.test(skill)) {
+    console.error(`${path}: missing ready default limit`);
+    process.exit(1);
+  }
+}
+if (!callCount) process.exit(1);
+NODE
+}
+
+check_setup_config_precedence() {
+  node - "$1" <<'NODE'
+const fs = require('fs');
+const skill = fs.readFileSync(process.argv[2], 'utf8');
+const explicit = skill.indexOf('if [ -n "${FORGED_CONFIG:-}" ]');
+const yaml = skill.indexOf('elif [ -e "$ANVIL_HOME/config.yaml" ]', explicit);
+const json = skill.indexOf('elif [ -e "$ANVIL_HOME/config.json" ]', yaml);
+if (!(explicit >= 0 && yaml > explicit && json > yaml)) process.exit(1);
+for (const token of [
+  'an explicit `FORGED_CONFIG` wins',
+  'existing `$ANVIL_HOME/config.yaml` wins',
+  '`$ANVIL_HOME/config.json` fallback',
+  'absent-config default path is',
+]) {
+  if (!skill.includes(token)) process.exit(1);
+}
+NODE
+}
+
 required=(
   "$plugin/README.md"
   "$plugin/LEARNINGS.md"
@@ -939,6 +992,7 @@ check "manage-work dual-host registration and contract parity" check_manage_work
 skill_files=("$plugin"/skills/*/SKILL.md)
 [[ ${#skill_files[@]} -eq 9 ]] && pass "exactly nine skills" || fail "exactly nine skills"
 for path in "${skill_files[@]}"; do check "frontmatter $path" check_frontmatter "$path"; done
+check "bounded repository ready-frontier contracts" check_ready_frontier_contract "${skill_files[@]}"
 check "critic frontmatter" check_frontmatter "$plugin/agents/critic.md"
 
 check_board_skill() {
@@ -990,7 +1044,7 @@ check "epic reconnect and resume command surface" check_reconnect_surface \
   "forged epic submit --epic"
 
 if grep -Ern --include='*.md' --include='*.sh' \
-  '(\.anvil/specs|--spec([[:space:]]|`)|--(description|acceptance|notes)-file|workflows/(execute-review-fix|run-epic|plan-critique-improve)\.js|watch-epic)' \
+  '(\.anvil/specs|--spec([[:space:]]|`)|workflows/(execute-review-fix|run-epic|plan-critique-improve)\.js|watch-epic)' \
   "$plugin"; then
   fail "no legacy spec-file, repo-routing, Workflow, or watch contract"
 else
@@ -1022,13 +1076,21 @@ done
 
 for needle in 'WORK_ID="ore-' 'metadata.repository' 'description' 'design' \
   'acceptanceCriteria' 'notes' '--id "$WORK_ID"' '--kind task' '--status open' \
-  '--repository "$TARGET_REPO"' '--description="$DESCRIPTION"' \
-  '--design="$DESIGN"' '--acceptance="$ACCEPTANCE"' '--notes="$NOTES"' \
+  '--repository "$TARGET_REPO"' '--description-file "$DESCRIPTION_PATH"' \
+  '--design-file "$DESIGN_PATH"' '--acceptance-file "$ACCEPTANCE_PATH"' \
+  '--notes-file "$NOTES_PATH"' 'for DRAFT_PATH in "$DESCRIPTION_PATH"' \
+  '[ ! -s "$DRAFT_PATH" ]' 'missing, unreadable, or non-UTF-8 draft file' \
+  'Each file flag conflicts with its corresponding' \
   'forged work create' 'forged work update' 'forged work link' \
   'forged work reopen' 'forged work show' 'forged work ready' 'parent-child'; do
   grep -Fq -- "$needle" "$plugin/skills/plan/SKILL.md" \
     && pass "native plan contract: $needle" || fail "native plan contract: $needle"
 done
+if grep -Fq '$(<' "$plugin/skills/plan/SKILL.md"; then
+  fail "native plan uses direct file flags instead of shell file substitution"
+else
+  pass "native plan uses direct file flags instead of shell file substitution"
+fi
 for needle in 'newly created id' 'ore-' 'existing or' \
   'imported stored id is preserved verbatim'; do
   grep -Fq -- "$needle" "$plugin/skills/plan/checklist.md" \
@@ -1054,6 +1116,26 @@ for needle in 'for CHILD_ID in <every exact id from preflight' \
   grep -Fq -- "$needle" "$plugin/skills/run-epic/SKILL.md" \
     && pass "epic child preflight contract: $needle" \
     || fail "epic child preflight contract: $needle"
+done
+for path in "$plugin/skills/dispatch/SKILL.md" "$plugin/skills/run-epic/SKILL.md"; do
+  for needle in 'every finding, recommendation, CRUX, and' \
+    'accepted item must be' 'normative fields' 'rejected item must' \
+    'retain its reason' \
+    'Checkbox-free critique prose is not evidence of' \
+    '/forged:adjudicate' 'unchecked-checkbox gate'; do
+    grep -Fq -- "$needle" "$path" \
+      && pass "critique disposition gate $path: $needle" \
+      || fail "critique disposition gate $path: $needle"
+  done
+done
+check "setup config precedence mirrors runtime" check_setup_config_precedence \
+  "$plugin/skills/setup/SKILL.md"
+for needle in 'The exact error code `BEADS_CONTENTION` from `epic advance`' \
+  'contention retry/backoff path' 'live detached controller' \
+  'Retry only after durable status'; do
+  grep -Fq -- "$needle" "$plugin/skills/run-epic/SKILL.md" \
+    && pass "typed epic contention recovery: $needle" \
+    || fail "typed epic contention recovery: $needle"
 done
 for needle in 'Tool rates are optional' 'default_rate_card' \
   'server-side tool use' 'custom `pricing` block replaces'; do

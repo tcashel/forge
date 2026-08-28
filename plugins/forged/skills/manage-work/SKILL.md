@@ -51,7 +51,6 @@ Resolve the operator home and canonical target repository once:
 ```bash
 export ANVIL_HOME="${ANVIL_HOME:-$HOME/.anvil}"
 TARGET_REPO="$(cd "$(git rev-parse --show-toplevel)" && pwd -P)"
-forged work ready
 ```
 
 `forged work` addresses the operator ledger. Every authored item stores the
@@ -61,6 +60,32 @@ create a parallel specification file.
 
 Repository language resolves first. An unavailable authoritative repository
 read fails closed; unknown identity must not widen to unrelated operator work.
+
+When this router needs the ready frontier, use the exact repository selector.
+The default limit is 100 and the maximum is 500. `result.ready` contains only
+summary fields (`id`, `title`, `kind`, `status`, `priority`, `repository`, and
+`revision`), not specification bodies. Compare `result.totals.shown` with
+`result.totals.total`, raise `--limit` to the reported total when truncated,
+and fail closed if the total exceeds 500. Fetch every considered item's full
+record by id:
+
+```bash
+READY_LIMIT=100
+while :; do
+  READY_JSON="$(forged work ready --repo "$TARGET_REPO" --limit "$READY_LIMIT")" || exit 1
+  READY_SHOWN="$(printf '%s' "$READY_JSON" | jq -er '.result.totals.shown')" || exit 1
+  READY_TOTAL="$(printf '%s' "$READY_JSON" | jq -er '.result.totals.total')" || exit 1
+  [ "$READY_SHOWN" -eq "$READY_TOTAL" ] && break
+  if [ "$READY_TOTAL" -gt 500 ]; then
+    printf 'ready frontier exceeds maximum limit: %s\n' "$READY_TOTAL" >&2
+    exit 1
+  fi
+  READY_LIMIT="$READY_TOTAL"
+done
+while IFS= read -r READY_ID; do
+  forged work show --id "$READY_ID"
+done < <(printf '%s' "$READY_JSON" | jq -r '.result.ready[].id')
+```
 
 ## Observe from headless projections
 

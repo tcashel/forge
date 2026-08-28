@@ -19,8 +19,10 @@ target repository.
 - Default `ANVIL_HOME` is `$HOME/.anvil`.
 - Durable work items and execution evidence live in the Forged ledger at
   `$ANVIL_HOME/state.db` unless configuration selects another operator path.
-- The authoring config is `$ANVIL_HOME/config.yaml`; an explicit
-  `FORGED_CONFIG` wins.
+- Config selection matches the runtime: an explicit `FORGED_CONFIG` wins;
+  otherwise an existing `$ANVIL_HOME/config.yaml` wins, then the legacy
+  `$ANVIL_HOME/config.json` fallback, then the absent-config default path is
+  `$ANVIL_HOME/config.yaml`.
 - Setup and this plugin never install or upgrade the `forged` binary.
 - Never create a repository-local work store, hooks, agent files, settings, or
   workflow files.
@@ -36,6 +38,10 @@ target repository.
 export ANVIL_HOME="${ANVIL_HOME:-$HOME/.anvil}"
 if [ -n "${FORGED_CONFIG:-}" ]; then
   CONFIG="$FORGED_CONFIG"
+elif [ -e "$ANVIL_HOME/config.yaml" ]; then
+  CONFIG="$ANVIL_HOME/config.yaml"
+elif [ -e "$ANVIL_HOME/config.json" ]; then
+  CONFIG="$ANVIL_HOME/config.json"
 else
   CONFIG="$ANVIL_HOME/config.yaml"
 fi

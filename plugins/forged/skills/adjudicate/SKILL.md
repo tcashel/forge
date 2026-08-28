@@ -108,20 +108,41 @@ Reopen only when:
 - no unchecked question remains;
 - the record is not deliberately held by a later-wave assumption.
 
-A dependency-blocked child may be open; `forged work ready` withholds it until
-its `blocks` targets close. A later-wave stub remains blocked.
+A dependency-blocked child may be open; the repository-scoped ready frontier
+withholds it until its `blocks` targets close. A later-wave stub remains
+blocked.
 
 ## Verify and report
 
 ```bash
+TARGET_REPO="$(cd "$(git rev-parse --show-toplevel)" && pwd -P)"
 forged work show --id "$WORK_ID"
-forged work ready
+READY_LIMIT=100
+while :; do
+  READY_JSON="$(forged work ready --repo "$TARGET_REPO" --limit "$READY_LIMIT")" || exit 1
+  READY_SHOWN="$(printf '%s' "$READY_JSON" | jq -er '.result.totals.shown')" || exit 1
+  READY_TOTAL="$(printf '%s' "$READY_JSON" | jq -er '.result.totals.total')" || exit 1
+  [ "$READY_SHOWN" -eq "$READY_TOTAL" ] && break
+  if [ "$READY_TOTAL" -gt 500 ]; then
+    printf 'ready frontier exceeds maximum limit: %s\n' "$READY_TOTAL" >&2
+    exit 1
+  fi
+  READY_LIMIT="$READY_TOTAL"
+done
+while IFS= read -r READY_ID; do
+  forged work show --id "$READY_ID"
+done < <(printf '%s' "$READY_JSON" | jq -r '.result.ready[].id')
 ```
 
-Filter the frontier by exact `metadata.repository`. Check that every intended
-edit persisted, metadata and graph edges remained unchanged unless explicitly
-adjudicated, and readiness matches reality. Report decisions, exact fields or
-edges changed, rejected findings, and the next valid skill or named blocker.
+The default ready limit is 100 and the maximum is 500. Each `result.ready` row
+contains only `id`, `title`, `kind`, `status`, `priority`, `repository`, and
+`revision`, not specification bodies. The loop compares
+`result.totals.shown` with `result.totals.total`, raises `--limit` when
+truncated, fails closed beyond the maximum, and fetches every full record by
+id. Check that every intended edit persisted, metadata and graph edges remained
+unchanged unless explicitly adjudicated, and readiness matches reality. Report
+decisions, exact fields or edges changed, rejected findings, and the next valid
+skill or named blocker.
 
 ## Never
 
