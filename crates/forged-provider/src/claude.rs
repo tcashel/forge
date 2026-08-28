@@ -4,6 +4,7 @@
 use forged_types::{claude_session_id, WorkPacket};
 use serde_json::{Map, Value};
 
+use crate::command::{provider_argv, ProviderKindV1};
 use crate::error::ProviderError;
 use crate::invocation::ProviderDriver;
 use crate::invocation::{validate_embedded_path, validate_model, Invocation, PacketDirs};
@@ -40,21 +41,21 @@ impl ProviderDriver for ClaudeDriver {
     ) -> Result<Invocation, ProviderError> {
         let prompt_path = dirs.prompt();
         let stdout_path = dirs.stdout_working();
-        let prompt = validate_embedded_path(&prompt_path)?;
-        let stdout = validate_embedded_path(&stdout_path)?;
+        validate_embedded_path(&prompt_path)?;
+        validate_embedded_path(&stdout_path)?;
         let model = &packet.provider_hints.model;
         validate_model(model)?;
         let session_id = claude_session_id(claim_token);
-        let permission = match packet.provider_hints.sandbox {
-            forged_types::Sandbox::ReadOnly => "--permission-mode plan --tools Read,Grep,Glob",
-            forged_types::Sandbox::WorkspaceWrite => "--dangerously-skip-permissions",
-        };
-        let shell_line = format!(
-            "claude -p --output-format stream-json --verbose {permission} \
-             --session-id {session_id} --model {model} < {prompt} > {stdout}"
+        let argv = provider_argv(
+            ProviderKindV1::Claude,
+            packet.provider_hints.sandbox,
+            model,
+            None,
+            Some(&session_id),
+            None,
         );
         Ok(Invocation {
-            shell_line,
+            argv,
             prompt_path,
             stdout_path,
             session_hint: Some(session_id),
