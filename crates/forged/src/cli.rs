@@ -965,6 +965,189 @@ pub enum WorkCmd {
     Map(WorkMapArgs),
     /// One-shot atomic import of the operator's bd store into the ledger.
     ImportBeads(KeyOnly),
+    /// One work item with its dependencies (read-only).
+    Show(WorkIdArgs),
+    /// The ready frontier (read-only).
+    Ready(KeyOnly),
+    /// Create a work item with its revision-1 spec.
+    Create(WorkCreateArgs),
+    /// Guarded spec update (revision CAS).
+    Update(WorkUpdateArgs),
+    /// Add one typed dependency edge.
+    Link(WorkLinkArgs),
+    /// Close a work item with a recorded reason.
+    Close(WorkCloseArgs),
+    /// Reopen: status open from any state, custody untouched.
+    Reopen(WorkActorArgs),
+    /// Release custody under the actor CAS.
+    Release(WorkActorArgs),
+    /// Supersede: link a successor and close the superseded item.
+    Supersede(WorkSupersedeArgs),
+    /// Revert spec content to an earlier revision's bytes.
+    Revert(WorkRevertArgs),
+}
+
+/// One work item id.
+#[derive(Debug, Args)]
+pub struct WorkIdArgs {
+    /// The work item id.
+    #[arg(long)]
+    pub id: String,
+    /// Override the derived idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+/// `work create` arguments.
+#[derive(Debug, Args)]
+pub struct WorkCreateArgs {
+    /// The stable work item id to mint.
+    #[arg(long)]
+    pub id: String,
+    /// Human-readable title.
+    #[arg(long)]
+    pub title: String,
+    /// Context and exact outcome.
+    #[arg(long)]
+    pub description: Option<String>,
+    /// Observable completion contract.
+    #[arg(long)]
+    pub acceptance: Option<String>,
+    /// Implementation constraints.
+    #[arg(long)]
+    pub design: Option<String>,
+    /// Agent instructions and non-goals.
+    #[arg(long)]
+    pub notes: Option<String>,
+    /// task or epic (default task).
+    #[arg(long)]
+    pub kind: Option<String>,
+    /// open or blocked (default open).
+    #[arg(long)]
+    pub status: Option<String>,
+    /// Scheduling priority.
+    #[arg(long)]
+    pub priority: Option<i64>,
+    /// Repository identity for scoped views.
+    #[arg(long)]
+    pub repository: Option<String>,
+    /// Override the derived idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+/// `work update` arguments.
+#[derive(Debug, Args)]
+pub struct WorkUpdateArgs {
+    /// The work item id.
+    #[arg(long)]
+    pub id: String,
+    /// The revision you read — the CAS guard.
+    #[arg(long)]
+    pub expected_revision: i64,
+    /// New title.
+    #[arg(long)]
+    pub title: Option<String>,
+    /// New description.
+    #[arg(long)]
+    pub description: Option<String>,
+    /// New acceptance criteria.
+    #[arg(long)]
+    pub acceptance: Option<String>,
+    /// New design notes.
+    #[arg(long)]
+    pub design: Option<String>,
+    /// New agent instructions.
+    #[arg(long)]
+    pub notes: Option<String>,
+    /// Override the derived idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+/// `work link` arguments.
+#[derive(Debug, Args)]
+pub struct WorkLinkArgs {
+    /// The dependent item.
+    #[arg(long)]
+    pub from: String,
+    /// The dependency target.
+    #[arg(long)]
+    pub to: String,
+    /// blocks | parent-child | related | discovered-from | supersedes.
+    #[arg(long)]
+    pub kind: Option<String>,
+    /// Override the derived idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+/// `work close` arguments.
+#[derive(Debug, Args)]
+pub struct WorkCloseArgs {
+    /// The work item id.
+    #[arg(long)]
+    pub id: String,
+    /// Why it closed (recorded in evidence).
+    #[arg(long)]
+    pub reason: String,
+    /// Acting identity (default operator).
+    #[arg(long)]
+    pub actor: Option<String>,
+    /// Override the derived idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+/// id + actor verbs (`work reopen`, `work release`).
+#[derive(Debug, Args)]
+pub struct WorkActorArgs {
+    /// The work item id.
+    #[arg(long)]
+    pub id: String,
+    /// Acting identity (default operator).
+    #[arg(long)]
+    pub actor: Option<String>,
+    /// Override the derived idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+/// `work supersede` arguments.
+#[derive(Debug, Args)]
+pub struct WorkSupersedeArgs {
+    /// The superseded item.
+    #[arg(long)]
+    pub id: String,
+    /// The replacement (create it first with `work create`).
+    #[arg(long)]
+    pub successor: String,
+    /// Acting identity (default operator).
+    #[arg(long)]
+    pub actor: Option<String>,
+    /// Override the derived idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+/// `work revert` arguments.
+#[derive(Debug, Args)]
+pub struct WorkRevertArgs {
+    /// The work item id.
+    #[arg(long)]
+    pub id: String,
+    /// The revision you read — the CAS guard.
+    #[arg(long)]
+    pub expected_revision: i64,
+    /// The revision whose bytes to restore.
+    #[arg(long)]
+    pub to_revision: i64,
+    /// Acting identity (default operator).
+    #[arg(long)]
+    pub actor: Option<String>,
+    /// Override the derived idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
 }
 
 /// Closed scope accepted by `work map`.
@@ -1468,6 +1651,16 @@ pub fn command_name(command: &Command) -> &'static str {
             WorkCmd::Detail(_) => "work_detail",
             WorkCmd::Map(_) => "work_map",
             WorkCmd::ImportBeads(_) => "work_import_beads",
+            WorkCmd::Show(_) => "work_show",
+            WorkCmd::Ready(_) => "work_ready",
+            WorkCmd::Create(_) => "work_create",
+            WorkCmd::Update(_) => "work_update",
+            WorkCmd::Link(_) => "work_link",
+            WorkCmd::Close(_) => "work_close",
+            WorkCmd::Reopen(_) => "work_reopen",
+            WorkCmd::Release(_) => "work_release",
+            WorkCmd::Supersede(_) => "work_supersede",
+            WorkCmd::Revert(_) => "work_revert",
         },
         Command::Attention { command } => match command {
             AttentionCmd::List(_) => "attention_list",
@@ -2068,6 +2261,129 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
                 "work_import_beads",
                 request(a.idempotency_key, None, json!({})),
             ),
+            WorkCmd::Show(a) => (
+                "work_show",
+                request(a.idempotency_key, None, json!({"id": a.id})),
+            ),
+            WorkCmd::Ready(a) => ("work_ready", request(a.idempotency_key, None, json!({}))),
+            WorkCmd::Create(a) => {
+                let mut params = Map::new();
+                params.insert("id".to_owned(), json!(a.id));
+                params.insert("title".to_owned(), json!(a.title));
+                for (name, value) in [
+                    ("description", a.description),
+                    ("acceptanceCriteria", a.acceptance),
+                    ("design", a.design),
+                    ("notes", a.notes),
+                    ("kind", a.kind),
+                    ("status", a.status),
+                ] {
+                    if let Some(value) = value {
+                        params.insert(name.to_owned(), json!(value));
+                    }
+                }
+                if let Some(priority) = a.priority {
+                    params.insert("priority".to_owned(), json!(priority));
+                }
+                if let Some(repository) = a.repository {
+                    params.insert("metadata".to_owned(), json!({"repository": repository}));
+                }
+                (
+                    "work_create",
+                    request(a.idempotency_key, None, Value::Object(params)),
+                )
+            }
+            WorkCmd::Update(a) => {
+                let mut params = Map::new();
+                params.insert("id".to_owned(), json!(a.id));
+                params.insert("expectedRevision".to_owned(), json!(a.expected_revision));
+                for (name, value) in [
+                    ("title", a.title),
+                    ("description", a.description),
+                    ("acceptanceCriteria", a.acceptance),
+                    ("design", a.design),
+                    ("notes", a.notes),
+                ] {
+                    if let Some(value) = value {
+                        params.insert(name.to_owned(), json!(value));
+                    }
+                }
+                (
+                    "work_update",
+                    request(a.idempotency_key, None, Value::Object(params)),
+                )
+            }
+            WorkCmd::Link(a) => {
+                let mut params = Map::new();
+                params.insert("fromId".to_owned(), json!(a.from));
+                params.insert("toId".to_owned(), json!(a.to));
+                if let Some(kind) = a.kind {
+                    params.insert("kind".to_owned(), json!(kind));
+                }
+                (
+                    "work_link",
+                    request(a.idempotency_key, None, Value::Object(params)),
+                )
+            }
+            WorkCmd::Close(a) => {
+                let mut params = Map::new();
+                params.insert("id".to_owned(), json!(a.id));
+                params.insert("reason".to_owned(), json!(a.reason));
+                if let Some(actor) = a.actor {
+                    params.insert("actor".to_owned(), json!(actor));
+                }
+                (
+                    "work_close",
+                    request(a.idempotency_key, None, Value::Object(params)),
+                )
+            }
+            WorkCmd::Reopen(a) => {
+                let mut params = Map::new();
+                params.insert("id".to_owned(), json!(a.id));
+                if let Some(actor) = a.actor {
+                    params.insert("actor".to_owned(), json!(actor));
+                }
+                (
+                    "work_reopen",
+                    request(a.idempotency_key, None, Value::Object(params)),
+                )
+            }
+            WorkCmd::Release(a) => {
+                let mut params = Map::new();
+                params.insert("id".to_owned(), json!(a.id));
+                if let Some(actor) = a.actor {
+                    params.insert("actor".to_owned(), json!(actor));
+                }
+                (
+                    "work_release",
+                    request(a.idempotency_key, None, Value::Object(params)),
+                )
+            }
+            WorkCmd::Supersede(a) => {
+                let mut params = Map::new();
+                params.insert("id".to_owned(), json!(a.id));
+                params.insert("successorId".to_owned(), json!(a.successor));
+                if let Some(actor) = a.actor {
+                    params.insert("actor".to_owned(), json!(actor));
+                }
+                (
+                    "work_supersede",
+                    request(a.idempotency_key, None, Value::Object(params)),
+                )
+            }
+            WorkCmd::Revert(a) => {
+                let mut params = Map::new();
+                params.insert("id".to_owned(), json!(a.id));
+                params.insert("expectedRevision".to_owned(), json!(a.expected_revision));
+                params.insert("toRevision".to_owned(), json!(a.to_revision));
+                if let Some(actor) = a.actor {
+                    params.insert("actor".to_owned(), json!(actor));
+                }
+                (
+                    "work_revert",
+                    request(a.idempotency_key, None, Value::Object(params)),
+                )
+            }
         },
         Command::Attention { command } => match command {
             AttentionCmd::List(a) => {

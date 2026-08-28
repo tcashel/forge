@@ -971,6 +971,78 @@ impl Ledger {
         })
     }
 
+    /// The repair revert: mint revision N+1 as an exact copy of an earlier
+    /// revision's spec fields, guarded by the CAS. Append-only history makes
+    /// bad spec content recoverable by construction — nothing is rewritten.
+    pub fn revert_work_spec(
+        &self,
+        work_id: &str,
+        expected_revision: i64,
+        to_revision: i64,
+        actor: &str,
+    ) -> Result<WorkItemSnapshot, LedgerError> {
+        let work_id = work_id.to_owned();
+        let actor = actor.to_owned();
+        self.submit(move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let current = require_snapshot_tx(&tx, &work_id)?;
+            if current.revision != expected_revision {
+                return Err(refused(
+                    ErrorCode::BeadsContention,
+                    format!(
+                        "work item {work_id:?} revision moved: expected {expected_revision}, \
+                         current {}",
+                        current.revision
+                    ),
+                ));
+            }
+            let target = tx
+                .query_row(
+                    "SELECT title, description, acceptance_criteria, design, notes \
+                     FROM work_revisions WHERE work_id = ?1 AND revision = ?2",
+                    rusqlite::params![work_id, to_revision],
+                    |row| {
+                        Ok(WorkSpecFields {
+                            title: row.get(0)?,
+                            description: row.get(1)?,
+                            acceptance_criteria: row.get(2)?,
+                            design: row.get(3)?,
+                            notes: row.get(4)?,
+                        })
+                    },
+                )
+                .optional()?
+                .ok_or_else(|| {
+                    refused(
+                        ErrorCode::InvalidRequest,
+                        format!("work item {work_id:?} has no revision {to_revision}"),
+                    )
+                })?;
+            let next = expected_revision + 1;
+            insert_revision_tx(&tx, &work_id, next, &target, WorkRevisionCause::Revert)?;
+            tx.execute(
+                "UPDATE work_items SET current_revision = ?2, updated_at = ?3 \
+                 WHERE work_id = ?1",
+                rusqlite::params![work_id, next, now_iso()],
+            )?;
+            append_event_tx(
+                &tx,
+                None,
+                "work.updated",
+                &json!({
+                    "workId": work_id,
+                    "verb": "revert",
+                    "actor": actor,
+                    "revision": next,
+                    "revertedTo": to_revision,
+                }),
+            )?;
+            let snapshot = require_snapshot_tx(&tx, &work_id)?;
+            tx.commit()?;
+            Ok(snapshot)
+        })
+    }
+
     /// The blocked-residue retake (operator-adjudicated): take custody of an
     /// UNASSIGNED `Open` or `Blocked` item without changing its status. The
     /// caller pins the exact status it observed (bd's `--if-status`); a
@@ -1018,6 +1090,51 @@ impl Ledger {
                 before.status,
                 Some(&holder),
                 &holder,
+            )?;
+            let snapshot = require_snapshot_tx(&tx, &work_id)?;
+            tx.commit()?;
+            Ok(snapshot)
+        })
+    }
+
+    /// The redispatch verb, atomic: link `successor_id -> work_id` with a
+    /// `supersedes` edge and close the superseded item, in one transaction.
+    /// The successor must already exist; the superseded item may be in any
+    /// non-closed state (closing a closed item is the idempotent no-op).
+    pub fn supersede_work_item(
+        &self,
+        work_id: &str,
+        successor_id: &str,
+        actor: &str,
+    ) -> Result<WorkItemSnapshot, LedgerError> {
+        let work_id = work_id.to_owned();
+        let successor_id = successor_id.to_owned();
+        let actor = actor.to_owned();
+        self.submit(move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let before = require_snapshot_tx(&tx, &work_id)?;
+            require_snapshot_tx(&tx, &successor_id)?;
+            tx.execute(
+                "INSERT OR IGNORE INTO work_deps (from_id, to_id, kind) \
+                 VALUES (?1, ?2, 'supersedes')",
+                rusqlite::params![successor_id, work_id],
+            )?;
+            if before.status != WorkStatus::Closed {
+                set_coordination_tx(&tx, &work_id, WorkStatus::Closed, None)?;
+                clear_lease_tx(&tx, &work_id)?;
+            }
+            append_event_tx(
+                &tx,
+                None,
+                "work.updated",
+                &json!({
+                    "workId": work_id,
+                    "verb": "supersede",
+                    "actor": actor,
+                    "supersededBy": successor_id,
+                    "status": { "from": before.status, "to": WorkStatus::Closed },
+                    "assignee": { "from": before.assignee, "to": Option::<String>::None },
+                }),
             )?;
             let snapshot = require_snapshot_tx(&tx, &work_id)?;
             tx.commit()?;

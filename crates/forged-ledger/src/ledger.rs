@@ -148,6 +148,19 @@ impl Ledger {
     /// thread has really exited — never early with a hollow `Ok`. A second
     /// `close` is an idempotent `Ok(())`; a panicked writer thread surfaces
     /// as `Internal`.
+    /// Snapshot the whole database to `dest` via `VACUUM INTO` — the
+    /// backup primitive for a store that now holds both the crash evidence
+    /// and the operator's backlog. Refuses to overwrite an existing file
+    /// (VACUUM INTO's own contract); callers stamp unique names.
+    pub fn snapshot_into(&self, dest: &std::path::Path) -> Result<(), LedgerError> {
+        let dest = dest.to_path_buf();
+        self.submit(move |conn| {
+            let dest_text = dest.to_string_lossy().into_owned();
+            conn.execute("VACUUM INTO ?1", [dest_text])?;
+            Ok(())
+        })
+    }
+
     pub fn close(self) -> Result<(), LedgerError> {
         let sender = self
             .sender

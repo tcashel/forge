@@ -1319,6 +1319,113 @@ impl ForgedServer {
         self.call("events_tail", args.0).await
     }
 
+    /// Typed work authoring: create.
+    #[tool(
+        name = "work_create",
+        description = "Create a work item with its revision-1 spec. params: id, title \
+                       (required); description, acceptanceCriteria, design, notes, kind \
+                       (task|epic), status (open|blocked), priority, metadata (string map)."
+    )]
+    pub async fn work_create(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
+        self.call("work_create", args.0).await
+    }
+
+    /// Typed work authoring: guarded spec update.
+    #[tool(
+        name = "work_update",
+        description = "Guarded spec write over title/description/acceptanceCriteria/design/\
+                       notes. params: id, expectedRevision (the revision you read — the CAS \
+                       guard); omitted fields keep their bytes. A moved revision refuses \
+                       with BEADS_CONTENTION: re-read and re-apply."
+    )]
+    pub async fn work_update(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
+        self.call("work_update", args.0).await
+    }
+
+    /// Typed work authoring: dependency edge.
+    #[tool(
+        name = "work_link",
+        description = "Add one dependency edge. params: fromId, toId, kind (blocks | \
+                       parent-child | related | discovered-from | supersedes; default \
+                       blocks). Only blocks edges gate readiness."
+    )]
+    pub async fn work_link(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
+        self.call("work_link", args.0).await
+    }
+
+    /// Typed work verb: close with a recorded reason.
+    #[tool(
+        name = "work_close",
+        description = "Close a work item. params: id, reason (required), actor. Idempotent \
+                       on an already-closed item; work_reopen is the deliberate exit."
+    )]
+    pub async fn work_close(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
+        self.call("work_close", args.0).await
+    }
+
+    /// Typed repair verb: reopen.
+    #[tool(
+        name = "work_reopen",
+        description = "Set a work item's status to open from any state, custody untouched. \
+                       params: id, actor."
+    )]
+    pub async fn work_reopen(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
+        self.call("work_reopen", args.0).await
+    }
+
+    /// Typed repair verb: release custody.
+    #[tool(
+        name = "work_release",
+        description = "Clear a work item's custody under the actor CAS. params: id, actor \
+                       (must equal the current holder; a foreign holder refuses with \
+                       BEAD_LEASE_HELD; unheld is an idempotent no-op)."
+    )]
+    pub async fn work_release(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
+        self.call("work_release", args.0).await
+    }
+
+    /// Typed repair verb: supersede (redispatch).
+    #[tool(
+        name = "work_supersede",
+        description = "Atomically link successorId -> id with a supersedes edge and close \
+                       the superseded item. params: id, successorId (create it first with \
+                       work_create), actor."
+    )]
+    pub async fn work_supersede(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
+        self.call("work_supersede", args.0).await
+    }
+
+    /// Typed repair verb: revert spec content.
+    #[tool(
+        name = "work_revert",
+        description = "Mint revision N+1 as an exact copy of an earlier revision's spec \
+                       bytes. params: id, expectedRevision (CAS), toRevision, actor. \
+                       Append-only history means nothing is ever lost."
+    )]
+    pub async fn work_revert(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
+        self.call("work_revert", args.0).await
+    }
+
+    /// Read one work item with its dependencies.
+    #[tool(
+        name = "work_show",
+        description = "One work item's current snapshot plus hydrated dependencies — the \
+                       read-only bd show replacement. params: id."
+    )]
+    pub async fn work_show(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
+        self.call("work_show", args.0).await
+    }
+
+    /// Read the ready frontier.
+    #[tool(
+        name = "work_ready",
+        description = "The ready frontier: open, unassigned, unleased items whose blocks \
+                       targets are all closed, priority-ordered. Takes no params."
+    )]
+    pub async fn work_ready(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
+        self.call("work_ready", args.0).await
+    }
+
     /// The discovery surface — the one tool that needs no id.
     #[tool(
         name = "work_list",
