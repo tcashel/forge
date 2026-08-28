@@ -815,10 +815,30 @@ fn three_submitted_rolling_epics_converge_below_capacity_with_one_isolated_crux(
         review_started,
         "one submitted epic reached assurance review"
     );
-    assert!(
-        deferred > 0,
-        "the below-N workload must exercise the durable capacity fence"
-    );
+    if deferred == 0 {
+        // The fence never recorded a deferral: name every decision and each
+        // epic's projected state so the failing host explains itself.
+        let ledger = env.ledger();
+        let decisions = ledger
+            .latest_admission_decisions(None, None)
+            .expect("admission decisions");
+        ledger.close().expect("close ledger");
+        let statuses: Vec<String> = epics
+            .iter()
+            .map(|(epic, _)| {
+                let (_, status) = env.forged(&["epic", "status", "--epic", epic]);
+                format!("{epic}: {status}")
+            })
+            .collect();
+        panic!(
+            "the below-N workload must exercise the durable capacity fence\n\
+             decisions: {decisions:?}\n\
+             provider log: {:?}\n\
+             {}",
+            env.provider_log(),
+            statuses.join("\n"),
+        );
+    }
 
     // The held round returns its ordinary finding. Its next review is the one
     // CRUX; after that terminal input releases capacity for both siblings.
