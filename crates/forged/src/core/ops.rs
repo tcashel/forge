@@ -57,6 +57,25 @@ pub async fn doctor(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
                 Err(f) => f.message.clone(),
             },
         }));
+        let work_findings = on_ledger(&ctx.ledger, |l| l.work_store_findings()).await;
+        probes.push(match &work_findings {
+            Ok(findings) if findings.is_empty() => json!({
+                "name": "work-store-integrity",
+                "ok": true,
+                "detail": "every enumerable work-store invariant holds",
+            }),
+            Ok(findings) => json!({
+                "name": "work-store-integrity",
+                "ok": false,
+                "detail": format!("{} finding(s); each names its typed repair", findings.len()),
+                "findings": findings,
+            }),
+            Err(failure) => json!({
+                "name": "work-store-integrity",
+                "ok": false,
+                "detail": failure.message,
+            }),
+        });
         let mut provider_binaries = vec!["claude", "codex"];
         if ctx.config.rosters.values().any(|roster| {
             roster

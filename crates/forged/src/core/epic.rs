@@ -31,6 +31,7 @@ use crate::core::{
 // epic's hold out of exactly those two; every other kind stays private to
 // the scheduler.
 pub(super) const STARTED: &str = "forged.epic.started";
+pub(super) const ABANDONED: &str = "forged.epic.abandoned";
 const INTEGRATION_READY: &str = "forged.epic.integration.ready";
 const WAVE_STARTED: &str = "forged.epic.wave.started";
 const CHILD_STARTED: &str = "forged.epic.child.started";
@@ -494,6 +495,23 @@ async fn epic_events(ctx: &Ctx, epic: &str) -> Result<Vec<forged_ledger::EventRo
     .await
 }
 
+/// The current start-epoch's events: everything after the latest
+/// `forged.epic.abandoned` marker. Projections and the start guard read
+/// this scope, so an abandoned epic folds as never-started and a fresh
+/// `epic start` opens a clean epoch. Control-key epochs deliberately keep
+/// counting the FULL stream — keys stay monotonic across epochs, so a
+/// replayed control in a new epoch can never collide with a stored
+/// response from an old one.
+async fn epoch_events(ctx: &Ctx, epic: &str) -> Result<Vec<forged_ledger::EventRow>, Failure> {
+    let events = epic_events(ctx, epic).await?;
+    let boundary = events
+        .iter()
+        .rposition(|row| row.kind == ABANDONED)
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    Ok(events.into_iter().skip(boundary).collect())
+}
+
 /// Return the exact durable integration SHA for an internal planning run.
 /// Old planning events intentionally return `None` and preserve their legacy
 /// worktree behavior; new cycles never consult the current remote here.
@@ -534,7 +552,7 @@ pub(super) async fn assurance_base_sha(ctx: &Ctx, run_id: &str) -> Result<Option
 }
 
 async fn project(ctx: &Ctx, epic: &str) -> Result<EpicView, Failure> {
-    let events = epic_events(ctx, epic).await?;
+    let events = epoch_events(ctx, epic).await?;
     let started = events
         .iter()
         .find(|row| row.kind == STARTED)
@@ -729,7 +747,7 @@ pub(super) async fn await_setup(ctx: &Ctx, epic: &str) -> Value {
 }
 
 async fn setup_probe(ctx: &Ctx, epic: &str) -> Result<Option<Value>, Failure> {
-    let events = epic_events(ctx, epic).await?;
+    let events = epoch_events(ctx, epic).await?;
     let mut latest_input: Option<&forged_ledger::EventRow> = None;
     let mut wave_started = false;
     for row in &events {
@@ -1222,7 +1240,7 @@ async fn recover_applied_epic_resolution(
     let Some(row) = row.filter(|row| row.state == OperationState::InProgress) else {
         return Ok(None);
     };
-    let rows = epic_events(ctx, epic).await?;
+    let rows = epoch_events(ctx, epic).await?;
     for event in rows
         .iter()
         .rev()
@@ -1288,7 +1306,7 @@ async fn recover_applied_epic_start(
             "epic start key was stored with a different request",
         ));
     }
-    let events = epic_events(ctx, epic).await?;
+    let events = epoch_events(ctx, epic).await?;
     let Some(landed) = events
         .iter()
         .find(|event| event.kind == STARTED)
@@ -1342,7 +1360,7 @@ async fn validate_requested_base_ref(
             "baseRef {requested:?} must be a bare branch name (e.g. \"main\")"
         )));
     };
-    let events = epic_events(ctx, epic).await?;
+    let events = epoch_events(ctx, epic).await?;
     if !events.iter().any(|row| row.kind == STARTED) {
         let repo = super::work_identity::canonical_repository(param_str(params, "repo")?)?;
         forged_git::remote_branch_sha(Path::new(&repo), bare)
@@ -1376,13 +1394,29 @@ pub async fn epic_start(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespo
     // The key's sequence segment is the released-attempt epoch: a corrected
     // start after a released failure must never reuse a key whose request
     // event already carries a different payload.
-    let epoch = match super::released_retry_seq(ctx, &epic, "epic_start").await {
-        Ok(epoch) => epoch,
+    let start_epoch = match epic_events(ctx, &epic).await {
+        Ok(events) => events.iter().filter(|row| row.kind == ABANDONED).count(),
         Err(error) => {
             return err_response(&derive_key("epic_start", Some(&epic), None, None), &error)
         }
     };
-    default_key(req, derive_key("epic_start", Some(&epic), None, epoch));
+    // Abandon epochs get their own key series via the stage segment, so a
+    // fresh start after an abandon can never replay the old epoch's stored
+    // response; released retries still count within the series.
+    let stage_segment = (start_epoch > 0).then(|| format!("e{start_epoch}"));
+    let epoch =
+        match super::released_retry_seq_staged(ctx, &epic, "epic_start", stage_segment.as_deref())
+            .await
+        {
+            Ok(epoch) => epoch,
+            Err(error) => {
+                return err_response(&derive_key("epic_start", Some(&epic), None, None), &error)
+            }
+        };
+    default_key(
+        req,
+        derive_key("epic_start", Some(&epic), stage_segment.as_deref(), epoch),
+    );
     if req.run_id.is_none() {
         req.run_id = Some(epic.clone());
     }
@@ -1418,7 +1452,7 @@ pub async fn epic_start(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespo
         {
             let epic = epic.clone();
             move |operation_id| async move {
-                let existing_events = epic_events(ctx, &epic).await?;
+                let existing_events = epoch_events(ctx, &epic).await?;
                 if let Some(started) = existing_events.iter().find(|row| row.kind == STARTED) {
                     let landed = payload(started)?;
                     if landed.get("operationId").and_then(Value::as_str)
@@ -2650,7 +2684,7 @@ async fn require_input_with_evidence(
 }
 
 async fn planning_protocol_terminal(ctx: &Ctx, run_id: &str) -> Result<Option<Value>, Failure> {
-    let events = epic_events(ctx, run_id).await?;
+    let events = epoch_events(ctx, run_id).await?;
     events
         .iter()
         .rev()
@@ -4627,7 +4661,7 @@ async fn planning_after_completed_wave(
     if view.config.planning_package.is_none() || view.waves.is_empty() {
         return Ok(None);
     }
-    let events = epic_events(ctx, &view.config.epic_id).await?;
+    let events = epoch_events(ctx, &view.config.epic_id).await?;
     let latest_wave_event = events
         .iter()
         .rev()
@@ -5521,6 +5555,108 @@ async fn control_event(
     }
 }
 
+/// Abandon a started-but-doomed epic: the typed terminal exit whose absence
+/// forced the pxv incident's rebuild-the-epic ritual. Appends the epoch
+/// boundary and stops desired work; a fresh `epic start` then opens a clean
+/// epoch (projections and the start guard read only events after the
+/// boundary). The children's work items are untouched — a new start
+/// re-freezes the inventory — and started children's runs settle through
+/// their own lifecycles.
+pub async fn epic_abandon(ctx: &Ctx, req: &mut OperationRequest) -> OperationResponse {
+    let epic = match param_str(&req.params, "epic") {
+        Ok(value) => value.to_owned(),
+        Err(error) => return err_response(&derive_key("epic_abandon", None, None, None), &error),
+    };
+    let reason = match param_str(&req.params, "reason") {
+        Ok(value) if !value.trim().is_empty() => value.to_owned(),
+        _ => {
+            return err_response(
+                &derive_key("epic_abandon", Some(&epic), None, None),
+                &Failure::invalid("reason is required and must be non-empty"),
+            )
+        }
+    };
+    // Key epoch: the number of abandons so far, from the FULL stream — the
+    // second abandon (of the next epoch) derives a fresh key.
+    let abandon_epoch = match epic_events(ctx, &epic).await {
+        Ok(events) => i64::try_from(
+            events
+                .iter()
+                .filter(|event| event.kind == ABANDONED)
+                .count(),
+        )
+        .unwrap_or(i64::MAX),
+        Err(error) => {
+            return err_response(&derive_key("epic_abandon", Some(&epic), None, None), &error)
+        }
+    };
+    default_key(
+        req,
+        derive_key("epic_abandon", Some(&epic), None, Some(abandon_epoch)),
+    );
+    let key = req.idempotency_key.clone();
+    // The current epoch must actually be started: abandoning nothing is a
+    // refusal, not a no-op — the operator asked to end something specific.
+    match epoch_events(ctx, &epic).await {
+        Ok(events) if events.iter().any(|event| event.kind == STARTED) => {}
+        Ok(_) => {
+            return err_response(
+                &key,
+                &Failure::invalid(format!("epic {epic:?} has no started epoch to abandon")),
+            )
+        }
+        Err(error) => return err_response(&key, &error),
+    }
+    // The driver slot is the liveness fence: a live controller holds it and
+    // this refuses with contention — stop or pause the epic first. A dead
+    // holder is force-released by acquisition itself.
+    let _guard = match acquire_driver(ctx, &epic).await {
+        Ok(guard) => guard,
+        Err(error) => return err_response(&key, &error),
+    };
+    let _submit_guard =
+        match super::handoff::acquire_submit(ctx, &epic, super::handoff::Scope::Epic).await {
+            Ok(guard) => guard,
+            Err(error) => return err_response(&key, &error),
+        };
+    let event = json!({"reason": reason, "controlId": key.clone()});
+    let event_epic = epic.clone();
+    match safe_effect(
+        ctx,
+        "epic_abandon",
+        key.clone(),
+        &epic,
+        event.clone(),
+        move |_operation| async move {
+            let desired_epic = event_epic.clone();
+            let desired_event = event.clone();
+            on_ledger(&ctx.ledger, move |ledger| {
+                ledger.append_event_controlling_desired(
+                    DesiredSubjectKind::Epic,
+                    &desired_epic,
+                    ABANDONED,
+                    desired_event,
+                    DesiredState::Stopped,
+                )
+            })
+            .await?;
+            Ok(json!({
+                "abandoned": true,
+                "epic": event_epic,
+                "nextSteps": [
+                    "a fresh `epic start` opens a clean epoch",
+                    "started children settle through their own run lifecycles",
+                ],
+            }))
+        },
+    )
+    .await
+    {
+        Ok(value) => ok_response(&key, false, value),
+        Err(error) => err_response(&key, &error),
+    }
+}
+
 /// Pause an epic.
 pub async fn epic_pause(ctx: &Ctx, req: &mut OperationRequest) -> OperationResponse {
     control_event(ctx, req, "epic_pause", PAUSED, false).await
@@ -5605,7 +5741,7 @@ pub async fn epic_resolve(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
                 Some(child) => child,
                 None => {
                     let Some(input) = view.input.as_ref() else {
-                        let rows = epic_events(ctx, &epic).await?;
+                        let rows = epoch_events(ctx, &epic).await?;
                         for row in rows.iter().filter(|row| row.kind == INPUT_RESOLVED) {
                             let landed = payload(row)?;
                             if landed.get("resolutionId") == resolved_event.get("resolutionId") {
@@ -5640,7 +5776,7 @@ pub async fn epic_resolve(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
                 )));
             };
             let Some(input) = view.input.as_ref() else {
-                let rows = epic_events(ctx, &epic).await?;
+                let rows = epoch_events(ctx, &epic).await?;
                 for row in rows.iter().filter(|row| row.kind == INPUT_RESOLVED) {
                     let landed = payload(row)?;
                     if landed.get("resolutionId") == resolved_event.get("resolutionId") {

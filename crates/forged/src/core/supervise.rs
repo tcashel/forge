@@ -1397,6 +1397,39 @@ impl ShutdownSignals {
 }
 
 /// `forged supervise [--once]` through the shared CLI/core dispatch seam.
+/// Keep a daily snapshot of state.db under `<anvil>/backups`, pruned to the
+/// newest seven. The backlog and the crash evidence share one file now, so
+/// backup is first-class rather than an operator afterthought.
+async fn maybe_snapshot(ctx: &Ctx) -> Result<(), Failure> {
+    let backups = ctx.config.anvil_home.join("backups");
+    std::fs::create_dir_all(&backups)
+        .map_err(|e| Failure::internal(format!("creating backups dir: {e}")))?;
+    let mut snapshots: Vec<std::path::PathBuf> = std::fs::read_dir(&backups)
+        .map_err(|e| Failure::internal(format!("reading backups dir: {e}")))?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("state-daily-") && name.ends_with(".db"))
+        })
+        .collect();
+    snapshots.sort();
+    let day = &crate::config::now_iso()[..10];
+    let today = backups.join(format!("state-daily-{day}.db"));
+    if !today.exists() {
+        let dest = today.clone();
+        on_ledger(&ctx.ledger, move |l| l.snapshot_into(&dest)).await?;
+        snapshots.push(today);
+        snapshots.sort();
+    }
+    while snapshots.len() > 7 {
+        let oldest = snapshots.remove(0);
+        let _ = std::fs::remove_file(oldest);
+    }
+    Ok(())
+}
+
 pub async fn supervise(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
     let key = if req.idempotency_key.is_empty() {
         format!(
@@ -1428,6 +1461,21 @@ pub async fn supervise(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
             &key,
             &Failure::invalid("--once cannot publish a long-running service generation"),
         );
+    }
+    // Cutover bootstrap: one COUNT query per pass; imports exactly once
+    // ever (snapshotting state.db first), and keeps a daily VACUUM INTO
+    // snapshot because the store now holds both evidence and backlog.
+    match super::work_import::auto_import_if_empty(ctx).await {
+        Ok(Some(summary)) => {
+            tracing::info!(%summary, "bootstrap: imported the beads store into the ledger");
+        }
+        Ok(None) => {}
+        Err(failure) => {
+            tracing::warn!(error = %failure.message, "bootstrap: beads import did not run");
+        }
+    }
+    if let Err(failure) = maybe_snapshot(ctx).await {
+        tracing::warn!(error = %failure.message, "bootstrap: snapshot pass failed");
     }
     if once {
         // One deterministic tick: the settlement pass is joined fully.

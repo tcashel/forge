@@ -779,12 +779,23 @@ pub(crate) async fn released_retry_seq(
     subject: &str,
     name: &str,
 ) -> Result<Option<i64>, Failure> {
+    released_retry_seq_staged(ctx, subject, name, None).await
+}
+
+/// As [`released_retry_seq`], but for a key series whose stage segment is
+/// not `-` (the abandon-epoch'd `epic_start` series).
+pub(crate) async fn released_retry_seq_staged(
+    ctx: &Ctx,
+    subject: &str,
+    name: &str,
+    stage: Option<&str>,
+) -> Result<Option<i64>, Failure> {
     let owned_subject = subject.to_owned();
     let rows = on_ledger(&ctx.ledger, move |ledger| {
         ledger.list_events(Some(&owned_subject), 0, 65_536)
     })
     .await?;
-    let series_prefix = format!("op:{name}:{subject}:-:");
+    let series_prefix = format!("op:{name}:{subject}:{}:", stage.unwrap_or("-"));
     let released = rows
         .iter()
         .filter(|row| row.kind == "operation.released")
@@ -840,6 +851,7 @@ pub async fn dispatch(ctx: &Ctx, name: &str, mut req: OperationRequest) -> Opera
         "epic_pause" => epic::epic_pause(ctx, &mut req).await,
         "epic_resume" => epic::epic_resume(ctx, &mut req).await,
         "epic_resolve" => epic::epic_resolve(ctx, &mut req).await,
+        "epic_abandon" => epic::epic_abandon(ctx, &mut req).await,
         "epic_revise_roster" => epic::epic_revise_roster(ctx, &mut req).await,
         "overview" => observe::overview(ctx, &req).await,
         "operations_overview" => ops::operations_overview(ctx, &req).await,

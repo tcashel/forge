@@ -68,7 +68,7 @@ fn doctor_shape(envelope: &Value) -> Value {
 }
 
 #[test]
-fn all_forty_six_tools_match_their_cli_counterparts() {
+fn all_fifty_seven_tools_match_their_cli_counterparts() {
     let env = TestEnv::new("forged-parity");
     env.forged(&["init"]);
     fabricate_run(&env, "par-repository");
@@ -130,9 +130,20 @@ fn all_forty_six_tools_match_their_cli_counterparts() {
         "work_list",
         "work_history",
         "work_map",
+        "epic_abandon",
+        "work_create",
+        "work_update",
+        "work_link",
+        "work_close",
+        "work_reopen",
+        "work_release",
+        "work_supersede",
+        "work_revert",
+        "work_show",
+        "work_ready",
     ];
     expected.sort_unstable();
-    assert_eq!(tools, expected, "the forty-six tools, exactly");
+    assert_eq!(tools, expected, "the fifty-seven tools, exactly");
 
     let overview_tool = mcp.tool("overview");
     assert_eq!(

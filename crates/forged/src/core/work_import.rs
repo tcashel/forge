@@ -17,7 +17,7 @@ use forged_ledger::{
     WorkStatus,
 };
 use forged_types::{OperationRequest, OperationResponse};
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::core::{on_ledger, read_only, Ctx, Failure};
 
@@ -34,6 +34,38 @@ const META_SPEC_ID: &str = "imported:spec-id";
 /// populated store reports `alreadyImported: true` and writes nothing.
 pub async fn work_import_beads(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
     read_only("work_import_beads", req, || async {
+        import_beads(ctx).await
+    })
+    .await
+}
+
+/// The cutover bootstrap: when the work store is empty and a bd store
+/// exists on disk, snapshot state.db and import once. Called from the
+/// supervise pass so the first daemon start after the upgrade migrates the
+/// operator without a manual step; every later pass is one COUNT query.
+pub(crate) async fn auto_import_if_empty(ctx: &Ctx) -> Result<Option<Value>, Failure> {
+    if !on_ledger(&ctx.ledger, |l| l.work_store_is_empty()).await? {
+        return Ok(None);
+    }
+    if !ctx.config.beads_dir.join("config.yaml").exists() {
+        // Nothing to import from: a fresh operator starts empty.
+        return Ok(None);
+    }
+    // Cutover-day backup before the one-shot import.
+    let backups = ctx.config.anvil_home.join("backups");
+    std::fs::create_dir_all(&backups)
+        .map_err(|e| Failure::internal(format!("creating backups dir: {e}")))?;
+    let dest = backups.join(format!(
+        "state-pre-import-{}.db",
+        crate::config::now_iso().replace(':', "-")
+    ));
+    on_ledger(&ctx.ledger, move |l| l.snapshot_into(&dest)).await?;
+    let summary = import_beads(ctx).await?;
+    Ok(Some(summary))
+}
+
+async fn import_beads(ctx: &Ctx) -> Result<Value, Failure> {
+    {
         if !on_ledger(&ctx.ledger, |l| l.work_store_is_empty()).await? {
             return Ok(json!({
                 "alreadyImported": true,
@@ -93,8 +125,7 @@ pub async fn work_import_beads(ctx: &Ctx, req: &OperationRequest) -> OperationRe
                 .collect::<Vec<_>>(),
             "verified": true,
         }))
-    })
-    .await
+    }
 }
 
 fn imported_item(issue: &IssueSummary) -> Result<ImportedWorkItem, Failure> {
