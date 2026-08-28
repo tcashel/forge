@@ -51,9 +51,9 @@ fn metadata_of(
 
 fn expected_revision_of(params: &serde_json::Map<String, Value>) -> Result<i64, Failure> {
     match params.get("expectedRevision") {
-        Some(Value::Number(number)) => number.as_i64().ok_or_else(|| {
-            Failure::invalid("expectedRevision must be an integer ledger revision")
-        }),
+        Some(Value::Number(number)) => number
+            .as_i64()
+            .ok_or_else(|| Failure::invalid("expectedRevision must be an integer ledger revision")),
         Some(Value::String(text)) => text.parse::<i64>().map_err(|_| {
             Failure::invalid(format!(
                 "expectedRevision {text:?} is not an integer ledger revision; re-read the item"
@@ -135,8 +135,12 @@ pub async fn work_create(ctx: &Ctx, req: &mut OperationRequest) -> OperationResp
                     acceptance_criteria: param_opt_str(&req.params, "acceptanceCriteria")
                         .unwrap_or_default()
                         .to_owned(),
-                    design: param_opt_str(&req.params, "design").unwrap_or_default().to_owned(),
-                    notes: param_opt_str(&req.params, "notes").unwrap_or_default().to_owned(),
+                    design: param_opt_str(&req.params, "design")
+                        .unwrap_or_default()
+                        .to_owned(),
+                    notes: param_opt_str(&req.params, "notes")
+                        .unwrap_or_default()
+                        .to_owned(),
                 },
                 cause: WorkRevisionCause::Authored,
             };
@@ -188,10 +192,7 @@ pub async fn work_update(ctx: &Ctx, req: &mut OperationRequest) -> OperationResp
             let spec = WorkSpecFields {
                 title: field("title", &current.spec.title),
                 description: field("description", &current.spec.description),
-                acceptance_criteria: field(
-                    "acceptanceCriteria",
-                    &current.spec.acceptance_criteria,
-                ),
+                acceptance_criteria: field("acceptanceCriteria", &current.spec.acceptance_criteria),
                 design: field("design", &current.spec.design),
                 notes: field("notes", &current.spec.notes),
             };
@@ -299,26 +300,49 @@ async fn one_id_verb(
 }
 
 enum WorkVerb {
-    Close { id: String, actor: String, reason: String },
-    Reopen { id: String, actor: String },
-    Release { id: String, actor: String },
-    Supersede { id: String, actor: String, successor: String },
-    Revert { id: String, actor: String, expected: i64, to: i64 },
+    Close {
+        id: String,
+        actor: String,
+        reason: String,
+    },
+    Reopen {
+        id: String,
+        actor: String,
+    },
+    Release {
+        id: String,
+        actor: String,
+    },
+    Supersede {
+        id: String,
+        actor: String,
+        successor: String,
+    },
+    Revert {
+        id: String,
+        actor: String,
+        expected: i64,
+        to: i64,
+    },
 }
 
 impl WorkVerb {
     async fn apply(self, ctx: &Ctx) -> Result<(WorkItemSnapshot, &'static str), Failure> {
         match self {
             WorkVerb::Close { id, actor, reason } => {
-                let snapshot =
-                    on_ledger(&ctx.ledger, move |l| l.close_work_item(&id, &actor, &reason))
-                        .await?;
+                let snapshot = on_ledger(&ctx.ledger, move |l| {
+                    l.close_work_item(&id, &actor, &reason)
+                })
+                .await?;
                 Ok((snapshot, "work_reopen is the deliberate exit from closed"))
             }
             WorkVerb::Reopen { id, actor } => {
                 let snapshot =
                     on_ledger(&ctx.ledger, move |l| l.reopen_work_item(&id, &actor)).await?;
-                Ok((snapshot, "the item is schedulable once unblocked and unheld"))
+                Ok((
+                    snapshot,
+                    "the item is schedulable once unblocked and unheld",
+                ))
             }
             WorkVerb::Release { id, actor } => {
                 let snapshot =
@@ -328,14 +352,23 @@ impl WorkVerb {
                     "custody cleared; a foreign holder refuses with BEAD_LEASE_HELD",
                 ))
             }
-            WorkVerb::Supersede { id, actor, successor } => {
+            WorkVerb::Supersede {
+                id,
+                actor,
+                successor,
+            } => {
                 let snapshot = on_ledger(&ctx.ledger, move |l| {
                     l.supersede_work_item(&id, &successor, &actor)
                 })
                 .await?;
                 Ok((snapshot, "the successor carries the supersedes edge"))
             }
-            WorkVerb::Revert { id, actor, expected, to } => {
+            WorkVerb::Revert {
+                id,
+                actor,
+                expected,
+                to,
+            } => {
                 let snapshot = on_ledger(&ctx.ledger, move |l| {
                     l.revert_work_spec(&id, expected, to, &actor)
                 })
@@ -391,7 +424,11 @@ pub async fn work_supersede(ctx: &Ctx, req: &mut OperationRequest) -> OperationR
                 Failure::invalid("successorId is required: create it first with work_create")
             })?
             .to_owned();
-        Ok(WorkVerb::Supersede { id, actor, successor })
+        Ok(WorkVerb::Supersede {
+            id,
+            actor,
+            successor,
+        })
     })
     .await
 }
@@ -405,7 +442,12 @@ pub async fn work_revert(ctx: &Ctx, req: &mut OperationRequest) -> OperationResp
             .get("toRevision")
             .and_then(Value::as_i64)
             .ok_or_else(|| Failure::invalid("toRevision is required (the revision to restore)"))?;
-        Ok(WorkVerb::Revert { id, actor, expected, to })
+        Ok(WorkVerb::Revert {
+            id,
+            actor,
+            expected,
+            to,
+        })
     })
     .await
 }
@@ -428,8 +470,7 @@ pub async fn work_show(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
             on_ledger(&ctx.ledger, move |l| l.work_item(&id)).await?
         }
         .ok_or_else(|| {
-            let mut failure =
-                Failure::invalid(format!("work item {id:?} does not exist"));
+            let mut failure = Failure::invalid(format!("work item {id:?} does not exist"));
             failure.code = ErrorCode::InvalidRequest;
             failure
         })?;
