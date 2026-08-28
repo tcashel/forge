@@ -4,6 +4,8 @@ This file records user-visible changes to Forge.
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-08-28
+
 ### Fixed
 
 - An epic that was abandoned and restarted while its base branch had not
