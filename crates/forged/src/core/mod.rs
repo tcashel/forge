@@ -789,6 +789,7 @@ pub async fn dispatch(ctx: &Ctx, name: &str, mut req: OperationRequest) -> Opera
         "run_adjudicate_settlement" => settlement::run_adjudicate_settlement(ctx, &mut req).await,
         "run_revise_roster" => ops::run_revise_roster(ctx, &mut req).await,
         "run_accept_risk" => ops::run_accept_risk(ctx, &mut req).await,
+        "epic_preflight" => epic::epic_preflight(ctx, &req).await,
         "epic_start" => epic::epic_start(ctx, &mut req).await,
         "epic_advance" => epic::epic_advance(ctx, &req).await,
         "epic_drive" => epic::epic_drive(ctx, &req).await,

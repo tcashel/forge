@@ -118,7 +118,7 @@ pub async fn doctor(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
 /// question — every PR step this slice drives goes through an authenticated
 /// `gh`, so the probe runs `gh auth status` against the real environment
 /// and reads its exit code, the same convention the sibling doctors follow.
-async fn gh_auth_status() -> Result<String, String> {
+pub(super) async fn gh_auth_status() -> Result<String, String> {
     let Some(path) = on_path("gh") else {
         return Err("gh not found on PATH".to_owned());
     };
@@ -143,7 +143,7 @@ async fn gh_auth_status() -> Result<String, String> {
 }
 
 /// PATH lookup for a provider binary — presence only, nothing spawned.
-fn on_path(binary: &str) -> Option<PathBuf> {
+pub(super) fn on_path(binary: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
         .map(|dir| dir.join(binary))
