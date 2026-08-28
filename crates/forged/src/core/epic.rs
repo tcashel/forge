@@ -323,10 +323,14 @@ fn parse_config(value: &Value, migration: Option<&Value>) -> Result<EpicConfig, 
             })?,
         rolling_authorized: rolling_authorized(value),
         legacy_membership_recorded,
-        root_revision: value
-            .get("specRevision")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
+        // Bead revisions are opaque strings end to end, but legacy events
+        // carried bd's raw numeric form; both must hydrate (the sibling
+        // readers in the ledger already accept both).
+        root_revision: value.get("specRevision").and_then(|value| match value {
+            Value::String(text) if !text.is_empty() => Some(text.clone()),
+            Value::Number(number) => Some(number.to_string()),
+            _ => None,
+        }),
         root_fields: value
             .get("rootFields")
             .filter(|value| !value.is_null())
@@ -1170,7 +1174,7 @@ async fn recover_applied_epic_resolution(
     ctx: &Ctx,
     key: &str,
     epic: &str,
-    child: &str,
+    child: Option<&str>,
     note: &str,
 ) -> Result<Option<OperationResponse>, Failure> {
     let name = "epic_resolve".to_owned();
@@ -1192,7 +1196,7 @@ async fn recover_applied_epic_resolution(
         if landed.get("resolutionId").and_then(Value::as_str) != Some(row.operation_id.as_str()) {
             continue;
         }
-        if landed.get("childId").and_then(Value::as_str) != Some(child)
+        if landed.get("childId").and_then(Value::as_str) != child
             || landed.get("note").and_then(Value::as_str) != Some(note)
         {
             return Err(Failure::refused(
@@ -1275,6 +1279,48 @@ async fn recover_applied_epic_start(
     Ok(Some(replayed))
 }
 
+/// The operator-facing base-ref contract: a bare branch name. `origin/<name>`
+/// passes `git check-ref-format` as a branch name yet poisons every
+/// downstream construction (`git fetch origin <base>`,
+/// `refs/remotes/origin/<base>`, the PR base), so the remote prefix is
+/// stripped rather than frozen.
+fn normalize_base_ref(requested: &str) -> Option<&str> {
+    let bare = requested.strip_prefix("origin/").unwrap_or(requested);
+    (!bare.is_empty()).then_some(bare)
+}
+
+/// Resolve an operator-supplied base ref to the normalized bare name the
+/// request hash and start event freeze. Normalization ALWAYS applies — a
+/// replay after `STARTED` must present the same canonical bytes the first
+/// invocation stored, or its idempotency hash (and crash recovery of an
+/// applied start) would refuse the identical command. Only the origin
+/// existence probe is gated on pre-durable state, so replays stay offline.
+async fn validate_requested_base_ref(
+    ctx: &Ctx,
+    epic: &str,
+    params: &Map<String, Value>,
+    requested: &str,
+) -> Result<String, Failure> {
+    let Some(bare) = normalize_base_ref(requested) else {
+        return Err(Failure::invalid(format!(
+            "baseRef {requested:?} must be a bare branch name (e.g. \"main\")"
+        )));
+    };
+    let events = epic_events(ctx, epic).await?;
+    if !events.iter().any(|row| row.kind == STARTED) {
+        let repo = super::work_identity::canonical_repository(param_str(params, "repo")?)?;
+        forged_git::remote_branch_sha(Path::new(&repo), bare)
+            .await
+            .map_err(|error| {
+                Failure::invalid(format!(
+                    "baseRef {requested:?} must name a branch that exists on origin \
+                     (pass the bare default branch name, e.g. \"main\"): {error}"
+                ))
+            })?;
+    }
+    Ok(bare.to_owned())
+}
+
 /// Freeze the Beads inventory and child execution defaults.
 pub async fn epic_start(ctx: &Ctx, req: &mut OperationRequest) -> OperationResponse {
     let epic = match param_str(&req.params, "epic") {
@@ -1299,6 +1345,18 @@ pub async fn epic_start(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespo
         Ok(guard) => guard,
         Err(error) => return err_response(&req.idempotency_key, &error),
     };
+    // Operator-supplied geometry is validated before the fenced request
+    // event exists: a refused start leaves nothing behind to replay, and the
+    // normalized value is what the request hash and start event freeze — on
+    // first start and on every replay alike.
+    if let Some(requested) = param_opt_str(&req.params, "baseRef").map(str::to_owned) {
+        match validate_requested_base_ref(ctx, &epic, &req.params, &requested).await {
+            Ok(normalized) => {
+                req.params.insert("baseRef".to_owned(), json!(normalized));
+            }
+            Err(error) => return err_response(&req.idempotency_key, &error),
+        }
+    }
     let params = req.params.clone();
     let key = req.idempotency_key.clone();
     match recover_applied_epic_start(ctx, &key, &epic, &params).await {
@@ -1503,6 +1561,7 @@ pub async fn epic_start(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespo
                     "packageSha256": compiled.package_sha256,
                     "executionPackage": compiled.package,
                     "planningPackage": planning_package,
+                    "assuranceStage": if assurance_package.is_some() { "rolling" } else { "none" },
                     "assurancePackage": assurance_package,
                     "rollingAuthorized": rolling_authorized,
                     "rootFields": root_fields,
@@ -2020,10 +2079,22 @@ pub async fn epic_revise_roster(ctx: &Ctx, req: &mut OperationRequest) -> Operat
     let roster_name = match param_str(&req.params, "roster") {
         Ok(value) => value.to_owned(),
         Err(error) => {
+            // A revision names a catalog entry; the config file is where the
+            // roster's content lives. An inline object here reads as the
+            // generic missing-param refusal without this hint.
+            let error = if req.params.get("roster").is_some_and(Value::is_object) {
+                Failure::invalid(
+                    "params.roster must be a roster NAME from the config catalog, \
+                     not an inline roster object; edit the config file and revise \
+                     by name",
+                )
+            } else {
+                error
+            };
             return err_response(
                 &derive_key("epic_revise_roster", Some(&epic), None, None),
                 &error,
-            )
+            );
         }
     };
     let reason = match param_str(&req.params, "reason") {
@@ -2275,6 +2346,10 @@ async fn ensure_integration(ctx: &Ctx, config: &EpicConfig) -> Result<Value, Fai
     let base = config.base_ref.clone();
     let epic = config.epic_id.clone();
     let event_epic = epic.clone();
+    let scratch = ctx
+        .config
+        .run_dir(&config.epic_id)
+        .join("integration-setup");
     safe_effect(
         ctx,
         "epic_setup",
@@ -2283,7 +2358,8 @@ async fn ensure_integration(ctx: &Ctx, config: &EpicConfig) -> Result<Value, Fai
         json!({"repo": repo, "integrationBranch": branch, "baseRef": base}),
         move |_operation| async move {
             let sha =
-                forged_git::ensure_integration_branch(Path::new(&repo), &branch, &base).await?;
+                forged_git::ensure_integration_branch(Path::new(&repo), &branch, &base, &scratch)
+                    .await?;
             let event = json!({"branch": branch, "baseRef": base, "cutSha": sha});
             append(ctx, &event_epic, INTEGRATION_READY, event.clone()).await?;
             Ok(event)
@@ -4339,7 +4415,33 @@ async fn advance_once(ctx: &Ctx, epic: &str) -> Result<Step, Failure> {
         return Ok(Step::Stop(json!({"inputRequired": input})));
     }
     if view.integration.is_none() {
-        return Ok(Step::Progress(ensure_integration(ctx, &view.config).await?));
+        // A deterministic setup refusal (hook rejection, missing base, auth)
+        // repeats identically under restart; it parks as explicit input with
+        // the full git diagnostic instead of consuming controller restarts.
+        return match ensure_integration(ctx, &view.config).await {
+            Ok(ready) => Ok(Step::Progress(ready)),
+            Err(failure) if failure.recoverable => Err(failure),
+            Err(failure) => {
+                let stopped = require_input_with_evidence(
+                    ctx,
+                    epic,
+                    "integration-setup-failed",
+                    None,
+                    format!("integration branch setup failed: {}", failure.message),
+                    Some(json!({
+                        "integrationBranch": view.config.integration_branch,
+                        "baseRef": view.config.base_ref,
+                        "error": {
+                            "code": failure.code,
+                            "message": failure.message,
+                            "recoverable": failure.recoverable,
+                        },
+                    })),
+                )
+                .await?;
+                Ok(Step::Stop(stopped))
+            }
+        };
     }
     if view.pr.is_some() {
         return advance_assurance(ctx, &view).await;
@@ -5071,17 +5173,15 @@ pub async fn epic_resolve(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
         Ok(value) => value.to_owned(),
         Err(error) => return err_response(&derive_key("epic_resolve", None, None, None), &error),
     };
-    let child = match param_str(&req.params, "child") {
-        Ok(value) => value.to_owned(),
-        Err(error) => {
-            return err_response(&derive_key("epic_resolve", Some(&epic), None, None), &error)
-        }
-    };
+    // A resolution may name a held child, or resolve an epic-level input
+    // requirement that itself names no child (`childId` null): the operator
+    // fixed conditions outside the ledger, and no child state changes.
+    let child = param_opt_str(&req.params, "child").map(str::to_owned);
     let note = match param_str(&req.params, "note") {
         Ok(value) => value.to_owned(),
         Err(error) => {
             return err_response(
-                &derive_key("epic_resolve", Some(&epic), Some(&child), None),
+                &derive_key("epic_resolve", Some(&epic), child.as_deref(), None),
                 &error,
             )
         }
@@ -5096,7 +5196,7 @@ pub async fn epic_resolve(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
         .unwrap_or(i64::MAX),
         Err(error) => {
             return err_response(
-                &derive_key("epic_resolve", Some(&epic), Some(&child), None),
+                &derive_key("epic_resolve", Some(&epic), child.as_deref(), None),
                 &error,
             )
         }
@@ -5106,7 +5206,7 @@ pub async fn epic_resolve(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
         derive_key(
             "epic_resolve",
             Some(&epic),
-            Some(&child),
+            child.as_deref(),
             Some(resolution_epoch),
         ),
     );
@@ -5115,7 +5215,7 @@ pub async fn epic_resolve(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
         Ok(guard) => guard,
         Err(error) => return err_response(&key, &error),
     };
-    match recover_applied_epic_resolution(ctx, &key, &epic, &child, &note).await {
+    match recover_applied_epic_resolution(ctx, &key, &epic, child.as_deref(), &note).await {
         Ok(Some(response)) => return response,
         Ok(None) => {}
         Err(error) => return err_response(&key, &error),
@@ -5137,6 +5237,38 @@ pub async fn epic_resolve(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
             let _parent_guard =
                 super::handoff::acquire_submit(ctx, &epic, super::handoff::Scope::Epic).await?;
             let view = project(ctx, &epic).await?;
+            let child = match child {
+                Some(child) => child,
+                None => {
+                    let Some(input) = view.input.as_ref() else {
+                        let rows = epic_events(ctx, &epic).await?;
+                        for row in rows.iter().filter(|row| row.kind == INPUT_RESOLVED) {
+                            let landed = payload(row)?;
+                            if landed.get("resolutionId") == resolved_event.get("resolutionId") {
+                                return Ok(resolved_event);
+                            }
+                        }
+                        return Err(Failure::invalid(format!(
+                            "epic {epic:?} has no input requirement to resolve"
+                        )));
+                    };
+                    if let Some(target) = input.get("childId").and_then(Value::as_str) {
+                        return Err(Failure::invalid(format!(
+                            "epic {epic:?} input requirement targets child {target:?}; \
+                             pass that child to resolve it"
+                        )));
+                    }
+                    append_resolution_event(
+                        ctx,
+                        &epic,
+                        resolved_event.clone(),
+                        view.paused.is_some(),
+                    )
+                    .await?;
+                    crate::failpoint::hit("epic.resolve.desired.after");
+                    return Ok(resolved_event);
+                }
+            };
             let Some(frozen_child) = view.config.children.iter().find(|item| item.id == child)
             else {
                 return Err(Failure::invalid(format!(
@@ -5322,6 +5454,18 @@ pub async fn epic_resolve(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn base_ref_normalization_strips_exactly_one_remote_prefix() {
+        assert_eq!(normalize_base_ref("main"), Some("main"));
+        assert_eq!(normalize_base_ref("origin/main"), Some("main"));
+        assert_eq!(
+            normalize_base_ref("origin/origin/main"),
+            Some("origin/main")
+        );
+        assert_eq!(normalize_base_ref("release/2026"), Some("release/2026"));
+        assert_eq!(normalize_base_ref("origin/"), None);
+    }
 
     #[test]
     fn old_start_and_plan_events_keep_legacy_defaults() {

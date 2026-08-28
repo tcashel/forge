@@ -6,7 +6,7 @@
     "intent": {
       "path": "intent-fixtures.json",
       "schema": "forged.manage-work-intent-fixtures/1",
-      "caseCount": 14,
+      "caseCount": 15,
       "caseIds": [
         "observe",
         "explore",
@@ -14,6 +14,7 @@
         "revise",
         "critique",
         "adjudicate",
+        "configure",
         "plan-approval",
         "execute-slice",
         "execute-epic",

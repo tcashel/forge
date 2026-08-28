@@ -5,13 +5,9 @@ use serde_json::Value;
 
 use crate::error::ProviderError;
 use crate::invocation::{
-    validate_embedded_path, validate_model, Invocation, PacketDirs, ProviderDriver,
+    validate_effort, validate_embedded_path, validate_model, Invocation, PacketDirs, ProviderDriver,
 };
 use crate::usage::{object_line, required_token, PricingBasis, UsageCapture, UsageRow};
-
-/// Reasoning levels accepted by Pi 0.84.x.
-pub(crate) const PI_EFFORTS: [&str; 7] =
-    ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
 /// Runs one packet through the provider-neutral `pi` CLI.
 #[derive(Debug, Clone, PartialEq)]
@@ -36,15 +32,9 @@ impl ProviderDriver for PiDriver {
         validate_model(model)?;
         let effort = match packet.provider_hints.effort.as_deref() {
             None => String::new(),
-            Some(effort) if PI_EFFORTS.contains(&effort) => {
-                format!(" --thinking {effort}")
-            }
             Some(effort) => {
-                return Err(ProviderError::Malformed {
-                    message: format!(
-                        "pi reasoning effort {effort:?} is outside off|minimal|low|medium|high|xhigh|max"
-                    ),
-                })
+                validate_effort(effort)?;
+                format!(" --thinking {effort}")
             }
         };
         let tools = match packet.provider_hints.sandbox {

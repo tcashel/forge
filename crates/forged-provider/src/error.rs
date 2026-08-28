@@ -27,10 +27,11 @@ pub enum ProviderError {
         /// Why the value was refused.
         reason: String,
     },
-    /// A reasoning effort outside the closed set
-    /// `minimal|low|medium|high|xhigh`.
+    /// A reasoning effort that cannot be embedded safely: outside
+    /// `^[A-Za-z0-9._-]{1,64}$`. Effort vocabulary itself is the provider
+    /// CLI's contract, never a forged allowlist.
     #[error(
-        "unsupported reasoning effort {effort:?}: must be one of minimal|low|medium|high|xhigh"
+        "unsafe reasoning effort {effort:?}: must match ^[A-Za-z0-9._-]{{1,64}}$; the provider cli decides which efforts are valid"
     )]
     UnsupportedEffort {
         /// The effort value the packet carried.

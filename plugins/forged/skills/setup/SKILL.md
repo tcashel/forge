@@ -84,6 +84,11 @@ If initial Forged configuration is absent, inspect `forged init --help` and tell
 the operator exactly what it will create under `ANVIL_HOME` before requesting
 consent. Never infer permission from invoking this skill.
 
+Setup proves the configuration is valid, not that it is well chosen. Choosing
+a model and effort per roster role, naming custom or gateway-routed models,
+and pricing token-only models are owned by `../configure/SKILL.md`; route
+there when the operator asks which model belongs where.
+
 Migration: the Claude plugin manifest now registers the `forged mcp` server
 itself. Operators with an existing user-scope entry migrate in this order:
 first open a fresh session and confirm the plugin-mounted forged tools are
