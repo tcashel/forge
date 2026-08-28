@@ -71,6 +71,8 @@ pub enum WorkStatus {
     InProgress,
     /// Deliberately not schedulable.
     Blocked,
+    /// Parked by the operator; not schedulable, not terminal.
+    Deferred,
     /// Terminal.
     Closed,
 }
@@ -82,6 +84,7 @@ impl WorkStatus {
             Self::Open => "open",
             Self::InProgress => "in_progress",
             Self::Blocked => "blocked",
+            Self::Deferred => "deferred",
             Self::Closed => "closed",
         }
     }
@@ -91,6 +94,7 @@ impl WorkStatus {
             "open" => Ok(Self::Open),
             "in_progress" => Ok(Self::InProgress),
             "blocked" => Ok(Self::Blocked),
+            "deferred" => Ok(Self::Deferred),
             "closed" => Ok(Self::Closed),
             other => Err(column_decode_error(idx, "work status", other)),
         }
@@ -252,6 +256,36 @@ pub struct NewWorkItem {
     pub spec: WorkSpecFields,
     /// Why revision 1 exists (`Authored` or `Import`).
     pub cause: WorkRevisionCause,
+}
+
+/// The importer's input: full imported state, any status, optional custody.
+#[derive(Debug, Clone)]
+pub struct ImportedWorkItem {
+    /// The bd id, kept verbatim.
+    pub work_id: String,
+    /// Item kind.
+    pub kind: WorkKind,
+    /// Imported status, any of the five.
+    pub status: WorkStatus,
+    /// Scheduling priority.
+    pub priority: Option<i64>,
+    /// Imported custody (no lease row is created for it).
+    pub assignee: Option<String>,
+    /// Transported string metadata.
+    pub metadata: BTreeMap<String, String>,
+    /// Revision-1 spec fields.
+    pub spec: WorkSpecFields,
+}
+
+/// What one atomic import inserted.
+#[derive(Debug, Clone)]
+pub struct WorkImportReport {
+    /// Snapshots in input order, for the caller's byte-fidelity check.
+    pub snapshots: Vec<WorkItemSnapshot>,
+    /// Edges inserted.
+    pub inserted_edges: u64,
+    /// Edges skipped because an endpoint was outside the batch.
+    pub skipped_edges: Vec<WorkDepRow>,
 }
 
 fn decode_metadata(idx: usize, raw: &str) -> Result<BTreeMap<String, String>, rusqlite::Error> {
@@ -448,6 +482,102 @@ impl Ledger {
             let snapshot = require_snapshot_tx(&tx, &new.work_id)?;
             tx.commit()?;
             Ok(snapshot)
+        })
+    }
+
+    /// The importer's one narrow door, atomic for the whole store: refuses
+    /// unless the work store is completely empty, then inserts every item
+    /// (ANY status, optional custody, NO lease row — custody without a lease
+    /// reads as long-expired, so the scoped reclaim can always free imported
+    /// residue), every revision-1 spec with cause `Import`, and every edge,
+    /// in ONE transaction. An edge naming an id outside the batch is skipped
+    /// and counted, never a partial failure. Returns the snapshots in input
+    /// order for the caller's byte-fidelity check.
+    pub fn import_work_store(
+        &self,
+        items: Vec<ImportedWorkItem>,
+        edges: Vec<WorkDepRow>,
+    ) -> Result<WorkImportReport, LedgerError> {
+        self.submit(move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let count: i64 = tx.query_row("SELECT COUNT(*) FROM work_items", [], |r| r.get(0))?;
+            if count != 0 {
+                return Err(refused(
+                    ErrorCode::InvalidRequest,
+                    format!("work store already holds {count} items; import is one-shot"),
+                ));
+            }
+            let ids: std::collections::BTreeSet<String> =
+                items.iter().map(|i| i.work_id.clone()).collect();
+            if ids.len() != items.len() {
+                return Err(refused(
+                    ErrorCode::InvalidRequest,
+                    "import batch contains duplicate work ids".to_string(),
+                ));
+            }
+            let now = now_iso();
+            let mut snapshots = Vec::with_capacity(items.len());
+            for item in &items {
+                let metadata_json = serde_json::to_string(&item.metadata)?;
+                tx.execute(
+                    "INSERT INTO work_items \
+                     (work_id, kind, status, priority, assignee, metadata_json, \
+                      current_revision, created_at, updated_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?7)",
+                    rusqlite::params![
+                        item.work_id,
+                        item.kind.as_str(),
+                        item.status.as_str(),
+                        item.priority,
+                        item.assignee,
+                        metadata_json,
+                        now,
+                    ],
+                )?;
+                insert_revision_tx(&tx, &item.work_id, 1, &item.spec, WorkRevisionCause::Import)?;
+            }
+            let mut inserted_edges = 0u64;
+            let mut skipped_edges = Vec::new();
+            for edge in &edges {
+                if !ids.contains(&edge.from_id) || !ids.contains(&edge.to_id) {
+                    skipped_edges.push(edge.clone());
+                    continue;
+                }
+                tx.execute(
+                    "INSERT OR IGNORE INTO work_deps (from_id, to_id, kind) \
+                     VALUES (?1, ?2, ?3)",
+                    rusqlite::params![edge.from_id, edge.to_id, edge.kind.as_str()],
+                )?;
+                inserted_edges += 1;
+            }
+            append_event_tx(
+                &tx,
+                None,
+                "work.imported",
+                &json!({
+                    "items": items.len(),
+                    "edges": inserted_edges,
+                    "skippedEdges": skipped_edges.len(),
+                }),
+            )?;
+            for item in &items {
+                snapshots.push(require_snapshot_tx(&tx, &item.work_id)?);
+            }
+            tx.commit()?;
+            Ok(WorkImportReport {
+                snapshots,
+                inserted_edges,
+                skipped_edges,
+            })
+        })
+    }
+
+    /// Whether the work store holds any items at all (the importer's
+    /// one-shot guard).
+    pub fn work_store_is_empty(&self) -> Result<bool, LedgerError> {
+        self.submit(move |conn| {
+            let count: i64 = conn.query_row("SELECT COUNT(*) FROM work_items", [], |r| r.get(0))?;
+            Ok(count == 0)
         })
     }
 

@@ -1120,7 +1120,8 @@ const MIGRATION_022: &str = "
 CREATE TABLE work_items (
   work_id          TEXT PRIMARY KEY CHECK (length(trim(work_id)) > 0),
   kind             TEXT NOT NULL CHECK (kind IN ('task','epic')),
-  status           TEXT NOT NULL CHECK (status IN ('open','in_progress','blocked','closed')),
+  status           TEXT NOT NULL CHECK (status IN
+                    ('open','in_progress','blocked','deferred','closed')),
   priority         INTEGER,
   assignee         TEXT CHECK (assignee IS NULL OR length(trim(assignee)) > 0),
   metadata_json    TEXT NOT NULL DEFAULT '{}',

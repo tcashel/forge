@@ -142,6 +142,12 @@ impl Ledger {
                         WORK_BLOCKED_CLAIM_REFUSAL.to_string(),
                     ));
                 }
+                WorkStatus::Deferred => {
+                    return Err(refused(
+                        ErrorCode::InvalidRequest,
+                        format!("{WORK_CLAIM_REFUSAL_PREFIX} work item {work_id:?} is deferred"),
+                    ));
+                }
                 WorkStatus::Closed => {
                     return Err(refused(
                         ErrorCode::InvalidRequest,
