@@ -1486,11 +1486,19 @@ async fn run_attempt(
                     intervention.id, intervention.requested_by, intervention.message
                 )
             }));
-        // The guardian heartbeats the lease that is actually held — bd's
-        // heartbeat is owner-only, and a heartbeat under a second, derived
-        // identity would be refused and let the run's own lease lapse under
-        // it.
+        // Renewal targets the lease that is actually held — renewal is
+        // owner-only, and a renewal under a second, derived identity would
+        // be refused and let the run's own lease lapse under it. Internal
+        // runs (assurance) claim NO work lease by design, so an attempt
+        // renews only when the lease row is this run's at spawn: renewing
+        // unconditionally turns the very first beat of a lease-less run
+        // into a genuine "has no lease" refusal that kills the provider.
         let holder = crate::core::lease_identity(&ctx.ledger, &packet.bead_id, &run_id).await?;
+        let lease_is_ours = {
+            let bead = packet.bead_id.clone();
+            on_ledger(&ctx.ledger, move |l| l.work_lease(&bead)).await?
+        }
+        .is_some_and(|row| row.holder == holder);
         let (stage_key, seq) = match &packet.execution {
             Some(execution) => (execution.stage_id.clone(), i64::from(execution.round)),
             None => {
@@ -1509,10 +1517,10 @@ async fn run_attempt(
         let prompt_stage = prompt_stage_of(&packet, exec.protocol.as_ref())?;
         let prompt = templates.render(prompt_stage, &context)?;
         crate::core::artifacts::materialize_prompt(&run_root, &dirs, prompt.as_bytes())?;
-        Ok::<_, Failure>((packet, interventions, holder, packet_dir))
+        Ok::<_, Failure>((packet, interventions, holder, lease_is_ours, packet_dir))
     }
     .await;
-    let (packet, interventions, holder, packet_dir) = match prepared {
+    let (packet, interventions, holder, lease_is_ours, packet_dir) = match prepared {
         Ok(prepared) => prepared,
         Err(failure) => {
             let as_of = now_iso();
@@ -2405,7 +2413,7 @@ async fn run_attempt(
                     let token = claim_token.clone();
                     let renewed =
                         on_ledger(&ctx.ledger, move |l| l.heartbeat_attempt(&token)).await;
-                    let lease_renewed = {
+                    let lease_renewed = if lease_is_ours {
                         let bead = packet.bead_id.clone();
                         let lease_holder = holder.clone();
                         on_ledger(&ctx.ledger, move |l| {
@@ -2416,6 +2424,8 @@ async fn run_attempt(
                             )
                         })
                         .await
+                    } else {
+                        Ok(())
                     };
                     let claim_refused = matches!(
                         &renewed,

@@ -776,9 +776,10 @@ fn three_submitted_rolling_epics_converge_below_capacity_with_one_isolated_crux(
         assert_eq!(code, 0, "rolling start {epic}: {started}");
     }
 
-    // Hold the first real review inside the one remaining admission slot.
-    // The competing siblings stay durable while the capacity fence is live.
-    env.set_scenario("reviewclaude", "wait-release", 1);
+    // Hold EVERY first review: the two admitted runs park inside their
+    // held reviews so both slots stay occupied, and the third run's
+    // admission defers deterministically instead of winning a spawn race.
+    env.set_scenario("reviewclaude", "wait-release", 3);
     for (epic, _) in epics {
         let (code, submitted) = env.forged(&["epic", "submit", "--epic", epic]);
         assert_eq!(code, 0, "epic submit {epic}: {submitted}");
@@ -792,7 +793,7 @@ fn three_submitted_rolling_epics_converge_below_capacity_with_one_isolated_crux(
     // review starts.
     let mut review_started = false;
     let mut deferred = 0_usize;
-    for _ in 0..600 {
+    for _ in 0..1_200 {
         review_started = review_started
             || env
                 .provider_log()
