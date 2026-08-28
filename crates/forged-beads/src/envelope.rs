@@ -87,21 +87,6 @@ pub(crate) fn parse_lenient(stdout: &str) -> Lenient {
     }
 }
 
-/// Resolve enveloped `data` defensively: returns `data` itself when it is an
-/// object, `data[0]` when it is an array, `None` otherwise.
-///
-/// Observed bd 1.2.1 shapes motivating this: `bd create ... --json` returns
-/// `data` as an OBJECT (`{"id":"beads-1al","title":"doctor probe",...}`) while
-/// `bd show <id> --json` and `bd update <id> --claim ... --json` return `data`
-/// as an ARRAY of one issue object.
-pub(crate) fn first_obj(data: &Value) -> Option<&Value> {
-    match data {
-        Value::Object(_) => Some(data),
-        Value::Array(items) => items.first(),
-        _ => None,
-    }
-}
-
 /// Interpret `data` as a list: `null` is the empty list (probe-verified:
 /// `bd gate list --json` on a fresh DB), an array is itself, anything else is
 /// not list-shaped.
@@ -188,24 +173,6 @@ mod tests {
     fn array_data_is_a_list_and_object_is_not() {
         assert_eq!(as_list(&json!([1, 2])).map(|v| v.len()), Some(2));
         assert_eq!(as_list(&json!({"id": "x"})), None);
-    }
-
-    #[test]
-    fn show_returns_array_first_obj_takes_first() {
-        // Observed: bd show beads-1al --json wraps the issue in an array.
-        let data = json!([{"id": "beads-1al", "assignee": "doctor"}]);
-        let obj = first_obj(&data).expect("first element");
-        assert_eq!(obj.get("id").and_then(Value::as_str), Some("beads-1al"));
-        // An object resolves to itself (bd create shape).
-        let data = json!({"id": "beads-2la"});
-        assert_eq!(
-            first_obj(&data)
-                .and_then(|o| o.get("id"))
-                .and_then(Value::as_str),
-            Some("beads-2la")
-        );
-        assert!(first_obj(&json!(null)).is_none());
-        assert!(first_obj(&json!([])).is_none());
     }
 
     #[test]

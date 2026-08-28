@@ -2112,29 +2112,22 @@ fn complete_recovered_controller_admission_at(
     remove_if_present(&admission_path)
 }
 
+/// A bd binary recorded in the manifest only when the configured path
+/// resolves to an executable file. The ledger owns work and readiness
+/// (ADR-0034); bd exists solely for the one-shot legacy import, so a
+/// machine with no bd installs the service without one.
+fn resolved_bd_bin(config: &ForgedConfig) -> Option<PathBuf> {
+    let bd_path = config.bd_path.canonicalize().ok()?;
+    let metadata = bd_path.metadata().ok()?;
+    (metadata.is_file() && metadata.permissions().mode() & 0o111 != 0).then_some(bd_path)
+}
+
 fn new_manifest(
     paths: &RuntimePaths,
     config: &ForgedConfig,
     mut binary: BinaryIdentity,
 ) -> Result<RuntimeManifest, Failure> {
-    let bd_path = config.bd_path.canonicalize().map_err(|error| {
-        Failure::invalid(format!(
-            "service installation requires an existing bd executable at {}: {error}",
-            config.bd_path.display()
-        ))
-    })?;
-    let bd_metadata = bd_path.metadata().map_err(|error| {
-        Failure::invalid(format!(
-            "service installation cannot inspect bd executable {}: {error}",
-            bd_path.display()
-        ))
-    })?;
-    if !bd_metadata.is_file() || bd_metadata.permissions().mode() & 0o111 == 0 {
-        return Err(Failure::invalid(format!(
-            "service installation requires an executable bd file, got {}",
-            bd_path.display()
-        )));
-    }
+    let bd_path = resolved_bd_bin(config);
     let generation = Uuid::now_v7().to_string();
     let target = paths.binary_path(&binary.sha256);
     binary.path = target.to_string_lossy().into_owned();
@@ -2152,7 +2145,7 @@ fn new_manifest(
             .into_owned(),
         config_path: config.config_path.to_string_lossy().into_owned(),
         beads_dir: config.beads_dir.to_string_lossy().into_owned(),
-        bd_bin: Some(bd_path.to_string_lossy().into_owned()),
+        bd_bin: bd_path.map(|path| path.to_string_lossy().into_owned()),
         plist_path: paths.plist.to_string_lossy().into_owned(),
         installed_at: now_iso(),
     };
@@ -2168,10 +2161,7 @@ fn manifest_matches_config(
         Path::new(&manifest.anvil_home) == canonicalize_anchor(&config.anvil_home)?
             && Path::new(&manifest.config_path) == canonicalize_anchor(&config.config_path)?
             && Path::new(&manifest.beads_dir) == canonicalize_anchor(&config.beads_dir)?
-            && manifest
-                .bd_bin
-                .as_deref()
-                .is_some_and(|path| Path::new(path) == config.bd_path.as_path()),
+            && manifest.bd_bin.as_deref().map(Path::new) == resolved_bd_bin(config).as_deref(),
     )
 }
 

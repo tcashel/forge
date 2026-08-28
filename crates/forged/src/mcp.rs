@@ -1276,7 +1276,7 @@ impl ForgedServer {
     #[tool(
         name = "session_stop",
         description = "Revoke and stop ONE provider attempt: confirmed death, terminal \
-                       `stopped`, the bead's bd lease left where it is. Returns attemptId, \
+                       `stopped`, the bead's work lease left where it is. Returns attemptId, \
                        runId, state and the reconcile report."
     )]
     pub async fn session_stop(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {

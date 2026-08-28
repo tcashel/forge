@@ -69,6 +69,60 @@ fn anvil_home_from(anvil_home: Option<OsString>, home: Option<OsString>) -> Path
     }
 }
 
+/// Return whether `version` is valid semver at or above the bd version floor,
+/// `1.2.1`. This predicate alone does not establish compatibility; the
+/// bd-gated import round-trip test remains authoritative. Prereleases of the
+/// minimum itself are below the floor.
+pub fn supported_bd_version(version: &str) -> bool {
+    let (without_build, build) = version
+        .split_once('+')
+        .map_or((version, None), |(core, build)| (core, Some(build)));
+    if build.is_some_and(|value| !valid_semver_identifiers(value, false)) {
+        return false;
+    }
+    let (core, prerelease) = without_build
+        .split_once('-')
+        .map_or((without_build, None), |(core, prerelease)| {
+            (core, Some(prerelease))
+        });
+    if prerelease.is_some_and(|value| !valid_semver_identifiers(value, true)) {
+        return false;
+    }
+    let mut parts = core.split('.');
+    let parse = |part: Option<&str>| {
+        let part = part?;
+        if part.is_empty() || (part.len() > 1 && part.starts_with('0')) {
+            return None;
+        }
+        part.parse::<u64>().ok()
+    };
+    let version = match (
+        parse(parts.next()),
+        parse(parts.next()),
+        parse(parts.next()),
+    ) {
+        (Some(major), Some(minor), Some(patch)) => (major, minor, patch),
+        _ => return false,
+    };
+    if parts.next().is_some() {
+        return false;
+    }
+    version > (1, 2, 1) || (version == (1, 2, 1) && prerelease.is_none())
+}
+
+fn valid_semver_identifiers(value: &str, reject_numeric_leading_zero: bool) -> bool {
+    value.split('.').all(|identifier| {
+        !identifier.is_empty()
+            && identifier
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            && !(reject_numeric_leading_zero
+                && identifier.len() > 1
+                && identifier.starts_with('0')
+                && identifier.bytes().all(|byte| byte.is_ascii_digit()))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -93,5 +147,28 @@ mod tests {
         assert_eq!(cfg.home_override, None);
         assert_eq!(cfg.read_timeout_s, 30);
         assert_eq!(cfg.write_timeout_s, 60);
+    }
+
+    #[test]
+    fn bd_version_accepts_every_semver_at_or_above_1_2_1() {
+        for version in ["1.2.1", "1.2.1+build.7", "1.3.0-rc.1", "2.0.0", "10.0.0"] {
+            assert!(supported_bd_version(version), "{version} should pass");
+        }
+    }
+
+    #[test]
+    fn bd_version_rejects_older_prerelease_and_malformed_values() {
+        for version in [
+            "1.2.0",
+            "1.2.1-rc.1",
+            "1.1.99",
+            "1.2",
+            "01.2.1",
+            "1.2.1-01",
+            "1.2.1+bad+build",
+            "not-semver",
+        ] {
+            assert!(!supported_bd_version(version), "{version} should fail");
+        }
     }
 }

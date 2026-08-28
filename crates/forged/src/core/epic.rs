@@ -983,7 +983,7 @@ fn is_no_diff(issue_type: &str) -> bool {
     matches!(issue_type, "chore" | "decision" | "milestone")
 }
 
-fn is_planning_stub(issue: &forged_beads::IssueSummary) -> bool {
+fn is_planning_stub(issue: &crate::core::work_types::IssueSummary) -> bool {
     !is_no_diff(&issue.issue_type)
         && !super::spec::carries_spec(issue)
         && spec_pointer(&issue.description).is_none()
@@ -997,7 +997,7 @@ fn is_planning_stub(issue: &forged_beads::IssueSummary) -> bool {
 /// `epic_preflight`, so the rehearsal reports exactly the refusals the
 /// freeze enforces.
 fn resolve_child_spec(
-    child: &forged_beads::IssueSummary,
+    child: &crate::core::work_types::IssueSummary,
     rolling_authorized: bool,
 ) -> Result<Option<String>, Failure> {
     // The bead's own fields win, but only when they are a WHOLE spec. A
@@ -1027,7 +1027,7 @@ fn resolve_child_spec(
     Ok(Some(pointer))
 }
 
-fn native_fields(issue: &forged_beads::IssueSummary) -> NativeBeadSpecV1 {
+fn native_fields(issue: &crate::core::work_types::IssueSummary) -> NativeBeadSpecV1 {
     NativeBeadSpecV1 {
         description: issue.description.clone(),
         acceptance_criteria: issue.acceptance_criteria.clone(),
@@ -2125,7 +2125,7 @@ fn record_check(checks: &mut Vec<Value>, name: &str, outcome: Result<String, Fai
 /// preflight that skipped this would pass an inventory whose children can
 /// never admit.
 fn check_bead_repository(
-    issue: &forged_beads::IssueSummary,
+    issue: &crate::core::work_types::IssueSummary,
     repo: Option<&str>,
 ) -> Result<(), Failure> {
     let Some(repo) = repo else { return Ok(()) };
@@ -2919,7 +2919,7 @@ async fn ensure_planning_run(
         .map(PlanningRunEnsure::Started)
 }
 
-fn issue_checkpoint(row: &forged_beads::PlanIssue, dependency_status: bool) -> Value {
+fn issue_checkpoint(row: &crate::core::work_types::PlanIssue, dependency_status: bool) -> Value {
     let mut blockers = row
         .dependencies
         .iter()
@@ -3506,7 +3506,7 @@ async fn apply_planning_result(
                 &ctx.ledger,
                 &child_id,
                 &format!("forged:{effect_epic_id}"),
-                &forged_beads::NativeSpecUpdate {
+                &crate::core::work_types::NativeSpecUpdate {
                     description: post_for_effect.description,
                     acceptance_criteria: post_for_effect.acceptance_criteria,
                     design: post_for_effect.design,

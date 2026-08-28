@@ -411,7 +411,6 @@ dependencies = [
 name = "forged-beads"
 version = "0.5.0"
 dependencies = [
- "fs2",
  "serde",
  "serde_json",
  "tokio",

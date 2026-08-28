@@ -209,8 +209,7 @@ fn bd_candidate() -> Option<PathBuf> {
 }
 
 fn verify_bd_version(bd: &Path) -> bool {
-    reported_bd_version(bd)
-        .is_ok_and(|version| forged_beads::doctor::supported_bd_version(&version))
+    reported_bd_version(bd).is_ok_and(|version| forged_beads::supported_bd_version(&version))
 }
 
 fn reported_bd_version(bd: &Path) -> Result<String, String> {

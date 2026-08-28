@@ -3,14 +3,14 @@
 //! backstop.
 //!
 //! Saga order (the epic's third seam contract): the durable `revoking`
-//! marker COMMITS before any external kill or bd reclaim, and neither
+//! marker COMMITS before any external kill or work-lease reclaim, and neither
 //! `reclaimed` nor `stopped` is reachable except from `revoking` — there is
 //! no path that skips the marker. While `revoking`, the fence refuses
 //! everything under that token.
 //!
 //! `revoking` has TWO terminal exits because the revocation has two scopes.
 //! `reclaimed` is the bead-scoped one: the reclaim saga confirmed a dead
-//! worker and took its bd lease back. `stopped` is the attempt-local one: an
+//! worker and took its work lease back. `stopped` is the attempt-local one: an
 //! operator ended one attempt, the lease was never in scope and is untouched.
 //! Both are kill-confirmed; a reader tells them apart to know which happened.
 //!
@@ -648,7 +648,7 @@ impl Ledger {
     }
 
     /// Durably mark `running → revoking` and COMMIT — this marker lands
-    /// BEFORE the caller performs any external kill or bd reclaim. `scope`
+    /// BEFORE the caller performs any external kill or work-lease reclaim. `scope`
     /// commits WITH it, and is what a later pass routes on: a marker is
     /// resumed by the revocation that placed it, never by the other one.
     ///
@@ -750,7 +750,7 @@ impl Ledger {
     /// the only path into `reclaimed`.
     ///
     /// Callers invoke this only after kill-confirmed. NOTHING external is
-    /// reclaimed on this path: the bd lease is bead-scoped and shared with
+    /// reclaimed on this path: the work lease is bead-scoped and shared with
     /// every sibling generation, so an attempt-local stop has no standing to
     /// take it. Sets `updated_at` and `ended_at`; the event's reason is the
     /// stored `revoke_reason`.

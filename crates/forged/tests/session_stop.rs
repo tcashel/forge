@@ -3,7 +3,7 @@
 //! The proto-level tests prove the transition; these prove the WIRING —
 //! the derived key, the response shape, the reconcile pass that still
 //! settles interrupted operations, and the one criterion no fake can speak
-//! to: the bd lease is in the same hands after the stop as before it, and a
+//! to: the work lease is in the same hands after the stop as before it, and a
 //! successor claims the packet with no waiting period.
 
 mod support;
@@ -134,7 +134,7 @@ fn a_session_stop_settles_the_attempt_and_leaves_the_bd_lease_where_it_was() {
     assert_eq!(
         env.assignee(BEAD).as_deref(),
         Some(HOLDER),
-        "the bd lease holder is unchanged by an attempt stop"
+        "the work lease holder is unchanged by an attempt stop"
     );
 }
 

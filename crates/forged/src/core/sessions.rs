@@ -550,7 +550,7 @@ pub async fn session_message(ctx: &Ctx, req: &mut OperationRequest) -> Operation
 ///
 /// The REVOCATION is attempt-local, and nothing wider. The stop names one
 /// attempt, so it takes one attempt to a terminal state and leaves the
-/// bead's bd lease alone: the lease is held under the bead-scoped
+/// bead's work lease alone: the lease is held under the bead-scoped
 /// `run_holder` that every generation of the run shares, and a successor on
 /// this packet claims under it immediately. The bead-scoped release is a
 /// different operation with a different fence, and is not this one. The

@@ -1,5 +1,5 @@
 //! `claim-next` ordering (BLOCKER-severity rule): a resumable ledger run is
-//! preferred over a fresh bd frontier pull, the bd reclaim is scoped, a
+//! preferred over a fresh frontier pull, the work-lease reclaim is scoped, a
 //! refusal leaves the run untouched, and the retry deadline is honored.
 
 mod support;
@@ -119,7 +119,7 @@ fn fabricate_resumable(env: &TestEnv, run_id: &str) {
         .expect("open packet");
     let claimed = ledger
         // The claimant is the per-attempt session identity: packet-scoped,
-        // not the run's bd lease holder.
+        // not the run's work lease holder.
         .claim_packet(
             &packet_id,
             &format!("forged:{packet_id}:0"),
@@ -206,7 +206,7 @@ fn a_fresh_bead_is_never_claimed_while_a_resumable_run_exists() {
 
 #[test]
 fn anothers_live_lease_leaves_the_run_alone() {
-    // The refusal shape: the bd reclaim reclaims nothing because another
+    // The refusal shape: the work-lease reclaim reclaims nothing because another
     // worker's lease is live — claim-next leaves the run untouched and
     // pulls the frontier instead.
     let env = TestEnv::new("forged-claim-next-refusal");

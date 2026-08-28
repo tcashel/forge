@@ -31,18 +31,75 @@ use crate::core::{
 pub async fn doctor(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
     read_only("doctor", req, || async {
         let mut probes: Vec<Value> = Vec::new();
-        let doctor_cfg = forged_beads::DoctorConfig {
-            bd: ctx.config.bd_config(),
-            scratch_root: ctx.config.anvil_home.join("doctor-scratch"),
-            herdr_sock: ctx.config.herdr_sock.clone(),
-        };
-        for probe in forged_beads::run_doctor(doctor_cfg).await {
-            probes.push(json!({
-                "name": probe.name,
-                "ok": probe.ok,
-                "detail": probe.detail,
-            }));
-        }
+        // gh reachability: PR creation and review delivery need it.
+        let gh = tokio::process::Command::new("gh")
+            .args(["auth", "status"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .status()
+            .await;
+        probes.push(match gh {
+            Ok(status) if status.success() => {
+                json!({"name": "gh-auth", "ok": true, "detail": "gh auth status ok"})
+            }
+            Ok(status) => json!({
+                "name": "gh-auth",
+                "ok": false,
+                "detail": format!("gh auth status exited {:?}", status.code()),
+            }),
+            Err(error) => json!({
+                "name": "gh-auth",
+                "ok": false,
+                "detail": format!("gh not runnable: {error}"),
+            }),
+        });
+        // herdr is an EXTERNAL, OPTIONAL daemon: absence is a normal
+        // `ok: false`, never a blocker.
+        let herdr_path = ctx
+            .config
+            .herdr_sock
+            .clone()
+            .or_else(|| std::env::var_os("HERDR_SOCK").map(PathBuf::from))
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .map(|home| PathBuf::from(home).join(".config/herdr/herdr.sock"))
+            });
+        probes.push(match &herdr_path {
+            Some(path) => match tokio::net::UnixStream::connect(path).await {
+                Ok(_) => json!({
+                    "name": "herdr-ping",
+                    "ok": true,
+                    "detail": format!("herdr reachable at {}", path.display()),
+                }),
+                Err(error) => json!({
+                    "name": "herdr-ping",
+                    "ok": false,
+                    "detail": format!("{}: {error}", path.display()),
+                }),
+            },
+            None => json!({
+                "name": "herdr-ping",
+                "ok": false,
+                "detail": "no herdr socket path resolvable (no HERDR_SOCK and no HOME)",
+            }),
+        });
+        // anvil home write probe.
+        let anvil_probe = (|| -> Result<String, String> {
+            let dir = &ctx.config.anvil_home;
+            std::fs::create_dir_all(dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
+            let probe_file = dir.join(format!("doctor-probe-{}", std::process::id()));
+            std::fs::write(&probe_file, b"doctor probe")
+                .map_err(|e| format!("writing {}: {e}", probe_file.display()))?;
+            std::fs::remove_file(&probe_file)
+                .map_err(|e| format!("removing {}: {e}", probe_file.display()))?;
+            Ok(format!("{} writable", dir.display()))
+        })();
+        probes.push(match anvil_probe {
+            Ok(detail) => json!({"name": "anvil-home-writable", "ok": true, "detail": detail}),
+            Err(detail) => json!({"name": "anvil-home-writable", "ok": false, "detail": detail}),
+        });
         // This slice's own probes.
         let ledger_ok = on_ledger(&ctx.ledger, |l| l.list_runs()).await;
         probes.push(json!({
@@ -238,7 +295,10 @@ pub async fn init(ctx: &Ctx, req: &mut OperationRequest) -> OperationResponse {
 /// a stale frontier claim) refuses exactly as the frontier read would.
 /// A non-code Bead has an explicit route instead of being forced through a
 /// commit-and-PR protocol that cannot represent its correct result.
-async fn ready_slice_bead(ctx: &Ctx, bead: &str) -> Result<forged_beads::IssueSummary, Failure> {
+async fn ready_slice_bead(
+    ctx: &Ctx,
+    bead: &str,
+) -> Result<crate::core::work_types::IssueSummary, Failure> {
     let issue = super::spec::read_bead(ctx, bead).await?;
     let frontier_claimed = issue.status == "in_progress"
         && issue.assignee.as_deref() == Some(crate::core::FRONTIER_HOLDER);
@@ -273,8 +333,8 @@ async fn ready_slice_bead(ctx: &Ctx, bead: &str) -> Result<forged_beads::IssueSu
         let readiness = rows
             .iter()
             .find(|row| row.issue.id == issue.id)
-            .map(forged_beads::PlanIssue::readiness);
-        if readiness != Some(forged_beads::PlanReadiness::Claimed) {
+            .map(crate::core::work_types::PlanIssue::readiness);
+        if readiness != Some(crate::core::work_types::PlanReadiness::Claimed) {
             return Err(Failure::invalid(format!(
                 "bead {bead} is frontier-claimed but its dependencies do not prove it ready \
                  ({readiness:?}); resolve its blockers before starting a run"
@@ -1445,7 +1505,7 @@ pub async fn packet_claim(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
                 on_ledger(&ctx.ledger, move |l| l.get_packet(&packet_id)).await?
             };
             // The claimant is the PACKET-scoped session identity, not the
-            // run's bd lease holder — see `core::session_claimant`.
+            // run's work lease holder — see `core::session_claimant`.
             let view = super::drive::project(ctx, &row.run_id).await?;
             let packet_admission = super::admission::PacketAdmission {
                 packet_id: packet_id.clone(),
@@ -2521,10 +2581,10 @@ pub(super) fn operator_queue(
     snapshot: &InventorySnapshot,
     entries: &mut [Value],
     attention: &[Value],
-    bead_read: Result<Vec<forged_beads::IssueSummary>, String>,
+    bead_read: Result<Vec<crate::core::work_types::IssueSummary>, String>,
 ) -> Value {
     let bead_error = bead_read.as_ref().err().cloned();
-    let beads: BTreeMap<String, forged_beads::IssueSummary> = bead_read
+    let beads: BTreeMap<String, crate::core::work_types::IssueSummary> = bead_read
         .unwrap_or_default()
         .into_iter()
         .map(|issue| (issue.id.clone(), issue))
@@ -3337,7 +3397,7 @@ fn work_ref(kind: WorkRefKind, id: &str) -> Result<Value, Failure> {
 }
 
 pub(super) fn live_plan_entry(
-    plan: &forged_beads::PlanIssue,
+    plan: &crate::core::work_types::PlanIssue,
     captured_at: &str,
 ) -> Result<Value, Failure> {
     let repository = plan
@@ -3686,7 +3746,7 @@ pub(super) fn entry_bead_ids(entries: &[Value]) -> Vec<String> {
 /// one, and always names the authority that answered.
 pub(super) fn decorate_titles(
     entries: &mut [Value],
-    beads: &[forged_beads::IssueSummary],
+    beads: &[crate::core::work_types::IssueSummary],
 ) -> Result<(), Failure> {
     let titles: BTreeMap<&str, &str> = beads
         .iter()
@@ -3749,7 +3809,7 @@ struct OperationsUniverse {
     ledger_captured_at: String,
     beads_captured_at: String,
     entries: Vec<Value>,
-    bead_summaries: Vec<forged_beads::IssueSummary>,
+    bead_summaries: Vec<crate::core::work_types::IssueSummary>,
     claim_error: Option<String>,
     plan_error: Option<String>,
     plan_discovered: usize,
@@ -3871,7 +3931,7 @@ async fn collect_operations_universe(
     }
 
     if plan_error.is_none() {
-        let plans_by_id: BTreeMap<&str, &forged_beads::PlanIssue> = plans
+        let plans_by_id: BTreeMap<&str, &crate::core::work_types::PlanIssue> = plans
             .iter()
             .map(|plan| (plan.issue.id.as_str(), plan))
             .collect();

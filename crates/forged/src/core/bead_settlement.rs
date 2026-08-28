@@ -46,7 +46,7 @@
 //! and replay semantics are untouched. The pass runs beside the supervisor
 //! tick, decoupled from it — see `BeadSettlementPass` in `supervise`.
 
-use forged_beads::IssueSummary;
+use crate::core::work_types::IssueSummary;
 use forged_ledger::{PendingBeadSettlementRow, RetryErrorUpdate, RunOutcome};
 use serde_json::{json, Value};
 
@@ -88,7 +88,7 @@ enum MutationFailure {
 
 /// Delay charged attempt `used + 1` schedules before the next mutating
 /// retry: 30s doubling, capped at 8 minutes. The full budget spans past the
-/// 5+ minute bd lease TTL that motivates the retry.
+/// 5+ minute work lease TTL that motivates the retry.
 fn backoff_seconds(used: u32) -> u64 {
     BACKOFF_BASE_SECONDS
         .saturating_mul(2u64.saturating_pow(used))
@@ -901,7 +901,7 @@ mod tests {
             .sum();
         assert!(
             total > forged_ledger::WORK_LEASE_TTL_S,
-            "the schedule must comfortably span the bd lease TTL"
+            "the schedule must comfortably span the work lease TTL"
         );
     }
 

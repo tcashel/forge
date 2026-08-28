@@ -42,7 +42,7 @@ fn stop_run_when_kill_evidence_is_ready(env: &TestEnv, run: &str, reason: &str) 
     // The provider process can become observable before its start-time
     // fingerprint is durably recorded. `run stop` deliberately refuses to
     // signal in that window, so retry the same SafeRetry operation until the
-    // guardian evidence catches up.
+    // kill evidence catches up.
     wait_for(
         env,
         &[
@@ -3262,7 +3262,7 @@ fn run_drive_reaches_done_with_one_draft_pr_and_real_commits() {
 
     // The two identity layers stayed apart: every attempt's claimant is the
     // PACKET-scoped session identity, so the two Review legs — which share
-    // the run's one bd lease — are told apart by their claimants and each
+    // the run's one work lease — are told apart by their claimants and each
     // resolves to its own packet directory. A run-scoped claimant here would
     // make liveness and kill aggregate across the legs.
     {
@@ -5042,8 +5042,8 @@ fn claude_rate_limit_is_a_free_transport_retry() {
 
 #[test]
 fn a_provider_that_never_reports_its_pid_is_killed_not_left_unguarded() {
-    // No `provider.pid` inside the wait window means no guardian, and a
-    // provider with no guardian stops renewing the bd lease while still
+    // No `provider.pid` inside the wait window means no revocable identity:
+    // an unidentified provider stops renewing the work lease while still
     // writing to the worktree — another worker would reclaim its
     // apparently-expired work. The spawn is treated as failed: the session
     // is killed, the packet fails `transport:`, and the transport-retry
