@@ -764,10 +764,14 @@ async fn release_if(ctx: &Ctx, on_error: OnEffectError, operation_id: &str) {
 /// event survives, so a default key that never varies would let a corrected
 /// retry append a second, differing request payload under the released key —
 /// the exact ambiguity the pre-record probe exists to refuse. Every retry
-/// after a release advances to the released count, so a key carries at most
-/// one payload across releases, not only across live rows. `None` is the
-/// historical bare `-` segment, keeping first-start keys byte-identical to
-/// every ledger written before this fence.
+/// after a DERIVED-key release advances to that release count, so a derived
+/// key carries at most one payload across releases, not only across live
+/// rows. Only the derived series counts: an explicitly keyed attempt that
+/// releases occupies its own key, and letting it advance this epoch would
+/// strand a terminal derived-key success behind a key that no keyless
+/// replay derives again. `None` is the historical bare `-` segment, keeping
+/// first-start keys byte-identical to every ledger written before this
+/// fence.
 pub(crate) async fn released_retry_seq(
     ctx: &Ctx,
     subject: &str,
@@ -778,14 +782,20 @@ pub(crate) async fn released_retry_seq(
         ledger.list_events(Some(&owned_subject), 0, 65_536)
     })
     .await?;
+    let series_prefix = format!("op:{name}:{subject}:-:");
     let released = rows
         .iter()
         .filter(|row| row.kind == "operation.released")
         .filter(|row| {
             serde_json::from_str::<Value>(&row.payload_json)
                 .ok()
-                .and_then(|payload| payload.get("name").cloned())
-                == Some(Value::from(name))
+                .is_some_and(|payload| {
+                    payload.get("name").and_then(Value::as_str) == Some(name)
+                        && payload
+                            .get("idempotencyKey")
+                            .and_then(Value::as_str)
+                            .is_some_and(|key| key.starts_with(&series_prefix))
+                })
         })
         .count() as i64;
     Ok((released > 0).then_some(released))
