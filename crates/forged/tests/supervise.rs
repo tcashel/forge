@@ -64,6 +64,7 @@ impl Drop for PausedProcessGroup {
 }
 
 fn start_run(env: &TestEnv, run: &str) {
+    env.seed_frontier(run);
     assert_eq!(env.forged(&["init"]).0, 0);
     let repo = env.repos.repo.to_string_lossy().into_owned();
     let spec = env.spec.to_string_lossy().into_owned();

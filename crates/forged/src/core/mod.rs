@@ -29,6 +29,7 @@ pub(crate) mod usage;
 pub(crate) mod work_identity;
 mod work_import;
 mod work_map;
+pub(crate) mod workstore;
 
 use forged_ledger::{DesiredSubjectKind, EffectClass, Ledger, LedgerError, OperationOutcome};
 use forged_proto::ProtoError;
@@ -333,13 +334,9 @@ pub fn run_holder(bead_id: &str) -> String {
 /// what makes the chain unwedgeable against itself. A holder this driver
 /// could not have taken is deliberately NOT adopted: the derived holder is
 /// returned, bd refuses the claim, and another worker's live lease stands.
-pub async fn lease_identity(
-    bd: &forged_beads::BdConfig,
-    bead: &str,
-    _run_id: &str,
-) -> Result<String, Failure> {
+pub async fn lease_identity(ledger: &Ledger, bead: &str, _run_id: &str) -> Result<String, Failure> {
     let derived = run_holder(bead);
-    let current = forged_beads::lease_holder(bd, bead).await?;
+    let current = workstore::lease_holder(ledger, bead).await?;
     Ok(match current {
         Some(held) if held == derived || held == FRONTIER_HOLDER => held,
         _ => derived,

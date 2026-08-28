@@ -287,7 +287,6 @@ async fn reconcile_run(ctx: &Ctx, pending: &PendingBeadSettlementRow) -> Result<
         map
     };
 
-    let bd = ctx.config.bd_config();
     // A pend-time custody resolution that FAILED is not a legacy
     // non-record: re-resolve on a later pass and stamp the result durably
     // via a re-pend, so a frontier wedge whose stop raced a bd outage still
@@ -298,7 +297,7 @@ async fn reconcile_run(ctx: &Ctx, pending: &PendingBeadSettlementRow) -> Result<
     if observed_holder.is_none()
         && payload.get("observedHolderUnresolved") == Some(&Value::Bool(true))
     {
-        if let Ok(actor) = lease_identity(&bd, &bead_id, &run_id).await {
+        if let Ok(actor) = lease_identity(&ctx.ledger, &bead_id, &run_id).await {
             let mut stamped = payload.clone();
             stamped["observedHolder"] = json!(actor);
             if let Some(map) = stamped.as_object_mut() {
@@ -319,7 +318,7 @@ async fn reconcile_run(ctx: &Ctx, pending: &PendingBeadSettlementRow) -> Result<
         }
     }
     let frontier_recorded = observed_holder.as_deref() == Some(FRONTIER_HOLDER);
-    let issue = match forged_beads::show_issue(&bd, &bead_id).await {
+    let issue = match super::workstore::show_issue(&ctx.ledger, &bead_id).await {
         Ok(issue) => issue,
         Err(error) => {
             // A failed read is not a mutating attempt: no charge, no event —
@@ -336,7 +335,7 @@ async fn reconcile_run(ctx: &Ctx, pending: &PendingBeadSettlementRow) -> Result<
     let decision = match custody_probe(outcome, &issue, &expected, frontier_recorded) {
         Probe::MarkerDecides => {
             let marker = settlement::settlement_marker(&run_id, outcome);
-            match forged_beads::comment_present(&bd, &bead_id, &marker).await {
+            match super::workstore::settlement_note_present(&ctx.ledger, &run_id, &marker).await {
                 Ok(true) => Probe::Converged,
                 Ok(false) => Probe::Retry,
                 Err(error) => {
@@ -428,7 +427,7 @@ async fn reconcile_run(ctx: &Ctx, pending: &PendingBeadSettlementRow) -> Result<
     let last_error_refusal = standing
         .as_ref()
         .and_then(|row| row.last_error.as_deref())
-        .filter(|error| error.contains(forged_beads::CLAIM_REFUSAL_PREFIX))
+        .filter(|error| error.contains(forged_ledger::WORK_CLAIM_REFUSAL_PREFIX))
         .map(str::to_owned);
     if payload
         .get(MECHANISM_REFUSED_FIELD)
@@ -472,7 +471,7 @@ async fn reconcile_run(ctx: &Ctx, pending: &PendingBeadSettlementRow) -> Result<
             payload
                 .get("error")
                 .cloned()
-                .unwrap_or_else(|| json!(forged_beads::BLOCKED_CLAIM_REFUSAL)),
+                .unwrap_or_else(|| json!(forged_ledger::WORK_BLOCKED_CLAIM_REFUSAL)),
         );
         return Ok(Value::Object(report));
     }
@@ -627,12 +626,12 @@ async fn reconcile_run(ctx: &Ctx, pending: &PendingBeadSettlementRow) -> Result<
                         if !matches!(issue.status.as_str(), "blocked" | "open") {
                             Err(MutationFailure::MechanismRefused(format!(
                                 "{}{} is not a shape landed custody may overwrite",
-                                forged_beads::CLAIM_REFUSAL_PREFIX,
+                                forged_ledger::WORK_CLAIM_REFUSAL_PREFIX,
                                 issue.status
                             )))
                         } else {
-                            match forged_beads::assign_unassigned_issue(
-                                &bd,
+                            match super::workstore::assign_unassigned_issue(
+                                &ctx.ledger,
                                 &bead_id,
                                 &expected,
                                 &issue.status,
@@ -640,12 +639,14 @@ async fn reconcile_run(ctx: &Ctx, pending: &PendingBeadSettlementRow) -> Result<
                             .await
                             {
                                 Ok(_) => Ok(true),
-                                Err(error) => match error.claim_refusal() {
-                                    Some(refusal) => {
-                                        Err(MutationFailure::MechanismRefused(refusal))
-                                    }
-                                    None => Err(MutationFailure::Retry(error.into())),
-                                },
+                                Err(error)
+                                    if error
+                                        .message
+                                        .contains(forged_ledger::WORK_CLAIM_REFUSAL_PREFIX) =>
+                                {
+                                    Err(MutationFailure::MechanismRefused(error.message))
+                                }
+                                Err(error) => Err(MutationFailure::Retry(error)),
                             }
                         }
                     } else {
@@ -801,8 +802,7 @@ async fn reconcile_run(ctx: &Ctx, pending: &PendingBeadSettlementRow) -> Result<
 /// unassigned bead — not the promised settled shape — and must fail the
 /// attempt rather than record success over it.
 async fn release_held_closed(ctx: &Ctx, bead_id: &str, actor: &str) -> Result<(), Failure> {
-    let bd = ctx.config.bd_config();
-    let released = forged_beads::release_issue(&bd, bead_id, actor).await?;
+    let released = super::workstore::release_issue(&ctx.ledger, bead_id, actor).await?;
     if released.status != "closed" {
         return Err(Failure {
             code: forged_types::ErrorCode::BeadsContention,
@@ -900,7 +900,7 @@ mod tests {
             .map(backoff_seconds)
             .sum();
         assert!(
-            total > forged_beads::BD_LEASE_TTL_S,
+            total > forged_ledger::WORK_LEASE_TTL_S,
             "the schedule must comfortably span the bd lease TTL"
         );
     }

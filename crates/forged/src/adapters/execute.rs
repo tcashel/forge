@@ -1490,8 +1490,7 @@ async fn run_attempt(
         // heartbeat is owner-only, and a heartbeat under a second, derived
         // identity would be refused and let the run's own lease lapse under
         // it.
-        let holder =
-            crate::core::lease_identity(&ctx.config.bd_config(), &packet.bead_id, &run_id).await?;
+        let holder = crate::core::lease_identity(&ctx.ledger, &packet.bead_id, &run_id).await?;
         let (stage_key, seq) = match &packet.execution {
             Some(execution) => (execution.stage_id.clone(), i64::from(execution.round)),
             None => {
@@ -2313,13 +2312,6 @@ async fn run_attempt(
     // the spawning driver is the sole process able to contain the effect.
     drop(submit_guard);
     failpoint::hit("guardian.start");
-    let gcfg = forged_beads::GuardianConfig::new(
-        ctx.config.bd_config(),
-        packet.bead_id.clone(),
-        holder.clone(),
-        pid,
-    );
-    let mut guardian = Some(tokio::spawn(forged_beads::run_guardian(gcfg)));
 
     // Await completion by polling the host; the sentinel status file is the
     // only exit-code truth.
@@ -2330,9 +2322,6 @@ async fn run_attempt(
         let observed = match host.alive(&session).await {
             Ok(observed) => observed,
             Err(e) => {
-                if let Some(handle) = guardian.take() {
-                    handle.abort();
-                }
                 return Err(e.into());
             }
         };
@@ -2346,9 +2335,6 @@ async fn run_attempt(
         {
             let marker = deadline_marker(ctx, attempt_id, &note).await?;
             if marker.state != AttemptState::Revoking {
-                if let Some(handle) = guardian.take() {
-                    handle.abort();
-                }
                 return if marker.state == AttemptState::Failed
                     && marker.revoke_scope == Some(RevokeScope::Deadline)
                 {
@@ -2366,9 +2352,6 @@ async fn run_attempt(
                     ),
                     recoverable: true,
                 })?;
-            if let Some(handle) = guardian.take() {
-                handle.abort();
-            }
             crate::core::artifacts::finalize_provider_files(&run_root, &dirs)?;
             let out = crate::core::artifacts::read_output_text(&run_root, &dirs)?;
             crate::core::usage::capture_attempt(
@@ -2409,19 +2392,33 @@ async fn run_attempt(
                 beats += 1;
                 if beats.is_multiple_of(25) {
                     // Heartbeats prove liveness but never renew the frozen
-                    // wall-clock deadline anchored at `started_at`.
+                    // wall-clock deadline anchored at `started_at`. The
+                    // attempt heartbeat and the work-lease renewal ride the
+                    // same cadence: a refused renewal means the lease was
+                    // reclaimed out from under us, and the attempt
+                    // self-terminates exactly as if revoked — the guardian
+                    // process this replaces never even reported it.
                     let token = claim_token.clone();
                     let renewed =
                         on_ledger(&ctx.ledger, move |l| l.heartbeat_attempt(&token)).await;
-                    if renewed.is_err() {
+                    let lease_renewed = {
+                        let bead = packet.bead_id.clone();
+                        let lease_holder = holder.clone();
+                        on_ledger(&ctx.ledger, move |l| {
+                            l.heartbeat_work_lease(
+                                &bead,
+                                &lease_holder,
+                                forged_ledger::WORK_LEASE_TTL_S,
+                            )
+                        })
+                        .await
+                    };
+                    if renewed.is_err() || lease_renewed.is_err() {
                         // Our attempt was revoked out from under us: stop the
                         // provider and report. Its tokens were still spent;
                         // freeze this attempt's private capture before any
                         // successor is allowed to proceed.
                         let _ = host.kill_confirmed(&session).await;
-                        if let Some(handle) = guardian.take() {
-                            handle.abort();
-                        }
                         crate::core::artifacts::finalize_provider_files(&run_root, &dirs)?;
                         let out = crate::core::artifacts::read_output_text(&run_root, &dirs)?;
                         crate::core::usage::capture_attempt(
@@ -2463,9 +2460,6 @@ async fn run_attempt(
             other => break other,
         }
     };
-    if let Some(handle) = guardian.take() {
-        handle.abort();
-    }
 
     // The shell sentinel is the runner exit. Its closed status proves the
     // provider termination/capture split without admitting renderer output
@@ -3460,6 +3454,23 @@ mod settle_tests {
             })
             .expect("create run");
         let run = ledger.get_run(RUN_ID).expect("run row");
+        ledger
+            .create_work_item(forged_ledger::NewWorkItem {
+                work_id: RUN_ID.to_owned(),
+                kind: forged_ledger::WorkKind::Task,
+                status: forged_ledger::WorkStatus::Open,
+                priority: Some(2),
+                metadata: std::collections::BTreeMap::new(),
+                spec: forged_ledger::WorkSpecFields {
+                    title: RUN_ID.to_owned(),
+                    description: "fixture".to_owned(),
+                    acceptance_criteria: "- fixture".to_owned(),
+                    design: String::new(),
+                    notes: String::new(),
+                },
+                cause: forged_ledger::WorkRevisionCause::Authored,
+            })
+            .expect("seed work item");
 
         let spec_path = root.join("spec.md");
         std::fs::write(&spec_path, "# spec\n").expect("spec");

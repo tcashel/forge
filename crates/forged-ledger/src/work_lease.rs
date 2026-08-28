@@ -145,13 +145,13 @@ impl Ledger {
                 WorkStatus::Deferred => {
                     return Err(refused(
                         ErrorCode::InvalidRequest,
-                        format!("{WORK_CLAIM_REFUSAL_PREFIX} work item {work_id:?} is deferred"),
+                        format!("{WORK_CLAIM_REFUSAL_PREFIX}deferred"),
                     ));
                 }
                 WorkStatus::Closed => {
                     return Err(refused(
                         ErrorCode::InvalidRequest,
-                        format!("{WORK_CLAIM_REFUSAL_PREFIX} work item {work_id:?} is closed"),
+                        format!("{WORK_CLAIM_REFUSAL_PREFIX}closed"),
                     ));
                 }
                 WorkStatus::Open | WorkStatus::InProgress => {}
@@ -384,7 +384,7 @@ mod tests {
         );
 
         seed(&l, "beads-cls", WorkStatus::Open, None);
-        l.close_work_item("beads-cls", "op").unwrap();
+        l.close_work_item("beads-cls", "op", "test").unwrap();
         let err = l.claim_specific_work("beads-cls", "me", 300).unwrap_err();
         assert!(err.to_string().contains(WORK_CLAIM_REFUSAL_PREFIX), "{err}");
     }
@@ -464,7 +464,8 @@ mod tests {
 
         // Custody with no lease row at all (importer residue) counts as
         // long-expired.
-        l.assign_unassigned_work_item("beads-rc", "ghost").unwrap();
+        l.assign_unassigned_work_item("beads-rc", "ghost", WorkStatus::Open)
+            .unwrap();
         let out = l.reclaim_work_lease("beads-rc", "ghost", 0).unwrap();
         assert_eq!(out.previous_owner.as_deref(), Some("ghost"));
     }

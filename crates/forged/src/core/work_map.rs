@@ -622,13 +622,9 @@ async fn project(ctx: &Ctx, request: MapRequest) -> Result<Value, Failure> {
         ),
     };
     let plan_limit = request.max_nodes.saturating_sub(entries.len()).max(1);
-    let plan_read = forged_beads::work_map_plan_inventory(
-        &ctx.config.bd_config(),
-        &plan_scope,
-        &exact_ids,
-        plan_limit,
-    )
-    .await;
+    let plan_read =
+        super::workstore::work_map_plan_inventory(&ctx.ledger, &plan_scope, &exact_ids, plan_limit)
+            .await;
     let beads_captured_at = now_iso();
     let (plan_inventory, plan_error) = match plan_read {
         Ok(inventory) => (Some(inventory), None),

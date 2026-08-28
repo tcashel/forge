@@ -142,6 +142,31 @@ async fn stop_live_attempts(ctx: &Ctx, run_id: &str, reason: &str) -> Result<Vec
     }
 }
 
+/// The settlement note: the bd-era `comment_once` marker as an idempotent
+/// ledger event in the SAME store as the run — the cross-store idempotence
+/// dance it existed for no longer has two stores to bridge.
+async fn settlement_note(
+    ctx: &Ctx,
+    run_id: &str,
+    bead_id: &str,
+    actor: &str,
+    marker: &str,
+    detail: &str,
+) -> Result<(), Failure> {
+    let run_id_owned = run_id.to_owned();
+    let payload = serde_json::json!({
+        "workId": bead_id,
+        "actor": actor,
+        "marker": marker,
+        "detail": detail,
+    });
+    crate::core::on_ledger(&ctx.ledger, move |l| {
+        l.append_event_once(&run_id_owned, "work.settled.note", payload)
+            .map(|_| ())
+    })
+    .await
+}
+
 /// Settle the bead under `actor` — the caller's resolved custody identity.
 ///
 /// The primary `run stop` path passes the bd lease identity actually in
@@ -168,7 +193,6 @@ pub(super) async fn settle_bead(
     settlement: &Settlement,
     actor: &str,
 ) -> Result<Value, Failure> {
-    let bd = ctx.config.bd_config();
     let marker = settlement_marker(run_id, settlement.outcome);
     let detail = match settlement.outcome {
         RunOutcome::Landed => format!(
@@ -190,8 +214,8 @@ pub(super) async fn settle_bead(
             // atomic update. A successor or an unowned Bead therefore gets
             // neither closed nor annotated by this predecessor. Close and
             // release are one CAS, removing the old partially-closed seam.
-            let closed = forged_beads::close_held_issue(&bd, bead_id, actor).await?;
-            forged_beads::comment_once(&bd, bead_id, actor, &marker, &detail).await?;
+            let closed = super::workstore::close_held_issue(&ctx.ledger, bead_id, actor).await?;
+            settlement_note(ctx, run_id, bead_id, actor, &marker, &detail).await?;
             Ok(json!({
                 "id": bead_id,
                 "settled": true,
@@ -202,8 +226,10 @@ pub(super) async fn settle_bead(
             }))
         }
         RunOutcome::Blocked | RunOutcome::InputRequired => {
-            forged_beads::comment_once(&bd, bead_id, actor, &marker, &detail).await?;
-            let issue = forged_beads::release_unresolved_issue(&bd, bead_id, actor, true).await?;
+            settlement_note(ctx, run_id, bead_id, actor, &marker, &detail).await?;
+            let issue =
+                super::workstore::release_unresolved_issue(&ctx.ledger, bead_id, actor, true)
+                    .await?;
             Ok(json!({
                 "id": bead_id,
                 "settled": true,
@@ -213,8 +239,10 @@ pub(super) async fn settle_bead(
             }))
         }
         RunOutcome::Cancelled | RunOutcome::Superseded => {
-            forged_beads::comment_once(&bd, bead_id, actor, &marker, &detail).await?;
-            let issue = forged_beads::release_unresolved_issue(&bd, bead_id, actor, false).await?;
+            settlement_note(ctx, run_id, bead_id, actor, &marker, &detail).await?;
+            let issue =
+                super::workstore::release_unresolved_issue(&ctx.ledger, bead_id, actor, false)
+                    .await?;
             Ok(json!({
                 "id": bead_id,
                 "settled": true,
@@ -227,7 +255,7 @@ pub(super) async fn settle_bead(
         // explicit landed settlement. AcceptedRisk is rejected by parse and
         // owned by the review acceptance operation.
         RunOutcome::Clean | RunOutcome::AcceptedRisk => {
-            forged_beads::comment_once(&bd, bead_id, actor, &marker, &detail).await?;
+            settlement_note(ctx, run_id, bead_id, actor, &marker, &detail).await?;
             Ok(json!({
                 "id": bead_id,
                 "settled": true,
@@ -259,7 +287,7 @@ async fn settle_aftermath(
     let stopped_attempts =
         stop_live_attempts(ctx, run_id, &run.stop_reason.clone().unwrap()).await?;
     let converged = if closed_bead_converges {
-        match forged_beads::show_issue(&ctx.config.bd_config(), &run.bead_id).await {
+        match super::workstore::show_issue(&ctx.ledger, &run.bead_id).await {
             Ok(issue) if issue.status == "closed" => {
                 // The closed Bead converges every adjudicated outcome, but
                 // stale forged custody is still released — leaving
@@ -271,15 +299,11 @@ async fn settle_aftermath(
                 let (assignee, released, release_error) = match issue.assignee.as_deref() {
                     None => (None, true, None),
                     Some(holder) if holder == expected => {
-                        match forged_beads::release_issue(
-                            &ctx.config.bd_config(),
-                            &run.bead_id,
-                            holder,
-                        )
-                        .await
+                        match super::workstore::release_issue(&ctx.ledger, &run.bead_id, holder)
+                            .await
                         {
                             Ok(after) => (after.assignee, true, None),
-                            Err(error) => (issue.assignee.clone(), false, Some(error.to_string())),
+                            Err(error) => (issue.assignee.clone(), false, Some(error.message)),
                         }
                     }
                     Some(_) => (issue.assignee.clone(), false, None),
@@ -319,7 +343,7 @@ async fn settle_aftermath(
         // later successful read rather than parking conservative-foreign
         // forever.
         let (settled, observed_holder) =
-            match lease_identity(&ctx.config.bd_config(), &run.bead_id, run_id).await {
+            match lease_identity(&ctx.ledger, &run.bead_id, run_id).await {
                 Ok(actor) => (
                     settle_bead(ctx, run_id, &run.bead_id, settlement, &actor).await,
                     Some(actor),

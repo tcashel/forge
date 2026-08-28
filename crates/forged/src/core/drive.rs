@@ -1398,11 +1398,11 @@ async fn machine_effect(
             let holder = if internal != InternalRunMode::Ordinary {
                 None
             } else {
-                let bd = ctx.config.bd_config();
-                let holder = crate::core::lease_identity(&bd, &run.bead_id, &run.run_id).await?;
-                failpoint::hit("bd.claim.before");
-                forged_beads::claim_specific(&bd, &run.bead_id, &holder).await?;
-                failpoint::hit("bd.claim.after");
+                let holder =
+                    crate::core::lease_identity(&ctx.ledger, &run.bead_id, &run.run_id).await?;
+                failpoint::hit("work.claim.before");
+                crate::core::workstore::claim_specific(&ctx.ledger, &run.bead_id, &holder).await?;
+                failpoint::hit("work.claim.after");
                 Some(holder)
             };
             let mut result = obj(json!({

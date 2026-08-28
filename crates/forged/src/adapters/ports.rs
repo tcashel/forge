@@ -493,14 +493,11 @@ impl ForgedPorts {
     /// identity the run's lease is held under, for the run the session
     /// names. `None` when the string is not a session claimant — then it is
     /// already whatever identity the caller meant, and is used verbatim.
-    async fn lease_holder_of(
-        &self,
-        bd: &forged_beads::BdConfig,
-        bead: &str,
-        session: &str,
-    ) -> Option<String> {
+    async fn lease_holder_of(&self, bead: &str, session: &str) -> Option<String> {
         let run_id = run_of_session(session)?;
-        crate::core::lease_identity(bd, bead, &run_id).await.ok()
+        crate::core::lease_identity(&self.ledger, bead, &run_id)
+            .await
+            .ok()
     }
 }
 
@@ -702,18 +699,20 @@ impl ReconcilePorts for ForgedPorts {
         // `previous_owner` against the claimant it passed reads a truthful
         // "the lease was taken from the identity you named". A holder that
         // is not a session claimant passes through untouched.
-        let bd = self.config.bd_config();
-        let lease_holder = self.lease_holder_of(&bd, bead, holder).await;
-        let bd_holder = lease_holder.as_deref().unwrap_or(holder);
-        failpoint::hit("bd.reclaim.before");
-        let outcome = forged_beads::reclaim(&bd, bead, bd_holder, older_than_s)
-            .await
-            .map_err(|e| PortError::Unavailable(e.to_string()))?;
-        failpoint::hit("bd.reclaim.after");
+        let lease_holder = self.lease_holder_of(bead, holder).await;
+        let store_holder = lease_holder.as_deref().unwrap_or(holder);
+        failpoint::hit("work.reclaim.before");
+        let previous_owner =
+            crate::core::workstore::reclaim(&self.ledger, bead, store_holder, older_than_s)
+                .await
+                .map_err(|e| PortError::Unavailable(e.message))?;
+        failpoint::hit("work.reclaim.after");
         Ok(LeaseReclaim {
-            scoped: outcome.scoped,
-            previous_owner: outcome.previous_owner.map(|owner| {
-                if owner == bd_holder {
+            // The in-ledger reclaim is scoped by construction: it takes both
+            // the item and the expected previous holder.
+            scoped: true,
+            previous_owner: previous_owner.map(|owner| {
+                if owner == store_holder {
                     holder.to_owned()
                 } else {
                     owner
@@ -792,10 +791,9 @@ impl ReconcilePorts for ForgedPorts {
     async fn resolve_state(&self, run_id: &str) -> Result<ResolveState, PortError> {
         let run = self.run_row(run_id).await?;
         let worktree_present = self.config.worktree(run_id).exists();
-        let bd = self.config.bd_config();
-        let lease_holder = forged_beads::lease_holder(&bd, &run.bead_id)
+        let lease_holder = crate::core::workstore::lease_holder(&self.ledger, &run.bead_id)
             .await
-            .map_err(|e| PortError::Unavailable(e.to_string()))?;
+            .map_err(|e| PortError::Unavailable(e.message))?;
         Ok(ResolveState {
             worktree_present,
             lease_holder,

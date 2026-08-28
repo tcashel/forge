@@ -2304,8 +2304,8 @@ async fn project_work_detail(
     ctx: &Ctx,
     snapshot: WorkObservationSnapshot,
 ) -> Result<Value, Failure> {
-    let live_title = forged_beads::list_issues(
-        &ctx.config.bd_config(),
+    let live_title = crate::core::workstore::list_issues(
+        &ctx.ledger,
         std::slice::from_ref(&snapshot.identity.bead.id),
     )
     .await

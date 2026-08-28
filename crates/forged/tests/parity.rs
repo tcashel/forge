@@ -74,6 +74,10 @@ fn all_forty_six_tools_match_their_cli_counterparts() {
     fabricate_run(&env, "par-repository");
     let repository = env.repos.repo.to_string_lossy().into_owned();
     env.set_bead_repository("bead-par-repository", &repository);
+    // The fixture bead exists for repository projections only; park it so
+    // the claim_next parity leg still sees an empty ready frontier (the
+    // ledger frontier is a query over open unassigned items).
+    env.set_bead_field("bead-par-repository", "status", "blocked");
     let mut mcp = McpClient::new(&env);
 
     // The server declares exactly the public operation tools.

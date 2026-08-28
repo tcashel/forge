@@ -1453,7 +1453,7 @@ pub async fn epic_start(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespo
                             serde_json::to_string(&errors).unwrap_or_default()
                         ))
                     })?;
-                let issue = forged_beads::show_issue(&ctx.config.bd_config(), &epic).await?;
+                let issue = super::workstore::show_issue(&ctx.ledger, &epic).await?;
                 if issue.issue_type != "epic" {
                     return Err(Failure::invalid(format!(
                         "bead {epic} has issue type {:?}, not epic",
@@ -1463,7 +1463,7 @@ pub async fn epic_start(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespo
                 let epic_spec = super::spec::resolve_issue(&issue)?;
                 let root_fields = native_fields(&issue);
                 let (inventory, legacy_non_parent) =
-                    forged_beads::epic_children_with_legacy(&ctx.config.bd_config(), &epic).await?;
+                    super::workstore::epic_children_with_legacy(&ctx.ledger, &epic).await?;
                 if inventory.is_empty() {
                     return Err(Failure::invalid(format!(
                         "epic {epic} has no Beads children"
@@ -1477,7 +1477,7 @@ pub async fn epic_start(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespo
                 let dependency_rows = if planning_ids.is_empty() {
                     BTreeMap::new()
                 } else {
-                    forged_beads::plan_issues(&ctx.config.bd_config(), &planning_ids)
+                    super::workstore::plan_issues(&ctx.ledger, &planning_ids)
                         .await?
                         .into_iter()
                         .map(|row| (row.issue.id.clone(), row))
@@ -1757,7 +1757,7 @@ async fn status_json(ctx: &Ctx, view: EpicView) -> Result<Value, Failure> {
     )
     .await;
     let (live, live_error) =
-        match forged_beads::epic_children(&ctx.config.bd_config(), &view.config.epic_id).await {
+        match super::workstore::epic_children(&ctx.ledger, &view.config.epic_id).await {
             Ok(live) => (live, None),
             Err(error) => (Vec::new(), Some(error.to_string())),
         };
@@ -2224,7 +2224,7 @@ pub async fn epic_preflight(ctx: &Ctx, req: &OperationRequest) -> OperationRespo
             }
         };
 
-        match forged_beads::show_issue(&ctx.config.bd_config(), &epic).await {
+        match super::workstore::show_issue(&ctx.ledger, &epic).await {
             Ok(issue) if issue.issue_type == "epic" => {
                 let outcome = super::spec::resolve_issue(&issue)
                     .map(|_| ())
@@ -2240,12 +2240,12 @@ pub async fn epic_preflight(ctx: &Ctx, req: &OperationRequest) -> OperationRespo
                     issue.issue_type
                 ))),
             ),
-            Err(error) => record_check(&mut checks, "epic-bead", Err(error.into())),
+            Err(error) => record_check(&mut checks, "epic-bead", Err(error)),
         }
 
         let mut children_identity: Vec<Value> = Vec::new();
         let mut planning_stubs = 0usize;
-        match forged_beads::epic_children_with_legacy(&ctx.config.bd_config(), &epic).await {
+        match super::workstore::epic_children_with_legacy(&ctx.ledger, &epic).await {
             Ok((inventory, _legacy)) if inventory.is_empty() => record_check(
                 &mut checks,
                 "children",
@@ -2306,7 +2306,7 @@ pub async fn epic_preflight(ctx: &Ctx, req: &OperationRequest) -> OperationRespo
                     );
                 }
             }
-            Err(error) => record_check(&mut checks, "children", Err(error.into())),
+            Err(error) => record_check(&mut checks, "children", Err(error)),
         }
 
         let compiled = match ctx.config.compile_definition(
@@ -2936,8 +2936,7 @@ async fn capture_planning_checkpoint(
     )
     .await?;
     let (live, live_legacy) =
-        forged_beads::epic_children_with_legacy(&ctx.config.bd_config(), &view.config.epic_id)
-            .await?;
+        super::workstore::epic_children_with_legacy(&ctx.ledger, &view.config.epic_id).await?;
     let live = live
         .into_iter()
         .map(|issue| (issue.id.clone(), issue))
@@ -2970,7 +2969,7 @@ async fn capture_planning_checkpoint(
     let mut exact_ids = vec![view.config.epic_id.clone(), child.id.clone()];
     exact_ids.sort();
     exact_ids.dedup();
-    let exact = forged_beads::plan_issues(&ctx.config.bd_config(), &exact_ids)
+    let exact = super::workstore::plan_issues(&ctx.ledger, &exact_ids)
         .await?
         .into_iter()
         .map(|row| (row.issue.id.clone(), row))
@@ -3286,7 +3285,7 @@ async fn apply_planning_result(
     let post_fields = candidate.spec;
     let traceability = candidate.traceability;
     let post_digest = fields_digest(&post_fields)?;
-    let initial_issue = forged_beads::show_issue(&ctx.config.bd_config(), &child.id).await?;
+    let initial_issue = super::workstore::show_issue(&ctx.ledger, &child.id).await?;
     let initial_digest = fields_digest(&native_fields(&initial_issue))?;
     if initial_digest == state.pre_digest
         && (initial_issue.status != "blocked" || initial_issue.assignee.is_some())
@@ -3355,7 +3354,7 @@ async fn apply_planning_result(
             return Ok(Step::Stop(input));
         }
     }
-    let issue = forged_beads::show_issue(&ctx.config.bd_config(), &child.id).await?;
+    let issue = super::workstore::show_issue(&ctx.ledger, &child.id).await?;
     let observed_revision = state
         .observed_revision
         .clone()
@@ -3456,7 +3455,7 @@ async fn apply_planning_result(
                 checkpoint_drift(&checkpoint_state, &checkpoint, &post_digest_for_effect)
                     .map_err(Failure::invalid)?;
             }
-            let current = forged_beads::show_issue(&ctx.config.bd_config(), &child_id).await?;
+            let current = super::workstore::show_issue(&ctx.ledger, &child_id).await?;
             let digest = fields_digest(&native_fields(&current))?;
             if digest == post_digest_for_effect
                 && current.status == "open"
@@ -3469,8 +3468,8 @@ async fn apply_planning_result(
                     "planning stub {child_id:?} changed before guarded apply"
                 )));
             }
-            let updated = forged_beads::apply_native_spec_to_blocked_stub(
-                &ctx.config.bd_config(),
+            let updated = super::workstore::apply_native_spec_to_blocked_stub(
+                &ctx.ledger,
                 &child_id,
                 &format!("forged:{effect_epic_id}"),
                 &forged_beads::NativeSpecUpdate {
@@ -3489,7 +3488,7 @@ async fn apply_planning_result(
     let applied = match applied {
         Ok(value) => value,
         Err(error) => {
-            let current = forged_beads::show_issue(&ctx.config.bd_config(), &child.id).await?;
+            let current = super::workstore::show_issue(&ctx.ledger, &child.id).await?;
             let digest = fields_digest(&native_fields(&current))?;
             if digest != post_digest || current.status != "open" || current.assignee.is_some() {
                 let input = require_input_with_evidence(
@@ -3529,7 +3528,7 @@ async fn apply_planning_result(
         },
     )
     .await?;
-    let post_image = forged_beads::show_issue(&ctx.config.bd_config(), &child.id).await?;
+    let post_image = super::workstore::show_issue(&ctx.ledger, &child.id).await?;
     if fields_digest(&native_fields(&post_image))? != post_digest
         || post_image.status != "open"
         || post_image.assignee.is_some()
@@ -3683,8 +3682,8 @@ async fn merge_child(
         &config.epic_id,
         json!({"child": child.id, "pr": pr_number}),
         move |_operation| async move {
-            let issue = forged_beads::close_issue(
-                &ctx.config.bd_config(),
+            let issue = super::workstore::close_issue(
+                &ctx.ledger,
                 &child_id,
                 &format!("forged:{epic_id}"),
                 &format!("clean slice PR #{pr_number} merged into integration branch"),
@@ -4656,7 +4655,7 @@ async fn planning_after_completed_wave(
         .iter()
         .map(|child| child.id.clone())
         .collect::<Vec<_>>();
-    let plan_rows = forged_beads::plan_issues(&ctx.config.bd_config(), &candidate_ids)
+    let plan_rows = super::workstore::plan_issues(&ctx.ledger, &candidate_ids)
         .await?
         .into_iter()
         .map(|row| (row.issue.id.clone(), row))
@@ -4816,7 +4815,7 @@ async fn advance_once(ctx: &Ctx, epic: &str) -> Result<Step, Failure> {
     }
 
     let (live, live_legacy_non_parent) =
-        forged_beads::epic_children_with_legacy(&ctx.config.bd_config(), epic).await?;
+        super::workstore::epic_children_with_legacy(&ctx.ledger, epic).await?;
     let issues = live
         .into_iter()
         .map(|issue| (issue.id.clone(), issue))
@@ -5135,15 +5134,12 @@ async fn advance_once(ctx: &Ctx, epic: &str) -> Result<Step, Failure> {
                     .cloned()
                     .collect::<Vec<_>>()
             };
-            let ready = forged_beads::ready_frozen_epic_children(
-                &ctx.config.bd_config(),
-                epic,
-                &legacy_non_parent,
-            )
-            .await?
-            .into_iter()
-            .map(|issue| (issue.id.clone(), issue))
-            .collect::<BTreeMap<_, _>>();
+            let ready =
+                super::workstore::ready_frozen_epic_children(&ctx.ledger, epic, &legacy_non_parent)
+                    .await?
+                    .into_iter()
+                    .map(|issue| (issue.id.clone(), issue))
+                    .collect::<BTreeMap<_, _>>();
             let mut frontier = view
                 .config
                 .children
@@ -5663,7 +5659,7 @@ pub async fn epic_resolve(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
             let planning = view.planning.get(&child);
             let planning_applied = planning.is_some_and(|state| state.applied.is_some());
             if frozen_child.planning_stub && !planning_applied {
-                let issue = forged_beads::show_issue(&ctx.config.bd_config(), &child).await?;
+                let issue = super::workstore::show_issue(&ctx.ledger, &child).await?;
                 let fields = native_fields(&issue);
                 let digest = fields_digest(&fields)?;
                 let external_apply = if issue.status == "open"
@@ -5783,10 +5779,10 @@ pub async fn epic_resolve(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
                 }
                 None => None,
             };
-            let issue = forged_beads::show_issue(&ctx.config.bd_config(), &child).await?;
+            let issue = super::workstore::show_issue(&ctx.ledger, &child).await?;
             if issue.status != "closed" && issue.status != "open" {
-                forged_beads::reopen_issue(
-                    &ctx.config.bd_config(),
+                super::workstore::reopen_issue(
+                    &ctx.ledger,
                     &child,
                     &format!("forged:{epic}"),
                 )

@@ -250,11 +250,7 @@ async fn ready_slice_bead(ctx: &Ctx, bead: &str) -> Result<forged_beads::IssueSu
     }
     if frontier_claimed {
         let rows =
-            forged_beads::plan_issues(&ctx.config.bd_config(), std::slice::from_ref(&issue.id))
-                .await
-                .map_err(|error| {
-                    super::spec::read_failure("hydrating the frontier-claimed bead", error)
-                })?;
+            super::workstore::plan_issues(&ctx.ledger, std::slice::from_ref(&issue.id)).await?;
         let readiness = rows
             .iter()
             .find(|row| row.issue.id == issue.id)
@@ -267,11 +263,7 @@ async fn ready_slice_bead(ctx: &Ctx, bead: &str) -> Result<forged_beads::IssueSu
         }
     }
     if !frontier_claimed {
-        let ready = forged_beads::ready_issues(&ctx.config.bd_config())
-            .await
-            .map_err(|error| {
-                super::spec::read_failure("reading the Beads ready frontier", error)
-            })?;
+        let ready = super::workstore::ready_issues(&ctx.ledger).await?;
         if !ready.iter().any(|candidate| candidate.id == bead) {
             return Err(Failure::invalid(format!(
                 "bead {bead} is absent from `bd ready`; resolve its blockers before starting a run"
@@ -760,7 +752,8 @@ pub async fn run_status(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
         )
         .await;
         let expected_assignee = crate::core::run_holder(&view.run.bead_id);
-        let claim_health = match forged_beads::show_issue(&ctx.config.bd_config(), &view.run.bead_id).await {
+        let claim_health = match super::workstore::show_issue(&ctx.ledger, &view.run.bead_id).await
+        {
             Ok(issue) => {
                 let holder_mismatch = issue
                     .assignee
@@ -3784,19 +3777,17 @@ async fn collect_operations_universe(
     decorate_durable_entries(&mut entries)?;
 
     let bead_ids = entry_bead_ids(&entries);
-    let plan_cfg = ctx.config.bd_config();
-    let claim_cfg = ctx.config.bd_config();
     let plan_repository = repository.clone();
     let claim_repository = repository.clone();
     let (plan_read, claim_read) = tokio::join!(
-        forged_beads::plan_inventory(&plan_cfg, plan_repository.as_deref(), LIVE_PLAN_LIMIT,),
+        super::workstore::plan_inventory(&ctx.ledger, plan_repository.as_deref(), LIVE_PLAN_LIMIT),
         async {
             match claim_repository.as_deref() {
                 Some(repository) => {
-                    forged_beads::list_issues_for_repository(&claim_cfg, &bead_ids, repository)
+                    super::workstore::list_issues_for_repository(&ctx.ledger, &bead_ids, repository)
                         .await
                 }
-                None => forged_beads::list_issues(&claim_cfg, &bead_ids).await,
+                None => super::workstore::list_issues(&ctx.ledger, &bead_ids).await,
             }
         }
     );
@@ -4400,7 +4391,7 @@ async fn all_attention(ctx: &Ctx) -> Result<Vec<AttentionItemV1>, Failure> {
     let bead_ids = entry_bead_ids(&entries);
     // A Beads outage cannot authorize a control over a condition that only
     // Beads can prove. Other ledger-backed items remain addressable.
-    let beads = forged_beads::list_issues(&ctx.config.bd_config(), &bead_ids)
+    let beads = super::workstore::list_issues(&ctx.ledger, &bead_ids)
         .await
         .unwrap_or_default();
     decorate_titles(&mut entries, &beads)?;
