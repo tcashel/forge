@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use forged_ledger::{
     AdmissionReservationState, AttemptState, DesiredReconcileOutcome, EffectClass, EventRow,
-    RunOutcome, WorkObservationSnapshot,
+    RevokeScope, RunOutcome, WorkObservationSnapshot,
 };
 use forged_types::{
     attention_id, attention_occurrence_id, AdmissionOutcome, AdmissionReason,
@@ -2467,6 +2467,11 @@ async fn project_work_detail(
     let event_limit = snapshot.events.limit;
     let event_after = snapshot.events.after_event_id;
     let event_has_more = snapshot.events.has_more;
+    let deadline_kills = snapshot
+        .attempts
+        .iter()
+        .filter(|attempt| attempt.revoke_scope == Some(RevokeScope::Deadline))
+        .count();
 
     Ok(json!({
         "schema": "forged.work-detail/1",
@@ -2483,6 +2488,7 @@ async fn project_work_detail(
         "cursor": cursor,
         "status": status,
         "delivery": delivery,
+        "deadlineKills": deadline_kills,
         "desired": desired,
         "admission": {
             "source": "ledger",
