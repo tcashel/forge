@@ -40,7 +40,9 @@ mod slots;
 mod time;
 mod types;
 mod usage;
+mod work;
 mod work_identity;
+mod work_lease;
 
 pub use bead_settlement::{RetryErrorUpdate, BEAD_SETTLEMENT_RETRY_BUDGET};
 pub use error::LedgerError;
@@ -76,3 +78,9 @@ pub use types::{
     ReviewPublicationSource, RevokeScope, RosterRevisionBatch, RosterRevisionRow, RunDefinitionRow,
     RunOutcome, RunRow, RunSettlement, RunState, SlotOutcome, SpecFence, UsageRecord, UsageTotals,
 };
+pub use work::{
+    ImportedWorkItem, NewWorkItem, WorkDepKind, WorkDepRow, WorkDependencyStatus, WorkImportReport,
+    WorkItemSnapshot, WorkKind, WorkRevisionCause, WorkSpecFields, WorkStatus,
+    WORK_BLOCKED_CLAIM_REFUSAL, WORK_CLAIM_REFUSAL_PREFIX,
+};
+pub use work_lease::{work_reclaim_older_than, WorkLeaseRow, WorkReclaimOutcome, WORK_LEASE_TTL_S};

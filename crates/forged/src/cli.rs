@@ -963,6 +963,8 @@ pub enum WorkCmd {
     Detail(WorkDetailArgs),
     /// Project the bounded plan, queue, execution, and history graph.
     Map(WorkMapArgs),
+    /// One-shot atomic import of the operator's bd store into the ledger.
+    ImportBeads(KeyOnly),
 }
 
 /// Closed scope accepted by `work map`.
@@ -1465,6 +1467,7 @@ pub fn command_name(command: &Command) -> &'static str {
             WorkCmd::History(_) => "work_history",
             WorkCmd::Detail(_) => "work_detail",
             WorkCmd::Map(_) => "work_map",
+            WorkCmd::ImportBeads(_) => "work_import_beads",
         },
         Command::Attention { command } => match command {
             AttentionCmd::List(_) => "attention_list",
@@ -2061,6 +2064,10 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
                     request(a.idempotency_key, None, Value::Object(params)),
                 )
             }
+            WorkCmd::ImportBeads(a) => (
+                "work_import_beads",
+                request(a.idempotency_key, None, json!({})),
+            ),
         },
         Command::Attention { command } => match command {
             AttentionCmd::List(a) => {

@@ -27,6 +27,7 @@ pub(crate) mod spec;
 mod supervise;
 pub(crate) mod usage;
 pub(crate) mod work_identity;
+mod work_import;
 mod work_map;
 
 use forged_ledger::{DesiredSubjectKind, EffectClass, Ledger, LedgerError, OperationOutcome};
@@ -846,6 +847,7 @@ pub async fn dispatch(ctx: &Ctx, name: &str, mut req: OperationRequest) -> Opera
         "operations_overview" => ops::operations_overview(ctx, &req).await,
         "work_detail" => observe::work_detail(ctx, &req).await,
         "work_map" => work_map::work_map(ctx, &req).await,
+        "work_import_beads" => work_import::work_import_beads(ctx, &req).await,
         "supervise" => supervise::supervise(ctx, &req).await,
         "packet_show" => ops::packet_show(ctx, &req).await,
         "packet_claim" => ops::packet_claim(ctx, &mut req).await,

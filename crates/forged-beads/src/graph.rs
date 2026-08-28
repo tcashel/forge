@@ -396,7 +396,20 @@ fn issue(value: &Value) -> Option<IssueSummary> {
     })
 }
 
+/// Which statuses a hydrate accepts. Plan flows stay fail-closed on the
+/// nonterminal vocabulary; the one-shot ledger import reads the WHOLE store,
+/// closed rows included.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatusVocabulary {
+    Nonterminal,
+    Any,
+}
+
 fn plan_issue(value: &Value) -> Result<PlanIssue, String> {
+    plan_issue_with(value, StatusVocabulary::Nonterminal)
+}
+
+fn plan_issue_with(value: &Value, vocab: StatusVocabulary) -> Result<PlanIssue, String> {
     let object = value
         .as_object()
         .ok_or_else(|| "hydrated issue is not an object".to_owned())?;
@@ -405,7 +418,16 @@ fn plan_issue(value: &Value) -> Result<PlanIssue, String> {
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| "hydrated issue has no non-empty string status".to_owned())?;
-    if !matches!(status, "open" | "in_progress" | "blocked" | "deferred") {
+    let allowed = match vocab {
+        StatusVocabulary::Nonterminal => {
+            matches!(status, "open" | "in_progress" | "blocked" | "deferred")
+        }
+        StatusVocabulary::Any => matches!(
+            status,
+            "open" | "in_progress" | "blocked" | "deferred" | "closed"
+        ),
+    };
+    if !allowed {
         return Err(format!(
             "hydrated issue has unexpected nonterminal status {status:?}"
         ));
@@ -634,6 +656,20 @@ fn hydrated_plan_rows(
     requested_ids: &[String],
     repository: Option<&str>,
 ) -> Result<Vec<PlanIssue>, String> {
+    hydrated_plan_rows_with(
+        rows,
+        requested_ids,
+        repository,
+        StatusVocabulary::Nonterminal,
+    )
+}
+
+fn hydrated_plan_rows_with(
+    rows: &[Value],
+    requested_ids: &[String],
+    repository: Option<&str>,
+    vocab: StatusVocabulary,
+) -> Result<Vec<PlanIssue>, String> {
     let requested: BTreeSet<&str> = requested_ids.iter().map(String::as_str).collect();
     if requested.len() != requested_ids.len() {
         return Err("selected discovery ids are not unique".to_owned());
@@ -641,7 +677,7 @@ fn hydrated_plan_rows(
 
     let mut by_id = BTreeMap::new();
     for row in rows {
-        let item = plan_issue(row)?;
+        let item = plan_issue_with(row, vocab)?;
         let id = item.issue.id.clone();
         if !requested.contains(id.as_str()) {
             return Err(format!("hydrate returned unrequested issue id {id:?}"));
@@ -760,6 +796,50 @@ pub async fn plan_issues(cfg: &BdConfig, ids: &[String]) -> Result<Vec<PlanIssue
     hydrated_plan_rows(&hydrated_rows, ids, None).map_err(|detail| BdError::Envelope {
         context: "bd show exact plan rows".to_owned(),
         detail,
+    })
+}
+
+/// Every issue id in the store across ALL statuses, for the one-shot
+/// ledger import. Discovery only — the importer hydrates full fields and
+/// dependencies through [`plan_issues`] afterwards.
+pub async fn all_issue_ids(cfg: &BdConfig) -> Result<Vec<String>, BdError> {
+    let args = [
+        "list",
+        "--status",
+        "open,in_progress,blocked,deferred,closed",
+        "--limit",
+        "0",
+        "--brief",
+        "--flat",
+        "--json",
+    ];
+    let data = invoke::read(cfg, &args).await?;
+    Ok(list(&data).into_iter().map(|issue| issue.id).collect())
+}
+
+/// The import hydrate: exact rows for the one-shot ledger import, accepting
+/// EVERY status (closed included) — the only consumer allowed past the
+/// nonterminal fail-closed vocabulary the plan flows keep.
+pub async fn all_issues_with_deps(
+    cfg: &BdConfig,
+    ids: &[String],
+) -> Result<Vec<PlanIssue>, BdError> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut args = Vec::with_capacity(ids.len() + 3);
+    args.push("show");
+    args.extend(ids.iter().map(String::as_str));
+    args.push("--brief-deps");
+    args.push("--json");
+    let hydrated_json = invoke::read(cfg, &args).await?;
+    let hydrated_rows =
+        envelope::as_list(&hydrated_json).unwrap_or_else(|| vec![hydrated_json.clone()]);
+    hydrated_plan_rows_with(&hydrated_rows, ids, None, StatusVocabulary::Any).map_err(|detail| {
+        BdError::Envelope {
+            context: "bd show import rows".to_owned(),
+            detail,
+        }
     })
 }
 
