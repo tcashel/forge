@@ -1,4 +1,9 @@
-# Central Beads server
+# Central Beads server (archived)
+
+> **Archived 2026-08-28.** The ledger owns work, readiness, and leases
+> ([ADR-0034](../adr/0034-ledger-native-work-store.md)); forged no longer
+> consults bd at runtime, so a central Beads server is no longer a forged
+> deployment concern. Kept for operators still running standalone bd.
 
 A central Dolt SQL server is an optional Beads deployment, not a Forged
 backend. Use it when several people or agent processes need the same specs,
