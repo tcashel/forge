@@ -189,7 +189,35 @@ impl From<forged_provider::ProviderError> for Failure {
 
 impl From<forged_host::HostError> for Failure {
     fn from(err: forged_host::HostError) -> Self {
-        Failure::refused(err.wire_code(), err.to_string())
+        // SessionNotFound retains INVALID_REQUEST on the public wire for
+        // compatibility, but it names mutable host-instance state rather
+        // than controller-local configuration truth. Preserve that source
+        // distinction before the drive loop records its terminal envelope,
+        // so supervision spends the bounded restart budget instead of
+        // halting permanently after one host-session loss.
+        let recoverable = matches!(&err, forged_host::HostError::SessionNotFound { .. });
+        Failure {
+            code: err.wire_code(),
+            message: err.to_string(),
+            recoverable,
+        }
+    }
+}
+
+#[cfg(test)]
+mod failure_tests {
+    use super::Failure;
+    use forged_host::HostError;
+    use forged_types::ErrorCode;
+
+    #[test]
+    fn host_session_loss_is_recoverable_despite_invalid_request_wire_code() {
+        let failure = Failure::from(HostError::SessionNotFound {
+            id: "pane-session-1".to_owned(),
+        });
+
+        assert_eq!(failure.code, ErrorCode::InvalidRequest);
+        assert!(failure.recoverable);
     }
 }
 

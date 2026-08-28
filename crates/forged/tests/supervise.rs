@@ -1873,7 +1873,7 @@ fn nonrecoverable_terminal_halts_without_charging_the_budget() {
 }
 
 #[test]
-fn recoverable_terminal_restarts_with_evidence_and_backoff() {
+fn mutable_host_invalid_request_restarts_with_evidence_and_backoff() {
     if !require_serialized_runner() {
         return;
     }
@@ -1897,7 +1897,10 @@ fn recoverable_terminal_restarts_with_evidence_and_backoff() {
         .append_event(
             Some("run-backoff"),
             "forged.controller.terminal",
-            terminal_marker(Some(1), "transient boot failure", true),
+            // HostError::SessionNotFound retains INVALID_REQUEST on the
+            // public wire but is normalized recoverable before this terminal
+            // envelope is recorded.
+            terminal_marker(Some(1), "session not found: pane-session-1", true),
         )
         .expect("terminal marker");
     ledger
@@ -1924,8 +1927,8 @@ fn recoverable_terminal_restarts_with_evidence_and_backoff() {
     assert_eq!(desired.controller_generation, 2);
     assert_eq!(
         desired.last_error.as_deref(),
-        Some("restarted after controller failure: transient boot failure"),
-        "a recoverable death restarts WITH its evidence preserved"
+        Some("restarted after controller failure: session not found: pane-session-1"),
+        "a mutable host-session loss restarts WITH its evidence preserved"
     );
     let wake = desired.next_wake_at.as_deref().expect("restart wake");
     assert!(

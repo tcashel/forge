@@ -1032,8 +1032,11 @@ struct ControllerTerminal {
 }
 
 fn deterministic_terminal_refusal(code: ErrorCode) -> bool {
-    // INVALID_REQUEST is the controller's closed malformed-request/config
-    // refusal, while SPEC_DRIFT is the closed persisted-spec mismatch. Every
+    // A nonrecoverable INVALID_REQUEST is the controller's closed
+    // malformed-request/config refusal, while SPEC_DRIFT is the closed
+    // persisted-spec mismatch. Producers must normalize mutable failures
+    // before recording the terminal: HostError::SessionNotFound retains the
+    // INVALID_REQUEST wire code for compatibility but is recoverable. Every
     // other ErrorCode can name mutable repository, GitHub, provider, host, or
     // transport state and therefore must consume the bounded restart path.
     matches!(code, ErrorCode::InvalidRequest | ErrorCode::SpecDrift)
