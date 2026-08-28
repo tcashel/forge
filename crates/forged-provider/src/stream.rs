@@ -14,6 +14,7 @@ use nix::libc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::command::{provider_argv, ProviderKindV1};
 use crate::invocation::{
     validate_effort, validate_embedded_path, validate_model, Invocation, PacketDirs,
 };
@@ -40,35 +41,6 @@ const DISPLAY_LINE_INTERVAL: Duration = Duration::from_millis(25);
 const TAIL_INTERVAL: Duration = Duration::from_millis(40);
 const RENDER_DRAIN_BUDGET: Duration = Duration::from_millis(250);
 const RUNNER_TRANSPORT_EXIT: i32 = 125;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum ProviderKindV1 {
-    Claude,
-    Codex,
-    Pi,
-}
-
-impl ProviderKindV1 {
-    fn from_name(name: &str) -> Result<Self, ProviderError> {
-        match name {
-            "claude" => Ok(Self::Claude),
-            "codex" => Ok(Self::Codex),
-            "pi" => Ok(Self::Pi),
-            _ => Err(ProviderError::Malformed {
-                message: "provider-stream request has an unsupported provider".to_owned(),
-            }),
-        }
-    }
-
-    fn program(self) -> &'static str {
-        match self {
-            Self::Claude => "claude",
-            Self::Codex => "codex",
-            Self::Pi => "pi",
-        }
-    }
-}
 
 /// Whether the private runner may emit allowlisted progress to its terminal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -655,81 +627,15 @@ fn terminal_transport(
 }
 
 fn provider_command(request: &ProviderStreamRequestV1, override_path: Option<&Path>) -> Command {
-    let program = override_path
-        .map(Path::as_os_str)
-        .unwrap_or_else(|| request.provider.program().as_ref());
-    let mut command = Command::new(program);
-    match request.provider {
-        ProviderKindV1::Claude => {
-            command.args(["-p", "--output-format", "stream-json", "--verbose"]);
-            match request.sandbox {
-                Sandbox::ReadOnly => {
-                    command.args(["--permission-mode", "plan", "--tools", "Read,Grep,Glob"]);
-                }
-                Sandbox::WorkspaceWrite => {
-                    command.arg("--dangerously-skip-permissions");
-                }
-            }
-            command.args([
-                "--session-id",
-                request
-                    .session_id
-                    .as_deref()
-                    .expect("validated claude request has a session id"),
-                "--model",
-                &request.model,
-            ]);
-        }
-        ProviderKindV1::Codex => {
-            let sandbox = match request.sandbox {
-                Sandbox::ReadOnly => "read-only",
-                Sandbox::WorkspaceWrite => "workspace-write",
-            };
-            command.args([
-                "exec",
-                "--json",
-                "--skip-git-repo-check",
-                "--sandbox",
-                sandbox,
-                "-m",
-                &request.model,
-            ]);
-            if let Some(effort) = request.effort.as_deref() {
-                command.args(["-c", &format!("model_reasoning_effort=\"{effort}\"")]);
-            }
-            command
-                .arg("-o")
-                .arg(
-                    request
-                        .last_message_path
-                        .as_deref()
-                        .expect("validated codex request has final-message path"),
-                )
-                .arg("-");
-        }
-        ProviderKindV1::Pi => {
-            command.args([
-                "--mode",
-                "json",
-                "-p",
-                "--no-session",
-                "--no-extensions",
-                "--approve",
-                "--model",
-                &request.model,
-                "--append-system-prompt",
-                "You are a Forged packet worker. Follow the frozen packet and repository skills. Do not invoke Forge lead planning, dispatch, or lifecycle-control skills.",
-            ]);
-            if let Some(effort) = request.effort.as_deref() {
-                command.args(["--thinking", effort]);
-            }
-            if request.sandbox == Sandbox::ReadOnly {
-                command.args(["--tools", "read,grep,find,ls"]);
-            }
-            command.env("FORGED_PI_WORKER", "1");
-        }
-    }
-    command
+    provider_argv(
+        request.provider,
+        request.sandbox,
+        &request.model,
+        request.effort.as_deref(),
+        request.session_id.as_deref(),
+        request.last_message_path.as_deref(),
+    )
+    .command(override_path)
 }
 
 fn write_status(

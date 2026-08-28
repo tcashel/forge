@@ -4,12 +4,12 @@
 use std::path::{Path, PathBuf};
 
 use forged_types::WorkPacket;
-use serde::{Deserialize, Serialize};
 
+use crate::command::ProviderArgv;
 use crate::error::ProviderError;
 use crate::usage::UsageCapture;
 
-/// A driver turns one packet into one shell line and parses that run's
+/// A driver turns one packet into one invocation and parses that run's
 /// output.
 ///
 /// No driver inspects `packet.provider_hints.provider`: picking which driver
@@ -22,9 +22,7 @@ pub trait ProviderDriver: Send + Sync {
     /// `provider`.
     fn name(&self) -> &'static str;
 
-    /// Build the single shell line (without a sentinel — `forged-host`
-    /// appends that) that runs this packet, plus the paths the caller
-    /// materializes around it.
+    /// Build the provider command and paths the caller materializes around it.
     fn invocation(
         &self,
         packet: &WorkPacket,
@@ -148,14 +146,10 @@ impl PacketDirs {
     }
 }
 
-/// One provider run, ready to hand to a host: the shell line (sentinel-free)
-/// and the paths it references.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+/// One provider run and the paths it references.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Invocation {
-    /// The single shell line that runs the packet. No sentinel — the host
-    /// appends its own.
-    pub shell_line: String,
+    pub(crate) argv: ProviderArgv,
     /// The prompt file the line redirects into stdin.
     pub prompt_path: PathBuf,
     /// The stdout capture file the line redirects into.
@@ -167,6 +161,13 @@ pub struct Invocation {
     /// `None` (Codex mints its thread id at runtime, while ephemeral Pi
     /// packet sessions deliberately publish no native session identity).
     pub session_hint: Option<String>,
+}
+
+impl Invocation {
+    /// Render the provider environment, argv, and capture paths as one shell line.
+    pub fn shell_line(&self) -> Result<String, ProviderError> {
+        self.argv.shell_line(&self.prompt_path, &self.stdout_path)
+    }
 }
 
 /// Validate a path this crate embeds in a shell line: non-empty, valid

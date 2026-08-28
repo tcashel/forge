@@ -1,8 +1,9 @@
 //! The Pi driver: a provider-neutral Pi CLI invocation and JSON-event usage parser.
 
-use forged_types::{Sandbox, WorkPacket};
+use forged_types::WorkPacket;
 use serde_json::Value;
 
+use crate::command::{provider_argv, ProviderKindV1};
 use crate::error::ProviderError;
 use crate::invocation::{
     validate_effort, validate_embedded_path, validate_model, Invocation, PacketDirs, ProviderDriver,
@@ -26,30 +27,26 @@ impl ProviderDriver for PiDriver {
     ) -> Result<Invocation, ProviderError> {
         let prompt_path = dirs.prompt();
         let stdout_path = dirs.stdout_working();
-        let prompt = validate_embedded_path(&prompt_path)?;
-        let stdout = validate_embedded_path(&stdout_path)?;
+        validate_embedded_path(&prompt_path)?;
+        validate_embedded_path(&stdout_path)?;
         let model = &packet.provider_hints.model;
         validate_model(model)?;
-        let effort = match packet.provider_hints.effort.as_deref() {
-            None => String::new(),
-            Some(effort) => {
-                validate_effort(effort)?;
-                format!(" --thinking {effort}")
-            }
-        };
-        let tools = match packet.provider_hints.sandbox {
-            Sandbox::ReadOnly => " --tools read,grep,find,ls",
-            Sandbox::WorkspaceWrite => "",
-        };
+        if let Some(effort) = packet.provider_hints.effort.as_deref() {
+            validate_effort(effort)?;
+        }
         // Skills and context files deliberately remain enabled. Extension
         // discovery is disabled because extension code is an unrecorded
         // executable surface, unlike repository skill/context prose.
-        let shell_line = format!(
-            "pi --mode json -p --no-session --no-extensions --approve \
-             --model {model}{effort}{tools} < {prompt} > {stdout}"
+        let argv = provider_argv(
+            ProviderKindV1::Pi,
+            packet.provider_hints.sandbox,
+            model,
+            packet.provider_hints.effort.as_deref(),
+            None,
+            None,
         );
         Ok(Invocation {
-            shell_line,
+            argv,
             prompt_path,
             stdout_path,
             session_hint: None,
@@ -116,7 +113,9 @@ impl ProviderDriver for PiDriver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use forged_types::{Deliverable, ProviderHints, SpecRef, Stage, StageContract, WorkPacket};
+    use forged_types::{
+        Deliverable, ProviderHints, Sandbox, SpecRef, Stage, StageContract, WorkPacket,
+    };
     use serde_json::json;
     use std::path::PathBuf;
 
@@ -164,18 +163,20 @@ mod tests {
                 "token",
             )
             .expect("invocation");
-        assert!(invocation.shell_line.contains("--no-extensions"));
-        assert!(invocation.shell_line.contains("--approve"));
-        assert!(invocation.shell_line.contains("--thinking high"));
-        assert!(!invocation.shell_line.contains("--no-skills"));
-        assert!(!invocation.shell_line.contains("--no-context-files"));
-        assert!(!invocation.shell_line.contains("--tools"));
+        let line = invocation.shell_line().expect("shell line");
+        assert!(line.contains("--no-extensions"));
+        assert!(line.contains("--approve"));
+        assert!(line.contains("--thinking high"));
+        assert!(!line.contains("--no-skills"));
+        assert!(!line.contains("--no-context-files"));
+        assert!(!line.contains("--tools"));
 
         let read_only = PiDriver
             .invocation(&packet(Sandbox::ReadOnly, None), &dirs, "token")
             .expect("read-only invocation");
-        assert!(read_only.shell_line.contains("--tools read,grep,find,ls"));
-        assert!(!read_only.shell_line.contains("bash"));
+        let line = read_only.shell_line().expect("read-only shell line");
+        assert!(line.contains("--tools read,grep,find,ls"));
+        assert!(!line.contains("bash"));
     }
 
     #[test]

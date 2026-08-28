@@ -1,9 +1,10 @@
 //! The codex driver: the `codex exec` shell line and the event-stream usage
 //! parser.
 
-use forged_types::{Sandbox, WorkPacket};
+use forged_types::WorkPacket;
 use serde_json::{Map, Value};
 
+use crate::command::{provider_argv, ProviderKindV1};
 use crate::error::ProviderError;
 use crate::invocation::{
     validate_effort, validate_embedded_path, validate_model, Invocation, PacketDirs, ProviderDriver,
@@ -36,28 +37,24 @@ impl ProviderDriver for CodexDriver {
         let prompt_path = dirs.prompt();
         let stdout_path = dirs.stdout_working();
         let last_path = dirs.last_message_working();
-        let prompt = validate_embedded_path(&prompt_path)?;
-        let stdout = validate_embedded_path(&stdout_path)?;
-        let last = validate_embedded_path(&last_path)?;
+        validate_embedded_path(&prompt_path)?;
+        validate_embedded_path(&stdout_path)?;
+        validate_embedded_path(&last_path)?;
         let model = &packet.provider_hints.model;
         validate_model(model)?;
-        let sandbox = match packet.provider_hints.sandbox {
-            Sandbox::ReadOnly => "read-only",
-            Sandbox::WorkspaceWrite => "workspace-write",
-        };
-        let effort_arg = match packet.provider_hints.effort.as_deref() {
-            None => String::new(),
-            Some(effort) => {
-                validate_effort(effort)?;
-                format!(" -c 'model_reasoning_effort=\"{effort}\"'")
-            }
-        };
-        let shell_line = format!(
-            "codex exec --json --skip-git-repo-check --sandbox {sandbox} \
-             -m {model}{effort_arg} -o {last} - < {prompt} > {stdout}"
+        if let Some(effort) = packet.provider_hints.effort.as_deref() {
+            validate_effort(effort)?;
+        }
+        let argv = provider_argv(
+            ProviderKindV1::Codex,
+            packet.provider_hints.sandbox,
+            model,
+            packet.provider_hints.effort.as_deref(),
+            None,
+            Some(&last_path),
         );
         Ok(Invocation {
-            shell_line,
+            argv,
             prompt_path,
             stdout_path,
             session_hint: None,

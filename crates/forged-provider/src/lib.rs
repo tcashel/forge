@@ -11,6 +11,7 @@
 
 mod claude;
 mod codex;
+mod command;
 mod error;
 mod invocation;
 mod pi;
