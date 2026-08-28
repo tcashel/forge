@@ -27,13 +27,17 @@ Source: `crates/forged-gate/src/runner.rs`.
 - Authoring-side validation only rejects empty/whitespace commands
   (`crates/forged-types/src/contract.rs`); everything else is the
   shell's problem at run time.
+- Before spawn, the runner removes both the controller-identity variables
+  and the operator-state variables (`ANVIL_HOME`, `FORGED_CONFIG`,
+  `BEADS_DIR`). Repository gates still inherit ordinary host and toolchain
+  environment such as `PATH` and `HOME`.
 - A `gate/<n>` entry in a run's settled operations means the gate was
   attempted, not that it passed. Pass/fail lives in the work detail's
   gate state.
 
 ## Environment contracts
 
-Three distinct mechanisms govern what a child process inherits. None of
+Four distinct mechanisms govern what a child process inherits. None of
 them is a general allowlist rebuild; know which one applies.
 
 ### 1. `CONTROLLER_ENV` — the identity strip
@@ -50,7 +54,19 @@ made. The strip is enforced at exactly two spawn points: the gate runner
 (`forged-provider/src/stream.rs`). Extend the shared list, never a local
 copy.
 
-### 2. Controller launch — an additive overlay, not a rebuild
+### 2. `OPERATOR_STATE_ENV` — the gate-only state strip
+
+Source: `crates/forged-types/src/controller_env.rs`.
+
+Three variables (`ANVIL_HOME`, `FORGED_CONFIG`, `BEADS_DIR`) route forged's
+operator-scoped config and state. Gate commands are repository-owned code and
+must not run against that state, so the gate runner removes the shared list in
+a second, separate loop. Provider children are forged-owned agents and retain
+these variables deliberately. This is a denylist strip, not `env_clear()`;
+gates continue to inherit `PATH`, `HOME`, and the rest of the launching
+environment.
+
+### 3. Controller launch — an additive overlay, not a rebuild
 
 Source: `crates/forged/src/core/handoff.rs` (spawn path).
 
@@ -60,11 +76,12 @@ the host process inherits: `PATH` (only if present in the parent),
 `FORGED_CONTROLLER_*` identity variables (plus failpoint plumbing under
 the `failpoints` feature). The host does not call `env_clear()`: a
 detached controller inherits the launching session's environment with
-the overlay applied. Operator-visible consequence: an env var exported
-in the shell that starts the daemon is visible to controllers and, minus
-the identity strip, to gates and providers.
+the overlay applied. Operator-visible consequence: an env var exported in the
+shell that starts the daemon is visible to controllers. Provider children see
+that environment minus controller identity; gate children see it minus both
+controller identity and operator state.
 
-### 3. The `bd` child — the only true `env_clear()` rebuild
+### 4. The `bd` child — the only true `env_clear()` rebuild
 
 Source: `crates/forged-beads/src/invoke.rs`.
 

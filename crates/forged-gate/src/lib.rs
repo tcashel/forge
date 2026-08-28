@@ -9,9 +9,9 @@
 //! group and timeouts SIGKILL the whole group. No `#[cfg]` fallbacks exist
 //! for other platforms. The crate reads no environment variables: callers
 //! pass `cwd` and `artifacts_dir` explicitly. Gate children inherit the
-//! caller's environment MINUS `forged_types::CONTROLLER_ENV`: a gate runs the
-//! repository's own commands, which must never observe the controller's
-//! attempt-ownership claim.
+//! caller's environment minus `forged_types::CONTROLLER_ENV` and
+//! `forged_types::OPERATOR_STATE_ENV`: repository commands must observe
+//! neither the controller's attempt claim nor the operator's forged state.
 
 mod error;
 mod runner;

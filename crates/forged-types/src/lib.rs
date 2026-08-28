@@ -43,7 +43,7 @@ pub use contract::{
     MAX_STAGE_BUDGET_S, MAX_TERMINATION_GRACE_S, PROFILE_SCHEMA_V1, RESOLVED_ROSTER_SCHEMA_V1,
     ROSTER_SCHEMA_V1,
 };
-pub use controller_env::CONTROLLER_ENV;
+pub use controller_env::{CONTROLLER_ENV, OPERATOR_STATE_ENV};
 pub use envelope::{OpError, OperationRequest, OperationResponse};
 pub use error::ErrorCode;
 pub use herdr_layout::{

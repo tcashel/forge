@@ -1641,6 +1641,9 @@ mod tests {
     use super::*;
 
     fn scratch_state(root: &std::path::Path) -> McpState {
+        // Each caller supplies its tempdir as ANVIL_HOME. scratch_config also
+        // carries no FORGED_CONFIG override, so MCP refreshes cannot escape
+        // into a populated ambient operator scope.
         McpState::new(crate::config::scratch_config(root))
     }
 
