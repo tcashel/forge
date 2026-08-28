@@ -61,10 +61,13 @@ Source: `crates/forged-types/src/controller_env.rs`.
 Three variables (`ANVIL_HOME`, `FORGED_CONFIG`, `BEADS_DIR`) route forged's
 operator-scoped config and state. Gate commands are repository-owned code and
 must not run against that state, so the gate runner removes the shared list in
-a second, separate loop. Provider children are forged-owned agents and retain
-these variables deliberately. This is a denylist strip, not `env_clear()`;
-gates continue to inherit `PATH`, `HOME`, and the rest of the launching
-environment.
+a second, separate loop — and then re-points `ANVIL_HOME` at a scratch path
+under the gate's own artifacts directory, because removal alone is not enough:
+forged-state readers fall back to `$HOME/.anvil` and the gate deliberately
+keeps `HOME`. Provider children are forged-owned agents and retain these
+variables deliberately. This is a denylist strip plus one scratch pin, not
+`env_clear()`; gates continue to inherit `PATH`, `HOME`, and the rest of the
+launching environment.
 
 ### 3. Controller launch — an additive overlay, not a rebuild
 

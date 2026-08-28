@@ -116,6 +116,11 @@ async fn run_one(req: &GateRequest, n: usize, command: &str) -> Result<GateRow, 
     for name in forged_types::OPERATOR_STATE_ENV {
         cmd.env_remove(name);
     }
+    // Removing ANVIL_HOME alone is not enough: forged-state readers fall
+    // back to `$HOME/.anvil`, and the gate deliberately keeps HOME. Point
+    // ANVIL_HOME at a scratch path under this gate's own artifacts so the
+    // fallback can never resolve the operator's live state.
+    cmd.env("ANVIL_HOME", req.artifacts_dir.join("anvil-scratch"));
     {
         // Own process group, so a timeout can kill every descendant.
         use std::os::unix::process::CommandExt;
@@ -442,11 +447,22 @@ mod tests {
         let stdout = std::fs::read_to_string(artifacts.join("gate-1-stdout.log"))
             .expect("gate stdout artifact");
         for name in names {
+            if name == "ANVIL_HOME" {
+                continue;
+            }
             assert!(
                 stdout.contains(&format!("{name}=[]")),
                 "{name} leaked into the gate child; stdout was:\n{stdout}"
             );
         }
+        // ANVIL_HOME is not merely removed — HOME survives, and forged-state
+        // readers fall back to `$HOME/.anvil`, so the runner re-points it at
+        // a scratch path under this gate's own artifacts.
+        let scratch = artifacts.join("anvil-scratch");
+        assert!(
+            stdout.contains(&format!("ANVIL_HOME=[{}]", scratch.display())),
+            "ANVIL_HOME must point at the gate-local scratch:\n{stdout}"
+        );
         assert!(
             stdout.contains("PATH_PRESENT=[x]"),
             "PATH was removed:\n{stdout}"
