@@ -91,6 +91,7 @@ impl From<RestPr> for PrMeta {
 pub struct GhClient {
     program: PathBuf,
     env_overrides: Vec<(OsString, OsString)>,
+    host: Option<OsString>,
 }
 
 impl Default for GhClient {
@@ -105,6 +106,7 @@ impl GhClient {
         Self {
             program: PathBuf::from("gh"),
             env_overrides: Vec::new(),
+            host: None,
         }
     }
 
@@ -113,6 +115,23 @@ impl GhClient {
         Self {
             program: program.into(),
             env_overrides: Vec::new(),
+            host: None,
+        }
+    }
+
+    /// Pin every spawned gh child to `host` through `GH_HOST` without
+    /// changing this process's environment.
+    pub fn with_host(mut self, host: impl Into<OsString>) -> Self {
+        self.host = Some(host.into());
+        self
+    }
+
+    /// Pin to `host` when one is worth pinning; `None` leaves gh's own
+    /// default-host resolution in force (the ssh-alias case).
+    pub fn with_host_opt(self, host: Option<impl Into<OsString>>) -> Self {
+        match host {
+            Some(host) => self.with_host(host),
+            None => self,
         }
     }
 
@@ -393,6 +412,11 @@ impl GhClient {
         cmd.args(args).stdin(std::process::Stdio::null());
         for (key, value) in &self.env_overrides {
             cmd.env(key, value);
+        }
+        if let Some(host) = &self.host {
+            // Apply the pin last so it overrides both the ambient process
+            // environment and any test-only generic override.
+            cmd.env("GH_HOST", host);
         }
         let output = cmd.output().await.map_err(|e| GhError::Exec {
             status: None,

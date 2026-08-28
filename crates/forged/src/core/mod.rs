@@ -34,7 +34,7 @@ pub(crate) mod work_types;
 pub(crate) mod workstore;
 
 use forged_ledger::{DesiredSubjectKind, EffectClass, Ledger, LedgerError, OperationOutcome};
-use forged_proto::ProtoError;
+use forged_proto::{PortError, ProtoError};
 use forged_types::{ErrorCode, OpError, OperationRequest, OperationResponse};
 use serde_json::{Map, Value};
 
@@ -134,6 +134,19 @@ impl From<ProtoError> for Failure {
     fn from(err: ProtoError) -> Self {
         match err {
             ProtoError::Ledger(inner) => inner.into(),
+            ProtoError::Port {
+                source: PortError::Gh(message),
+                ..
+            } => Failure::refused(ErrorCode::GhError, message),
+            other => Failure::internal(other.to_string()),
+        }
+    }
+}
+
+impl From<PortError> for Failure {
+    fn from(err: PortError) -> Self {
+        match err {
+            PortError::Gh(message) => Failure::refused(ErrorCode::GhError, message),
             other => Failure::internal(other.to_string()),
         }
     }

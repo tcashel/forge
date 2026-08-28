@@ -23,7 +23,7 @@ use sha2::{Digest, Sha256};
 use crate::adapters::execute::{
     build_packet, execute_packet, open_packet_op, ExecutionContext, PacketOutcome,
 };
-use crate::adapters::ports::{repo_slug, ForgedPorts};
+use crate::adapters::ports::{github_remote, ForgedPorts};
 use crate::config::now_iso;
 use crate::core::spec::SpecSource;
 use crate::core::{
@@ -1512,18 +1512,18 @@ async fn machine_effect(
             unreachable!("push loop always runs at least once")
         }
         MachineStage::DraftPr => {
-            let slug = repo_slug(std::path::Path::new(&run.repo))
+            let remote = github_remote(std::path::Path::new(&run.repo))
                 .await
-                .map_err(|e| Failure::internal(e.to_string()))?;
+                .map_err(Failure::from)?;
             let title = format!("{}: {}", run.bead_id, run.branch);
             let body = format!(
                 "Draft PR opened by forged for run {} (bead {}).",
                 run.run_id, run.bead_id
             );
-            let gh = GhClient::new();
+            let gh = GhClient::new().with_host_opt(remote.gh_host());
             failpoint::hit("gh.call.before");
             let pr = gh
-                .create_draft_pr(&slug, &run.branch, &run.base_ref, &title, &body)
+                .create_draft_pr(&remote.slug, &run.branch, &run.base_ref, &title, &body)
                 .await?;
             failpoint::hit("gh.call.after");
             let event = ProtoEvent::Pr {

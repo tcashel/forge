@@ -481,6 +481,45 @@ async fn plain_gh_resolves_through_the_child_path_only() {
     assert_eq!(branch, "trunk");
 }
 
+#[tokio::test]
+async fn host_pin_overrides_ambient_gh_host_on_the_child_only() {
+    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    struct RestoreEnv(Option<std::ffi::OsString>);
+    impl Drop for RestoreEnv {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(value) => std::env::set_var("GH_HOST", value),
+                None => std::env::remove_var("GH_HOST"),
+            }
+        }
+    }
+
+    let _guard = ENV_LOCK.lock().await;
+    let _restore = RestoreEnv(std::env::var_os("GH_HOST"));
+    std::env::set_var("GH_HOST", "ambient.example.com");
+
+    let shim = Shim::new();
+    let host_log = shim.scenario_dir.join("host.log");
+    shim.set("repo", "stdout", r#"{"default_branch":"trunk"}"#);
+    let branch = shim
+        .client()
+        .env("GH_SHIM_HOST_LOG", &host_log)
+        .with_host("ghe.example.com")
+        .default_branch(REPO)
+        .await
+        .expect("host-pinned call succeeds");
+
+    assert_eq!(branch, "trunk");
+    assert_eq!(
+        std::fs::read_to_string(host_log).expect("captured GH_HOST"),
+        "ghe.example.com"
+    );
+    assert_eq!(
+        std::env::var("GH_HOST").expect("ambient GH_HOST remains set"),
+        "ambient.example.com"
+    );
+}
+
 /// Live smoke test — `#[ignore]`d so the default `cargo test` run never
 /// touches the network. Run with `cargo test -- --ignored` on a machine with
 /// an authenticated gh.
