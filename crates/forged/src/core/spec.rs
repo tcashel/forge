@@ -19,7 +19,7 @@
 
 use std::path::Path;
 
-use forged_beads::IssueSummary;
+use crate::core::work_types::IssueSummary;
 use forged_ledger::SpecFence;
 use forged_types::{ErrorCode, SpecRef};
 

@@ -1144,7 +1144,7 @@ pub enum AttemptState {
     /// Kill-confirmed and externally reclaimed; a successor may claim.
     Reclaimed,
     /// Kill-confirmed and settled by an operator's attempt-local stop. The
-    /// bead's bd lease is deliberately untouched — it is bead-scoped and
+    /// bead's work lease is deliberately untouched — it is bead-scoped and
     /// shared with every sibling generation — so a successor claims under
     /// the same `run_holder` with no waiting period.
     Stopped,
@@ -1160,7 +1160,7 @@ pub enum AttemptState {
 /// avoid. Written once, when the marker commits, and never changed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RevokeScope {
-    /// The reclaim saga: a dead or hung worker, whose bd lease the run wants
+    /// The reclaim saga: a dead or hung worker, whose work lease the run wants
     /// back. Resumes through the full revoke order and ends at
     /// [`AttemptState::Reclaimed`].
     Bead,

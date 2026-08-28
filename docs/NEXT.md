@@ -9,7 +9,8 @@ user, lock the work, submit it, then inspect durable state.
 - The user talks to one lead agent.
 - Forge's dual-host `plugins/forged` lead-agent plugin owns plan,
   proportional critique, adjudication, and the explicit typed handoff.
-- Beads owns inventory, dependencies, readiness, and leases.
+- The Forged ledger owns work items, dependencies, readiness, and
+  leases (ADR-0034).
 - Forged owns cognitive-stage contracts, topology, provider dispatch, gates,
   review/remediation, epic waves, and results.
 - Provider adapters perform cognition.
@@ -55,12 +56,11 @@ codex plugin add forged@forge
 pi install "$HOME/.local/share/forge"
 ```
 
-Provide Beads through `PATH` or `BD_BIN`; the Forge installer does not install,
-upgrade, or downgrade Beads or other host dependencies. Forge `v0.5.0` is
-release-qualified with exact `bd 1.2.1`; upstream `bd 1.2.2` lacks required
-commands and is unsupported. Run `/forged:setup` in Claude Code or Codex, or
-`/skill:setup` in Pi, after registration. Setup requires the epic and lease
-command surface, and doctor behavior remains the compatibility authority. Setup
+Beads is optional: only the one-shot legacy import reads it (ADR-0034).
+When importing, provide bd through `BD_BIN`; the Forge installer does not
+install, upgrade, or downgrade Beads or other host dependencies, and the
+import is release-qualified with exact `bd 1.2.1`. Run `/forged:setup` in
+Claude Code or Codex, or `/skill:setup` in Pi, after registration. Setup
 preserves explicit `ANVIL_HOME` and `BEADS_DIR` values and proves zero
 target-repository imposition.
 
@@ -109,11 +109,12 @@ portable state without invoking launchctl. Normal tests use an isolated fake
 host. The real macOS smoke is ignored unless explicitly armed with
 `FORGED_SERVICE_SMOKE_TEST=1`.
 
-`BEADS_DIR` may point to an embedded store or to metadata for one central team
-Dolt SQL database. The collaborative setup, credential boundary, connectivity
-check, and the reasons active embedded work need not migrate are documented in
-[Central Beads server](beads-team-server.md). In either mode Beads owns the
-work graph and leases while Forged retains its separate execution ledger.
+The ledger owns the work graph, readiness, and leases
+([ADR-0034](adr/0034-ledger-native-work-store.md)). `BEADS_DIR` and the bd
+binary matter only to the one-shot legacy import (`forged work
+import-beads`, or the automatic import at first daemon start); the central
+team-server setup is archived at
+[Central Beads server](archive/beads-team-server.md).
 
 `$ANVIL_HOME/config.yaml` contains named assurance profiles (`lean`,
 `standard`, `high`) and named ordered provider/model rosters. Change a roster
@@ -167,14 +168,14 @@ forged run start --bead <id> --repo /absolute/repo \
 forged run submit --run <id>
 ```
 
-The spec is the bead: its `description`, `acceptance_criteria`, `design`, and
-`notes` fields become the body every seat reads, and the packet is fenced on
-the SHA-256 of that rendered body instead of a file hash. The bead's
-`revision` is recorded as provenance, not as the fence — bd mints a new one
-on every write to the bead, forged's own lease claim included, so a run
-fenced on it would refuse its own resume. Revise a spec with `bd update`; the
-next packet opened pins the new body, and a packet already open is re-pinned
-before its next claim. `--spec <path>` still names a spec file for one
+The spec is the work item: its `description`, `acceptance_criteria`,
+`design`, and `notes` fields become the body every seat reads, and the
+packet is fenced on the SHA-256 of that rendered body instead of a file
+hash. The item's `revision` is recorded as provenance alongside the fence —
+spec writes mint revision N+1 under CAS while coordination churn (claims,
+heartbeats, releases) never touches it. Revise a spec with `forged work
+update`; the next packet opened pins the new body, and a packet already
+open is re-pinned before its next claim. `--spec <path>` still names a spec file for one
 release and is recorded as deprecated.
 
 Submit returns a durable controller identity immediately. Retrying while it is
@@ -306,11 +307,10 @@ forged attention reopen --subject <id> --attention-id <id> \
 `operations overview` returns `forged.operations-overview/1` and renders
 through `ui://forged/operations-overview.html`. Its stable groups are **Needs
 me**, **Ready to merge**, **Running**, **Stalled or recoverable**, and
-**Planned**. The live-plan adapter uses exactly one bounded N+1 native Beads
-discovery and one batched exact-id hydrate; it never parses `bd graph`, calls
-`bd ready`, claims work, or performs a per-node subprocess. Durable rows win
-when a Bead also has execution history. A Beads outage keeps the durable
-projection and marks plan coverage unavailable. The hot path reports
+**Planned**. The live-plan adapter reads the ledger work store in one
+bounded discovery and one batched exact-id hydrate; no subprocess is
+involved. Durable execution rows win when a work item also has execution
+history. The hot path reports
 controller liveness only from its one ledger snapshot, so it performs no
 per-row process or controller-file probe.
 
@@ -448,7 +448,7 @@ ledger did not record:
 | Ledger | The raw event stream, filterable by kind and payload text, with payloads on demand. |
 
 Epics swap Flow's matrix for a **Waves** board: every frozen child bead by
-wave, with its bd status, run, merge state, and the child that is holding
+wave, with its work status, run, merge state, and the child that is holding
 for input.
 
 Above every view sits an attention rail that fires only on things that need

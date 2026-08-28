@@ -2112,29 +2112,22 @@ fn complete_recovered_controller_admission_at(
     remove_if_present(&admission_path)
 }
 
+/// A bd binary recorded in the manifest only when the configured path
+/// resolves to an executable file. The ledger owns work and readiness
+/// (ADR-0034); bd exists solely for the one-shot legacy import, so a
+/// machine with no bd installs the service without one.
+fn resolved_bd_bin(config: &ForgedConfig) -> Option<PathBuf> {
+    let bd_path = config.bd_path.canonicalize().ok()?;
+    let metadata = bd_path.metadata().ok()?;
+    (metadata.is_file() && metadata.permissions().mode() & 0o111 != 0).then_some(bd_path)
+}
+
 fn new_manifest(
     paths: &RuntimePaths,
     config: &ForgedConfig,
     mut binary: BinaryIdentity,
 ) -> Result<RuntimeManifest, Failure> {
-    let bd_path = config.bd_path.canonicalize().map_err(|error| {
-        Failure::invalid(format!(
-            "service installation requires an existing bd executable at {}: {error}",
-            config.bd_path.display()
-        ))
-    })?;
-    let bd_metadata = bd_path.metadata().map_err(|error| {
-        Failure::invalid(format!(
-            "service installation cannot inspect bd executable {}: {error}",
-            bd_path.display()
-        ))
-    })?;
-    if !bd_metadata.is_file() || bd_metadata.permissions().mode() & 0o111 == 0 {
-        return Err(Failure::invalid(format!(
-            "service installation requires an executable bd file, got {}",
-            bd_path.display()
-        )));
-    }
+    let bd_path = resolved_bd_bin(config);
     let generation = Uuid::now_v7().to_string();
     let target = paths.binary_path(&binary.sha256);
     binary.path = target.to_string_lossy().into_owned();
@@ -2152,7 +2145,7 @@ fn new_manifest(
             .into_owned(),
         config_path: config.config_path.to_string_lossy().into_owned(),
         beads_dir: config.beads_dir.to_string_lossy().into_owned(),
-        bd_bin: Some(bd_path.to_string_lossy().into_owned()),
+        bd_bin: bd_path.map(|path| path.to_string_lossy().into_owned()),
         plist_path: paths.plist.to_string_lossy().into_owned(),
         installed_at: now_iso(),
     };
@@ -2167,11 +2160,11 @@ fn manifest_matches_config(
     Ok(
         Path::new(&manifest.anvil_home) == canonicalize_anchor(&config.anvil_home)?
             && Path::new(&manifest.config_path) == canonicalize_anchor(&config.config_path)?
-            && Path::new(&manifest.beads_dir) == canonicalize_anchor(&config.beads_dir)?
-            && manifest
-                .bd_bin
-                .as_deref()
-                .is_some_and(|path| Path::new(path) == config.bd_path.as_path()),
+            && Path::new(&manifest.beads_dir) == canonicalize_anchor(&config.beads_dir)?,
+        // bd is deliberately NOT part of the identity: it exists only for
+        // the one-shot legacy import, the daemon re-reads bd_path from the
+        // config file, and ambient drift (installing or deleting a bd after
+        // install) must never crash-loop the service into a reinstall.
     )
 }
 
@@ -2344,6 +2337,32 @@ async fn install_with_probe<H: ServiceHost, P: ControllerProcessProbe + ?Sized>(
     let source = PathBuf::from(&source_identity.path);
     let target = copy_content_addressed(paths, &source, &source_identity)?;
     let previous = read_manifest(paths)?;
+
+    // A legacy beads store that has never been imported must not be
+    // silently orphaned: installing (or reconciling an existing install)
+    // without a resolvable bd would let the first native work item
+    // permanently close the one-shot import path. This sits ABOVE the
+    // same-install early return so a reconcile after the legacy store
+    // appears, or after the recorded bd disappears, is caught too. Fresh
+    // operators (no beads config) and already-imported stores are
+    // untouched — bd stays optional for them (ADR-0034).
+    if config.beads_dir.join("config.yaml").exists() && resolved_bd_bin(config).is_none() {
+        let ledger = forged_ledger::Ledger::open(&config.db_path).map_err(Failure::from)?;
+        let unimported = ledger.work_store_is_empty().map_err(Failure::from)?
+            && ledger
+                .list_events_by_kind("work.imported")
+                .map_err(Failure::from)?
+                .is_empty();
+        ledger.close().map_err(Failure::from)?;
+        if unimported {
+            return Err(Failure::invalid(format!(
+                "legacy beads store at {} is not yet imported and no bd \
+                 executable resolves; install bd (or set bd_path), run the \
+                 import, then rerun `forged service install`",
+                config.beads_dir.display()
+            )));
+        }
+    }
 
     let same_install = match previous.as_ref() {
         Some(value) => {
@@ -3354,6 +3373,36 @@ mod tests {
         fs::create_dir_all(&home).expect("home");
         let paths = RuntimePaths::new(&config.anvil_home, &home, 501).expect("runtime paths");
         (root, config, paths)
+    }
+
+    #[test]
+    fn ambient_bd_drift_never_breaks_the_manifest_identity() {
+        // bd exists only for the one-shot import: a bd appearing after an
+        // install (or disappearing after cutover) must not force reinstall.
+        let (_root, config, paths) = setup();
+        let source = _root.path().join("drift-forged");
+        fs::write(&source, b"forged executable").expect("executable");
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o700)).expect("mode");
+        paths.ensure_layout().expect("layout");
+        let identity = binary_identity(&source).expect("identity");
+        let manifest = new_manifest(&paths, &config, identity).expect("manifest");
+        assert!(manifest.bd_bin.is_some(), "the fixture bd resolves");
+        assert!(manifest_matches_config(&manifest, &config).expect("match"));
+        // The bd disappears post-cutover: still the same install.
+        fs::remove_file(&config.bd_path).expect("delete bd");
+        assert!(
+            manifest_matches_config(&manifest, &config).expect("match"),
+            "deleting bd never invalidates the manifest"
+        );
+        // A manifest recorded WITHOUT bd matches after one appears.
+        let mut bare = manifest.clone();
+        bare.bd_bin = None;
+        fs::write(&config.bd_path, b"#!/bin/sh\nexit 0\n").expect("bd back");
+        fs::set_permissions(&config.bd_path, fs::Permissions::from_mode(0o700)).expect("mode");
+        assert!(
+            manifest_matches_config(&bare, &config).expect("match"),
+            "a bd appearing later never invalidates the manifest"
+        );
     }
 
     fn seed_old_install(

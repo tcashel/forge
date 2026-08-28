@@ -544,7 +544,7 @@ impl Ledger {
                     skipped_edges.push(edge.clone());
                     continue;
                 }
-                // `execute` reports affected rows: a duplicate edge (the
+                // execute reports affected rows: a duplicate edge (the
                 // importer emits parent-child from both the dependency list
                 // and the parent field) is ignored and must not be counted.
                 inserted_edges += tx.execute(

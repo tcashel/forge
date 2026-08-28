@@ -2,7 +2,7 @@
 //! merged wave-2 crates, plus the claimant-to-process resolution the proto
 //! crate deliberately does not own.
 //!
-//! Identity model (operator-adjudicated): the bd lease holder is the
+//! Identity model (operator-adjudicated): the work lease holder is the
 //! DRIVER's — one lease per slice, shared by every attempt of the run, and
 //! ONE string across every process that touches it
 //! ([`crate::core::lease_identity`]) — and per-attempt session identity is
@@ -224,7 +224,7 @@ impl ForgedPorts {
     /// the shell writing `provider.pid` can leave a provider process no
     /// later process can name, and therefore cannot kill. The residual is
     /// accepted because it is contained: the orphan never heartbeats, so the
-    /// bd lease lapses and the packet is reclaimed, and its eventual result
+    /// work lease lapses and the packet is reclaimed, and its eventual result
     /// is fenced by a claim token that is no longer live, so it is
     /// quarantined rather than landed. What must NOT happen is the port
     /// answering `Unavailable` — that aborts the whole reconcile pass and
@@ -489,7 +489,7 @@ impl ForgedPorts {
         self.on_ledger(move |l| l.get_run(&run_id)).await
     }
 
-    /// The bd lease holder behind a per-attempt session claimant: the ONE
+    /// The work lease holder behind a per-attempt session claimant: the ONE
     /// identity the run's lease is held under, for the run the session
     /// names. `None` when the string is not a session claimant — then it is
     /// already whatever identity the caller meant, and is used verbatim.

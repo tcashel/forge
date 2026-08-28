@@ -361,13 +361,15 @@ fn boundary_node(id: &str, status: Value) -> Result<WorkMapNodeV1, Failure> {
     })
 }
 
-fn dependency_kind(kind: forged_beads::PlanDependencyType) -> WorkMapEdgeKind {
+fn dependency_kind(kind: crate::core::work_types::PlanDependencyType) -> WorkMapEdgeKind {
     match kind {
-        forged_beads::PlanDependencyType::Blocks => WorkMapEdgeKind::Blocks,
-        forged_beads::PlanDependencyType::ParentChild => WorkMapEdgeKind::ParentChild,
-        forged_beads::PlanDependencyType::Related => WorkMapEdgeKind::Related,
-        forged_beads::PlanDependencyType::DiscoveredFrom => WorkMapEdgeKind::DiscoveredFrom,
-        forged_beads::PlanDependencyType::Supersedes => WorkMapEdgeKind::Supersedes,
+        crate::core::work_types::PlanDependencyType::Blocks => WorkMapEdgeKind::Blocks,
+        crate::core::work_types::PlanDependencyType::ParentChild => WorkMapEdgeKind::ParentChild,
+        crate::core::work_types::PlanDependencyType::Related => WorkMapEdgeKind::Related,
+        crate::core::work_types::PlanDependencyType::DiscoveredFrom => {
+            WorkMapEdgeKind::DiscoveredFrom
+        }
+        crate::core::work_types::PlanDependencyType::Supersedes => WorkMapEdgeKind::Supersedes,
     }
 }
 
@@ -609,15 +611,15 @@ async fn project(ctx: &Ctx, request: MapRequest) -> Result<Value, Failure> {
     }
     let exact_ids = super::ops::entry_bead_ids(&entries);
     let plan_scope = match request.scope.kind {
-        WorkMapScopeKind::Operator => forged_beads::WorkMapPlanScope::Operator,
-        WorkMapScopeKind::Repository => forged_beads::WorkMapPlanScope::Repository(
+        WorkMapScopeKind::Operator => crate::core::work_types::WorkMapPlanScope::Operator,
+        WorkMapScopeKind::Repository => crate::core::work_types::WorkMapPlanScope::Repository(
             request
                 .scope
                 .repository
                 .clone()
                 .expect("validated repository"),
         ),
-        WorkMapScopeKind::Epic => forged_beads::WorkMapPlanScope::Epic(
+        WorkMapScopeKind::Epic => crate::core::work_types::WorkMapPlanScope::Epic(
             request.scope.epic_id.clone().expect("validated epic"),
         ),
     };
@@ -794,7 +796,7 @@ async fn project(ctx: &Ctx, request: MapRequest) -> Result<Value, Failure> {
                             .unwrap_or(Value::Null)
                     });
             }
-            if dependency.dependency_type == forged_beads::PlanDependencyType::Blocks
+            if dependency.dependency_type == crate::core::work_types::PlanDependencyType::Blocks
                 && dependency.status.is_none()
             {
                 missing_blocker_status.push(json!({

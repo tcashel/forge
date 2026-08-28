@@ -23,7 +23,7 @@ const PENDING: &str = "run.bead-settlement.pending";
 const SUCCEEDED: &str = "run.bead-settlement.succeeded";
 
 /// Mutating-retry budget. With the supervisor's 30s-doubling backoff capped
-/// at 8 minutes, eight charges span well past the 5+ minute bd lease TTL
+/// at 8 minutes, eight charges span well past the 5+ minute work lease TTL
 /// that motivates the retry in the first place.
 pub const BEAD_SETTLEMENT_RETRY_BUDGET: u32 = 8;
 

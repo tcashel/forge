@@ -13,10 +13,9 @@
 //!
 //! Sites are fixed strings at forged-owned boundaries only:
 //! `op.begin.before`, `op.begin.after`, `packet.materialize.before`,
-//! `provider.spawn.before`, `provider.spawn.after`, `bd.claim.before`,
-//! `bd.claim.after`, `bd.reclaim.before`, `bd.reclaim.after`,
-//! `guardian.start`, `git.push.before`, `git.push.after`, `gh.call.before`,
-//! `gh.call.after`.
+//! `provider.spawn.before`, `provider.spawn.after`, `work.claim.before`,
+//! `work.claim.after`, `work.reclaim.before`, `work.reclaim.after`,
+//! `git.push.before`, `git.push.after`, `gh.call.before`, `gh.call.after`.
 //! `admission.batch.commit.before` and `admission.batch.commit.after` fence
 //! the atomic admission decision/reservation write; the latter represents a
 //! committed response that the caller has not yet observed.

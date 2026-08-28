@@ -2,7 +2,7 @@
 //!
 //! The revoke order is load-bearing: `revoke_attempt` commits the durable
 //! `revoking` marker BEFORE any external kill or reclaim; `kill_confirmed`
-//! succeeds only on verified death; the external bd reclaim must be scoped
+//! succeeds only on verified death; the external work-lease reclaim must be scoped
 //! and name the requested holder; only then `mark_reclaimed`; only then may
 //! a successor claim. Failure means stop, not improvise: a port failure
 //! surfaces as [`ProtoError::Port`] with the attempt left `revoking`, and
@@ -10,7 +10,7 @@
 //!
 //! [`stop_attempt`] is the attempt-local sibling of that order, and a
 //! SEPARATE function on purpose: it ends at `stopped` after the same
-//! confirmed death and reclaims nothing, because the bd lease is bead-scoped
+//! confirmed death and reclaims nothing, because the work lease is bead-scoped
 //! and shared with every sibling generation. One function serving both
 //! scopes is what let an attempt-local stop reach for a bead-scoped lease.
 //!
@@ -37,16 +37,16 @@ use crate::events::{parse_proto_events, record, ProtoEvent};
 use crate::ports::{ReconcilePorts, SessionLiveness};
 use crate::project::fetch_all_events;
 
-/// A local mirror of bd 1.2.1's hardcoded lease TTL
-/// (`forged_beads::BD_LEASE_TTL_S`) — forged-beads is a port, not a
+/// A local mirror of the work-lease TTL
+/// (`forged_ledger::WORK_LEASE_TTL_S`) — the ledger is a port here, not a
 /// dependency.
-const BD_LEASE_TTL_S: u64 = 300;
+const WORK_LEASE_TTL_S: u64 = 300;
 
 /// The epic's frozen timing equation, mirroring
-/// `forged_beads::reclaim_older_than`: reclaim fires at TTL + older_than,
+/// the reclaim ports' timing: reclaim fires at TTL + older_than,
 /// so `older_than = stage_budget - TTL`, saturating at 0.
 fn reclaim_older_than(stage_budget_s: u64) -> u64 {
-    stage_budget_s.saturating_sub(BD_LEASE_TTL_S)
+    stage_budget_s.saturating_sub(WORK_LEASE_TTL_S)
 }
 
 /// Caller-supplied reconcile inputs. This crate reads no environment
@@ -569,7 +569,7 @@ async fn revoke_order(
     // from here is safe because step 2 already confirmed this attempt's
     // death — the pair "process dead, lease unheld" is exactly what the
     // reclaim exists to establish, however it came to be true (an expired
-    // TTL, an operator's own `bd reclaim`, a partially-completed earlier
+    // TTL, an operator's own `work-lease reclaim`, a partially-completed earlier
     // pass). Treating it as a refusal instead strands the attempt in
     // `revoking` forever, because no later pass can make an absent lease
     // reappear for this holder to reclaim.
@@ -821,10 +821,10 @@ fn recovered_request<'e>(
 /// `proto.operation.request` event wherever the observation alone cannot
 /// prove it:
 ///
-/// - `resolve` — the worktree is present AND the observed bd lease holder
+/// - `resolve` — the worktree is present AND the observed work lease holder
 ///   equals the request's `params.leaseHolder`. A worktree with no lease or
 ///   the wrong lease is an unowned (or hijacked) run and must not settle,
-///   per the effect-class table's "worktree presence + bd lease holder".
+///   per the effect-class table's "worktree presence + work lease holder".
 /// - `draftpr` — the PR exists.
 /// - `push` — the observed remote sha equals the request's
 ///   `params.expectedSha`. A pre-existing stale branch answers with SOME

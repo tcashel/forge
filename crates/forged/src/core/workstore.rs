@@ -14,7 +14,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use forged_beads::{
+use crate::core::work_types::{
     IssueSummary, NativeSpecUpdate, PlanDependency, PlanDependencyStatus, PlanDependencyType,
     PlanIssue, PlanReadiness,
 };
@@ -403,7 +403,7 @@ pub async fn plan_inventory(
     ledger: &Ledger,
     repository: Option<&str>,
     limit: usize,
-) -> Result<forged_beads::PlanInventory, Failure> {
+) -> Result<crate::core::work_types::PlanInventory, Failure> {
     if limit == 0 {
         return Err(Failure::invalid("plan inventory limit must be positive"));
     }
@@ -421,7 +421,7 @@ pub async fn plan_inventory(
     for snapshot in matching.into_iter().take(limit) {
         issues.push(plan_issue(ledger, &snapshot.work_id).await?);
     }
-    Ok(forged_beads::PlanInventory {
+    Ok(crate::core::work_types::PlanInventory {
         issues,
         truncated,
         discovered,
@@ -433,11 +433,11 @@ pub async fn plan_inventory(
 /// store remain absent, exactly as the bd union hydrate allowed.
 pub async fn work_map_plan_inventory(
     ledger: &Ledger,
-    scope: &forged_beads::WorkMapPlanScope,
+    scope: &crate::core::work_types::WorkMapPlanScope,
     exact_ids: &[String],
     limit: usize,
-) -> Result<forged_beads::WorkMapPlanInventory, Failure> {
-    use forged_beads::WorkMapPlanScope;
+) -> Result<crate::core::work_types::WorkMapPlanInventory, Failure> {
+    use crate::core::work_types::WorkMapPlanScope;
     if limit == 0 {
         return Err(Failure::invalid("work map plan limit must be positive"));
     }
@@ -525,7 +525,7 @@ pub async fn work_map_plan_inventory(
         issues.push(plan_issue(ledger, id).await?);
     }
     let exact_issues = list_issues(ledger, &union).await?;
-    Ok(forged_beads::WorkMapPlanInventory {
+    Ok(crate::core::work_types::WorkMapPlanInventory {
         issues,
         exact_issues,
         truncated,

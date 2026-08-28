@@ -9,7 +9,6 @@ license-file.workspace = true
 workspace = true
 
 [dependencies]
-fs2.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

@@ -169,7 +169,7 @@ async fn settlement_note(
 
 /// Settle the bead under `actor` — the caller's resolved custody identity.
 ///
-/// The primary `run stop` path passes the bd lease identity actually in
+/// The primary `run stop` path passes the work lease identity actually in
 /// force — the derived run holder or an adopted frontier claim from
 /// `claim-next` — read at settlement time. A hardcoded derived holder would
 /// wedge settlement of a frontier-claimed bead against forged's own lease.

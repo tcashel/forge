@@ -5,7 +5,7 @@
 //!
 //! The session parameter of [`ReconcilePorts::liveness`] and
 //! [`ReconcilePorts::kill_confirmed`] is the attempt's `claimant` column,
-//! passed through verbatim: `claimant` is simultaneously the bd lease holder
+//! passed through verbatim: `claimant` is simultaneously the work lease holder
 //! and the session reference, and this crate never parses, splits, or
 //! normalizes it. The wave-4 adapter owns resolving it back to a host
 //! session id.
@@ -34,9 +34,9 @@ pub enum KillOutcome {
     AlreadyDead,
 }
 
-/// Outcome of a scoped bd lease reclaim, mirroring
-/// `forged_beads::ReclaimOutcome`. `previous_owner: None` is the refusal
-/// shape (nothing reclaimed), not an error.
+/// Outcome of a scoped work-lease reclaim, mirroring
+/// `forged_ledger::reclaim_work_lease`. `previous_owner: None` is the
+/// refusal shape (nothing reclaimed), not an error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeaseReclaim {
     /// Whether bd confirmed the reclaim was scoped (expect `true`).
@@ -46,13 +46,13 @@ pub struct LeaseReclaim {
     pub previous_owner: Option<String>,
 }
 
-/// What settles a crashed `Resolve`: worktree presence plus the bd lease
+/// What settles a crashed `Resolve`: worktree presence plus the work lease
 /// holder.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolveState {
     /// Whether the run's worktree exists.
     pub worktree_present: bool,
-    /// The current bd lease holder for the run's bead, when any.
+    /// The current work lease holder for the run's bead, when any.
     pub lease_holder: Option<String>,
 }
 
@@ -90,7 +90,7 @@ pub trait ReconcilePorts: Send + Sync {
         termination_grace_s: u64,
     ) -> Result<KillOutcome, PortError>;
 
-    /// Scoped bd lease reclaim, mirroring `forged_beads::reclaim(bd, bead,
+    /// Scoped work-lease reclaim, mirroring `reclaim_work_lease(work,
     /// previous_holder, older_than_s)`. `holder` is the attempt's
     /// `claimant`, verbatim.
     async fn reclaim_lease(
@@ -122,7 +122,7 @@ pub trait ReconcilePorts: Send + Sync {
         body: &[u8],
     ) -> Result<(), PortError>;
 
-    /// Settles `Resolve` after a crash: worktree presence + bd lease holder.
+    /// Settles `Resolve` after a crash: worktree presence + work lease holder.
     async fn resolve_state(&self, run_id: &str) -> Result<ResolveState, PortError>;
 
     /// Settles `DraftPr` after a crash: mirrors

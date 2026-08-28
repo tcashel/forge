@@ -1392,7 +1392,7 @@ async fn machine_effect(
             // pre-run identity a fresh `claim-next` claimed it with — or
             // under this run's derived holder from an earlier pass — IS this
             // run's lease. Claim under that string rather than a second,
-            // differing one: bd refuses a claim by any other actor outright
+            // differing one: the store refuses a claim by any other actor outright
             // ("issue already claimed by …"), which is how a driver used to
             // wedge on BEAD_LEASE_HELD against its own frontier claim.
             let holder = if internal != InternalRunMode::Ordinary {

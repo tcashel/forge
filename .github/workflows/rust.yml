@@ -210,9 +210,8 @@ jobs:
         with:
           tool: cargo-nextest@0.9.143
 
-      # The failpoint kill-matrix — the bd-gated cases SKIP loudly when no
-      # sandboxed bd 1.2.1 binary is present, and the genuine-expiry variant
-      # stays #[ignore]d (run deliberately with FORGED_SLOW_TESTS=1).
+      # The failpoint kill-matrix. Lease semantics are ledger-native
+      # (ADR-0034): no bd binary is involved here.
       - name: failpoints
         run: cargo nextest run -p forged --features failpoints
 

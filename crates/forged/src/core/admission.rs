@@ -188,7 +188,7 @@ fn bounded_input_error(error: impl std::fmt::Display) -> String {
 
 fn project_candidates(
     snapshot: &AdmissionLedgerSnapshot,
-    issues: &[forged_beads::IssueSummary],
+    issues: &[crate::core::work_types::IssueSummary],
     targets: &BTreeSet<(DesiredSubjectKind, String)>,
     explicit_submit: Option<&(DesiredSubjectKind, String)>,
     input_error: Option<&str>,

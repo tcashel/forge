@@ -1087,7 +1087,7 @@ pub async fn execute_packet(
     // the identical refusal until a human intervened.
     let packet = &repin_packet(ctx, packet, &spec).await?;
 
-    // Claim under the PER-ATTEMPT session identity (the bd lease stays the
+    // Claim under the PER-ATTEMPT session identity (the work lease stays the
     // run's, held by the driver): the ledger re-checks the stored fence
     // against what the caller just observed — the caller re-reads, the
     // ledger does no file or process IO.
@@ -1946,7 +1946,7 @@ async fn run_attempt(
     // leaves a provider no later process can identify, so no later process
     // can kill it. It is CONTAINED rather than prevented — nothing this
     // side of the spawn can make a process identity durable before the
-    // process exists. The orphan never heartbeats, so the bd lease lapses
+    // process exists. The orphan never heartbeats, so the work lease lapses
     // and the packet is reclaimed; and its eventual result is fenced by a
     // claim token that is no longer live, so `land_packet_result` quarantines
     // it instead of landing it. Reconcile's half of the containment is in
@@ -2229,7 +2229,7 @@ async fn run_attempt(
     // process-group id. Guardian heartbeats stop the moment it dies.
     //
     // No pid inside the window is a FAILED SPAWN, not a reason to continue:
-    // an unguarded provider renews no bd lease, so another worker would
+    // an unguarded provider renews no work lease, so another worker would
     // reclaim its apparently-expired work while it is still writing to the
     // worktree. Stop the session, record a transport failure, and let the
     // transport-retry budget decide whether to try again.
@@ -2352,7 +2352,6 @@ async fn run_attempt(
     // cross-process identity that its revoker can verify. Before this point
     // the spawning driver is the sole process able to contain the effect.
     drop(submit_guard);
-    failpoint::hit("guardian.start");
 
     // Await completion by polling the host; the sentinel status file is the
     // only exit-code truth.
@@ -3330,7 +3329,7 @@ mod settle_tests {
     }
 
     /// A provably dead pid: by the time an attempt settles its provider
-    /// shell has exited, so the guardian's first probe ends the guardian.
+    /// shell has exited, so any liveness probe sees a dead process.
     fn exited_provider_pid() -> u32 {
         let mut child = std::process::Command::new("/bin/sh")
             .arg("-c")

@@ -30,6 +30,7 @@ pub(crate) mod work_identity;
 mod work_import;
 mod work_map;
 mod work_ops;
+pub(crate) mod work_types;
 pub(crate) mod workstore;
 
 use forged_ledger::{DesiredSubjectKind, EffectClass, Ledger, LedgerError, OperationOutcome};
@@ -140,13 +141,7 @@ impl From<ProtoError> for Failure {
 
 impl From<forged_beads::BdError> for Failure {
     fn from(err: forged_beads::BdError) -> Self {
-        use forged_beads::BdError;
-        // The wire mapping the classifier documents per variant.
-        let code = match &err {
-            BdError::Contention { .. } => ErrorCode::BeadsContention,
-            BdError::LeaseHeld { .. } => ErrorCode::BeadLeaseHeld,
-            _ => ErrorCode::BeadsError,
-        };
+        let code = ErrorCode::BeadsError;
         Failure {
             code,
             message: err.to_string(),
@@ -326,7 +321,7 @@ pub fn split_packet_key(packet_id: &str) -> Result<(String, String, i64), Failur
     Ok((run_id.to_owned(), stage.to_owned(), seq))
 }
 
-/// The pre-run bd lease identity: the actor a FRESH frontier claim in
+/// The pre-run work lease identity: the actor a FRESH frontier claim in
 /// `claim-next` is taken under.
 ///
 /// `bd ready --claim --actor <holder>` demands its actor BEFORE it says
@@ -361,17 +356,18 @@ pub fn run_holder(bead_id: &str) -> String {
     format!("forged:{bead_id}:0")
 }
 
-/// The bd lease identity in force for a run: the holder forged already has
+/// The work lease identity in force for a run: the holder forged already has
 /// the bead under when that holder is one of ours — [`FRONTIER_HOLDER`] from
 /// a fresh `claim-next` claim, or this run's derived [`run_holder`] from an
 /// earlier pass — else the derived holder.
 ///
-/// Every consumer of the run's lease (Resolve's claim, the guardian's
-/// heartbeat, claim-next's scoped reclaim, the `reclaim_lease` port) reads
+/// Every consumer of the run's lease (Resolve's claim, the attempt
+/// heartbeat's renewal, claim-next's scoped reclaim, the `reclaim_lease`
+/// port) reads
 /// the identity here rather than deriving a second, differing one, which is
 /// what makes the chain unwedgeable against itself. A holder this driver
 /// could not have taken is deliberately NOT adopted: the derived holder is
-/// returned, bd refuses the claim, and another worker's live lease stands.
+/// returned, the claim is refused, and another worker's live lease stands.
 pub async fn lease_identity(ledger: &Ledger, bead: &str, _run_id: &str) -> Result<String, Failure> {
     let derived = run_holder(bead);
     let current = workstore::lease_holder(ledger, bead).await?;
@@ -396,7 +392,7 @@ pub async fn lease_identity(ledger: &Ledger, bead: &str, _run_id: &str) -> Resul
 /// it carry a real pid: no other process has to reproduce the string, only
 /// read it back from the row.
 ///
-/// The bd lease holder stays the run's ([`lease_identity`]): one lease per
+/// The work lease holder stays the run's ([`lease_identity`]): one lease per
 /// slice, shared by both concurrent Review legs, translated back at the
 /// `reclaim_lease` seam.
 pub fn session_claimant(packet_id: &str, provider: &str) -> String {

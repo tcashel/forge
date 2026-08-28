@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use forged_beads::IssueSummary;
+use crate::core::work_types::IssueSummary;
 use forged_ledger::{
     AdmissionReservationState, AttemptState, DesiredReconcileOutcome, DesiredState, EffectClass,
     InventorySnapshot, InventoryUsage, RunOutcome,
