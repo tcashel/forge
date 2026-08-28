@@ -129,16 +129,16 @@ pub async fn work_create(ctx: &Ctx, req: &mut OperationRequest) -> OperationResp
                 metadata,
                 spec: WorkSpecFields {
                     title: title.clone(),
-                    description: param_opt_str(&req.params, "description")
+                    description: param_opt_str_strict(&req.params, "description")?
                         .unwrap_or_default()
                         .to_owned(),
-                    acceptance_criteria: param_opt_str(&req.params, "acceptanceCriteria")
+                    acceptance_criteria: param_opt_str_strict(&req.params, "acceptanceCriteria")?
                         .unwrap_or_default()
                         .to_owned(),
-                    design: param_opt_str(&req.params, "design")
+                    design: param_opt_str_strict(&req.params, "design")?
                         .unwrap_or_default()
                         .to_owned(),
-                    notes: param_opt_str(&req.params, "notes")
+                    notes: param_opt_str_strict(&req.params, "notes")?
                         .unwrap_or_default()
                         .to_owned(),
                 },

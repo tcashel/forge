@@ -175,13 +175,18 @@ impl Ledger {
         let holder = holder.to_owned();
         self.submit(move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            // Only tasks are claimable work: an epic in the frontier (no
-            // outgoing blocks edges) must never be claimed under the
-            // frontier holder — no run can execute it and the lease strands.
-            let Some(item) = ready_tx(&tx)?
-                .into_iter()
-                .find(|item| item.kind == WorkKind::Task)
-            else {
+            // Only schedulable work is claimable: an epic (no run can
+            // execute it) and an imported no-diff type (chore / decision /
+            // milestone — the slice validator refuses them AFTER a claim)
+            // must never be claimed under the frontier holder, or the lease
+            // strands with nothing to resume or settle.
+            let Some(item) = ready_tx(&tx)?.into_iter().find(|item| {
+                item.kind == WorkKind::Task
+                    && !matches!(
+                        item.metadata.get("imported:issue-type").map(String::as_str),
+                        Some("chore") | Some("decision") | Some("milestone")
+                    )
+            }) else {
                 tx.commit()?;
                 return Ok(None);
             };
@@ -351,12 +356,34 @@ mod tests {
             None,
             "an epic alone in the frontier is never claimed"
         );
+        // An imported no-diff type maps to WorkKind::Task with its real
+        // type in metadata — the frontier must skip it too, or the slice
+        // validator refuses AFTER the claim and the lease strands.
+        l.create_work_item(NewWorkItem {
+            work_id: "chore-frontier".to_string(),
+            kind: WorkKind::Task,
+            status: WorkStatus::Open,
+            priority: Some(1),
+            metadata: BTreeMap::from([("imported:issue-type".to_string(), "chore".to_string())]),
+            spec: WorkSpecFields {
+                title: "an imported chore".to_string(),
+                description: String::new(),
+                acceptance_criteria: String::new(),
+                design: String::new(),
+                notes: String::new(),
+            },
+            cause: WorkRevisionCause::Import,
+        })
+        .unwrap();
         seed(&l, "task-frontier", WorkStatus::Open, Some(5));
         let claimed = l
             .claim_ready_work("forged:frontier:0", 300)
             .unwrap()
             .expect("the task claims");
-        assert_eq!(claimed.work_id, "task-frontier");
+        assert_eq!(
+            claimed.work_id, "task-frontier",
+            "the higher-priority imported chore is skipped"
+        );
     }
 
     fn seed(l: &Ledger, id: &str, status: WorkStatus, priority: Option<i64>) {
