@@ -343,7 +343,7 @@ pub enum EpicCmd {
     /// Drive until the final draft PR or explicit input is required.
     Drive(EpicScoped),
     /// Hand the epic to a detached durable controller.
-    Submit(EpicScoped),
+    Submit(EpicSubmitArgs),
     /// Project waves, children, blockers, and the final PR (read-only).
     Status(EpicScoped),
     /// Pause scheduling after the current durable boundary.
@@ -419,6 +419,21 @@ pub struct EpicScoped {
     /// Durable epic id.
     #[arg(long)]
     pub epic: String,
+    /// Override the derived/read-only idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+/// `epic submit` flags.
+#[derive(Debug, Args)]
+pub struct EpicSubmitArgs {
+    /// Durable epic id.
+    #[arg(long)]
+    pub epic: String,
+    /// Block briefly until initial setup resolves and include the advisory
+    /// `setup` readback in the response.
+    #[arg(long)]
+    pub wait_setup: bool,
     /// Override the derived/read-only idempotency key.
     #[arg(long)]
     pub idempotency_key: Option<String>,
@@ -1634,7 +1649,13 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
                 request(
                     a.idempotency_key,
                     Some(a.epic.clone()),
-                    json!({"epic": a.epic}),
+                    // The flag is omitted when unset so the fenced request
+                    // params stay byte-identical to every prior submit.
+                    if a.wait_setup {
+                        json!({"epic": a.epic, "waitSetup": true})
+                    } else {
+                        json!({"epic": a.epic})
+                    },
                 ),
             ),
             EpicCmd::Status(a) => (

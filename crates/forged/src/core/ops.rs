@@ -2720,7 +2720,38 @@ pub(super) fn operator_queue(
             }),
             _ => "Submit a detached controller when this work should start".to_owned(),
         };
+        let entry_desired = snapshot
+            .desired_work
+            .iter()
+            .find(|row| row.subject_id == id);
+        let entry_deferred = snapshot
+            .admission_decisions
+            .iter()
+            .find(|decision| decision.subject_id == id)
+            .is_some_and(|decision| decision.outcome == forged_types::AdmissionOutcome::Deferred);
+        let execution_health = super::health::execution_health(super::health::HealthInputs {
+            started: true,
+            terminal: visibly_terminal,
+            paused: false,
+            // The portfolio row cannot cheaply distinguish an input-required
+            // stop; the drill-down surfaces (epic_status, work_detail) carry
+            // that verdict.
+            input_required: false,
+            admission_deferred: entry_deferred,
+            desired: entry_desired,
+            controller_live: if execution_live {
+                Some(true)
+            } else if dead_controller {
+                Some(false)
+            } else {
+                None
+            },
+        });
         if let Some(object) = entry.as_object_mut() {
+            object.insert(
+                "executionHealth".to_owned(),
+                Value::String(execution_health.to_owned()),
+            );
             object.insert("title".to_owned(), Value::String(title));
             object.insert(
                 "repositoryScope".to_owned(),

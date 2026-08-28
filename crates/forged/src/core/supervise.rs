@@ -892,7 +892,8 @@ async fn reconcile_claimed(
                     next_wake_at: None,
                     last_progress_at: None,
                     last_error: Some(format!(
-                        "halted after one nonrecoverable controller failure: {}",
+                        "{} {}",
+                        super::health::HALTED_ERROR_PREFIX,
                         terminal.message
                     )),
                     attention_condition: Some("restart-budget-exhausted".to_owned()),
