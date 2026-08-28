@@ -187,9 +187,16 @@ fn epic_drive_runs_ready_children_merges_integration_and_stops_at_one_draft_pr()
     assert_eq!(started["result"]["schema"], json!("forged.epic/1"));
 
     env.set_scenario("implement", "slow", 1);
-    let (code, submitted) = env.forged(&["epic", "submit", "--epic", "epic-one"]);
+    let (code, submitted) = env.forged(&["epic", "submit", "--epic", "epic-one", "--wait-setup"]);
     assert_eq!(code, 0, "epic submit: {submitted}");
     assert_eq!(submitted["result"]["submitted"], json!(true));
+    assert_eq!(submitted["result"]["phase"], json!("spawned"));
+    assert_eq!(submitted["result"]["controlRevision"], json!(1));
+    assert_eq!(
+        submitted["result"]["setup"]["state"],
+        json!("complete"),
+        "wave-1 setup resolves inside the bounded wait: {submitted}"
+    );
     assert_eq!(submitted["result"]["controller"]["host"], json!("process"));
     assert!(submitted["result"]["controller"]["sessionId"].is_string());
 
@@ -229,6 +236,11 @@ fn epic_drive_runs_ready_children_merges_integration_and_stops_at_one_draft_pr()
         held["result"]["finalPr"].is_null(),
         "pause precedes merge: {held}"
     );
+    assert_eq!(
+        held["result"]["executionHealth"],
+        json!("paused"),
+        "one derived verdict: {held}"
+    );
     let (code, resumed) = env.forged(&[
         "epic",
         "resume",
@@ -241,6 +253,13 @@ fn epic_drive_runs_ready_children_merges_integration_and_stops_at_one_draft_pr()
     let (code, resubmitted) = env.forged(&["epic", "submit", "--epic", "epic-one"]);
     assert_eq!(code, 0, "epic resubmit: {resubmitted}");
     assert_eq!(resubmitted["result"]["controller"]["generation"], json!(2));
+    assert_eq!(resubmitted["result"]["phase"], json!("spawned"));
+    // The pause and resume control transitions each bumped the revision;
+    // the readback names whichever revision this authorization minted.
+    assert!(
+        resubmitted["result"]["controlRevision"].as_u64() > Some(1),
+        "a resubmit visibly mints the next control revision: {resubmitted}"
+    );
 
     let driven = wait_for(&env, &["epic", "status", "--epic", "epic-one"], |value| {
         value["result"]["finalPr"]["number"] == json!(8)
@@ -256,6 +275,16 @@ fn epic_drive_runs_ready_children_merges_integration_and_stops_at_one_draft_pr()
     assert_eq!(code, 0, "epic status: {status}");
     assert_eq!(status["result"]["finalPr"]["number"], json!(8));
     assert_eq!(status["result"]["waves"].as_array().map(Vec::len), Some(1));
+    assert_eq!(
+        status["result"]["executionHealth"],
+        json!("terminal"),
+        "a delivered epic reads terminal: {status}"
+    );
+    assert_eq!(status["result"]["deferred"], json!({}));
+    assert!(
+        status["result"]["desired"].is_object(),
+        "the epic-level desired row is projected: {status}"
+    );
     assert_eq!(
         status["result"]["children"][0]["beadsStatus"],
         json!("closed")
@@ -5133,4 +5162,165 @@ fn reconcile_runs_the_ports_end_to_end_on_a_live_run() {
     let unique: std::collections::BTreeSet<String> =
         ids.iter().map(std::string::ToString::to_string).collect();
     assert_eq!(unique.len(), ids.len(), "distinct operation ids: {ids:?}");
+}
+
+/// One derived execution-health verdict on every operator surface, and the
+/// wave-level deferral summary that makes single-writer serialization read
+/// as expected behavior instead of a stall.
+#[test]
+fn execution_health_and_deferrals_read_from_every_surface() {
+    let env = TestEnv::new("forged-epic-health");
+    env.enable_dynamic_gh();
+    env.seed_epic(
+        "epic-defer",
+        &[("child-d1", &env.spec, true), ("child-d2", &env.spec, true)],
+    );
+    assert_eq!(env.forged(&["init"]).0, 0);
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let spec = env.spec.to_string_lossy().into_owned();
+    let (code, started) = env.forged(&[
+        "epic",
+        "start",
+        "--epic",
+        "epic-defer",
+        "--repo",
+        &repo,
+        "--spec",
+        &spec,
+    ]);
+    assert_eq!(code, 0, "epic start: {started}");
+
+    // Started but never submitted: the verdict says so, and no desired row
+    // or failure is invented.
+    let (code, unsubmitted) = env.forged(&["epic", "status", "--epic", "epic-defer"]);
+    assert_eq!(code, 0, "{unsubmitted}");
+    assert_eq!(
+        unsubmitted["result"]["executionHealth"],
+        json!("unsubmitted")
+    );
+    assert!(unsubmitted["result"]["desired"].is_null());
+    assert!(unsubmitted["result"]["lastControllerFailure"].is_null());
+    assert_eq!(unsubmitted["result"]["deferred"], json!({}));
+
+    // A standalone hang run holds the single repository-write slot with
+    // settled custody BEFORE the epic dispatches: racing the epic's own
+    // children against each other is not deterministic (a slow child spawn
+    // releases and re-admits the slot), but a provider that is already live
+    // holds it for the whole observation.
+    env.set_scenario("implement", "hang", 1);
+    env.seed_frontier("blocker-writer");
+    let (code, blocker) = env.forged(&[
+        "run",
+        "start",
+        "--bead",
+        "blocker-writer",
+        "--repo",
+        &repo,
+        "--spec",
+        &spec,
+        "--base-ref",
+        "main",
+    ]);
+    assert_eq!(code, 0, "blocker start: {blocker}");
+    env.authorize_run("blocker-writer");
+    let (code, blocker_submitted) = env.forged(&["run", "submit", "--run", "blocker-writer"]);
+    assert_eq!(code, 0, "blocker submit: {blocker_submitted}");
+    // The provider start line IS the custody proof: once the hang provider
+    // is live it holds the repository-write slot for the whole observation.
+    wait_for(
+        &env,
+        &["run", "status", "--run", "blocker-writer"],
+        |value| {
+            value["result"]["run"]["state"].is_string()
+                && env
+                    .provider_log()
+                    .iter()
+                    .any(|line| line.contains("blocker-writer/implementation/0 start "))
+        },
+    );
+
+    let (code, submitted) = env.forged(&["epic", "submit", "--epic", "epic-defer"]);
+    assert_eq!(code, 0, "epic submit: {submitted}");
+    assert_eq!(submitted["result"]["phase"], json!("spawned"));
+    assert_eq!(submitted["result"]["controlRevision"], json!(1));
+
+    // Both ready wave-1 children collide with the held repository-write
+    // slot: they defer, and the wave-level summary says why without
+    // diffing per-child admission blobs.
+    let status = wait_for(&env, &["epic", "status", "--epic", "epic-defer"], |value| {
+        value["result"]["deferred"]["repository-write-capacity"] == json!(2)
+    });
+    assert_eq!(status["result"]["executionHealth"], json!("running"));
+    let children = status["result"]["children"].as_array().expect("children");
+    for id in ["child-d1", "child-d2"] {
+        let child = children
+            .iter()
+            .find(|child| child["id"] == json!(id))
+            .unwrap_or_else(|| panic!("child {id} in status: {status}"));
+        assert_eq!(
+            child["executionHealth"],
+            json!("queued"),
+            "the deferred child reads queued: {status}"
+        );
+    }
+
+    // The portfolio row carries the same derived verdict.
+    let (code, operations) = env.forged(&["operations", "overview"]);
+    assert_eq!(code, 0, "{operations}");
+    let entry = operations["result"]["queue"]["groups"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|group| group["entries"].as_array())
+        .flatten()
+        .find(|entry| entry["id"] == json!("epic-defer"))
+        .cloned()
+        .unwrap_or_else(|| panic!("epic entry in operations: {operations}"));
+    assert!(
+        entry["executionHealth"].is_string(),
+        "portfolio verdict present: {entry}"
+    );
+
+    // And the work-detail status block.
+    let (code, detail) = env.forged(&["work", "detail", "--id", "epic-defer"]);
+    assert_eq!(code, 0, "{detail}");
+    assert!(
+        detail["result"]["status"]["executionHealth"].is_string(),
+        "work detail verdict present: {detail}"
+    );
+
+    // Wind down: pause scheduling first so nothing new dispatches, then stop
+    // the hanging child with the typed kill path. The paused verdict is
+    // durable the moment the pause event lands — it never waits on the
+    // detached controller's own exit cadence.
+    let (code, paused) = env.forged(&[
+        "epic",
+        "pause",
+        "--epic",
+        "epic-defer",
+        "--reason",
+        "test wind-down",
+    ]);
+    assert_eq!(code, 0, "{paused}");
+    stop_run_when_kill_evidence_is_ready(&env, "blocker-writer", "test wind-down");
+    let held = wait_for(&env, &["epic", "status", "--epic", "epic-defer"], |value| {
+        value["result"]["paused"].is_object()
+    });
+    assert_eq!(held["result"]["executionHealth"], json!("paused"));
+
+    // Fixture teardown, not semantics: the paused detached controller exits
+    // on its own schedule, so reap its process group directly rather than
+    // waiting out that cadence.
+    let record: Value = serde_json::from_slice(
+        &std::fs::read(env.anvil.join("runs/epic-defer/controller/controller.json"))
+            .expect("epic controller record"),
+    )
+    .expect("controller JSON");
+    if let Some(pid) = record["driver"]["pid"]
+        .as_i64()
+        .and_then(|pid| i32::try_from(pid).ok())
+    {
+        let group = nix::unistd::Pid::from_raw(-pid);
+        let _ = nix::sys::signal::kill(group, nix::sys::signal::Signal::SIGKILL);
+    }
 }

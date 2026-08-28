@@ -698,6 +698,68 @@ pub(super) async fn epic_submission_stop(ctx: &Ctx, epic: &str) -> Result<Option
     })
 }
 
+/// Poll the durable epic stream until initial setup resolves: the first
+/// wave started (`complete`), an unresolved input requirement or a
+/// halted/exhausted supervisor row (`failed`, with the evidence), or the
+/// bounded wait elapsed (`pending`). Read-only; the submit wrapper attaches
+/// the verdict as an advisory readback that is never stored.
+pub(super) async fn await_setup(ctx: &Ctx, epic: &str) -> Value {
+    const SETUP_WAIT_POLLS: u32 = 30;
+    const SETUP_WAIT_POLL: std::time::Duration = std::time::Duration::from_secs(1);
+    for poll in 0..SETUP_WAIT_POLLS {
+        match setup_probe(ctx, epic).await {
+            Ok(Some(verdict)) => return verdict,
+            Ok(None) => {}
+            Err(failure) => {
+                return json!({"state": "pending", "detail": failure.message});
+            }
+        }
+        if poll + 1 < SETUP_WAIT_POLLS {
+            tokio::time::sleep(SETUP_WAIT_POLL).await;
+        }
+    }
+    json!({
+        "state": "pending",
+        "detail": "setup did not resolve within the bounded wait",
+    })
+}
+
+async fn setup_probe(ctx: &Ctx, epic: &str) -> Result<Option<Value>, Failure> {
+    let events = epic_events(ctx, epic).await?;
+    let mut latest_input: Option<&forged_ledger::EventRow> = None;
+    let mut wave_started = false;
+    for row in &events {
+        match row.kind.as_str() {
+            WAVE_STARTED => wave_started = true,
+            INPUT_REQUIRED => latest_input = Some(row),
+            INPUT_RESOLVED => latest_input = None,
+            _ => {}
+        }
+    }
+    if let Some(row) = latest_input {
+        let evidence = serde_json::from_str::<Value>(&row.payload_json).unwrap_or(Value::Null);
+        return Ok(Some(json!({"state": "failed", "inputRequired": evidence})));
+    }
+    if wave_started {
+        return Ok(Some(json!({"state": "complete"})));
+    }
+    let id = epic.to_owned();
+    let desired = on_ledger(&ctx.ledger, move |ledger| {
+        ledger.get_desired_work(DesiredSubjectKind::Epic, &id)
+    })
+    .await?;
+    if let Some(row) = desired {
+        if row.exhausted_at.is_some()
+            || row.last_outcome == Some(DesiredReconcileOutcome::Exhausted)
+        {
+            return Ok(Some(
+                json!({"state": "failed", "lastError": row.last_error}),
+            ));
+        }
+    }
+    Ok(None)
+}
+
 fn is_assurance_cleanup_input(input: &Value, run_id: &str) -> bool {
     input.get("code").and_then(Value::as_str) == Some("assurance-cleanup-failed")
         && input.pointer("/evidence/runId").and_then(Value::as_str) == Some(run_id)
@@ -1491,6 +1553,8 @@ struct ChildDurable<'a> {
     pr: Option<&'a Value>,
     planning_generation: Option<u32>,
     planning_blocker: Option<&'a Value>,
+    execution_health: &'static str,
+    terminal_failure: Option<&'a Value>,
 }
 
 fn child_json(
@@ -1510,9 +1574,13 @@ fn child_json(
         pr,
         planning_generation,
         planning_blocker,
+        execution_health,
+        terminal_failure,
     } = durable;
     json!({
         "id": child.id,
+        "executionHealth": execution_health,
+        "lastControllerFailure": terminal_failure,
         "identity": identity,
         "title": child.title,
         "issueType": child.issue_type,
@@ -1585,7 +1653,11 @@ async fn status_json(ctx: &Ctx, view: EpicView) -> Result<Value, Failure> {
     // single backwards-compatible liveness probe.
     let snapshot = on_ledger(&ctx.ledger, |ledger| {
         ledger.inventory_snapshot(
-            &["proto.pr", "forged.controller.started"],
+            &[
+                "proto.pr",
+                "forged.controller.started",
+                super::handoff::CONTROLLER_TERMINAL_EVENT,
+            ],
             InventoryUsageSelection::Omit,
         )
     })
@@ -1652,6 +1724,32 @@ async fn status_json(ctx: &Ctx, view: EpicView) -> Result<Value, Failure> {
     };
     let controllers = latest_payloads("forged.controller.started")?;
     let prs = latest_payloads("proto.pr")?;
+    // Latest recorded terminal failure per subject, with its timestamp: the
+    // durable "why is it not running" every health-bearing row attaches.
+    let mut terminal_failures: BTreeMap<String, Value> = BTreeMap::new();
+    for event in snapshot.events(super::handoff::CONTROLLER_TERMINAL_EVENT) {
+        let Some(run_id) = event.run_id.clone() else {
+            continue;
+        };
+        let Ok(payload) = serde_json::from_str::<Value>(&event.payload_json) else {
+            continue;
+        };
+        terminal_failures.insert(
+            run_id,
+            super::health::controller_failure_json(&payload, &event.ts),
+        );
+    }
+    let epic_desired = snapshot.desired_work.iter().find(|row| {
+        row.subject_kind == DesiredSubjectKind::Epic && row.subject_id == view.config.epic_id
+    });
+    let epic_admission_deferred = snapshot
+        .admission_decisions
+        .iter()
+        .find(|decision| {
+            decision.subject_kind == AdmissionSubjectKind::Epic
+                && decision.subject_id == view.config.epic_id
+        })
+        .is_some_and(|decision| decision.outcome == AdmissionOutcome::Deferred);
     let slot_name = format!("epic:{}", view.config.epic_id);
     let integration_owner = on_ledger(&ctx.ledger, {
         let slot_name = slot_name.clone();
@@ -1673,6 +1771,10 @@ async fn status_json(ctx: &Ctx, view: EpicView) -> Result<Value, Failure> {
         ("held", 0),
         ("merged", 0),
     ]);
+    // Deferral reasons across non-terminal children, so expected
+    // serialization (`repository-write-capacity: 1`) reads as a wave-level
+    // fact instead of a stall diffed out of two children's admission blobs.
+    let mut deferred_reasons: BTreeMap<String, u64> = BTreeMap::new();
     let mut next_wakes = Vec::new();
     let epic_context = WorkIdentityContextV1 {
         id: view.config.epic_id.clone(),
@@ -1728,6 +1830,27 @@ async fn status_json(ctx: &Ctx, view: EpicView) -> Result<Value, Failure> {
         if run_id.is_some() && !terminal && !queued && !held {
             *counts.get_mut("active").expect("active counter") += 1;
         }
+        if !terminal {
+            if let Some(decision) =
+                admission.filter(|decision| decision.outcome == AdmissionOutcome::Deferred)
+            {
+                let reason = serde_json::to_value(decision.reason)
+                    .ok()
+                    .and_then(|value| value.as_str().map(str::to_owned))
+                    .unwrap_or_else(|| "deferred".to_owned());
+                *deferred_reasons.entry(reason).or_insert(0) += 1;
+            }
+        }
+        let child_health = super::health::execution_health(super::health::HealthInputs {
+            started: run_id.is_some(),
+            terminal,
+            paused: false,
+            input_required: planning_blocker.is_some(),
+            admission_deferred: admission
+                .is_some_and(|decision| decision.outcome == AdmissionOutcome::Deferred),
+            desired,
+            controller_live: None,
+        });
         if let Some(wake) = desired
             .and_then(|row| row.next_wake_at.as_deref())
             .or_else(|| admission.and_then(|row| row.next_eligible_wake_at.as_deref()))
@@ -1781,6 +1904,8 @@ async fn status_json(ctx: &Ctx, view: EpicView) -> Result<Value, Failure> {
                 pr,
                 planning_generation: view.planning_generations.get(&child.id).copied(),
                 planning_blocker,
+                execution_health: child_health,
+                terminal_failure: run_id.and_then(|run_id| terminal_failures.get(run_id)),
             },
         ));
     }
@@ -1808,9 +1933,26 @@ async fn status_json(ctx: &Ctx, view: EpicView) -> Result<Value, Failure> {
             }),
         })
     });
+    let epic_health = super::health::execution_health(super::health::HealthInputs {
+        started: true,
+        terminal: final_pr.is_some(),
+        paused: view.paused.is_some(),
+        input_required: view.input.is_some(),
+        admission_deferred: epic_admission_deferred,
+        desired: epic_desired,
+        controller_live: match controller.get("state").and_then(Value::as_str) {
+            Some("running") => Some(true),
+            Some("exited" | "vanished" | "dead") => Some(false),
+            _ => None,
+        },
+    });
     Ok(json!({
         "schema": "forged.epic.status/1",
         "epicId": view.config.epic_id,
+        "executionHealth": epic_health,
+        "desired": desired_json(epic_desired),
+        "lastControllerFailure": terminal_failures.get(view.config.epic_id.as_str()),
+        "deferred": deferred_reasons,
         "identity": identity,
         "herdrLayout": herdr_layout,
         "title": view.config.title,

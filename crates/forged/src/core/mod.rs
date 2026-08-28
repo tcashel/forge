@@ -12,6 +12,7 @@ mod claimnext;
 mod drive;
 mod epic;
 pub(crate) mod handoff;
+pub(crate) mod health;
 pub(crate) mod herdr_layout;
 pub(crate) mod herdr_ownership;
 pub(crate) mod herdr_projection;
