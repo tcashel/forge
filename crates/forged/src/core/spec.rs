@@ -19,7 +19,7 @@
 
 use std::path::Path;
 
-use forged_beads::{BdError, IssueSummary};
+use forged_beads::IssueSummary;
 use forged_ledger::SpecFence;
 use forged_types::{ErrorCode, SpecRef};
 
@@ -182,34 +182,6 @@ fn sha256_bytes(bytes: &[u8]) -> String {
     hex
 }
 
-/// A bd read that failed on the spec path is never drift and never
-/// terminal for the run: bd's answer, or its silence, says nothing about
-/// whether the spec changed. `SpecDrift` is deliberately unreachable here.
-///
-/// Only a call bd never ANSWERED is recoverable ([`BdError::is_transport`]).
-/// A deleted or mistyped bead id is a refusal, not an outage: charging it to
-/// the bounded budget would burn every retry and its backoff before the run
-/// reported the one thing the operator can act on. The `transport:` prefix
-/// is load-bearing — it is what classifies a stored fail note as transport —
-/// so only a genuinely unanswered call may carry it.
-pub(crate) fn read_failure(context: &str, err: BdError) -> Failure {
-    let code = match &err {
-        BdError::Contention { .. } => ErrorCode::BeadsContention,
-        _ => ErrorCode::BeadsError,
-    };
-    let recoverable = err.is_transport();
-    let label = if recoverable {
-        "transport"
-    } else {
-        "bd refused"
-    };
-    Failure {
-        code,
-        message: format!("{label}: {context}: {err}"),
-        recoverable,
-    }
-}
-
 /// The refusal a bead carrying no spec earns.
 ///
 /// It names the bead and EVERY required field that bead left empty, so one
@@ -223,11 +195,10 @@ fn no_spec_refusal(bead_id: &str, missing: &[&'static str]) -> Failure {
     ))
 }
 
-/// Read one bead, budgeting exactly one bd call.
+/// Read one work item from the ledger-native store (formerly one budgeted
+/// bd call; an in-process read has no transport failure mode to budget).
 pub(crate) async fn read_bead(ctx: &Ctx, bead_id: &str) -> Result<IssueSummary, Failure> {
-    forged_beads::show_issue(&ctx.config.bd_config(), bead_id)
-        .await
-        .map_err(|err| read_failure(&format!("reading bead {bead_id}"), err))
+    crate::core::workstore::show_issue(&ctx.ledger, bead_id).await
 }
 
 /// Resolve a bead into a spec: one read, rendered body, revision fence.
@@ -481,51 +452,6 @@ mod tests {
         assert!(
             carries_spec(&issue),
             "both required sections present: the bead is the spec"
-        );
-    }
-
-    #[test]
-    fn a_bd_outage_on_the_spec_path_is_recoverable_and_never_drift() {
-        let failure = read_failure(
-            "reading bead bead-1",
-            BdError::Timeout {
-                context: "bd show".to_owned(),
-                after_s: 30,
-            },
-        );
-        assert!(failure.recoverable, "a bd outage must stay retryable");
-        assert_ne!(
-            failure.code,
-            ErrorCode::SpecDrift,
-            "an unreachable bd says nothing about whether the spec changed"
-        );
-        assert!(failure.message.starts_with("transport: "), "{failure}");
-    }
-
-    #[test]
-    fn a_bead_bd_says_does_not_exist_fails_fast_instead_of_burning_the_budget() {
-        // bd 1.2.1's probe-verified refusal for an unknown id: exit 1 with
-        // the envelope still delivered. A deleted or mistyped bead id must
-        // reach the operator now, not after three backoffs.
-        let failure = read_failure(
-            "reading bead bead-typo",
-            BdError::Beads {
-                context: "bd show bead-typo".to_owned(),
-                exit: Some(1),
-                stdout: "{\"data\":{\"error\":\"no issues found matching the provided IDs\"},\
-                         \"schema_version\":1}\n"
-                    .to_owned(),
-                stderr: "Error fetching bead-typo: no issue found".to_owned(),
-            },
-        );
-        assert!(
-            !failure.recoverable,
-            "a bead that does not exist is an answer, not an outage: {failure}"
-        );
-        assert_ne!(failure.code, ErrorCode::SpecDrift);
-        assert!(
-            !failure.message.starts_with("transport: "),
-            "the transport prefix classifies a stored fail note: {failure}"
         );
     }
 

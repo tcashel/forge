@@ -1,5 +1,5 @@
 //! CLI/MCP parity (the two-adapters-over-one-core criterion): for each of
-//! the forty-six public core functions, the CLI path and the MCP tool path produce
+//! the fifty-six public core functions, the CLI path and the MCP tool path produce
 //! identical `OperationResponse` values — modulo the minted `operationId` —
 //! from the same core call.
 
@@ -68,12 +68,16 @@ fn doctor_shape(envelope: &Value) -> Value {
 }
 
 #[test]
-fn all_forty_six_tools_match_their_cli_counterparts() {
+fn all_fifty_six_tools_match_their_cli_counterparts() {
     let env = TestEnv::new("forged-parity");
     env.forged(&["init"]);
     fabricate_run(&env, "par-repository");
     let repository = env.repos.repo.to_string_lossy().into_owned();
     env.set_bead_repository("bead-par-repository", &repository);
+    // The fixture bead exists for repository projections only; park it so
+    // the claim_next parity leg still sees an empty ready frontier (the
+    // ledger frontier is a query over open unassigned items).
+    env.set_bead_field("bead-par-repository", "status", "blocked");
     let mut mcp = McpClient::new(&env);
 
     // The server declares exactly the public operation tools.
@@ -126,9 +130,19 @@ fn all_forty_six_tools_match_their_cli_counterparts() {
         "work_list",
         "work_history",
         "work_map",
+        "work_create",
+        "work_update",
+        "work_link",
+        "work_close",
+        "work_reopen",
+        "work_release",
+        "work_supersede",
+        "work_revert",
+        "work_show",
+        "work_ready",
     ];
     expected.sort_unstable();
-    assert_eq!(tools, expected, "the forty-six tools, exactly");
+    assert_eq!(tools, expected, "the fifty-six tools, exactly");
 
     let overview_tool = mcp.tool("overview");
     assert_eq!(

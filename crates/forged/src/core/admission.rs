@@ -535,7 +535,7 @@ async fn admit_once(
         .collect::<Vec<_>>();
     // Exactly one bounded read, regardless of candidate count.
     let (issues, input_error) =
-        match forged_beads::list_issues(&ctx.config.bd_config(), &bead_ids).await {
+        match crate::core::workstore::list_issues(&ctx.ledger, &bead_ids).await {
             Ok(issues) => (issues, None),
             Err(error) => (Vec::new(), Some(bounded_input_error(error))),
         };
@@ -710,8 +710,8 @@ async fn admit_packet_facts_once(
             }),
         });
     }
-    let (issues, input_error) = match forged_beads::list_issues(
-        &ctx.config.bd_config(),
+    let (issues, input_error) = match crate::core::workstore::list_issues(
+        &ctx.ledger,
         std::slice::from_ref(&packet.bead_id),
     )
     .await

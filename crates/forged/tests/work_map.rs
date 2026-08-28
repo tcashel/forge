@@ -79,6 +79,7 @@ fn map_preserves_plan_twins_multiple_executions_and_native_edge_direction() {
     env.set_bead_field("plan-next", "title", "Next plan");
     env.set_bead_field("plan-next", "status", "blocked");
     env.set_bead_field("plan-next", "parent", "epic-boundary");
+    env.set_bead_repository("epic-boundary", "/tmp/a-different-repository");
     env.set_bead_field(
         "plan-next",
         "dependencies",
@@ -88,7 +89,6 @@ fn map_preserves_plan_twins_multiple_executions_and_native_edge_direction() {
     env.set_bead_field("other-repo", "status", "open");
     env.set_bead_repository("other-repo", "/tmp/a-different-repository");
 
-    let before = env.bd_calls().len();
     let (code, response) = env.forged(&[
         "work",
         "map",
@@ -175,20 +175,8 @@ fn map_preserves_plan_twins_multiple_executions_and_native_edge_direction() {
     assert_eq!(rows["plan:epic-boundary"]["contextOnly"], true);
     assert_eq!(rows["plan:foundation-boundary"]["contextOnly"], true);
 
-    let calls = &env.bd_calls()[before..];
-    assert_eq!(
-        calls.len(),
-        2,
-        "one discovery plus one union hydrate: {calls:?}"
-    );
-    assert!(calls[0].starts_with("list --status open,in_progress,blocked,deferred"));
-    assert!(calls[1].starts_with("show "), "{calls:?}");
-    assert!(!calls.iter().any(|call| {
-        call.starts_with("ready")
-            || call.starts_with("update")
-            || call.starts_with("heartbeat")
-            || call.contains("graph")
-    }));
+    // The bounded discovery-plus-hydrate contract is structural in the
+    // in-process store; no argv trace exists to count.
 }
 
 /// `supersedes` survives the map as itself. Collapsing it into `related`
@@ -209,6 +197,9 @@ fn a_supersedes_edge_keeps_its_native_kind_and_direction() {
         r#"[{"id":"plan-superseded","dependency_type":"supersedes","status":"open"}]"#,
     );
     env.set_bead_repository("plan-replacement", &repository);
+    // The superseded bead must be genuinely outside the hydrated scope for
+    // the boundary-context claim to mean anything.
+    env.set_bead_repository("plan-superseded", "/tmp/a-different-repository");
 
     let (code, response) = env.forged(&[
         "work",
@@ -257,7 +248,7 @@ fn a_supersedes_edge_keeps_its_native_kind_and_direction() {
 }
 
 #[test]
-fn epic_scope_unions_native_and_legacy_children_in_three_reads() {
+fn epic_scope_unions_native_and_legacy_children() {
     let env = TestEnv::new("forged-work-map-epic");
     env.forged(&["init"]);
     env.set_bead_field("epic-map", "type", "epic");
@@ -275,13 +266,6 @@ fn epic_scope_unions_native_and_legacy_children_in_three_reads() {
         r#"[{"id":"epic-map","dependency_type":"parent-child","status":"open"}]"#,
     );
     env.set_bead_field("legacy-child", "status", "open");
-    std::fs::write(
-        env.beads_dir.join("shim-state/epic-map.children"),
-        "native-child\n",
-    )
-    .expect("native children fixture");
-
-    let before = env.bd_calls().len();
     let (code, response) = env.forged(&["work", "map", "--scope", "epic", "--epic-id", "epic-map"]);
     assert_eq!(code, 0, "epic map: {response}");
     let rows = nodes(&response);
@@ -299,41 +283,27 @@ fn epic_scope_unions_native_and_legacy_children_in_three_reads() {
         "byte-identical native coordinates are emitted once with both origins"
     );
     edge(&response, "plan:epic-map", "related", "plan:legacy-child");
-    let calls = &env.bd_calls()[before..];
-    assert_eq!(
-        calls.len(),
-        3,
-        "children, root, and union hydrate: {calls:?}"
-    );
-    assert!(
-        calls[0].starts_with("list --parent epic-map --status open,in_progress,blocked,deferred")
-    );
-    assert!(calls[0].contains("--limit 251 --max-rows 251"));
-    assert!(calls[1].starts_with("show epic-map --json"));
-    assert!(calls[2].starts_with("show "));
 }
 
 #[test]
-fn beads_outage_keeps_durable_identity_and_marks_unresolved_coordinate() {
+fn a_run_whose_plan_bead_is_absent_marks_an_unresolved_coordinate() {
     let env = TestEnv::new("forged-work-map-outage");
     env.forged(&["init"]);
     fabricate_run(&env, "outage-run");
-    env.set_bd_list_unreachable(true);
-    let before = env.bd_calls().len();
 
     let (code, response) = env.forged(&["work", "map", "--source", "durable"]);
-    assert_eq!(code, 0, "Beads outage is source degradation: {response}");
+    assert_eq!(code, 0, "the store answers: {response}");
     assert_eq!(
         response["result"]["sourceHealth"]["ledger"]["state"],
         "available"
     );
     assert_eq!(
         response["result"]["sourceHealth"]["beads"]["state"],
-        "unavailable"
+        "available"
     );
     assert_eq!(
         response["result"]["sourceHealth"]["plan"]["state"],
-        "unavailable"
+        "available"
     );
     let rows = nodes(&response);
     assert!(rows.contains_key("run:outage-run"), "{response}");
@@ -344,11 +314,6 @@ fn beads_outage_keeps_durable_identity_and_marks_unresolved_coordinate() {
     assert_eq!(
         response["result"]["graphHealth"]["danglingTargets"][0],
         json!({"schema":"forged.work-ref/1","kind":"plan","id":"bead-outage-run"})
-    );
-    assert_eq!(
-        env.bd_calls()[before..].len(),
-        1,
-        "failed discovery is not retried per node"
     );
 }
 
@@ -387,8 +352,6 @@ fn graph_cap_refuses_without_returning_a_partial_map() {
     for id in ["plan-a", "plan-b", "plan-c"] {
         env.set_bead_field(id, "status", "open");
     }
-    let before = env.bd_calls().len();
-
     let (code, response) = env.forged(&["work", "map", "--max-nodes", "2"]);
     assert_ne!(code, 0, "cap overflow must refuse: {response}");
     assert_eq!(response["error"]["code"], "GRAPH_SCOPE_TOO_LARGE");
@@ -396,10 +359,13 @@ fn graph_cap_refuses_without_returning_a_partial_map() {
     assert!(response["error"]["message"]
         .as_str()
         .is_some_and(|message| message.contains("narrow scope")));
-    assert_eq!(
-        env.bd_calls()[before..].len(),
-        2,
-        "bounded N+1 discovery and one hydrate only"
+    // The N+1 discovery contract, at the one surface that states it: the
+    // bound is proved by discovering exactly limit+1, never the whole store.
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("at least 3 live-plan nodes")),
+        "the refusal reports the N+1 probe, not a full count: {response}"
     );
 }
 

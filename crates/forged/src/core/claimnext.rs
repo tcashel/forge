@@ -157,8 +157,6 @@ pub async fn claim_next(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
 }
 
 async fn claim_next_effect(ctx: &Ctx, holder: &str) -> Result<Value, Failure> {
-    let bd = ctx.config.bd_config();
-
     // 1. Resume from forged's own ledger first — every resumable candidate
     //    in ledger order, until one of them actually resumes.
     for candidate in find_resumables(ctx).await? {
@@ -168,26 +166,32 @@ async fn claim_next_effect(ctx: &Ctx, holder: &str) -> Result<Value, Failure> {
         // The ONE lease identity for this run: whatever forged already holds
         // the bead under, else the derived holder. Never a second, differing
         // identity of our own making.
-        let run_holder_id = lease_identity(&bd, &candidate.bead_id, &candidate.run_id).await?;
-        let older_than = forged_beads::reclaim_older_than(candidate.stage_budget_s);
+        let run_holder_id =
+            lease_identity(&ctx.ledger, &candidate.bead_id, &candidate.run_id).await?;
+        let older_than = forged_ledger::work_reclaim_older_than(candidate.stage_budget_s);
 
         // Scoped reclaim — `--id` and `--assignee` both mandatory; an
         // unscoped reclaim would rob every other worker. The previous holder
         // named here is that one identity, so the reclaim can only ever take
         // back forged's own expired lease.
-        failpoint::hit("bd.reclaim.before");
-        let outcome =
-            forged_beads::reclaim(&bd, &candidate.bead_id, &run_holder_id, older_than).await?;
-        failpoint::hit("bd.reclaim.after");
+        failpoint::hit("work.reclaim.before");
+        let previous_owner = crate::core::workstore::reclaim(
+            &ctx.ledger,
+            &candidate.bead_id,
+            &run_holder_id,
+            older_than,
+        )
+        .await?;
+        failpoint::hit("work.reclaim.after");
         // On the refusal shape (`previous_owner: None`, nothing reclaimed)
         // only the two whitelisted branches resume — see `resume_decision`.
-        let current = if outcome.previous_owner.is_some() {
+        let current = if previous_owner.is_some() {
             None
         } else {
-            forged_beads::lease_holder(&bd, &candidate.bead_id).await?
+            crate::core::workstore::lease_holder(&ctx.ledger, &candidate.bead_id).await?
         };
         let retake = match resume_decision(
-            outcome.previous_owner.as_deref(),
+            previous_owner.as_deref(),
             current.as_deref(),
             &run_holder_id,
         ) {
@@ -199,9 +203,10 @@ async fn claim_next_effect(ctx: &Ctx, holder: &str) -> Result<Value, Failure> {
         };
         if retake {
             // (Re-)take the lease under that same one identity.
-            failpoint::hit("bd.claim.before");
-            forged_beads::claim_specific(&bd, &candidate.bead_id, &run_holder_id).await?;
-            failpoint::hit("bd.claim.after");
+            failpoint::hit("work.claim.before");
+            crate::core::workstore::claim_specific(&ctx.ledger, &candidate.bead_id, &run_holder_id)
+                .await?;
+            failpoint::hit("work.claim.after");
         }
         // Allocate only after the lease decision. A foreign live lease is a
         // skipped candidate, not capacity ownership; reserving before that
@@ -337,9 +342,9 @@ async fn claim_next_effect(ctx: &Ctx, holder: &str) -> Result<Value, Failure> {
         actor = %FRONTIER_HOLDER,
         "frontier claim: the bd actor is the derived pre-run identity"
     );
-    failpoint::hit("bd.claim.before");
-    let claimed = forged_beads::claim_ready(&bd, FRONTIER_HOLDER).await?;
-    failpoint::hit("bd.claim.after");
+    failpoint::hit("work.claim.before");
+    let claimed = crate::core::workstore::claim_ready(&ctx.ledger, FRONTIER_HOLDER).await?;
+    failpoint::hit("work.claim.after");
     Ok(match claimed {
         None => json!({"claimed": null}),
         Some(bead) => json!({

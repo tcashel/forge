@@ -99,6 +99,7 @@ fn expire_latest_retry(env: &TestEnv, run: &str) {
 fn push_transport_retries_are_bounded_then_stop_as_input_required() {
     let env = TestEnv::new("forged-push-retry");
     assert_eq!(env.forged(&["init"]).0, 0);
+    env.seed_frontier("bead-push-retry");
     let repo = env.repos.repo.to_string_lossy().into_owned();
     let spec = env.spec.to_string_lossy().into_owned();
     let (code, started) = env.forged(&[
@@ -470,6 +471,14 @@ fn reach_rolling_planning_boundary(env: &TestEnv) -> usize {
     env.set_bead_field("child-stub", "dependencies", "[]");
     env.set_bead_field("child-stub", "priority", "0");
     env.set_bead_field("child-next", "priority", "4");
+    // `ready: false` no longer withholds an open child: readiness is a store
+    // query. Hold child-next off the frontier the way the graph does, so the
+    // release in `start_rolling_plan` is a real state change.
+    env.set_bead_field(
+        "child-next",
+        "dependencies",
+        r#"[{"id":"child-next-blocker","dependency_type":"blocks","status":"open"}]"#,
+    );
     assert_eq!(env.forged(&["init"]).0, 0);
     let repo = env.repos.repo.to_string_lossy().into_owned();
     let (code, started) = env.forged(&[
@@ -510,9 +519,29 @@ fn reach_rolling_planning_boundary(env: &TestEnv) -> usize {
     env.gh_calls().len()
 }
 
+/// How many guarded planning applies landed for one work item — the
+/// transactional witness the bd argv count used to approximate.
+fn planning_applies(env: &TestEnv, work_id: &str) -> usize {
+    let ledger = env.ledger();
+    let count = ledger
+        .list_events(None, 0, 65_536)
+        .expect("work.updated events")
+        .into_iter()
+        .filter(|event| {
+            event.kind == "work.updated"
+                && serde_json::from_str::<Value>(&event.payload_json).is_ok_and(|payload| {
+                    payload["workId"] == json!(work_id)
+                        && payload["verb"] == json!("planning-apply")
+                })
+        })
+        .count();
+    ledger.close().expect("close ledger");
+    count
+}
+
 fn start_rolling_plan(env: &TestEnv) -> usize {
     let gh_before_plan = reach_rolling_planning_boundary(env);
-    env.seed_frontier("child-next");
+    env.set_bead_field("child-next-blocker", "status", "closed");
     let (code, planning) = env.forged(&["epic", "advance", "--epic", "epic-rolling"]);
     assert_eq!(code, 0, "planning dispatch: {planning}");
     assert_eq!(
@@ -684,8 +713,7 @@ fn rolling_epic_assures_the_exact_draft_pr_head_before_completion() {
         .iter()
         .all(|line| { !line.starts_with("epic-assurance-epic-assurance/implementation/") }));
     assert_eq!(
-        std::fs::read_to_string(env.beads_dir.join("shim-state/epic-assurance.status"))
-            .expect("root status"),
+        env.bead_status("epic-assurance"),
         "open",
         "internal assurance must not mutate or resolve the root Bead"
     );
@@ -748,21 +776,38 @@ fn three_submitted_rolling_epics_converge_below_capacity_with_one_isolated_crux(
         assert_eq!(code, 0, "rolling start {epic}: {started}");
     }
 
-    // Hold the first real review inside the one remaining admission slot.
-    // The competing siblings stay durable while the capacity fence is live.
-    env.set_scenario("reviewclaude", "wait-release", 1);
+    // Hold EVERY first review: the two admitted runs park inside their
+    // held reviews so both slots stay occupied, and the third run's
+    // admission defers deterministically instead of winning a spawn race.
+    env.set_scenario("reviewclaude", "wait-release", 3);
     for (epic, _) in epics {
         let (code, submitted) = env.forged(&["epic", "submit", "--epic", epic]);
         assert_eq!(code, 0, "epic submit {epic}: {submitted}");
         assert_eq!(submitted["result"]["submitted"], json!(true));
     }
+    // Two fence facts must become observable, not merely the first: the held
+    // review starting proves one epic won a slot, and a durable Deferred
+    // decision proves a sibling hit the capacity fence. The siblings'
+    // controllers can lag the winner on a slow host, so wait for each fact
+    // on its own clock instead of reading the decisions the instant the
+    // review starts.
     let mut review_started = false;
-    for _ in 0..600 {
-        review_started = env
-            .provider_log()
-            .iter()
-            .any(|line| line.contains("/review-1/0 start "));
-        if review_started {
+    let mut deferred = 0_usize;
+    for _ in 0..1_200 {
+        review_started = review_started
+            || env
+                .provider_log()
+                .iter()
+                .any(|line| line.contains("/review-1/0 start "));
+        let ledger = env.ledger();
+        deferred = ledger
+            .latest_admission_decisions(None, None)
+            .expect("admission decisions")
+            .into_iter()
+            .filter(|decision| decision.outcome == forged_types::AdmissionOutcome::Deferred)
+            .count();
+        ledger.close().expect("close ledger");
+        if review_started && deferred > 0 {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -771,18 +816,60 @@ fn three_submitted_rolling_epics_converge_below_capacity_with_one_isolated_crux(
         review_started,
         "one submitted epic reached assurance review"
     );
-    let ledger = env.ledger();
-    let deferred = ledger
-        .latest_admission_decisions(None, None)
-        .expect("admission decisions")
-        .into_iter()
-        .filter(|decision| decision.outcome == forged_types::AdmissionOutcome::Deferred)
-        .count();
-    ledger.close().expect("close ledger");
-    assert!(
-        deferred > 0,
-        "the below-N workload must exercise the durable capacity fence"
-    );
+    if deferred == 0 {
+        // The fence never recorded a deferral: name every decision and each
+        // epic's projected state so the failing host explains itself.
+        let ledger = env.ledger();
+        let decisions = ledger
+            .latest_admission_decisions(None, None)
+            .expect("admission decisions");
+        ledger.close().expect("close ledger");
+        let statuses: Vec<String> = epics
+            .iter()
+            .map(|(epic, _)| {
+                let (_, status) = env.forged(&["epic", "status", "--epic", epic]);
+                format!("{epic}: {status}")
+            })
+            .collect();
+        let mut evidence = String::new();
+        for (epic, _) in epics {
+            let controller = env
+                .anvil
+                .join("runs")
+                .join(epic)
+                .join("controller/controller-1.log");
+            let log = std::fs::read_to_string(&controller).unwrap_or_default();
+            let tail: Vec<&str> = log.lines().rev().take(30).collect();
+            evidence.push_str(&format!("--- {epic} controller tail ---\n"));
+            for line in tail.iter().rev() {
+                evidence.push_str(line);
+                evidence.push('\n');
+            }
+            let attempts = env
+                .anvil
+                .join("runs")
+                .join(format!("{epic}-epic-assurance"))
+                .join("packets/review-1/0/attempts");
+            if let Ok(entries) = std::fs::read_dir(&attempts) {
+                for entry in entries.flatten() {
+                    for file in ["result.json", ".provider-stream-status.json"] {
+                        let path = entry.path().join(file);
+                        if let Ok(body) = std::fs::read_to_string(&path) {
+                            evidence.push_str(&format!("--- {} ---\n{body}\n", path.display()));
+                        }
+                    }
+                }
+            }
+        }
+        panic!(
+            "the below-N workload must exercise the durable capacity fence\n\
+             decisions: {decisions:?}\n\
+             provider log: {:?}\n\
+             {}\n{evidence}",
+            env.provider_log(),
+            statuses.join("\n"),
+        );
+    }
 
     // The held round returns its ordinary finding. Its next review is the one
     // CRUX; after that terminal input releases capacity for both siblings.
@@ -1625,11 +1712,7 @@ fn resolving_pre_cycle_planning_stop_never_opens_the_placeholder() {
         .all(|event| event.kind != "forged.epic.plan.started"));
 
     env.set_bead_field("child-stub", "dependencies", "[]");
-    let updates_before = env
-        .bd_calls()
-        .into_iter()
-        .filter(|call| call.starts_with("update child-stub "))
-        .count();
+    let updates_before = planning_applies(&env, "child-stub");
     let (code, resolved) = env.forged(&[
         "epic",
         "resolve",
@@ -1642,18 +1725,14 @@ fn resolving_pre_cycle_planning_stop_never_opens_the_placeholder() {
     ]);
     assert_eq!(code, 0, "resolve pre-cycle drift: {resolved}");
     assert_eq!(
-        std::fs::read_to_string(env.beads_dir.join("shim-state/child-stub.status"))
-            .expect("stub status"),
+        env.bead_status("child-stub"),
         "blocked",
         "resolution must not materialize the placeholder"
     );
     assert_eq!(
-        env.bd_calls()
-            .iter()
-            .filter(|call| call.starts_with("update child-stub "))
-            .count(),
+        planning_applies(&env, "child-stub"),
         updates_before,
-        "pre-cycle resolution performs no Beads write"
+        "pre-cycle resolution performs no guarded apply"
     );
 
     let (code, restarted) = env.forged(&["epic", "advance", "--epic", "epic-rolling"]);
@@ -1940,7 +2019,18 @@ fn adjudicating_internal_plan_settlement_never_mutates_the_parent_epic_bead() {
         )
         .expect("legacy missing-identity controller evidence");
     ledger.close().expect("close ledger");
-    let before = env.bd_calls();
+    let mutations = |env: &TestEnv| {
+        let ledger = env.ledger();
+        let count = ledger
+            .list_events(None, 0, 65_536)
+            .expect("events")
+            .into_iter()
+            .filter(|event| event.kind == "work.updated")
+            .count();
+        ledger.close().expect("close ledger");
+        count
+    };
+    let before = mutations(&env);
 
     let (code, settled) = env.forged(&[
         "run",
@@ -1971,19 +2061,12 @@ fn adjudicating_internal_plan_settlement_never_mutates_the_parent_epic_bead() {
         "the internal planning artifact directory is preserved"
     );
     assert_eq!(
-        env.bd_calls(),
+        mutations(&env),
         before,
-        "adjudication performs no parent or child Beads mutation"
+        "adjudication performs no parent or child work mutation"
     );
-    let state = env.beads_dir.join("shim-state");
-    assert_eq!(
-        std::fs::read_to_string(state.join("epic-rolling.status")).expect("epic status"),
-        "open"
-    );
-    assert_eq!(
-        std::fs::read_to_string(state.join("child-stub.status")).expect("child status"),
-        "blocked"
-    );
+    assert_eq!(env.bead_status("epic-rolling"), "open");
+    assert_eq!(env.bead_status("child-stub"), "blocked");
 
     let (code, held) = env.forged(&["epic", "advance", "--epic", "epic-rolling"]);
     assert_eq!(code, 0, "epic consumes internal stop: {held}");
@@ -2003,17 +2086,13 @@ fn rolling_epic_plans_applies_and_opens_the_next_wave_without_manual_handoff() {
     );
     assert!(!env.worktree("child-stub-epic-plan").exists());
     assert_eq!(env.gh_calls().len(), gh_before_plan);
-    let state = env.beads_dir.join("shim-state");
+    assert_eq!(env.bead_status("child-stub"), "open");
     assert_eq!(
-        std::fs::read_to_string(state.join("child-stub.status")).expect("status"),
-        "open"
-    );
-    assert_eq!(
-        std::fs::read_to_string(state.join("child-stub.description")).expect("description"),
+        env.bead_field("child-stub", "description"),
         "planned context and outcome"
     );
     assert_eq!(
-        std::fs::read_to_string(state.join("child-stub.acceptance")).expect("acceptance"),
+        env.bead_field("child-stub", "acceptance"),
         "planned observable acceptance"
     );
     let (_, status) = env.forged(&["epic", "status", "--epic", "epic-rolling"]);
@@ -2055,7 +2134,6 @@ fn rolling_epic_plans_applies_and_opens_the_next_wave_without_manual_handoff() {
         planned["planning"]["result"]["traceability"]["requirements"][0],
         json!("preserve the frozen epic outcome")
     );
-    env.seed_frontier("child-stub");
 
     let (code, wave) = env.forged(&["epic", "advance", "--epic", "epic-rolling"]);
     assert_eq!(code, 0, "automatic continuation: {wave}");
@@ -2064,15 +2142,13 @@ fn rolling_epic_plans_applies_and_opens_the_next_wave_without_manual_handoff() {
         json!(["child-stub", "child-next"]),
         "the applied stub becomes the next frozen wave without resolve/resubmit"
     );
-    let calls = env.bd_calls();
-    assert!(calls
-        .iter()
-        .any(|call| { call.contains("ready --parent epic-rolling --limit 0 --json") }));
-    assert!(calls.iter().any(|call| {
-        call.contains("update child-stub")
-            && call.contains("--if-status blocked")
-            && call.contains("--if-assignee")
-    }));
+    // The frontier read is an in-process query with no wire form; the
+    // guarded apply's transaction is its own witness.
+    assert_eq!(
+        planning_applies(&env, "child-stub"),
+        1,
+        "exactly one guarded apply landed"
+    );
 }
 
 #[test]
@@ -2092,8 +2168,7 @@ fn dirty_planning_worktree_blocks_apply_and_preserves_child_artifacts() {
     assert_eq!(held["result"]["stopped"]["childId"], json!("child-stub"));
     assert!(worktree.exists(), "dirty artifacts remain for adjudication");
     assert_eq!(
-        std::fs::read_to_string(env.beads_dir.join("shim-state/child-stub.status"))
-            .expect("stub status"),
+        env.bead_status("child-stub"),
         "blocked",
         "no Beads mutation crosses the dirty-worktree gate"
     );
@@ -2169,18 +2244,14 @@ fn assigned_blocked_stub_blocks_apply_and_preserves_child_artifacts() {
         "custody refusal preserves plan artifacts"
     );
     assert_eq!(
-        std::fs::read_to_string(env.beads_dir.join("shim-state/child-stub.status"))
-            .expect("stub status"),
+        env.bead_status("child-stub"),
         "blocked",
-        "no Beads mutation crosses the custody gate"
+        "no work mutation crosses the custody gate"
     );
     assert_eq!(
-        env.bd_calls()
-            .iter()
-            .filter(|call| call.starts_with("update child-stub "))
-            .count(),
+        planning_applies(&env, "child-stub"),
         0,
-        "custody refusal performs no guarded update"
+        "custody refusal performs no guarded apply"
     );
 }
 
@@ -2202,12 +2273,9 @@ fn structural_stub_drift_blocks_apply_with_exact_checkpoint_evidence() {
     assert!(held["result"]["stopped"]["evidence"]["observed"]["targetSnapshot"].is_object());
     assert!(worktree.exists(), "drift preserves planning artifacts");
     assert_eq!(
-        env.bd_calls()
-            .iter()
-            .filter(|call| call.starts_with("update child-stub "))
-            .count(),
+        planning_applies(&env, "child-stub"),
         0,
-        "structural drift performs no Beads write"
+        "structural drift performs no guarded apply"
     );
 }
 
@@ -2220,7 +2288,7 @@ fn root_drift_before_planning_checkpoint_stops_against_frozen_contract() {
         "description",
         "Changed outside the frozen epic contract",
     );
-    env.seed_frontier("child-next");
+    env.set_bead_field("child-next-blocker", "status", "closed");
 
     let (code, held) = env.forged(&["epic", "advance", "--epic", "epic-rolling"]);
     assert_eq!(code, 0, "root drift becomes typed epic input: {held}");
@@ -2251,7 +2319,7 @@ fn root_revision_only_churn_does_not_hold_planning_or_apply() {
         frozen_revision,
         "the unchanged semantic root must still receive a new write token"
     );
-    env.seed_frontier("child-next");
+    env.set_bead_field("child-next-blocker", "status", "closed");
 
     let (code, planning) = env.forged(&["epic", "advance", "--epic", "epic-rolling"]);
     assert_eq!(
@@ -2296,9 +2364,9 @@ fn resolving_post_apply_implementation_failure_uses_ordinary_child_reset() {
     prepare_reviewed_rolling_plan(&env);
     let (code, applied) = env.forged(&["epic", "advance", "--epic", "epic-rolling"]);
     assert_eq!(code, 0, "apply plan: {applied}");
-    std::fs::write(env.beads_dir.join("shim-state/frontier"), "")
-        .expect("isolate post-apply child wave");
-    env.seed_frontier("child-stub");
+    // Isolate the post-apply wave to the planned stub: hold the sibling off
+    // the frontier again now that the apply has opened child-stub.
+    env.set_bead_field("child-next", "status", "blocked");
     let (code, wave) = env.forged(&["epic", "advance", "--epic", "epic-rolling"]);
     assert_eq!(code, 0, "post-plan wave: {wave}");
     env.set_scenario("implement", "wait-release", 1);
@@ -2372,22 +2440,13 @@ fn rolling_plan_apply_recovers_exact_post_image_without_a_second_beads_write() {
         "the process must abort after the Beads write"
     );
 
-    let state = env.beads_dir.join("shim-state");
+    assert_eq!(env.bead_status("child-stub"), "open");
     assert_eq!(
-        std::fs::read_to_string(state.join("child-stub.status")).expect("status"),
-        "open"
-    );
-    assert_eq!(
-        std::fs::read_to_string(state.join("child-stub.description")).expect("description"),
+        env.bead_field("child-stub", "description"),
         "planned context and outcome"
     );
-    let update_count = || {
-        env.bd_calls()
-            .iter()
-            .filter(|call| call.starts_with("update child-stub "))
-            .count()
-    };
-    assert_eq!(update_count(), 1, "the guarded Beads write landed once");
+    let update_count = || planning_applies(&env, "child-stub");
+    assert_eq!(update_count(), 1, "the guarded apply landed once");
     let ledger = env.ledger();
     let applied_before = ledger
         .list_events(Some("epic-rolling"), 0, 65_536)
@@ -2430,7 +2489,6 @@ fn rolling_plan_apply_recovers_exact_post_image_without_a_second_beads_write() {
         recovered["result"]["progress"]["postDigest"]
     );
 
-    env.seed_frontier("child-stub");
     let (code, wave) = env.forged(&["epic", "advance", "--epic", "epic-rolling"]);
     assert_eq!(code, 0, "automatic continuation: {wave}");
     assert_eq!(
@@ -2737,6 +2795,7 @@ fn epic_fanout_obeys_repository_write_capacity_for_detached_child_attempts() {
 fn interventions_cross_a_durable_boundary_and_sessions_stay_observable() {
     let env = TestEnv::new("forged-session-boundary");
     assert_eq!(env.forged(&["init"]).0, 0);
+    env.seed_frontier("bead-session");
     let repo = env.repos.repo.to_string_lossy().into_owned();
     let spec = env.spec.to_string_lossy().into_owned();
     let (code, started) = env.forged(&[
@@ -2830,6 +2889,7 @@ fn a_rejected_cross_run_intervention_never_enters_the_target_queue() {
     let repo = env.repos.repo.to_string_lossy().into_owned();
     let spec = env.spec.to_string_lossy().into_owned();
     for bead in ["bead-message-target", "bead-message-owner"] {
+        env.seed_frontier(bead);
         let (code, started) = env.forged(&[
             "run",
             "start",
@@ -2884,6 +2944,7 @@ fn a_rejected_cross_run_intervention_never_enters_the_target_queue() {
 fn concurrent_submit_keys_share_one_controller_generation() {
     let env = TestEnv::new("forged-submit-singleton");
     assert_eq!(env.forged(&["init"]).0, 0);
+    env.seed_frontier("bead-submit-singleton");
     let repo = env.repos.repo.to_string_lossy().into_owned();
     let spec = env.spec.to_string_lossy().into_owned();
     let (code, started) = env.forged(&[
@@ -3108,6 +3169,7 @@ fn repeated_epic_pause_resume_cycles_get_distinct_transition_keys() {
 fn roster_failover_cycles_get_distinct_revision_keys() {
     let env = TestEnv::new("forged-roster-cycles");
     env.forged(&["init"]);
+    env.seed_frontier("bead-roster-cycles");
     env.add_uniform_roster("outage", "codex", "gpt-5.6-sol");
     let repo = env.repos.repo.to_string_lossy().into_owned();
     let spec = env.spec.to_string_lossy().into_owned();
@@ -3149,6 +3211,7 @@ fn roster_failover_cycles_get_distinct_revision_keys() {
 fn run_drive_reaches_done_with_one_draft_pr_and_real_commits() {
     let env = TestEnv::new("forged-e2e");
     let (code, init) = env.forged(&["init"]);
+    env.seed_frontier("bead-e2e");
     assert_eq!(code, 0, "init: {init}");
 
     let repo = env.repos.repo.to_string_lossy().into_owned();
@@ -3296,14 +3359,28 @@ fn run_drive_reaches_done_with_one_draft_pr_and_real_commits() {
         ledger.close().expect("close");
     }
 
-    // The guardian heartbeated the run's lease (per attempt) through bd,
-    // under the derived per-run holder.
-    let beats = env
-        .bd_calls()
-        .iter()
-        .filter(|l| l.starts_with("heartbeat bead-e2e") && l.contains("forged:bead-e2e:0"))
-        .count();
-    assert!(beats >= 1, "guardian heartbeats: {:?}", env.bd_calls());
+    // The run's work lease is held under the ONE derived per-run identity
+    // (`run_holder`), which is what the bd heartbeat argv used to witness.
+    // Renewal itself rides the attempt heartbeat every 25 polls (~5s) and is
+    // covered by the lease-loss self-termination test; a 4-second stage
+    // never reaches a renewal tick.
+    let ledger = env.ledger();
+    let lease = ledger
+        .work_lease("bead-e2e")
+        .expect("lease query")
+        .expect("the run holds its work lease");
+    assert_eq!(lease.holder, "forged:bead-e2e:0");
+    assert_eq!(
+        ledger
+            .work_item("bead-e2e")
+            .expect("work item")
+            .expect("bead")
+            .assignee
+            .as_deref(),
+        Some("forged:bead-e2e:0"),
+        "custody and lease move together under one identity"
+    );
+    ledger.close().expect("close");
 
     // Usage ingestion maps the captured shim streams into ledger rows.
     let (code, ingested) = env.forged(&["usage", "ingest", "--run", "bead-e2e"]);
@@ -3426,6 +3503,7 @@ fn profiles_scale_topology_and_an_explicit_roster_revision_switches_provider_fam
     // Lean proves inexpensive work uses one reviewer and no fix/synthesis.
     let lean = TestEnv::new("forged-profile-lean");
     lean.forged(&["init"]);
+    lean.seed_frontier("bead-lean");
     lean.add_uniform_roster("all-claude", "claude", "opus");
     let repo = lean.repos.repo.to_string_lossy().into_owned();
     let spec = lean.spec.to_string_lossy().into_owned();
@@ -3473,6 +3551,7 @@ fn profiles_scale_topology_and_an_explicit_roster_revision_switches_provider_fam
     // provider roster. The subsequent full run is driven entirely by Codex.
     let switched = TestEnv::new("forged-roster-switch");
     switched.forged(&["init"]);
+    switched.seed_frontier("bead-switch");
     switched.add_uniform_roster("all-codex", "codex", "gpt-5.6-sol");
     let repo = switched.repos.repo.to_string_lossy().into_owned();
     let spec = switched.spec.to_string_lossy().into_owned();
@@ -3543,6 +3622,7 @@ fn profiles_scale_topology_and_an_explicit_roster_revision_switches_provider_fam
 fn transport_failure_advances_to_the_next_candidate_and_lands_once() {
     let env = TestEnv::new("forged-roster-fallback");
     env.forged(&["init"]);
+    env.seed_frontier("bead-fallback");
     env.add_implementation_fallback_roster("fallback");
     let repo = env.repos.repo.to_string_lossy().into_owned();
     let spec = env.spec.to_string_lossy().into_owned();
@@ -3633,6 +3713,7 @@ fn real_provider_timeout_falls_back_to_the_next_candidate() {
     env.append_implementation_candidate("timeout-fallback", "codex", "gpt-5.6-sol");
     env.set_scenario("implement", "hang", 1);
     env.forged(&["init"]);
+    env.seed_frontier("bead-timeout-fallback");
     let repo = env.repos.repo.to_string_lossy().into_owned();
     let spec = env.spec.to_string_lossy().into_owned();
     let (code, started) = env.forged(&[
@@ -3704,6 +3785,7 @@ fn real_provider_timeouts_exhaust_the_frozen_retry_budget() {
     .expect("write timeout config");
     env.set_scenario("implement", "hang", 2);
     env.forged(&["init"]);
+    env.seed_frontier("bead-timeout-exhaustion");
     let repo = env.repos.repo.to_string_lossy().into_owned();
     let spec = env.spec.to_string_lossy().into_owned();
     let (code, started) = env.forged(&[
@@ -3766,6 +3848,7 @@ fn real_provider_timeouts_exhaust_the_frozen_retry_budget() {
 fn roster_revision_resets_transport_fallback_to_its_first_candidate() {
     let env = TestEnv::new("forged-roster-revision-fallback");
     env.forged(&["init"]);
+    env.seed_frontier("bead-revision-fallback");
     env.add_uniform_roster("revised-order", "claude", "opus");
     env.append_implementation_candidate("revised-order", "codex", "gpt-5.6-sol");
     let repo = env.repos.repo.to_string_lossy().into_owned();
@@ -3845,6 +3928,7 @@ fn roster_revision_resets_transport_fallback_to_its_first_candidate() {
 fn high_profile_runs_three_reviews_and_a_synthesis_seat() {
     let env = TestEnv::new("forged-profile-high");
     env.forged(&["init"]);
+    env.seed_frontier("bead-high");
     let repo = env.repos.repo.to_string_lossy().into_owned();
     let spec = env.spec.to_string_lossy().into_owned();
     let (code, started) = env.forged(&[
@@ -3879,6 +3963,8 @@ fn high_profile_runs_three_reviews_and_a_synthesis_seat() {
 fn synthetic_review_failure_is_honest_and_both_new_terminals_accept_risk() {
     let env = TestEnv::new("forged-review-terminal-exits");
     env.forged(&["init"]);
+    env.seed_frontier("bead-review-provenance");
+    env.seed_frontier("bead-done-risk");
     let config_path = env.anvil.join("config.json");
     let mut config: Value =
         serde_json::from_str(&std::fs::read_to_string(&config_path).expect("config"))
@@ -4025,6 +4111,7 @@ fn synthetic_review_failure_is_honest_and_both_new_terminals_accept_risk() {
 fn review_budget_above_one_exhausts_exactly_and_accept_risk_is_durable() {
     let env = TestEnv::new("forged-review-budget");
     env.forged(&["init"]);
+    env.seed_frontier("bead-round-budget");
     let config_path = env.anvil.join("config.json");
     let mut config: Value =
         serde_json::from_str(&std::fs::read_to_string(&config_path).expect("config"))
@@ -4182,6 +4269,7 @@ fn review_budget_above_one_exhausts_exactly_and_accept_risk_is_durable() {
 fn implementer_spec_amendment_stops_before_gate_or_review() {
     let env = TestEnv::new("forged-spec-amendment");
     env.forged(&["init"]);
+    env.seed_frontier("bead-amendment");
     env.set_scenario("implement", "spec-amendment", 1);
     let repo = env.repos.repo.to_string_lossy().into_owned();
     let spec = env.spec.to_string_lossy().into_owned();
@@ -4228,6 +4316,7 @@ fn gate_failure_escalates_once_but_standard_review_never_escalates_topology() {
     // repeated projection/drive without duplicating the transition.
     let gate = TestEnv::new("forged-escalate-gate");
     gate.forged(&["init"]);
+    gate.seed_frontier("bead-gate-edge");
     let config_path = gate.anvil.join("config.json");
     let mut config: Value =
         serde_json::from_str(&std::fs::read_to_string(&config_path).expect("gate config"))
@@ -4283,6 +4372,7 @@ fn gate_failure_escalates_once_but_standard_review_never_escalates_topology() {
     // itself into the high-assurance panel after a review result.
     let conflict = TestEnv::new("forged-escalate-conflict");
     conflict.forged(&["init"]);
+    conflict.seed_frontier("bead-conflict-edge");
     let repo = conflict.repos.repo.to_string_lossy().into_owned();
     let spec = conflict.spec.to_string_lossy().into_owned();
     assert_eq!(
@@ -4333,6 +4423,7 @@ fn gate_failure_escalates_once_but_standard_review_never_escalates_topology() {
 fn pre_policy_run_package_is_migrated_once_and_then_stays_frozen() {
     let env = TestEnv::new("forged-legacy-run-policy");
     assert_eq!(env.forged(&["init"]).0, 0);
+    env.seed_frontier("legacy-policy-run");
     let repo = env.repos.repo.to_string_lossy().into_owned();
     let spec = env.spec.to_string_lossy().into_owned();
     let (code, started) = env.forged(&[
@@ -4444,6 +4535,7 @@ fn pre_policy_run_package_is_migrated_once_and_then_stays_frozen() {
 fn stored_old_policy_with_an_excessive_budget_fails_before_execution() {
     let env = TestEnv::new("forged-old-package-budget-bound");
     assert_eq!(env.forged(&["init"]).0, 0);
+    env.seed_frontier("old-package-budget-bound");
     let repo = env.repos.repo.to_string_lossy().into_owned();
     let spec = env.spec.to_string_lossy().into_owned();
     let (code, started) = env.forged(&[
@@ -4516,6 +4608,7 @@ fn stored_old_policy_with_an_excessive_budget_fails_before_execution() {
 fn pre_upgrade_run_start_operation_replays_with_its_legacy_request_hash() {
     let env = TestEnv::new("forged-legacy-run-start-replay");
     assert_eq!(env.forged(&["init"]).0, 0);
+    env.seed_frontier("legacy-start-replay");
     let repo = env.repos.repo.to_string_lossy().into_owned();
     let spec = env.spec.to_string_lossy().into_owned();
     let args = [
@@ -4704,6 +4797,7 @@ fn pre_snapshot_epic_start_gets_one_package_event_and_remains_driveable() {
 fn run_uses_its_frozen_roster_after_the_authoring_config_changes() {
     let env = TestEnv::new("forged-frozen-roster");
     assert_eq!(env.forged(&["init"]).0, 0);
+    env.seed_frontier("bead-frozen");
     let repo = env.repos.repo.to_string_lossy().into_owned();
     let spec = env.spec.to_string_lossy().into_owned();
     let (code, started) = env.forged(&[
@@ -4780,6 +4874,11 @@ fn epic_roster_revision_updates_current_and_future_children() {
             ("roster-child-two", &env.spec, false),
         ],
     );
+    env.set_bead_field(
+        "roster-child-two",
+        "dependencies",
+        r#"[{"id":"roster-child-two-blocker","dependency_type":"blocks","status":"open"}]"#,
+    );
     assert_eq!(env.forged(&["init"]).0, 0);
     let repo = env.repos.repo.to_string_lossy().into_owned();
     let spec = env.spec.to_string_lossy().into_owned();
@@ -4832,7 +4931,7 @@ fn epic_roster_revision_updates_current_and_future_children() {
     );
 
     env.set_scenario("reviewclaude", "approve", 2);
-    env.seed_frontier("roster-child-two");
+    env.set_bead_field("roster-child-two-blocker", "status", "closed");
     let (code, driven) = env.forged(&["epic", "drive", "--epic", "epic-roster"]);
     assert_eq!(code, 0, "drive revised epic: {driven}");
     let ledger = env.ledger();
@@ -4900,6 +4999,7 @@ fn semantic_failure_consumes_no_transport_budget_and_reclaims() {
     // "no forged-result block".
     let env = TestEnv::new("forged-e2e-semantic");
     env.forged(&["init"]);
+    env.seed_frontier("bead-sem");
     let repo = env.repos.repo.to_string_lossy().into_owned();
     let spec = env.spec.to_string_lossy().into_owned();
     env.forged(&[
@@ -4956,6 +5056,7 @@ fn claude_rate_limit_is_a_free_transport_retry() {
     // small stage budget so the deadline math stays observable.
     let env = TestEnv::new("forged-e2e-transport");
     env.forged(&["init"]);
+    env.seed_frontier("bead-tr");
     let repo = env.repos.repo.to_string_lossy().into_owned();
     let spec = env.spec.to_string_lossy().into_owned();
     env.forged(&[
@@ -5008,6 +5109,7 @@ fn a_provider_that_never_reports_its_pid_is_killed_not_left_unguarded() {
     // budget decides what happens next.
     let env = TestEnv::new("forged-e2e-nopid");
     env.forged(&["init"]);
+    env.seed_frontier("bead-nopid");
     let repo = env.repos.repo.to_string_lossy().into_owned();
     let spec = env.spec.to_string_lossy().into_owned();
     env.forged(&[
@@ -5096,6 +5198,7 @@ fn reconcile_runs_the_ports_end_to_end_on_a_live_run() {
     // forged_proto::reconcile against a real (finished) run.
     let env = TestEnv::new("forged-e2e-reconcile");
     env.forged(&["init"]);
+    env.seed_frontier("bead-rec");
     let repo = env.repos.repo.to_string_lossy().into_owned();
     let spec = env.spec.to_string_lossy().into_owned();
     env.forged(&[
@@ -5454,4 +5557,155 @@ fn explicit_key_releases_never_advance_the_default_start_epoch() {
         json!("op:epic_start:epic-noise:-:1"),
         "{started}"
     );
+}
+
+#[test]
+fn a_reclaimed_work_lease_self_terminates_the_attempt_with_frozen_evidence() {
+    // The two behaviours that replaced the guardian, proved end to end:
+    // (1) the work lease is RENEWED mid-attempt on the 25-beat heartbeat
+    // cadence, and (2) a renewal refused because the lease was reclaimed
+    // out from under the attempt self-terminates it exactly like a
+    // revocation — provider confirmed dead, capture frozen, and the attempt
+    // settled durably so the packet never strands with a live attempt.
+    let env = TestEnv::new("forged-e2e-lease-loss");
+    env.forged(&["init"]);
+    env.seed_frontier("bead-lease-loss");
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let spec = env.spec.to_string_lossy().into_owned();
+    let (code, started) = env.forged(&[
+        "run",
+        "start",
+        "--bead",
+        "bead-lease-loss",
+        "--repo",
+        &repo,
+        "--spec",
+        &spec,
+        "--base-ref",
+        "main",
+    ]);
+    assert_eq!(code, 0, "run start: {started}");
+    env.authorize_run("bead-lease-loss");
+    env.set_scenario("implement", "wait-release", 1);
+
+    // Resolve + open, then execute in the background: the provider holds at
+    // wait-release, so the attempt outlives several heartbeat ticks.
+    for _ in 0..2 {
+        let (code, resp) = env.forged(&["run", "advance", "--run", "bead-lease-loss"]);
+        assert_eq!(code, 0, "run advance: {resp}");
+    }
+    let mut executing = env
+        .forged_cmd(&["run", "advance", "--run", "bead-lease-loss"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("background execute step");
+
+    let lease_of = || {
+        let ledger = env.ledger();
+        let lease = ledger.work_lease("bead-lease-loss").expect("lease read");
+        ledger.close().expect("close");
+        lease
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let initial = loop {
+        if let Some(lease) = lease_of() {
+            break lease;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the executing attempt never took its work lease"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    assert_eq!(initial.holder, "forged:bead-lease-loss:0");
+
+    // (1) Renewal: the 25-beat cadence (~5s at the 200ms poll) pushes
+    // `expires_at` forward while the provider holds.
+    let renew_deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        match lease_of() {
+            Some(lease) if lease.expires_at > initial.expires_at => break,
+            _ => {}
+        }
+        assert!(
+            std::time::Instant::now() < renew_deadline,
+            "the attempt heartbeat never renewed the work lease"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+
+    // (2) Reclaim the lease out from under the live attempt: force expiry
+    // (the scoped reclaim refuses an unexpired lease) and reclaim under the
+    // recorded holder — exactly what a successor's claim-next would do.
+    {
+        let connection =
+            rusqlite::Connection::open(env.anvil.join("state.db")).expect("open state.db");
+        connection
+            .execute(
+                "UPDATE work_leases SET expires_at = '2020-01-01T00:00:00.000000000Z' \
+                 WHERE work_id = 'bead-lease-loss'",
+                [],
+            )
+            .expect("force lease expiry");
+    }
+    let ledger = env.ledger();
+    let reclaimed = ledger
+        .reclaim_work_lease("bead-lease-loss", "forged:bead-lease-loss:0", 0)
+        .expect("scoped reclaim");
+    ledger.close().expect("close");
+    assert_eq!(
+        reclaimed.previous_owner.as_deref(),
+        Some("forged:bead-lease-loss:0"),
+        "the reclaim fired"
+    );
+
+    // The next renewal tick refuses and the attempt self-terminates: the
+    // background execute step exits on its own, no release file ever
+    // written.
+    let exit_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        match executing.try_wait().expect("poll execute step") {
+            Some(_) => break,
+            None => {
+                assert!(
+                    std::time::Instant::now() < exit_deadline,
+                    "the attempt did not self-terminate after lease loss"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+        }
+    }
+
+    // Durable settlement: no live attempt remains, and the failure names
+    // the lease loss.
+    let ledger = env.ledger();
+    let live = ledger
+        .list_live_attempts(Some("bead-lease-loss"))
+        .expect("live");
+    assert!(
+        live.is_empty(),
+        "the packet must not strand with a live attempt: {live:?}"
+    );
+    ledger.close().expect("close");
+    let (_, events) = env.forged(&["events", "--run", "bead-lease-loss"]);
+    let rows = events["result"]["events"]
+        .as_array()
+        .expect("events")
+        .clone();
+    assert!(
+        rows.iter().any(|event| {
+            event["kind"] == json!("attempt.state")
+                && event["payload"]["new"] == json!("failed")
+                && event["payload"]["reason"]
+                    .as_str()
+                    .is_some_and(|reason| reason.starts_with("work lease lost:"))
+        }),
+        "the attempt settled with the lease-loss note: {rows:?}"
+    );
+    // Capture froze: the attempt's provider files were finalized.
+    let manifest = env
+        .packet_dir("bead-lease-loss", "implementation", 0)
+        .join("attempts/1");
+    assert!(manifest.exists(), "the attempt's capture directory exists");
 }

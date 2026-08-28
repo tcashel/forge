@@ -24,13 +24,14 @@ use crate::events::append_event_tx;
 use crate::ledger::Ledger;
 use crate::time::now_iso;
 
-/// The stable refusal message prefix for a claim refused on mechanism (not
-/// contention). Consumers classify on this prefix, mirroring bd's
-/// `CLAIM_REFUSAL_PREFIX` contract.
-pub const WORK_CLAIM_REFUSAL_PREFIX: &str = "claim refused:";
+/// The stable refusal prefix for a claim refused on mechanism (not
+/// contention) — the bd-era spelling VERBATIM, because durable retry rows
+/// already store it in `last_error` and the classifier matches history and
+/// new refusals with one vocabulary.
+pub const WORK_CLAIM_REFUSAL_PREFIX: &str = "issue not claimable: status ";
 
 /// The blocked-claim refusal message, stable for classification.
-pub const WORK_BLOCKED_CLAIM_REFUSAL: &str = "claim refused: work item is blocked";
+pub const WORK_BLOCKED_CLAIM_REFUSAL: &str = "issue not claimable: status blocked";
 
 /// Work item kind — the closed vocabulary forged schedules.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -687,17 +688,20 @@ impl Ledger {
         })
     }
 
-    /// The planning run's guarded apply: refuses unless the item is
-    /// `Blocked` with EMPTY custody, then performs the revision-CAS spec
-    /// write with cause `PlanningApply`. The read-back dance the bd path
-    /// needed is unnecessary — the CAS is the read-back.
+    /// The planning run's guarded apply, exactly the bd-era contract in one
+    /// transaction: refuses unless the item is `Blocked` with EMPTY custody,
+    /// mints the next spec revision with cause `PlanningApply`, and promotes
+    /// the stub to `Open`. No revision token is taken — atomicity is the
+    /// fence the bd path faked with a read-back, and the epic driver's own
+    /// digest pre/post-image checks stand unchanged around it.
     pub fn apply_work_planning_spec(
         &self,
         work_id: &str,
-        expected_revision: i64,
+        actor: &str,
         spec: WorkSpecFields,
     ) -> Result<WorkItemSnapshot, LedgerError> {
         let work_id = work_id.to_owned();
+        let actor = actor.to_owned();
         self.submit(move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let current = require_snapshot_tx(&tx, &work_id)?;
@@ -716,22 +720,24 @@ impl Ledger {
                     format!("planning apply requires empty custody on {work_id:?}"),
                 ));
             }
-            if current.revision != expected_revision {
-                return Err(refused(
-                    ErrorCode::BeadsContention,
-                    format!(
-                        "work item {work_id:?} revision moved: expected {expected_revision}, \
-                         current {}",
-                        current.revision
-                    ),
-                ));
-            }
-            let next = expected_revision + 1;
+            let next = current.revision + 1;
             insert_revision_tx(&tx, &work_id, next, &spec, WorkRevisionCause::PlanningApply)?;
             tx.execute(
-                "UPDATE work_items SET current_revision = ?2, updated_at = ?3 \
+                "UPDATE work_items SET current_revision = ?2, status = 'open', updated_at = ?3 \
                  WHERE work_id = ?1",
                 rusqlite::params![work_id, next, now_iso()],
+            )?;
+            append_event_tx(
+                &tx,
+                None,
+                "work.updated",
+                &json!({
+                    "workId": work_id,
+                    "verb": "planning-apply",
+                    "actor": actor,
+                    "status": { "from": WorkStatus::Blocked, "to": WorkStatus::Open },
+                    "revision": next,
+                }),
             )?;
             let snapshot = require_snapshot_tx(&tx, &work_id)?;
             tx.commit()?;
@@ -739,16 +745,18 @@ impl Ledger {
         })
     }
 
-    /// Close a work item: any non-closed status closes; custody and lease
-    /// clear. Closing a closed item is an idempotent no-op returning the
-    /// current snapshot.
+    /// Close a work item with a recorded reason: any non-closed status
+    /// closes; custody and lease clear. Closing a closed item is an
+    /// idempotent no-op returning the current snapshot.
     pub fn close_work_item(
         &self,
         work_id: &str,
         actor: &str,
+        reason: &str,
     ) -> Result<WorkItemSnapshot, LedgerError> {
         let work_id = work_id.to_owned();
         let actor = actor.to_owned();
+        let reason = reason.to_owned();
         self.submit(move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let before = require_snapshot_tx(&tx, &work_id)?;
@@ -758,14 +766,18 @@ impl Ledger {
             }
             set_coordination_tx(&tx, &work_id, WorkStatus::Closed, None)?;
             clear_lease_tx(&tx, &work_id)?;
-            coordination_event_tx(
+            append_event_tx(
                 &tx,
-                &work_id,
-                "close",
-                &before,
-                WorkStatus::Closed,
                 None,
-                &actor,
+                "work.updated",
+                &json!({
+                    "workId": work_id,
+                    "verb": "close",
+                    "actor": actor,
+                    "reason": reason,
+                    "status": { "from": before.status, "to": WorkStatus::Closed },
+                    "assignee": { "from": before.assignee, "to": Option::<String>::None },
+                }),
             )?;
             let snapshot = require_snapshot_tx(&tx, &work_id)?;
             tx.commit()?;
@@ -786,11 +798,22 @@ impl Ledger {
         self.submit(move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let before = require_snapshot_tx(&tx, &work_id)?;
-            if let Some(current) = &before.assignee {
-                if current != &holder {
+            if before.status == WorkStatus::Closed && before.assignee.is_none() {
+                tx.commit()?;
+                return Ok(before);
+            }
+            match before.assignee.as_deref() {
+                Some(current) if current == holder => {}
+                Some(current) => {
                     return Err(refused(
-                        ErrorCode::BeadsContention,
+                        ErrorCode::BeadLeaseHeld,
                         format!("work item {work_id:?} is held by {current:?}, not {holder:?}"),
+                    ));
+                }
+                None => {
+                    return Err(refused(
+                        ErrorCode::BeadLeaseHeld,
+                        format!("work item {work_id:?} is unheld; expected holder {holder:?}"),
                     ));
                 }
             }
@@ -811,22 +834,56 @@ impl Ledger {
         })
     }
 
-    /// Release custody (and the lease) of a non-closed item, returning it to
-    /// `Open` from `InProgress`; `Open`/`Blocked` keep their status. A closed
-    /// item refuses — closure is terminal here; `reopen_work_item` is the
-    /// deliberate exit.
+    /// Idempotently clear custody (and the lease) under the actor CAS,
+    /// status untouched — the bd-era guarded release, closed items included
+    /// (recovery of older already-closed state). Unheld is an idempotent
+    /// no-op; a different holder refuses with `BeadLeaseHeld`.
     pub fn release_work_item(
         &self,
         work_id: &str,
         actor: &str,
     ) -> Result<WorkItemSnapshot, LedgerError> {
-        self.release_with_status(work_id, actor, None, "release")
+        let work_id = work_id.to_owned();
+        let actor = actor.to_owned();
+        self.submit(move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let before = require_snapshot_tx(&tx, &work_id)?;
+            match before.assignee.as_deref() {
+                None => {
+                    tx.commit()?;
+                    return Ok(before);
+                }
+                Some(holder) if holder != actor => {
+                    return Err(refused(
+                        ErrorCode::BeadLeaseHeld,
+                        format!("work item {work_id:?} is held by {holder:?}, not {actor:?}"),
+                    ));
+                }
+                Some(_) => {}
+            }
+            set_coordination_tx(&tx, &work_id, before.status, None)?;
+            clear_lease_tx(&tx, &work_id)?;
+            coordination_event_tx(
+                &tx,
+                &work_id,
+                "release",
+                &before,
+                before.status,
+                None,
+                &actor,
+            )?;
+            let snapshot = require_snapshot_tx(&tx, &work_id)?;
+            tx.commit()?;
+            Ok(snapshot)
+        })
     }
 
-    /// Terminal-run settlement release: custody clears and status becomes
-    /// `Blocked` (blocked/input-required outcomes) or `Open` (cancelled/
-    /// superseded). REFUSES on a closed item — the preserved adjudicated
-    /// guard: terminal run settlement must never reopen a hand-closed item.
+    /// Terminal-run settlement release: custody clears under the actor CAS
+    /// and status becomes `Blocked` (blocked/input-required) or `Open`
+    /// (cancelled/superseded). REFUSES on a closed item — the preserved
+    /// adjudicated guard: terminal run settlement must never reopen a
+    /// hand-closed item. Unheld and already at the target status is an
+    /// idempotent no-op; a different holder refuses with `BeadLeaseHeld`.
     pub fn release_unresolved_work_item(
         &self,
         work_id: &str,
@@ -838,19 +895,8 @@ impl Ledger {
         } else {
             WorkStatus::Open
         };
-        self.release_with_status(work_id, actor, Some(status), "release-unresolved")
-    }
-
-    fn release_with_status(
-        &self,
-        work_id: &str,
-        actor: &str,
-        target: Option<WorkStatus>,
-        verb: &str,
-    ) -> Result<WorkItemSnapshot, LedgerError> {
         let work_id = work_id.to_owned();
         let actor = actor.to_owned();
-        let verb = verb.to_owned();
         self.submit(move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let before = require_snapshot_tx(&tx, &work_id)?;
@@ -863,21 +909,40 @@ impl Ledger {
                     ),
                 ));
             }
-            let status = target.unwrap_or(match before.status {
-                WorkStatus::InProgress => WorkStatus::Open,
-                other => other,
-            });
+            match before.assignee.as_deref() {
+                None if before.status == status => {
+                    tx.commit()?;
+                    return Ok(before);
+                }
+                None => {}
+                Some(holder) if holder != actor => {
+                    return Err(refused(
+                        ErrorCode::BeadLeaseHeld,
+                        format!("work item {work_id:?} is held by {holder:?}, not {actor:?}"),
+                    ));
+                }
+                Some(_) => {}
+            }
             set_coordination_tx(&tx, &work_id, status, None)?;
             clear_lease_tx(&tx, &work_id)?;
-            coordination_event_tx(&tx, &work_id, &verb, &before, status, None, &actor)?;
+            coordination_event_tx(
+                &tx,
+                &work_id,
+                "release-unresolved",
+                &before,
+                status,
+                None,
+                &actor,
+            )?;
             let snapshot = require_snapshot_tx(&tx, &work_id)?;
             tx.commit()?;
             Ok(snapshot)
         })
     }
 
-    /// Reopen a closed item to `Open` with empty custody. Reopening a
-    /// non-closed item refuses (use release verbs for custody changes).
+    /// Reopen: set status `Open` from ANY status (the bd-era
+    /// `update --status open`), custody untouched. Already-open is an
+    /// idempotent no-op.
     pub fn reopen_work_item(
         &self,
         work_id: &str,
@@ -888,23 +953,18 @@ impl Ledger {
         self.submit(move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let before = require_snapshot_tx(&tx, &work_id)?;
-            if before.status != WorkStatus::Closed {
-                return Err(refused(
-                    ErrorCode::InvalidRequest,
-                    format!(
-                        "work item {work_id:?} is {}, not closed",
-                        before.status.as_str()
-                    ),
-                ));
+            if before.status == WorkStatus::Open {
+                tx.commit()?;
+                return Ok(before);
             }
-            set_coordination_tx(&tx, &work_id, WorkStatus::Open, None)?;
+            set_coordination_tx(&tx, &work_id, WorkStatus::Open, before.assignee.as_deref())?;
             coordination_event_tx(
                 &tx,
                 &work_id,
                 "reopen",
                 &before,
                 WorkStatus::Open,
-                None,
+                before.assignee.as_deref(),
                 &actor,
             )?;
             let snapshot = require_snapshot_tx(&tx, &work_id)?;
@@ -913,14 +973,88 @@ impl Ledger {
         })
     }
 
+    /// The repair revert: mint revision N+1 as an exact copy of an earlier
+    /// revision's spec fields, guarded by the CAS. Append-only history makes
+    /// bad spec content recoverable by construction — nothing is rewritten.
+    pub fn revert_work_spec(
+        &self,
+        work_id: &str,
+        expected_revision: i64,
+        to_revision: i64,
+        actor: &str,
+    ) -> Result<WorkItemSnapshot, LedgerError> {
+        let work_id = work_id.to_owned();
+        let actor = actor.to_owned();
+        self.submit(move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let current = require_snapshot_tx(&tx, &work_id)?;
+            if current.revision != expected_revision {
+                return Err(refused(
+                    ErrorCode::BeadsContention,
+                    format!(
+                        "work item {work_id:?} revision moved: expected {expected_revision}, \
+                         current {}",
+                        current.revision
+                    ),
+                ));
+            }
+            let target = tx
+                .query_row(
+                    "SELECT title, description, acceptance_criteria, design, notes \
+                     FROM work_revisions WHERE work_id = ?1 AND revision = ?2",
+                    rusqlite::params![work_id, to_revision],
+                    |row| {
+                        Ok(WorkSpecFields {
+                            title: row.get(0)?,
+                            description: row.get(1)?,
+                            acceptance_criteria: row.get(2)?,
+                            design: row.get(3)?,
+                            notes: row.get(4)?,
+                        })
+                    },
+                )
+                .optional()?
+                .ok_or_else(|| {
+                    refused(
+                        ErrorCode::InvalidRequest,
+                        format!("work item {work_id:?} has no revision {to_revision}"),
+                    )
+                })?;
+            let next = expected_revision + 1;
+            insert_revision_tx(&tx, &work_id, next, &target, WorkRevisionCause::Revert)?;
+            tx.execute(
+                "UPDATE work_items SET current_revision = ?2, updated_at = ?3 \
+                 WHERE work_id = ?1",
+                rusqlite::params![work_id, next, now_iso()],
+            )?;
+            append_event_tx(
+                &tx,
+                None,
+                "work.updated",
+                &json!({
+                    "workId": work_id,
+                    "verb": "revert",
+                    "actor": actor,
+                    "revision": next,
+                    "revertedTo": to_revision,
+                }),
+            )?;
+            let snapshot = require_snapshot_tx(&tx, &work_id)?;
+            tx.commit()?;
+            Ok(snapshot)
+        })
+    }
+
     /// The blocked-residue retake (operator-adjudicated): take custody of an
-    /// UNASSIGNED `Open` or `Blocked` item without changing its status.
-    /// Existing custody by anyone (including `holder`) refuses — the caller
-    /// asked for an unassigned item specifically.
+    /// UNASSIGNED `Open` or `Blocked` item without changing its status. The
+    /// caller pins the exact status it observed (bd's `--if-status`); a
+    /// moved status refuses. Existing custody by anyone (including `holder`)
+    /// refuses — the caller asked for an unassigned item specifically.
     pub fn assign_unassigned_work_item(
         &self,
         work_id: &str,
         holder: &str,
+        expected_status: WorkStatus,
     ) -> Result<WorkItemSnapshot, LedgerError> {
         let work_id = work_id.to_owned();
         let holder = holder.to_owned();
@@ -933,13 +1067,20 @@ impl Ledger {
                     format!("work item {work_id:?} is already held by {current:?}"),
                 ));
             }
+            if before.status != expected_status {
+                return Err(refused(
+                    ErrorCode::BeadsContention,
+                    format!(
+                        "work item {work_id:?} is {}, not the pinned {}",
+                        before.status.as_str(),
+                        expected_status.as_str()
+                    ),
+                ));
+            }
             if !matches!(before.status, WorkStatus::Open | WorkStatus::Blocked) {
                 return Err(refused(
                     ErrorCode::InvalidRequest,
-                    format!(
-                        "work item {work_id:?} is {}, not an unassigned residue",
-                        before.status.as_str()
-                    ),
+                    format!("{WORK_CLAIM_REFUSAL_PREFIX}{}", before.status.as_str()),
                 ));
             }
             set_coordination_tx(&tx, &work_id, before.status, Some(&holder))?;
@@ -951,6 +1092,51 @@ impl Ledger {
                 before.status,
                 Some(&holder),
                 &holder,
+            )?;
+            let snapshot = require_snapshot_tx(&tx, &work_id)?;
+            tx.commit()?;
+            Ok(snapshot)
+        })
+    }
+
+    /// The redispatch verb, atomic: link `successor_id -> work_id` with a
+    /// `supersedes` edge and close the superseded item, in one transaction.
+    /// The successor must already exist; the superseded item may be in any
+    /// non-closed state (closing a closed item is the idempotent no-op).
+    pub fn supersede_work_item(
+        &self,
+        work_id: &str,
+        successor_id: &str,
+        actor: &str,
+    ) -> Result<WorkItemSnapshot, LedgerError> {
+        let work_id = work_id.to_owned();
+        let successor_id = successor_id.to_owned();
+        let actor = actor.to_owned();
+        self.submit(move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let before = require_snapshot_tx(&tx, &work_id)?;
+            require_snapshot_tx(&tx, &successor_id)?;
+            tx.execute(
+                "INSERT OR IGNORE INTO work_deps (from_id, to_id, kind) \
+                 VALUES (?1, ?2, 'supersedes')",
+                rusqlite::params![successor_id, work_id],
+            )?;
+            if before.status != WorkStatus::Closed {
+                set_coordination_tx(&tx, &work_id, WorkStatus::Closed, None)?;
+                clear_lease_tx(&tx, &work_id)?;
+            }
+            append_event_tx(
+                &tx,
+                None,
+                "work.updated",
+                &json!({
+                    "workId": work_id,
+                    "verb": "supersede",
+                    "actor": actor,
+                    "supersededBy": successor_id,
+                    "status": { "from": before.status, "to": WorkStatus::Closed },
+                    "assignee": { "from": before.assignee, "to": Option::<String>::None },
+                }),
             )?;
             let snapshot = require_snapshot_tx(&tx, &work_id)?;
             tx.commit()?;
@@ -1046,9 +1232,27 @@ impl Ledger {
         self.submit(move |conn| {
             let mut stmt = conn.prepare(&format!(
                 "{SNAPSHOT_SQL} JOIN work_deps d ON d.from_id = wi.work_id \
-                 WHERE d.to_id = ?1 AND d.kind = 'parent-child' ORDER BY wi.work_id"
+                 WHERE d.to_id = ?1 AND d.kind = 'parent-child' \
+                 ORDER BY wi.priority IS NULL, wi.priority, wi.work_id"
             ))?;
             let rows = stmt.query_map([&epic_id], snapshot_from_row)?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+    }
+
+    /// Every non-closed item, priority-ordered (ascending, nulls last) then
+    /// id-ordered — the live-plan discovery read.
+    pub fn nonterminal_work_items(&self) -> Result<Vec<WorkItemSnapshot>, LedgerError> {
+        self.submit(move |conn| {
+            let mut stmt = conn.prepare(&format!(
+                "{SNAPSHOT_SQL} WHERE wi.status <> 'closed' \
+                 ORDER BY wi.priority IS NULL, wi.priority, wi.work_id"
+            ))?;
+            let rows = stmt.query_map([], snapshot_from_row)?;
             let mut out = Vec::new();
             for row in rows {
                 out.push(row?);
@@ -1199,16 +1403,16 @@ mod tests {
         let (_dir, l) = ledger();
         l.create_work_item(item("beads-churn", WorkStatus::Open))
             .unwrap();
-        l.assign_unassigned_work_item("beads-churn", "holder-a")
+        l.assign_unassigned_work_item("beads-churn", "holder-a", WorkStatus::Open)
             .unwrap();
         l.release_work_item("beads-churn", "holder-a").unwrap();
-        l.close_work_item("beads-churn", "op").unwrap();
+        l.close_work_item("beads-churn", "op", "test").unwrap();
         l.reopen_work_item("beads-churn", "op").unwrap();
         assert_eq!(l.work_item("beads-churn").unwrap().unwrap().revision, 1);
     }
 
     #[test]
-    fn planning_apply_is_guarded_by_blocked_status_empty_custody_and_cas() {
+    fn planning_apply_is_guarded_by_blocked_status_and_empty_custody() {
         let (_dir, l) = ledger();
         l.create_work_item(item("beads-stub", WorkStatus::Blocked))
             .unwrap();
@@ -1216,29 +1420,28 @@ mod tests {
             .unwrap();
 
         let err = l
-            .apply_work_planning_spec("beads-live", 1, spec("planned"))
+            .apply_work_planning_spec("beads-live", "forged:e", spec("planned"))
             .unwrap_err();
         assert!(err.to_string().contains("requires a blocked stub"), "{err}");
 
-        l.assign_unassigned_work_item("beads-stub", "squatter")
+        l.assign_unassigned_work_item("beads-stub", "squatter", WorkStatus::Blocked)
             .unwrap();
         let err = l
-            .apply_work_planning_spec("beads-stub", 1, spec("planned"))
+            .apply_work_planning_spec("beads-stub", "forged:e", spec("planned"))
             .unwrap_err();
         assert!(err.to_string().contains("empty custody"), "{err}");
         l.release_work_item("beads-stub", "squatter").unwrap();
 
-        let err = l
-            .apply_work_planning_spec("beads-stub", 9, spec("planned"))
-            .unwrap_err();
-        assert_eq!(err.code(), ErrorCode::BeadsContention);
-
         let applied = l
-            .apply_work_planning_spec("beads-stub", 1, spec("planned"))
+            .apply_work_planning_spec("beads-stub", "forged:e", spec("planned"))
             .unwrap();
         assert_eq!(applied.revision, 2);
         assert_eq!(applied.spec.title, "planned");
-        assert_eq!(applied.status, WorkStatus::Blocked, "apply never unblocks");
+        assert_eq!(
+            applied.status,
+            WorkStatus::Open,
+            "the guarded apply promotes the stub to the frontier"
+        );
     }
 
     #[test]
@@ -1246,7 +1449,7 @@ mod tests {
         let (_dir, l) = ledger();
         l.create_work_item(item("beads-done", WorkStatus::Open))
             .unwrap();
-        l.close_work_item("beads-done", "op").unwrap();
+        l.close_work_item("beads-done", "op", "test").unwrap();
         let err = l
             .release_unresolved_work_item("beads-done", "settler", false)
             .unwrap_err();
@@ -1268,15 +1471,22 @@ mod tests {
         let (_dir, l) = ledger();
         l.create_work_item(item("beads-held", WorkStatus::Open))
             .unwrap();
-        l.assign_unassigned_work_item("beads-held", "mine").unwrap();
+        l.assign_unassigned_work_item("beads-held", "mine", WorkStatus::Open)
+            .unwrap();
         let err = l.close_held_work_item("beads-held", "thief").unwrap_err();
-        assert_eq!(err.code(), ErrorCode::BeadsContention);
+        assert_eq!(err.code(), ErrorCode::BeadLeaseHeld);
         let closed = l.close_held_work_item("beads-held", "mine").unwrap();
         assert_eq!(closed.status, WorkStatus::Closed);
         assert_eq!(closed.assignee, None);
-        // Idempotent for the same holder once custody is gone.
+        // Closed + unassigned is the idempotent convergence shape.
         let again = l.close_held_work_item("beads-held", "mine").unwrap();
         assert_eq!(again.status, WorkStatus::Closed);
+        // Unheld custody on a NON-closed item refuses — that refusal is what
+        // drives the landed pending → guarded-retake choreography.
+        l.create_work_item(item("beads-unheld", WorkStatus::Open))
+            .unwrap();
+        let err = l.close_held_work_item("beads-unheld", "mine").unwrap_err();
+        assert_eq!(err.code(), ErrorCode::BeadLeaseHeld);
     }
 
     #[test]
@@ -1285,12 +1495,12 @@ mod tests {
         l.create_work_item(item("beads-res", WorkStatus::Blocked))
             .unwrap();
         let taken = l
-            .assign_unassigned_work_item("beads-res", "retaker")
+            .assign_unassigned_work_item("beads-res", "retaker", WorkStatus::Blocked)
             .unwrap();
         assert_eq!(taken.status, WorkStatus::Blocked, "status is untouched");
         assert_eq!(taken.assignee.as_deref(), Some("retaker"));
         let err = l
-            .assign_unassigned_work_item("beads-res", "other")
+            .assign_unassigned_work_item("beads-res", "other", WorkStatus::Blocked)
             .unwrap_err();
         assert_eq!(err.code(), ErrorCode::BeadsContention);
     }
@@ -1321,7 +1531,7 @@ mod tests {
         // missing ones, so unprioritized items sort last.
         assert_eq!(ready, ["beads-low", "beads-gate", "beads-nopri"]);
 
-        l.close_work_item("beads-gate", "op").unwrap();
+        l.close_work_item("beads-gate", "op", "test").unwrap();
         let ready: Vec<String> = l
             .ready_work_items()
             .unwrap()
@@ -1332,7 +1542,7 @@ mod tests {
 
         // Custody removes an item from the frontier; non-blocking edge kinds
         // never gate.
-        l.assign_unassigned_work_item("beads-low", "someone")
+        l.assign_unassigned_work_item("beads-low", "someone", WorkStatus::Open)
             .unwrap();
         l.add_work_dep("beads-nopri", "beads-high", WorkDepKind::Related)
             .unwrap();
@@ -1400,7 +1610,8 @@ mod tests {
             .any(|s| s.work_id == "beads-s1"));
 
         // open/blocked + assigned custody (no lease): release_work_item.
-        l.assign_unassigned_work_item("beads-s1", "h").unwrap();
+        l.assign_unassigned_work_item("beads-s1", "h", WorkStatus::Open)
+            .unwrap();
         assert_eq!(l.release_work_item("beads-s1", "h").unwrap().assignee, None);
 
         // in_progress + live lease: close_held (landed) — custody and lease
@@ -1436,7 +1647,7 @@ mod tests {
 
         // blocked + custody residue: close_held or release both exit; the
         // retake path also re-enters.
-        l.assign_unassigned_work_item("beads-s1", "resident")
+        l.assign_unassigned_work_item("beads-s1", "resident", WorkStatus::Blocked)
             .unwrap();
         assert_eq!(
             l.release_work_item("beads-s1", "resident")
@@ -1451,7 +1662,8 @@ mod tests {
         let (_dir, l) = ledger();
         l.create_work_item(item("beads-ev", WorkStatus::Open))
             .unwrap();
-        l.assign_unassigned_work_item("beads-ev", "h").unwrap();
+        l.assign_unassigned_work_item("beads-ev", "h", WorkStatus::Open)
+            .unwrap();
         l.close_held_work_item("beads-ev", "h").unwrap();
         let kinds: Vec<String> = l
             .list_events(None, 0, 100)

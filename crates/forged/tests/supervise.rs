@@ -64,6 +64,7 @@ impl Drop for PausedProcessGroup {
 }
 
 fn start_run(env: &TestEnv, run: &str) {
+    env.seed_frontier(run);
     assert_eq!(env.forged(&["init"]).0, 0);
     let repo = env.repos.repo.to_string_lossy().into_owned();
     let spec = env.spec.to_string_lossy().into_owned();
@@ -168,6 +169,38 @@ fn recovered_live_attempt_persists_a_wake_no_later_than_its_deadline() {
         "--reason",
         "test cleanup",
     ]);
+}
+
+/// Retry a cleanup `run stop` until it lands, panicking with the LAST
+/// refusal envelope on timeout — a bare timeout hides the wedge.
+fn stop_until_lands(env: &TestEnv, run: &str, reason: &str, what: &str) {
+    // A stop can legitimately defer for the FULL identity grace window
+    // (ports.rs IDENTITY_GRACE_S = 60s): when the controller group dies
+    // before the provider's start stamp lands, kill confirmation refuses to
+    // signal the unverifiable pid until the grace adjudicates it a bounded
+    // orphan. The retry budget must outlive that window.
+    const STOP_WAIT: Duration = Duration::from_secs(90);
+    let started = Instant::now();
+    loop {
+        let (code, stop) = env.forged(&[
+            "run",
+            "stop",
+            "--run",
+            run,
+            "--outcome",
+            "cancelled",
+            "--reason",
+            reason,
+        ]);
+        if code == 0 {
+            break;
+        }
+        assert!(
+            started.elapsed() < STOP_WAIT,
+            "timed out waiting for {what}; last refusal: {stop}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
 }
 
 fn wait_until(what: &str, mut predicate: impl FnMut() -> bool) {
@@ -1279,19 +1312,12 @@ fn nonrecoverable_terminal_halts_without_charging_the_budget() {
     // Kill confirmation DEFERS while the resubmitted controller's start
     // time is not yet recorded, so the cleanup stop retries until the
     // identity is verifiable instead of racing it.
-    wait_until("halt fixture stop lands", || {
-        env.forged(&[
-            "run",
-            "stop",
-            "--run",
-            "run-halt",
-            "--outcome",
-            "cancelled",
-            "--reason",
-            "halt fixture cleanup",
-        ])
-        .0 == 0
-    });
+    stop_until_lands(
+        &env,
+        "run-halt",
+        "halt fixture cleanup",
+        "halt fixture stop lands",
+    );
     let record: Value = serde_json::from_slice(
         &std::fs::read(env.anvil.join("runs/run-halt/controller/controller.json"))
             .expect("controller record"),
@@ -1435,19 +1461,12 @@ fn recoverable_terminal_restarts_with_evidence_and_backoff() {
     // Kill confirmation DEFERS while the fresh generation's start time is
     // not yet recorded, so the cleanup stop retries until the identity is
     // verifiable instead of racing it.
-    wait_until("backoff fixture stop lands", || {
-        env.forged(&[
-            "run",
-            "stop",
-            "--run",
-            "run-backoff",
-            "--outcome",
-            "cancelled",
-            "--reason",
-            "backoff fixture cleanup",
-        ])
-        .0 == 0
-    });
+    stop_until_lands(
+        &env,
+        "run-backoff",
+        "backoff fixture cleanup",
+        "backoff fixture stop lands",
+    );
     wait_until("third controller group death", || {
         !process_group_alive(third_pid)
     });

@@ -45,14 +45,17 @@ fn adjudicate_args<'a>(run: &'a str, outcome: &'a str, rationale: &'a str) -> Ve
     ]
 }
 
-fn mutation_calls(env: &TestEnv, bead: &str) -> Vec<String> {
-    env.bd_calls()
+/// Every `work.updated` payload the ledger recorded for one work item,
+/// oldest first (coordination events carry no run id).
+fn mutation_calls(env: &TestEnv, bead: &str) -> Vec<Value> {
+    let ledger = env.ledger();
+    let events = ledger.list_events(None, 0, 65_536).expect("events");
+    ledger.close().expect("close");
+    events
         .into_iter()
-        .filter(|call| {
-            call.starts_with(&format!("update {bead} "))
-                || call.starts_with(&format!("close {bead} "))
-                || call.starts_with(&format!("comment {bead} "))
-        })
+        .filter(|event| event.kind == "work.updated")
+        .map(|event| serde_json::from_str::<Value>(&event.payload_json).expect("payload"))
+        .filter(|payload| payload["workId"] == json!(bead))
         .collect()
 }
 
@@ -286,7 +289,17 @@ fn replay_reuses_the_stored_response_and_a_different_assertion_conflicts() {
     assert_eq!(code, 0, "{first}");
     assert_eq!(first["ok"], json!(true), "{first}");
 
-    let before = env.bd_calls().len();
+    let writes_before_replay = {
+        let ledger = env.ledger();
+        let count = ledger
+            .list_events(None, 0, 65_536)
+            .expect("events")
+            .into_iter()
+            .filter(|event| event.kind == "work.updated")
+            .count();
+        ledger.close().expect("close");
+        count
+    };
     let (code, replay) = env.forged(&adjudicate_args(run, "cancelled", "legacy run"));
     assert_eq!(code, 0, "{replay}");
     assert_eq!(replay["reused"], json!(true), "{replay}");
@@ -294,7 +307,21 @@ fn replay_reuses_the_stored_response_and_a_different_assertion_conflicts() {
         replay["result"], first["result"],
         "stored response, verbatim"
     );
-    assert_eq!(env.bd_calls().len(), before, "replay fires no Beads write");
+    assert_eq!(
+        {
+            let ledger = env.ledger();
+            let count = ledger
+                .list_events(None, 0, 65_536)
+                .expect("events")
+                .into_iter()
+                .filter(|event| event.kind == "work.updated")
+                .count();
+            ledger.close().expect("close");
+            count
+        },
+        writes_before_replay,
+        "replay fires no work write"
+    );
 
     // Same derived key, different rationale: the stored request wins.
     let (_, conflict) = env.forged(&adjudicate_args(run, "cancelled", "a different rationale"));
@@ -400,7 +427,7 @@ fn a_closed_bead_converges_for_every_outcome() {
             json!(true),
             "{run}: {response}"
         );
-        let mutations: Vec<String> = mutation_calls(&env, &bead)
+        let mutations: Vec<Value> = mutation_calls(&env, &bead)
             .into_iter()
             .skip(before)
             .collect();
@@ -408,10 +435,20 @@ fn a_closed_bead_converges_for_every_outcome() {
         // closed Bead, and nothing else is written.
         let expected_holder = format!("forged:{bead}:0");
         assert_eq!(mutations.len(), 1, "{run}: {mutations:?}");
-        assert!(
-            mutations[0].contains("--assignee ")
-                && mutations[0].contains(&format!("--if-assignee {expected_holder}")),
+        assert_eq!(
+            mutations[0]["verb"],
+            json!("release"),
+            "{run}: the release is the custody clear alone: {mutations:?}"
+        );
+        assert_eq!(
+            mutations[0]["actor"],
+            json!(expected_holder),
             "{run}: the release is CAS-guarded on the stale holder: {mutations:?}"
+        );
+        assert_eq!(
+            mutations[0]["status"]["to"],
+            json!("closed"),
+            "{run}: releasing stale custody never reopens the closed item"
         );
         assert_eq!(
             response["result"]["bead"]["released"],

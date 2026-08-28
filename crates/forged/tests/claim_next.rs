@@ -10,7 +10,34 @@ use support::TestEnv;
 /// Fabricate a resumable run in the ledger: an Active run whose implement
 /// packet has one transport-failed attempt and no live attempt, with the
 /// resolve machine step settled (the shape a crashed driver leaves).
+/// Every `work.lease.reclaimed` payload, oldest first. Work coordination
+/// events carry no run id, so the scan is over the whole stream.
+fn reclaims(env: &TestEnv) -> Vec<Value> {
+    let ledger = env.ledger();
+    let events = ledger.list_events(None, 0, 65_536).expect("events");
+    ledger.close().expect("close");
+    events
+        .into_iter()
+        .filter(|event| event.kind == "work.lease.reclaimed")
+        .map(|event| serde_json::from_str::<Value>(&event.payload_json).expect("payload"))
+        .collect()
+}
+
+/// The live status of one work item.
+fn work_status(env: &TestEnv, bead: &str) -> String {
+    let ledger = env.ledger();
+    let item = ledger.work_item(bead).expect("work item read");
+    ledger.close().expect("close");
+    item.expect("the work item exists")
+        .status
+        .as_str()
+        .to_owned()
+}
+
 fn fabricate_resumable(env: &TestEnv, run_id: &str) {
+    // The run's bead must exist as a ledger row: the resume reads its lease
+    // holder, and an absent work item refuses instead of defaulting open.
+    env.ensure_work_item(run_id);
     let ledger = env.ledger();
     let run = forged_ledger::NewRun {
         run_id: forged_types::RunId::new(run_id).expect("run id"),
@@ -137,30 +164,28 @@ fn a_fresh_bead_is_never_claimed_while_a_resumable_run_exists() {
     assert!(claimed["attempt_id"].as_i64().is_some());
     assert!(claimed["claim_token"].as_str().is_some());
 
-    // The fresh bead was NOT claimed: no frontier pull reached bd, and the
-    // frontier still holds it.
-    let calls = env.bd_calls();
-    assert!(
-        !calls.iter().any(|l| l.starts_with("ready ")),
-        "no frontier pull while a resumable run exists: {calls:?}"
+    // The fresh bead was NOT claimed: it is still open and unheld on the
+    // frontier, which is now a query over exactly those two facts.
+    assert_eq!(
+        env.assignee("bead-fresh"),
+        None,
+        "no frontier claim fired while a resumable run exists"
     );
-    assert!(
-        std::fs::read_to_string(env.beads_dir.join("shim-state/frontier"))
-            .expect("frontier")
-            .contains("bead-fresh"),
-        "the fresh bead stays on the frontier"
-    );
+    assert_eq!(work_status(&env, "bead-fresh"), "open");
 
-    // The reclaim was scoped: --id and --assignee both present, naming the
-    // derived holder.
-    let reclaim = calls
-        .iter()
-        .find(|l| l.starts_with("reclaim "))
-        .expect("a scoped reclaim ran");
-    assert!(reclaim.contains("--id bead-cn"), "scoped by id: {reclaim}");
-    assert!(
-        reclaim.contains("--assignee forged:bead-cn:0"),
-        "scoped by assignee: {reclaim}"
+    // The reclaim was scoped: it names this run's bead and the derived
+    // holder, and nothing else was reclaimed.
+    let reclaimed = reclaims(&env);
+    assert_eq!(
+        reclaimed.len(),
+        1,
+        "exactly one scoped reclaim: {reclaimed:?}"
+    );
+    assert_eq!(reclaimed[0]["workId"], json!("bead-cn"), "scoped by id");
+    assert_eq!(
+        reclaimed[0]["previousOwner"],
+        json!("forged:bead-cn:0"),
+        "scoped by the derived holder"
     );
     // And the lease is back under the derived holder.
     assert_eq!(env.assignee("bead-cn").as_deref(), Some("forged:bead-cn:0"));
@@ -254,17 +279,12 @@ fn a_refusal_skips_that_run_and_the_scan_reaches_the_next_resumable() {
     assert_eq!(claimed["packet_id"], json!("bead-next/implement/1"));
 
     // No fresh bead was pulled while a resumable run remained.
-    let calls = env.bd_calls();
-    assert!(
-        !calls.iter().any(|l| l.starts_with("ready ")),
-        "no frontier pull while a resumable run exists: {calls:?}"
+    assert_eq!(
+        env.assignee("bead-fresh"),
+        None,
+        "no frontier claim fired while a resumable run exists"
     );
-    assert!(
-        std::fs::read_to_string(env.beads_dir.join("shim-state/frontier"))
-            .expect("frontier")
-            .contains("bead-fresh"),
-        "the fresh bead stays on the frontier"
-    );
+    assert_eq!(work_status(&env, "bead-fresh"), "open");
 
     // The refused run was left entirely alone.
     assert_eq!(
@@ -350,18 +370,22 @@ fn a_lease_already_under_our_identity_resumes_without_retaking_it() {
         "our own live lease is not a reason to skip the run: {resp}"
     );
     assert_eq!(claimed["run_id"], json!("bead-ours"));
-    // No retake: the lease was already ours, so no claim call was needed.
-    let calls = env.bd_calls();
-    assert!(
-        !calls
-            .iter()
-            .any(|l| l.starts_with("update bead-ours") && l.contains("--claim")),
-        "a lease already under our identity is never re-claimed: {calls:?}"
+    // No retake: the lease was already ours, so the far-future expiry
+    // `set_lease_unexpired` pinned is still exactly where it was. A retake
+    // runs `claim_specific_work`, which rewrites `expires_at` to now + TTL.
+    let ledger = env.ledger();
+    let lease = ledger
+        .work_lease("bead-ours")
+        .expect("lease read")
+        .expect("the lease is still held");
+    ledger.close().expect("close");
+    assert_eq!(lease.holder, "forged:bead-ours:0");
+    assert_eq!(
+        lease.expires_at, "2099-01-01T00:00:00.000000000Z",
+        "a lease already under our identity is never re-claimed: {lease:?}"
     );
-    assert!(
-        !calls.iter().any(|l| l.starts_with("ready ")),
-        "no frontier pull while a resumable run exists: {calls:?}"
-    );
+    // No frontier claim fired while a resumable run existed.
+    assert_eq!(env.assignee("bead-fresh"), None);
     assert_eq!(
         env.assignee("bead-ours").as_deref(),
         Some("forged:bead-ours:0")
@@ -425,10 +449,9 @@ fn a_frontier_claimed_in_progress_bead_starts_and_drives_under_one_lease_identit
         json!("bead-composed")
     );
     assert_eq!(
-        std::fs::read_to_string(env.beads_dir.join("shim-state/bead-composed.status"))
-            .expect("claimed bead status"),
+        work_status(&env, "bead-composed"),
         "in_progress",
-        "claim-next must move the ready bead to bd's claimed status"
+        "claim-next must move the ready bead to the claimed status"
     );
     assert_eq!(
         env.assignee("bead-composed").as_deref(),
@@ -442,7 +465,6 @@ fn a_frontier_claimed_in_progress_bead_starts_and_drives_under_one_lease_identit
     );
 
     let repo = env.repos.repo.to_string_lossy().into_owned();
-    let calls_before_start = env.bd_calls().len();
     let (code, started) = env.forged(&[
         "run",
         "start",
@@ -454,12 +476,11 @@ fn a_frontier_claimed_in_progress_bead_starts_and_drives_under_one_lease_identit
         "main",
     ]);
     assert_eq!(code, 0, "run start: {started}");
-    let start_calls = env.bd_calls();
-    assert!(
-        !start_calls[calls_before_start..]
-            .iter()
-            .any(|call| call.starts_with("ready ")),
-        "run start must accept the exact frontier-held in_progress shape without re-reading the open frontier: {start_calls:?}"
+    assert_eq!(
+        env.assignee("bead-composed").as_deref(),
+        Some("forged:frontier:0"),
+        "run start must accept the exact frontier-held in_progress shape \
+         without re-claiming it: {started}"
     );
     env.authorize_run("bead-composed");
 
@@ -474,18 +495,29 @@ fn a_frontier_claimed_in_progress_bead_starts_and_drives_under_one_lease_identit
         driven["result"]["terminal"]["done"].is_object(),
         "the run drives to Done over its own lease: {driven}"
     );
-    let calls = env.bd_calls();
+    // The operator's --holder never became a custody identity anywhere in
+    // the ledger's work record.
+    let ledger = env.ledger();
+    let events = ledger.list_events(None, 0, 65_536).expect("events");
+    let lease = ledger.work_lease("bead-composed").expect("lease read");
+    ledger.close().expect("close");
     assert!(
-        !calls.iter().any(|l| l.contains("operator:laptop:4242")),
-        "no bd call may carry the operator holder: {calls:?}"
-    );
-    // The guardian heartbeated the ONE identity the lease is held under.
-    let holder = env.assignee("bead-composed").expect("the lease is held");
-    assert!(
-        calls
+        !events
             .iter()
-            .any(|l| l.starts_with("heartbeat bead-composed") && l.contains(&holder)),
-        "the guardian heartbeats the identity actually in force ({holder}): {calls:?}"
+            .any(|event| event.payload_json.contains("operator:laptop:4242")),
+        "no work event may carry the operator holder"
+    );
+    // ONE identity end to end. Lease renewal rides the attempt heartbeat,
+    // and a renewal under any other identity refuses with BeadLeaseHeld and
+    // self-terminates the attempt — so reaching Done over a lease still
+    // held by the frontier identity IS the proof the renewal used it.
+    assert_eq!(
+        lease.expect("the lease is held").holder,
+        "forged:frontier:0"
+    );
+    assert_eq!(
+        env.assignee("bead-composed").as_deref(),
+        Some("forged:frontier:0")
     );
 
     env.seed_bead_spec(
@@ -517,13 +549,12 @@ fn a_frontier_claimed_in_progress_bead_starts_and_drives_under_one_lease_identit
 }
 
 #[test]
-fn a_bead_sourced_packet_resumes_though_the_reclaim_moved_its_revision() {
+fn a_bead_sourced_packet_resumes_and_its_lease_writes_never_move_the_revision() {
     // The crash-resume path for the supported route. `claim-next` RECLAIMS
-    // and then RE-CLAIMS the run's bd lease before it re-reads the spec, and
-    // each of those writes mints a fresh bd revision — so the revision the
-    // packet was opened at is already gone by the time the fence is checked.
-    // Fenced on that token, this resume would fail SpecDrift, non-recoverably
-    // and forever; fenced on the rendered body, it resumes.
+    // and then RE-CLAIMS the run's lease before it re-reads the spec. Those
+    // are coordination writes, and coordination never mints a revision — so
+    // the token the packet was opened at is still the live one, and the
+    // resume is fenced on the rendered body either way.
     let env = TestEnv::new("forged-claim-next-bead");
     env.forged(&["init"]);
     env.seed_bead_spec(
@@ -594,20 +625,21 @@ fn a_bead_sourced_packet_resumes_though_the_reclaim_moved_its_revision() {
     assert_eq!(claimed["resumed"], json!(true), "ledger first: {resumed}");
     assert_eq!(claimed["packet_id"], json!(packet.packet_id));
 
-    // The lease writes really did move the token, and the claim re-pinned
-    // the row to where bd is now rather than leaving a dead value behind.
+    // The lease writes did NOT move the token: revisions are minted by spec
+    // writes alone, and the claim re-pins the row to where the store is now
+    // rather than leaving a dead value behind.
     let ledger = env.ledger();
     let row = ledger.get_packet(&packet.packet_id).expect("packet row");
     ledger.close().expect("close");
-    assert_ne!(
+    assert_eq!(
         env.bead_revision("bead-resume"),
         opened_at,
-        "the reclaim and re-claim must have moved the write token"
+        "custody and lease churn must never move the revision"
     );
     assert_eq!(
         row.spec_revision.as_deref(),
         Some(env.bead_revision("bead-resume").as_str()),
-        "the resuming claim re-pins the write token: {row:?}"
+        "the resuming claim pins the live write token: {row:?}"
     );
     assert_eq!(
         row.spec_sha256, packet.spec_sha256,

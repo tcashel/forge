@@ -31,6 +31,7 @@ fn wait_until(what: &str, mut pred: impl FnMut() -> bool) {
 fn start_run(env: &TestEnv, bead: &str) {
     let (code, init) = env.forged(&["init"]);
     assert_eq!(code, 0, "init: {init}");
+    env.seed_frontier(bead);
     let repo = env.repos.repo.to_string_lossy().into_owned();
     let spec = env.spec.to_string_lossy().into_owned();
     let (code, started) = env.forged(&[
@@ -1889,28 +1890,29 @@ fn two_racing_reconcilers_converge_to_reclaimed() {
     let reclaimed = states.iter().filter(|(_, s)| s == "reclaimed").count();
     assert_eq!(reclaimed, 1, "one reclaimed attempt: {states:?}");
 
-    // At most two scoped reclaim attempts reached bd, at most one of which
-    // reclaimed (the second sees the refusal shape); no reclaim named a
-    // different holder.
-    let reclaims: Vec<String> = env
-        .bd_calls()
-        .iter()
-        .filter(|l| l.starts_with("reclaim ") && l.contains("--id bead-k5"))
-        .cloned()
-        .collect();
-    assert!(
-        (1..=2).contains(&reclaims.len()),
-        "at most two scoped reclaims: {reclaims:?}"
+    // The lease is UNEXPIRED (real 300s TTL — the bd shim ignored it), so
+    // both racing reclaims answer the refusal shape: nothing reclaimed, no
+    // event appended, custody intact under the derived holder. The saga
+    // counts that as success — the attempt is what gets reclaimed, never a
+    // live lease — and the resume proceeds under our own held lease.
+    let ledger = env.ledger();
+    let reclaim_events = ledger
+        .list_events(None, 0, 65_536)
+        .expect("events")
+        .into_iter()
+        .filter(|event| {
+            event.kind == "work.lease.reclaimed" && event.payload_json.contains("bead-k5")
+        })
+        .count();
+    ledger.close().expect("close");
+    assert_eq!(
+        reclaim_events, 0,
+        "an unexpired lease is never reclaimed, by either racer"
     );
-    for call in &reclaims {
-        assert!(
-            call.contains("--assignee forged:bead-k5:0"),
-            "every reclaim is scoped to the expected holder: {call}"
-        );
-    }
-    assert!(
-        env.assignee("bead-k5").is_none(),
-        "exactly one reclaim took effect"
+    assert_eq!(
+        env.assignee("bead-k5").as_deref(),
+        Some("forged:bead-k5:0"),
+        "custody stands under the ONE derived identity for the resume"
     );
 
     // The run resumes and finishes with real content.
@@ -2393,6 +2395,7 @@ fn a_required_herdr_host_settles_before_the_spawn_rather_than_propagating() {
         serde_json::to_string_pretty(&config).expect("config json"),
     )
     .expect("rewrite config");
+    env.seed_frontier("bead-k9c");
     let repo = env.repos.repo.to_string_lossy().into_owned();
     let spec = env.spec.to_string_lossy().into_owned();
     let (code, started) = env.forged(&[

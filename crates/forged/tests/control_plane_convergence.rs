@@ -20,11 +20,23 @@ struct ControlPlaneFixture {
     repository_b: support::Repos,
 }
 
+/// One work item's identity-relevant columns, row-level so a same-count
+/// mutation is still caught.
+type WorkItemFingerprint = (
+    String,
+    String,
+    String,
+    Option<i64>,
+    Option<String>,
+    String,
+    i64,
+);
+
 #[derive(Debug, PartialEq, Eq)]
 struct ReadFingerprint {
     ledger_counts: BTreeMap<String, i64>,
     event_high_water: i64,
-    bead_state: BTreeMap<PathBuf, Vec<u8>>,
+    work_state: Vec<WorkItemFingerprint>,
     provider_log: Vec<String>,
     github_calls: Vec<Vec<String>>,
     repositories: Vec<(String, String)>,
@@ -337,6 +349,10 @@ impl ControlPlaneFixture {
             "owned_herdr_sessions",
             "herdr_pane_projections",
             "review_finding_deliveries",
+            "work_items",
+            "work_revisions",
+            "work_deps",
+            "work_leases",
         ] {
             let count = connection
                 .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
@@ -350,10 +366,32 @@ impl ControlPlaneFixture {
                 row.get(0)
             })
             .expect("event high water");
+        let mut stmt = connection
+            .prepare(
+                "SELECT work_id, kind, status, priority, assignee, metadata_json, \
+                 current_revision FROM work_items ORDER BY work_id",
+            )
+            .expect("work item fingerprint");
+        let work_state = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            })
+            .expect("work rows")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("work fingerprint rows");
+        drop(stmt);
         ReadFingerprint {
             ledger_counts,
             event_high_water,
-            bead_state: tree_snapshot(&self.env.beads_dir.join("shim-state")),
+            work_state,
             provider_log: self.env.provider_log(),
             github_calls: self.env.gh_calls(),
             repositories: [&self.env.repos.repo, &self.repository_b.repo]
@@ -427,30 +465,6 @@ fn seed_admission(
         .expect("admission decision");
 }
 
-fn tree_snapshot(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
-    fn visit(root: &Path, path: &Path, out: &mut BTreeMap<PathBuf, Vec<u8>>) {
-        for entry in std::fs::read_dir(path).expect("read fixture state") {
-            let entry = entry.expect("fixture state entry");
-            let path = entry.path();
-            if path.is_dir() {
-                visit(root, &path, out);
-            } else if path.file_name().and_then(|name| name.to_str()) != Some("calls.log")
-                && path.extension().and_then(|extension| extension.to_str()) != Some("seen")
-            {
-                out.insert(
-                    path.strip_prefix(root)
-                        .expect("state relative path")
-                        .to_owned(),
-                    std::fs::read(path).expect("read fixture state file"),
-                );
-            }
-        }
-    }
-    let mut out = BTreeMap::new();
-    visit(root, root, &mut out);
-    out
-}
-
 fn normalized(mut envelope: Value) -> Value {
     if envelope["operationId"]
         .as_str()
@@ -513,19 +527,6 @@ fn entries(response: &Value) -> Vec<&Value> {
         .collect()
 }
 
-fn assert_read_slice(calls: &[String], maximum: usize, name: &str) {
-    assert!(
-        calls.len() <= maximum,
-        "{name} exceeded its Beads budget: {calls:?}"
-    );
-    assert!(
-        calls
-            .iter()
-            .all(|call| call.starts_with("list ") || call.starts_with("show ")),
-        "{name} issued a non-read Beads call: {calls:?}"
-    );
-}
-
 #[test]
 fn modern_projections_and_all_five_apps_converge_on_real_envelopes() {
     let fixture = ControlPlaneFixture::new("forged-control-plane-convergence");
@@ -536,7 +537,7 @@ fn modern_projections_and_all_five_apps_converge_on_real_envelopes() {
     tools.sort();
     assert_eq!(
         tools.len(),
-        46,
+        56,
         "the integrated public tool inventory moved"
     );
     assert!(tools.contains(&"review_publish".to_owned()));
@@ -556,7 +557,6 @@ fn modern_projections_and_all_five_apps_converge_on_real_envelopes() {
     );
 
     let envelope = |params: Value| json!({"schemaVersion": 1, "params": params});
-    let bd_start = fixture.env.bd_calls().len();
     let operations_cli = fixture
         .env
         .forged(&[
@@ -568,16 +568,12 @@ fn modern_projections_and_all_five_apps_converge_on_real_envelopes() {
             "50",
         ])
         .1;
-    assert_read_slice(&fixture.env.bd_calls()[bd_start..], 3, "Operations CLI");
-    let bd_start = fixture.env.bd_calls().len();
     let operations_raw = mcp.call_tool_result(
         "operations_overview",
         envelope(json!({"repo": repository, "limit": 50})),
     );
-    assert_read_slice(&fixture.env.bd_calls()[bd_start..], 3, "Operations MCP");
     let operations = assert_raw_parity(operations_cli, &operations_raw, "Operations");
 
-    let bd_start = fixture.env.bd_calls().len();
     let detail_cli = fixture
         .env
         .forged(&[
@@ -589,16 +585,12 @@ fn modern_projections_and_all_five_apps_converge_on_real_envelopes() {
             "run-a",
         ])
         .1;
-    assert_read_slice(&fixture.env.bd_calls()[bd_start..], 1, "Work Detail CLI");
-    let bd_start = fixture.env.bd_calls().len();
     let detail_raw = mcp.call_tool_result(
         "work_detail",
         envelope(json!({"subjectKind": "run", "subjectId": "run-a"})),
     );
-    assert_read_slice(&fixture.env.bd_calls()[bd_start..], 1, "Work Detail MCP");
     let detail = assert_raw_parity(detail_cli, &detail_raw, "Work Detail");
 
-    let bd_start = fixture.env.bd_calls().len();
     let map_cli = fixture
         .env
         .forged(&[
@@ -610,16 +602,12 @@ fn modern_projections_and_all_five_apps_converge_on_real_envelopes() {
             &repository,
         ])
         .1;
-    assert_read_slice(&fixture.env.bd_calls()[bd_start..], 2, "Work Map CLI");
-    let bd_start = fixture.env.bd_calls().len();
     let map_raw = mcp.call_tool_result(
         "work_map",
         envelope(json!({"scope": "repository", "repository": repository})),
     );
-    assert_read_slice(&fixture.env.bd_calls()[bd_start..], 2, "Work Map MCP");
     let map = assert_raw_parity(map_cli, &map_raw, "Work Map");
 
-    let bd_start = fixture.env.bd_calls().len();
     let session_cli = fixture
         .env
         .forged(&[
@@ -630,13 +618,10 @@ fn modern_projections_and_all_five_apps_converge_on_real_envelopes() {
             "--include-historical",
         ])
         .1;
-    assert_read_slice(&fixture.env.bd_calls()[bd_start..], 0, "Sessions CLI");
-    let bd_start = fixture.env.bd_calls().len();
     let session_raw = mcp.call_tool_result(
         "session_inventory",
         envelope(json!({"run": "run-a", "includeHistorical": true})),
     );
-    assert_read_slice(&fixture.env.bd_calls()[bd_start..], 0, "Sessions MCP");
     let sessions = assert_raw_parity(session_cli, &session_raw, "Agent Sessions");
 
     let overview_cli = fixture.env.forged(&["overview", "--run", "run-a"]).1;
@@ -757,25 +742,20 @@ fn modern_projections_and_all_five_apps_converge_on_real_envelopes() {
 }
 
 #[test]
-fn source_outage_keeps_durable_truth_without_cross_repository_leakage() {
+fn durable_and_plan_reads_answer_from_the_store_without_cross_repository_leakage() {
     let fixture = ControlPlaneFixture::new("forged-control-plane-degraded");
     let repository = fixture.repository_a();
-    fixture.env.set_bd_list_unreachable(true);
-    fixture.env.set_bd_show_unreachable(true);
     let before = fixture.fingerprint();
 
     let (code, operations) = fixture.env.forged(&["operations", "overview"]);
-    assert_eq!(
-        code, 0,
-        "durable Operations survives Beads outage: {operations}"
-    );
+    assert_eq!(code, 0, "operations overview: {operations}");
     assert_eq!(
         operations["result"]["sourceHealth"]["beads"]["state"],
-        "unavailable"
+        "available"
     );
     assert_eq!(
         operations["result"]["sourceHealth"]["plan"]["state"],
-        "unavailable"
+        "available"
     );
     assert!(entries(&operations)
         .iter()
@@ -783,7 +763,10 @@ fn source_outage_keeps_durable_truth_without_cross_repository_leakage() {
     assert!(entries(&operations)
         .iter()
         .any(|entry| entry["id"] == "run-b"));
-    assert!(!entries(&operations)
+    // The plan read now succeeds, so the live-plan rows are present rather
+    // than absent — this call is operator-scoped, so both repositories' plan
+    // rows are in view and neither is a leak.
+    assert!(entries(&operations)
         .iter()
         .any(|entry| entry["source"] == "live-plan"));
 
@@ -795,11 +778,8 @@ fn source_outage_keeps_durable_truth_without_cross_repository_leakage() {
         "--repository",
         &repository,
     ]);
-    assert_eq!(code, 0, "durable Work Map survives Beads outage: {map}");
-    assert_eq!(
-        map["result"]["sourceHealth"]["beads"]["state"],
-        "unavailable"
-    );
+    assert_eq!(code, 0, "repository-scoped Work Map: {map}");
+    assert_eq!(map["result"]["sourceHealth"]["beads"]["state"], "available");
     assert!(map["result"]["nodes"].as_array().is_some_and(|nodes| nodes
         .iter()
         .any(|node| node["workRef"]["id"] == "run-a")
@@ -808,11 +788,6 @@ fn source_outage_keeps_durable_truth_without_cross_repository_leakage() {
     assert_eq!(
         before,
         fixture.fingerprint(),
-        "degraded reads changed durable fixture state"
+        "reads changed durable fixture state"
     );
-    assert!(fixture
-        .env
-        .bd_calls()
-        .iter()
-        .all(|call| { call.starts_with("list ") || call.starts_with("show ") }));
 }

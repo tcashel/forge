@@ -29,6 +29,8 @@ pub(crate) mod usage;
 pub(crate) mod work_identity;
 mod work_import;
 mod work_map;
+mod work_ops;
+pub(crate) mod workstore;
 
 use forged_ledger::{DesiredSubjectKind, EffectClass, Ledger, LedgerError, OperationOutcome};
 use forged_proto::ProtoError;
@@ -246,6 +248,43 @@ pub fn param_opt_str<'p>(params: &'p Map<String, Value>, key: &str) -> Option<&'
         .filter(|s| !s.is_empty())
 }
 
+/// Strict optional string read: absent and null read as `None`, an empty
+/// string reads as `None` (the MCP boundary's "unset"), and any OTHER type
+/// refuses — a present-but-malformed value must never silently take a
+/// default that mutates durable state.
+pub fn param_opt_str_strict<'p>(
+    params: &'p Map<String, Value>,
+    key: &str,
+) -> Result<Option<&'p str>, Failure> {
+    match params.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(text)) if text.is_empty() => Ok(None),
+        Some(Value::String(text)) => Ok(Some(text)),
+        Some(other) => Err(Failure::invalid(format!(
+            "{key} must be a string, got {other}"
+        ))),
+    }
+}
+
+/// Strict optional integer read, same contract as
+/// [`param_opt_str_strict`]: absent/null is `None`, an integer is itself,
+/// anything else refuses.
+pub fn param_opt_i64_strict(
+    params: &Map<String, Value>,
+    key: &str,
+) -> Result<Option<i64>, Failure> {
+    match params.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(number)) => number
+            .as_i64()
+            .map(Some)
+            .ok_or_else(|| Failure::invalid(format!("{key} must be an integer, got {number}"))),
+        Some(other) => Err(Failure::invalid(format!(
+            "{key} must be an integer, got {other}"
+        ))),
+    }
+}
+
 /// Read an optional string param that must NAME something: a
 /// whitespace-only value reads as absent, matching the MCP boundary's
 /// `named_string` refusal so both surfaces agree on what counts as a name.
@@ -333,13 +372,9 @@ pub fn run_holder(bead_id: &str) -> String {
 /// what makes the chain unwedgeable against itself. A holder this driver
 /// could not have taken is deliberately NOT adopted: the derived holder is
 /// returned, bd refuses the claim, and another worker's live lease stands.
-pub async fn lease_identity(
-    bd: &forged_beads::BdConfig,
-    bead: &str,
-    _run_id: &str,
-) -> Result<String, Failure> {
+pub async fn lease_identity(ledger: &Ledger, bead: &str, _run_id: &str) -> Result<String, Failure> {
     let derived = run_holder(bead);
-    let current = forged_beads::lease_holder(bd, bead).await?;
+    let current = workstore::lease_holder(ledger, bead).await?;
     Ok(match current {
         Some(held) if held == derived || held == FRONTIER_HOLDER => held,
         _ => derived,
@@ -848,6 +883,16 @@ pub async fn dispatch(ctx: &Ctx, name: &str, mut req: OperationRequest) -> Opera
         "work_detail" => observe::work_detail(ctx, &req).await,
         "work_map" => work_map::work_map(ctx, &req).await,
         "work_import_beads" => work_import::work_import_beads(ctx, &req).await,
+        "work_create" => work_ops::work_create(ctx, &mut req).await,
+        "work_update" => work_ops::work_update(ctx, &mut req).await,
+        "work_link" => work_ops::work_link(ctx, &mut req).await,
+        "work_close" => work_ops::work_close(ctx, &mut req).await,
+        "work_reopen" => work_ops::work_reopen(ctx, &mut req).await,
+        "work_release" => work_ops::work_release(ctx, &mut req).await,
+        "work_supersede" => work_ops::work_supersede(ctx, &mut req).await,
+        "work_revert" => work_ops::work_revert(ctx, &mut req).await,
+        "work_show" => work_ops::work_show(ctx, &req).await,
+        "work_ready" => work_ops::work_ready(ctx, &req).await,
         "supervise" => supervise::supervise(ctx, &req).await,
         "packet_show" => ops::packet_show(ctx, &req).await,
         "packet_claim" => ops::packet_claim(ctx, &mut req).await,
