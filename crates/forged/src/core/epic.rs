@@ -1872,11 +1872,15 @@ async fn status_json(ctx: &Ctx, view: EpicView) -> Result<Value, Failure> {
         },
     )
     .await;
-    let (live, live_error) =
-        match super::workstore::epic_children(&ctx.ledger, &view.config.epic_id).await {
-            Ok(live) => (live, None),
-            Err(error) => (Vec::new(), Some(error.to_string())),
-        };
+    let (live, live_error) = match super::workstore::epic_children_with_legacy(
+        &ctx.ledger,
+        &view.config.epic_id,
+    )
+    .await
+    {
+        Ok((live, _)) => (live, None),
+        Err(error) => (Vec::new(), Some(error.to_string())),
+    };
     let live: BTreeMap<_, _> = live
         .into_iter()
         .map(|issue| (issue.id.clone(), issue))

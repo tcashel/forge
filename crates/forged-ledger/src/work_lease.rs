@@ -18,6 +18,7 @@ use crate::error::{refused, LedgerError};
 use crate::events::append_event_tx;
 use crate::ledger::Ledger;
 use crate::time::{now_iso, now_plus_secs_iso};
+use crate::work::WorkKind;
 use crate::work::{
     clear_lease_tx, ready_tx, snapshot_tx, WorkItemSnapshot, WorkStatus,
     WORK_BLOCKED_CLAIM_REFUSAL, WORK_CLAIM_REFUSAL_PREFIX,
@@ -174,7 +175,18 @@ impl Ledger {
         let holder = holder.to_owned();
         self.submit(move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let Some(item) = ready_tx(&tx)?.into_iter().next() else {
+            // Only schedulable work is claimable: an epic (no run can
+            // execute it) and an imported no-diff type (chore / decision /
+            // milestone — the slice validator refuses them AFTER a claim)
+            // must never be claimed under the frontier holder, or the lease
+            // strands with nothing to resume or settle.
+            let Some(item) = ready_tx(&tx)?.into_iter().find(|item| {
+                item.kind == WorkKind::Task
+                    && !matches!(
+                        item.metadata.get("imported:issue-type").map(String::as_str),
+                        Some("chore") | Some("decision") | Some("milestone")
+                    )
+            }) else {
                 tx.commit()?;
                 return Ok(None);
             };
@@ -318,6 +330,60 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let ledger = Ledger::open(&dir.path().join("state.db")).expect("ledger");
         (dir, ledger)
+    }
+
+    #[test]
+    fn the_frontier_claim_skips_epics_for_the_first_ready_task() {
+        let (_dir, l) = ledger();
+        l.create_work_item(NewWorkItem {
+            work_id: "epic-frontier".to_string(),
+            kind: WorkKind::Epic,
+            status: WorkStatus::Open,
+            priority: Some(0),
+            metadata: BTreeMap::new(),
+            spec: WorkSpecFields {
+                title: "an open unassigned epic".to_string(),
+                description: String::new(),
+                acceptance_criteria: String::new(),
+                design: String::new(),
+                notes: String::new(),
+            },
+            cause: WorkRevisionCause::Authored,
+        })
+        .unwrap();
+        assert_eq!(
+            l.claim_ready_work("forged:frontier:0", 300).unwrap(),
+            None,
+            "an epic alone in the frontier is never claimed"
+        );
+        // An imported no-diff type maps to WorkKind::Task with its real
+        // type in metadata — the frontier must skip it too, or the slice
+        // validator refuses AFTER the claim and the lease strands.
+        l.create_work_item(NewWorkItem {
+            work_id: "chore-frontier".to_string(),
+            kind: WorkKind::Task,
+            status: WorkStatus::Open,
+            priority: Some(1),
+            metadata: BTreeMap::from([("imported:issue-type".to_string(), "chore".to_string())]),
+            spec: WorkSpecFields {
+                title: "an imported chore".to_string(),
+                description: String::new(),
+                acceptance_criteria: String::new(),
+                design: String::new(),
+                notes: String::new(),
+            },
+            cause: WorkRevisionCause::Import,
+        })
+        .unwrap();
+        seed(&l, "task-frontier", WorkStatus::Open, Some(5));
+        let claimed = l
+            .claim_ready_work("forged:frontier:0", 300)
+            .unwrap()
+            .expect("the task claims");
+        assert_eq!(
+            claimed.work_id, "task-frontier",
+            "the higher-priority imported chore is skipped"
+        );
     }
 
     fn seed(l: &Ledger, id: &str, status: WorkStatus, priority: Option<i64>) {
