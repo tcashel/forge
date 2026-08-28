@@ -1,5 +1,5 @@
 //! CLI/MCP parity (the two-adapters-over-one-core criterion): for each of
-//! the forty-six public core functions, the CLI path and the MCP tool path produce
+//! the fifty-seven public core functions, the CLI path and the MCP tool path produce
 //! identical `OperationResponse` values — modulo the minted `operationId` —
 //! from the same core call.
 
