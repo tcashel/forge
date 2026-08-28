@@ -443,8 +443,21 @@ async fn subject_runtime(
 /// remains the crash-recovery timer; the controller's local wait is only an
 /// accelerator while that exact process stays alive.
 async fn subject_observation_wake(ctx: &Ctx, row: &DesiredWorkRow) -> Result<String, Failure> {
+    subject_wake_with_cadence(ctx, row, POLL_SECONDS).await
+}
+
+/// The durable wake for one subject at a requested cadence, bounded by the
+/// shortest stage budget and every inherited live attempt's stage deadline.
+/// A restart backoff stretches only the cadence — it must never outwait a
+/// deadline the supervisor is on the hook to enforce for an attempt the
+/// replacement controller inherited.
+async fn subject_wake_with_cadence(
+    ctx: &Ctx,
+    row: &DesiredWorkRow,
+    cadence_s: u64,
+) -> Result<String, Failure> {
     let now = now_iso();
-    let mut wake = deadline_after(&now, POLL_SECONDS)?;
+    let mut wake = deadline_after(&now, cadence_s)?;
     if row.subject_kind != DesiredSubjectKind::Run {
         return Ok(wake);
     }
@@ -853,6 +866,19 @@ async fn reconcile_claimed(
         });
     if let Some(terminal) = terminal.as_ref() {
         if !terminal.recoverable {
+            // The halt parks the subject with no future wake, so this tick
+            // is the last chance to release the reservation: left held, one
+            // halted subject pins its repository/provider capacity until an
+            // operator resubmits.
+            let reservation_id = admission_reservation.reservation_id.clone();
+            on_ledger(&ctx.ledger, move |ledger| {
+                ledger.release_admission_reservation(
+                    &reservation_id,
+                    Some("halted on a nonrecoverable controller failure"),
+                )?;
+                Ok(())
+            })
+            .await?;
             return finish_action(
                 ctx,
                 &row,
@@ -885,10 +911,21 @@ async fn reconcile_claimed(
     .await?;
     let reserved = match restart_reservation {
         DesiredRestartReservation::Exhausted(exhausted) => {
+            // Exhaustion also parks the subject with no wake; its
+            // reservation must not keep consuming capacity while parked.
+            let reservation_id = admission_reservation.reservation_id.clone();
+            on_ledger(&ctx.ledger, move |ledger| {
+                ledger.release_admission_reservation(
+                    &reservation_id,
+                    Some("restart budget exhausted"),
+                )?;
+                Ok(())
+            })
+            .await?;
             return Ok(json!({
                 "action": "exhausted",
                 "desiredWork": row_json(&exhausted),
-            }))
+            }));
         }
         DesiredRestartReservation::Reserved(reserved) => reserved,
     };
@@ -931,9 +968,10 @@ async fn reconcile_claimed(
             // already spent, mirroring the spawn-failure schedule: a
             // controller dying at boot must not be re-observed — and so
             // re-restarted — at the flat poll cadence (six generations in 43
-            // seconds was the incident shape). The just-spawned controller
-            // holds no live attempts, so no stage deadline is outwaited, and
-            // an adoption on the next wake returns to the flat cadence.
+            // seconds was the incident shape). The backoff stretches only
+            // the cadence: an attempt the replacement inherited live keeps
+            // its stage deadline as the wake bound, and an adoption on the
+            // next wake returns to the flat cadence.
             let backoff = POLL_SECONDS
                 .saturating_mul(2u64.saturating_pow(reserved.restart_used.saturating_sub(1)))
                 .min(MAX_BACKOFF_SECONDS);
@@ -946,7 +984,7 @@ async fn reconcile_claimed(
                     outcome: DesiredReconcileOutcome::Restarted,
                     controller_generation: Some(generation),
                     predecessor_generation: predecessor,
-                    next_wake_at: Some(deadline_after(&now_iso(), backoff)?),
+                    next_wake_at: Some(subject_wake_with_cadence(ctx, &reserved, backoff).await?),
                     last_progress_at: last_progress(ctx, &reserved.subject_id).await?,
                     // The dead generation's recorded failure rides through
                     // the restart so exhaustion still names it.

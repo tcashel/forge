@@ -1248,6 +1248,17 @@ fn nonrecoverable_terminal_halts_without_charging_the_budget() {
             .count(),
         1
     );
+    // The halt parks the subject with no wake, so its admission reservation
+    // must be released NOW — held, it would pin the single repository-write
+    // slot for unrelated work until a resubmit.
+    let snapshot = ledger.admission_snapshot(None).expect("admission snapshot");
+    assert!(
+        snapshot.reservations.iter().all(|reservation| {
+            reservation.subject_kind != forged_types::AdmissionSubjectKind::Run
+                || reservation.subject_id != "run-halt"
+        }),
+        "a halted subject holds no admission reservation"
+    );
     ledger.close().expect("close");
 
     // The typed recovery: a bare resubmit authorizes the next control
