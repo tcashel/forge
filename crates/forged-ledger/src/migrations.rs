@@ -1106,6 +1106,68 @@ BEGIN
 END;
 ";
 
+/// Migration 022: the ledger-native work store (Ingot). Work items carry
+/// identity and mutable coordination state; the rendered-body inputs live in
+/// `work_revisions`, which is append-only by trigger so spec history is
+/// unlosable and a pinned revision always dereferences to its exact bytes.
+/// Coordination churn (status, custody, leases) never mints a revision —
+/// that separation is what makes the spec drift fence's revision signal
+/// trustworthy. Dependency kinds mirror the closed, operator-adjudicated
+/// bd 1.2.1 subset; only `blocks` affects readiness. The lease row and the
+/// `assignee` column always move together: assignee is the holder of record
+/// (what bd called the lease holder), the lease row adds the expiry clock.
+const MIGRATION_022: &str = "
+CREATE TABLE work_items (
+  work_id          TEXT PRIMARY KEY CHECK (length(trim(work_id)) > 0),
+  kind             TEXT NOT NULL CHECK (kind IN ('task','epic')),
+  status           TEXT NOT NULL CHECK (status IN ('open','in_progress','blocked','closed')),
+  priority         INTEGER,
+  assignee         TEXT CHECK (assignee IS NULL OR length(trim(assignee)) > 0),
+  metadata_json    TEXT NOT NULL DEFAULT '{}',
+  current_revision INTEGER NOT NULL CHECK (current_revision > 0),
+  created_at       TEXT NOT NULL,
+  updated_at       TEXT NOT NULL
+);
+CREATE TABLE work_revisions (
+  work_id             TEXT NOT NULL REFERENCES work_items(work_id),
+  revision            INTEGER NOT NULL CHECK (revision > 0),
+  title               TEXT NOT NULL CHECK (length(trim(title)) > 0),
+  description         TEXT NOT NULL DEFAULT '',
+  acceptance_criteria TEXT NOT NULL DEFAULT '',
+  design              TEXT NOT NULL DEFAULT '',
+  notes               TEXT NOT NULL DEFAULT '',
+  cause               TEXT NOT NULL CHECK (cause IN
+                       ('authored','planning-apply','revert','import')),
+  written_at          TEXT NOT NULL,
+  PRIMARY KEY (work_id, revision)
+);
+CREATE TRIGGER work_revisions_append_only_update
+BEFORE UPDATE ON work_revisions
+BEGIN
+  SELECT RAISE(ABORT, 'work revisions are append-only');
+END;
+CREATE TRIGGER work_revisions_append_only_delete
+BEFORE DELETE ON work_revisions
+BEGIN
+  SELECT RAISE(ABORT, 'work revisions are append-only');
+END;
+CREATE TABLE work_deps (
+  from_id TEXT NOT NULL REFERENCES work_items(work_id),
+  to_id   TEXT NOT NULL REFERENCES work_items(work_id),
+  kind    TEXT NOT NULL CHECK (kind IN
+           ('blocks','parent-child','related','discovered-from','supersedes')),
+  PRIMARY KEY (from_id, to_id, kind),
+  CHECK (from_id <> to_id)
+);
+CREATE INDEX work_deps_to ON work_deps(to_id, kind);
+CREATE TABLE work_leases (
+  work_id     TEXT PRIMARY KEY REFERENCES work_items(work_id),
+  holder      TEXT NOT NULL CHECK (length(trim(holder)) > 0),
+  acquired_at TEXT NOT NULL,
+  expires_at  TEXT NOT NULL
+);
+";
+
 /// Embedded ordered migrations; `user_version` records the last applied index.
 const MIGRATIONS: &[&str] = &[
     MIGRATION_001,
@@ -1129,6 +1191,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_019,
     MIGRATION_020,
     MIGRATION_021,
+    MIGRATION_022,
 ];
 
 /// Configure pragmas and apply pending migrations on a fresh connection.
@@ -1265,6 +1328,34 @@ impl Ledger {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn work_revisions_are_append_only_by_trigger() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut conn = rusqlite::Connection::open(dir.path().join("state.db")).expect("open");
+        super::configure_connection(&mut conn).expect("migrate");
+        conn.execute_batch(
+            "INSERT INTO work_items (work_id, kind, status, priority, assignee, \
+               metadata_json, current_revision, created_at, updated_at) \
+             VALUES ('w1','task','open',NULL,NULL,'{}',1,'t','t'); \
+             INSERT INTO work_revisions (work_id, revision, title, cause, written_at) \
+             VALUES ('w1',1,'title','authored','t');",
+        )
+        .expect("seed");
+        let update = conn.execute(
+            "UPDATE work_revisions SET title = 'x' WHERE work_id = 'w1'",
+            [],
+        );
+        assert!(
+            update.unwrap_err().to_string().contains("append-only"),
+            "UPDATE must abort"
+        );
+        let delete = conn.execute("DELETE FROM work_revisions WHERE work_id = 'w1'", []);
+        assert!(
+            delete.unwrap_err().to_string().contains("append-only"),
+            "DELETE must abort"
+        );
+    }
+
     use super::{MIGRATIONS, MIGRATION_001};
     use crate::Ledger;
 
@@ -1280,7 +1371,7 @@ mod tests {
         assert_eq!(pragmas.synchronous, 2);
         assert!(pragmas.foreign_keys);
         assert_eq!(pragmas.busy_timeout_ms, 5000);
-        assert_eq!(pragmas.user_version, 21);
+        assert_eq!(pragmas.user_version, 22);
         ledger.close().expect("close");
 
         // Table names via a separate connection: sqlite_master is data, and
@@ -1385,7 +1476,7 @@ mod tests {
 
             let ledger = Ledger::open(&path)
                 .unwrap_or_else(|error| panic!("upgrade from v{version} failed: {error}"));
-            assert_eq!(ledger.pragmas().expect("pragmas").user_version, 21);
+            assert_eq!(ledger.pragmas().expect("pragmas").user_version, 22);
             assert_eq!(
                 ledger
                     .list_events_by_kind("legacy.progress")
@@ -1485,7 +1576,7 @@ mod tests {
         }
 
         let ledger = Ledger::open(&path).expect("upgrade owned v20 database");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 21);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 22);
         assert!(ledger
             .get_owned_herdr_session("migration-owned")
             .expect("owned row")
@@ -1529,7 +1620,7 @@ mod tests {
             .close()
             .expect("close");
         let ledger = Ledger::open(&path).expect("second open");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 21);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 22);
         ledger.close().expect("close");
     }
 
@@ -1590,7 +1681,7 @@ mod tests {
                 .expect("mark v0");
         }
         let ledger = Ledger::open(&path).expect("migrate");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 21);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 22);
         let old = ledger.get_run("old-run").expect("old run");
         assert_eq!(old.bead_id, "old-bead");
         assert_eq!(old.stop_reason.as_deref(), Some("legacy stop"));
@@ -1633,7 +1724,7 @@ mod tests {
         }
 
         let ledger = Ledger::open(&path).expect("migrate");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 21);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 22);
         let first = ledger.get_attempt(1).expect("attempt 1 survived");
         assert_eq!(first.claim_token, "tok-1");
         assert_eq!(first.state, crate::AttemptState::Reclaimed);

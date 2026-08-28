@@ -102,7 +102,7 @@ fn eight_concurrent_opens_migrate_once() {
         ledgers.push(handle.join().expect("open thread").expect("open succeeds"));
     }
     for ledger in &ledgers {
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 21);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 22);
     }
     for ledger in ledgers {
         ledger.close().expect("close");

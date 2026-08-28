@@ -319,6 +319,13 @@ fn migration_015_uses_only_durable_events_and_child_epic_context() {
              DROP TRIGGER work_identity_immutable;
              DROP TABLE work_identities;
              DROP INDEX events_run_event;
+             DROP TABLE work_leases;
+             DROP INDEX work_deps_to;
+             DROP TABLE work_deps;
+             DROP TRIGGER work_revisions_append_only_update;
+             DROP TRIGGER work_revisions_append_only_delete;
+             DROP TABLE work_revisions;
+             DROP TABLE work_items;
              PRAGMA user_version=14;
              INSERT INTO runs (run_id, bead_id, repo, base_ref, branch, state, created_at, updated_at)
                VALUES ('child-run', 'child-bead', '/Users/tripp/repositories/./forge', 'main',
@@ -342,7 +349,7 @@ fn migration_015_uses_only_durable_events_and_child_epic_context() {
         .expect("seed v14");
     }
     let ledger = Ledger::open(&path).expect("migrate 015");
-    assert_eq!(ledger.pragmas().expect("pragmas").user_version, 21);
+    assert_eq!(ledger.pragmas().expect("pragmas").user_version, 22);
     let epic = ledger
         .get_work_identity(WorkIdentitySubjectKind::Epic, "epic-one")
         .expect("read")

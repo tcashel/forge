@@ -11,6 +11,26 @@ pub(crate) fn now_iso() -> String {
     widen_fraction(&jiff::Timestamp::now().to_string())
 }
 
+/// `now + secs` in the same fixed-width form (lease expiry stamps).
+pub(crate) fn now_plus_secs_iso(secs: u64) -> String {
+    plus_secs_ts(jiff::Timestamp::now(), secs)
+}
+
+/// `stamp + secs` in the same fixed-width form. A stored stamp that does not
+/// parse is storage corruption and fails closed.
+pub(crate) fn plus_secs_iso(stamp: &str, secs: u64) -> Result<String, crate::error::LedgerError> {
+    let ts: jiff::Timestamp = stamp
+        .parse()
+        .map_err(|err| crate::error::internal(format!("bad stored timestamp {stamp:?}: {err}")))?;
+    Ok(plus_secs_ts(ts, secs))
+}
+
+fn plus_secs_ts(ts: jiff::Timestamp, secs: u64) -> String {
+    let span = jiff::SignedDuration::from_secs(i64::try_from(secs).unwrap_or(i64::MAX));
+    let shifted = ts.checked_add(span).unwrap_or(jiff::Timestamp::MAX);
+    widen_fraction(&shifted.to_string())
+}
+
 /// Normalize an RFC-3339 UTC string (as jiff displays it) to exactly nine
 /// fractional digits before the trailing `Z`.
 fn widen_fraction(s: &str) -> String {
