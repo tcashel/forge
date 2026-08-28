@@ -2392,10 +2392,14 @@ async fn run_attempt(
                     // Heartbeats prove liveness but never renew the frozen
                     // wall-clock deadline anchored at `started_at`. The
                     // attempt heartbeat and the work-lease renewal ride the
-                    // same cadence: a refused renewal means the lease was
-                    // reclaimed out from under us, and the attempt
+                    // same cadence: a REFUSED renewal means the claim or the
+                    // lease was taken out from under us, and the attempt
                     // self-terminates exactly as if revoked — the guardian
-                    // process this replaces never even reported it.
+                    // process this replaces never even reported it. Only the
+                    // typed refusals revoke: any other ledger error is
+                    // transport (a busy writer under load), the beat is
+                    // skipped, and the next beat renews — the lease TTL
+                    // absorbs missed beats by construction.
                     let token = claim_token.clone();
                     let renewed =
                         on_ledger(&ctx.ledger, move |l| l.heartbeat_attempt(&token)).await;
@@ -2411,7 +2415,15 @@ async fn run_attempt(
                         })
                         .await
                     };
-                    if renewed.is_err() || lease_renewed.is_err() {
+                    let claim_refused = matches!(
+                        &renewed,
+                        Err(failure) if failure.code == ErrorCode::StaleClaimToken
+                    );
+                    let lease_refused = matches!(
+                        &lease_renewed,
+                        Err(failure) if failure.code == ErrorCode::BeadLeaseHeld
+                    );
+                    if claim_refused || lease_refused {
                         // Our claim or our lease was taken out from under us:
                         // stop the provider and report. Its tokens were still
                         // spent; freeze this attempt's private capture before
@@ -2438,7 +2450,7 @@ async fn run_attempt(
                             &session_evidence,
                         )
                         .await?;
-                        if renewed.is_ok() {
+                        if !claim_refused {
                             // Lease-loss alone: the ATTEMPT is still live in
                             // the ledger (no revoker touched it), so it must
                             // settle durably here or the packet strands with
