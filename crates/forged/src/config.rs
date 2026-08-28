@@ -643,8 +643,9 @@ impl ForgedConfig {
             }]);
         };
         let mut errors = Vec::new();
-        // Authoring boundary: effort rules apply to the roster being frozen
-        // NOW, never to already-frozen packages (see validate_efforts).
+        // Authoring boundary: provider embedding rules apply to the roster
+        // being frozen NOW, never to already-frozen packages.
+        errors.extend(roster.validate_models());
         errors.extend(roster.validate_efforts());
         let mut profile_catalog = BTreeMap::new();
         let mut cursor = Some((profile_name.to_owned(), profile.clone()));
@@ -774,8 +775,9 @@ impl ForgedConfig {
             });
         }
         // A revision mints NEW frozen state from the current config, so the
-        // authoring-time effort rules apply here exactly as in
+        // authoring-time provider embedding rules apply here exactly as in
         // compile_definition.
+        errors.extend(roster.validate_models());
         errors.extend(roster.validate_efforts());
         if package.profile_catalog.is_empty() {
             errors.extend(roster.validate_for(&package.profile));
@@ -1620,6 +1622,49 @@ mod tests {
         // effort-carrying bytes; the fixture does the same.
         package.roster_sha256 = digest_of(&package.roster).expect("roster digest");
         compile_frozen_package(package).expect("frozen claude effort stays loadable");
+    }
+
+    #[test]
+    fn definition_model_charset_accepts_brackets_and_frozen_recovery_bypasses_it() {
+        let mut cfg = config();
+        {
+            let roster = cfg.rosters.get_mut("default").expect("default roster");
+            for candidates in roster.roles.values_mut() {
+                for candidate in candidates {
+                    candidate.model = "claude-sonnet-4[1m]".to_owned();
+                }
+            }
+        }
+        cfg.compile_definition(None, None)
+            .expect("definition accepts bracketed model");
+
+        cfg.rosters
+            .get_mut("default")
+            .expect("default roster")
+            .roles
+            .get_mut(&role("implementation"))
+            .expect("implementation role")[0]
+            .model = "claude-sonnet-4{1m}".to_owned();
+        let errors = cfg
+            .compile_definition(None, None)
+            .expect_err("definition rejects unembeddable model");
+        assert!(errors.iter().any(|error| {
+            error.path.ends_with(".model")
+                && error.message == forged_types::MODEL_VALUE_CHARSET_ERROR
+        }));
+
+        let mut package = config()
+            .compile_definition(None, None)
+            .expect("baseline compile")
+            .package;
+        package
+            .roster
+            .roles
+            .get_mut(&role("implementation"))
+            .expect("implementation role")[0]
+            .model = "claude-sonnet-4{1m}".to_owned();
+        package.roster_sha256 = digest_of(&package.roster).expect("roster digest");
+        compile_frozen_package(package).expect("historical model stays loadable");
     }
 
     #[test]

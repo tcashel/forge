@@ -681,7 +681,7 @@ async fn projection_uses_display_and_custom_lifecycle_only() {
     let source = "forged:projection:lifecycle:0123456789abcdef";
     let mut tokens = BTreeMap::new();
     tokens.insert("provider_session".into(), Some("thread-7".into()));
-    tokens.insert("model".into(), Some("gpt-5".into()));
+    tokens.insert("model".into(), Some("claude-sonnet-4[1m]".into()));
     assert_eq!(
         control
             .report_metadata(
@@ -746,6 +746,10 @@ async fn projection_uses_display_and_custom_lifecycle_only() {
     assert_eq!(
         mock.params_of("pane.report_metadata")["tokens"]["provider_session"],
         "thread-7"
+    );
+    assert_eq!(
+        mock.params_of("pane.report_metadata")["tokens"]["model"],
+        "claude-sonnet-4[1m]"
     );
     assert!(mock
         .params_of("pane.report_metadata")
