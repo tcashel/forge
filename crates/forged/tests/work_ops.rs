@@ -3,6 +3,9 @@
 
 mod support;
 
+use std::collections::{BTreeMap, BTreeSet};
+
+use forged_ledger::{NewWorkItem, WorkKind, WorkRevisionCause, WorkSpecFields, WorkStatus};
 use serde_json::{json, Value};
 use support::TestEnv;
 
@@ -13,6 +16,155 @@ fn result(env: &TestEnv, args: &[&str]) -> Value {
     let (code, envelope) = env.forged(args);
     assert_eq!(code, 0, "{args:?}: {envelope}");
     envelope["result"].clone()
+}
+
+fn seed_ready_items(env: &TestEnv, count: usize) {
+    let ledger = env.ledger();
+    for index in 0..count {
+        ledger
+            .create_work_item(NewWorkItem {
+                work_id: format!("ready-{index:03}"),
+                kind: WorkKind::Task,
+                status: WorkStatus::Open,
+                priority: Some(index as i64),
+                metadata: BTreeMap::from([("repository".to_owned(), "/tmp/ready-repo".to_owned())]),
+                spec: WorkSpecFields {
+                    title: format!("Ready item {index}"),
+                    description: format!("fat description {index}"),
+                    acceptance_criteria: format!("fat acceptance {index}"),
+                    design: format!("fat design {index}"),
+                    notes: format!("fat notes {index}"),
+                },
+                cause: WorkRevisionCause::Authored,
+            })
+            .expect("create ready work item");
+    }
+    ledger.close().expect("close test ledger");
+}
+
+#[test]
+fn work_ready_summarizes_by_default_and_full_round_trips_complete_rows() {
+    let env = TestEnv::new("forged-work-ready-detail");
+    assert_eq!(env.forged(&["init"]).0, 0);
+    let created = result(
+        &env,
+        &[
+            "work",
+            "create",
+            "--id",
+            "fat-ready",
+            "--title",
+            "Fat ready item",
+            "--description",
+            "description bytes that must stay out of summaries",
+            "--acceptance",
+            "acceptance bytes that must stay out of summaries",
+            "--design",
+            "design bytes that must stay out of summaries",
+            "--notes",
+            "notes bytes that must stay out of summaries",
+            "--priority",
+            "2",
+            "--repository",
+            "/tmp/fat-ready-repo",
+        ],
+    );
+
+    let summarized = result(&env, &["work", "ready"]);
+    assert_eq!(
+        summarized["filters"],
+        json!({"detail": "summary", "limit": 100})
+    );
+    assert_eq!(summarized["totals"], json!({"shown": 1, "total": 1}));
+    let row = &summarized["ready"][0];
+    let keys: BTreeSet<&str> = row
+        .as_object()
+        .expect("summary row")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        keys,
+        BTreeSet::from([
+            "id",
+            "kind",
+            "priority",
+            "repository",
+            "revision",
+            "status",
+            "title",
+        ])
+    );
+    assert_eq!(
+        row,
+        &json!({
+            "id": "fat-ready",
+            "title": "Fat ready item",
+            "kind": "task",
+            "status": "open",
+            "priority": 2,
+            "repository": "/tmp/fat-ready-repo",
+            "revision": 1,
+        })
+    );
+
+    let full = result(&env, &["work", "ready", "--full"]);
+    assert_eq!(full["filters"], json!({"detail": "full", "limit": 100}));
+    assert_eq!(
+        full["ready"][0], created["work"],
+        "--full preserves the complete pre-summary snapshot shape and bytes"
+    );
+}
+
+#[test]
+fn work_ready_reports_total_and_shown_across_the_default_bound() {
+    let env = TestEnv::new("forged-work-ready-bound");
+    assert_eq!(env.forged(&["init"]).0, 0);
+    seed_ready_items(&env, 101);
+
+    let bounded = result(&env, &["work", "ready"]);
+    assert_eq!(bounded["filters"]["limit"], json!(100));
+    assert_eq!(bounded["totals"], json!({"shown": 100, "total": 101}));
+    assert_eq!(bounded["ready"].as_array().expect("ready rows").len(), 100);
+
+    let raised = result(&env, &["work", "ready", "--limit", "101"]);
+    assert_eq!(raised["filters"]["limit"], json!(101));
+    assert_eq!(raised["totals"], json!({"shown": 101, "total": 101}));
+    assert_eq!(raised["ready"].as_array().expect("ready rows").len(), 101);
+}
+
+#[test]
+fn work_ready_limits_equal_attention_list_limits() {
+    let env = TestEnv::new("forged-work-ready-limit-parity");
+    assert_eq!(env.forged(&["init"]).0, 0);
+
+    let ready_default = result(&env, &["work", "ready"]);
+    let attention_default = result(&env, &["attention", "list"]);
+    assert_eq!(
+        ready_default["filters"]["limit"], attention_default["filters"]["limit"],
+        "the default collection limits must remain equal"
+    );
+    assert_eq!(ready_default["filters"]["limit"], json!(100));
+
+    let ready_max = result(&env, &["work", "ready", "--limit", "500"]);
+    let attention_max = result(&env, &["attention", "list", "--limit", "500"]);
+    assert_eq!(
+        ready_max["filters"]["limit"], attention_max["filters"]["limit"],
+        "the maximum accepted collection limits must remain equal"
+    );
+    assert_eq!(ready_max["filters"]["limit"], json!(500));
+
+    let (ready_code, ready_over) = env.forged(&["work", "ready", "--limit", "501"]);
+    let (attention_code, attention_over) = env.forged(&["attention", "list", "--limit", "501"]);
+    assert_ne!(
+        ready_code, 0,
+        "work_ready accepted an over-cap limit: {ready_over}"
+    );
+    assert_ne!(
+        attention_code, 0,
+        "attention_list accepted an over-cap limit: {attention_over}"
+    );
+    assert_eq!(ready_over["error"]["code"], attention_over["error"]["code"]);
 }
 
 /// One epic's whole event stream as (kind, payload), oldest first.
@@ -132,7 +284,7 @@ fn authoring_and_repair_verbs_cover_the_lifecycle() {
         .as_array()
         .expect("ready")
         .iter()
-        .filter_map(|item| item["workId"].as_str())
+        .filter_map(|item| item["id"].as_str())
         .collect();
     assert!(
         ids.contains(&"ops-gate") && !ids.contains(&"ops-slice"),
@@ -155,7 +307,7 @@ fn authoring_and_repair_verbs_cover_the_lifecycle() {
             .as_array()
             .expect("ready")
             .iter()
-            .any(|item| item["workId"] == json!("ops-slice")),
+            .any(|item| item["id"] == json!("ops-slice")),
         "{ready}"
     );
 

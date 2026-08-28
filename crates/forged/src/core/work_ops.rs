@@ -20,6 +20,24 @@ use crate::core::{
     param_opt_str_strict, param_str, Ctx, Failure,
 };
 
+const WORK_READY_DEFAULT_LIMIT: u64 = 100;
+const WORK_READY_MAX_LIMIT: u64 = 500;
+
+#[derive(Clone, Copy)]
+enum WorkReadyDetail {
+    Summary,
+    Full,
+}
+
+impl WorkReadyDetail {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Summary => "summary",
+            Self::Full => "full",
+        }
+    }
+}
+
 fn snapshot_json(snapshot: &WorkItemSnapshot, next_steps: &[&str]) -> Value {
     json!({
         "work": snapshot,
@@ -543,8 +561,66 @@ pub async fn work_show(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
 /// `work_ready` — the ready frontier (read-only).
 pub async fn work_ready(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
     crate::core::read_only("work_ready", req, || async {
+        let detail = match req.params.get("detail") {
+            None => WorkReadyDetail::Summary,
+            Some(Value::String(value)) if value == "full" => WorkReadyDetail::Full,
+            Some(_) => {
+                return Err(Failure::invalid(
+                    "work_ready detail must be \"full\" when present",
+                ))
+            }
+        };
+        let limit = req
+            .params
+            .get("limit")
+            .map(|value| {
+                value
+                    .as_u64()
+                    .ok_or_else(|| Failure::invalid("work_ready limit must be an unsigned integer"))
+            })
+            .transpose()?
+            .unwrap_or(WORK_READY_DEFAULT_LIMIT);
+        if !(1..=WORK_READY_MAX_LIMIT).contains(&limit) {
+            return Err(Failure::invalid(format!(
+                "work_ready limit must be between 1 and {WORK_READY_MAX_LIMIT}"
+            )));
+        }
+
         let ready = on_ledger(&ctx.ledger, |l| l.ready_work_items()).await?;
-        Ok(json!({"ready": ready}))
+        let total = ready.len();
+        let ready = match detail {
+            WorkReadyDetail::Summary => ready
+                .into_iter()
+                .take(limit as usize)
+                .map(|item| {
+                    json!({
+                        "id": item.work_id,
+                        "title": item.spec.title,
+                        "kind": item.kind,
+                        "status": item.status,
+                        "priority": item.priority,
+                        "repository": item.metadata.get("repository"),
+                        "revision": item.revision,
+                    })
+                })
+                .collect::<Vec<_>>(),
+            WorkReadyDetail::Full => ready
+                .into_iter()
+                .take(limit as usize)
+                .map(|item| json!(item))
+                .collect::<Vec<_>>(),
+        };
+        Ok(json!({
+            "filters": {
+                "detail": detail.as_str(),
+                "limit": limit,
+            },
+            "totals": {
+                "shown": ready.len(),
+                "total": total,
+            },
+            "ready": ready,
+        }))
     })
     .await
 }

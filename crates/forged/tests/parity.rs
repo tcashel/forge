@@ -199,6 +199,34 @@ fn all_fifty_seven_tools_match_their_cli_counterparts() {
         repository_schema.to_string().contains("string"),
         "work_list advertises params.repo as a string: {repository_schema}"
     );
+    let work_ready = mcp.tool("work_ready");
+    let ready_schema = work_ready
+        .pointer("/inputSchema/properties/params/properties")
+        .cloned()
+        .unwrap_or(Value::Null);
+    for param in ["detail", "limit"] {
+        assert!(
+            ready_schema.get(param).is_some(),
+            "work_ready advertises params.{param}: {ready_schema}"
+        );
+    }
+    assert!(
+        ready_schema["detail"].to_string().contains("full"),
+        "work_ready advertises full detail: {ready_schema}"
+    );
+    let description = work_ready["description"].as_str().unwrap_or_default();
+    for statement in [
+        "summary rows by default",
+        "params.detail",
+        "params.limit",
+        "100",
+        "500",
+    ] {
+        assert!(
+            description.contains(statement),
+            "work_ready description states {statement:?}: {description}"
+        );
+    }
     let work_history = mcp.tool("work_history");
     let history_schema = work_history
         .pointer("/inputSchema")
@@ -1214,6 +1242,14 @@ fn all_fifty_seven_tools_match_their_cli_counterparts() {
         normalized(tool),
         "repository-scoped work_list parity"
     );
+
+    let cli = env.forged(&["work", "ready", "--full", "--limit", "25"]).1;
+    let tool = mcp.call_tool(
+        "work_ready",
+        envelope(json!({"detail": "full", "limit": 25})),
+    );
+    assert_eq!(tool["operationId"], json!("op:work_ready:read"));
+    assert_eq!(normalized(cli), normalized(tool), "work_ready parity");
 
     let cli = env
         .forged(&[

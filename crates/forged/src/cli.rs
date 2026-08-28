@@ -984,7 +984,7 @@ pub enum WorkCmd {
     /// One work item with its dependencies (read-only).
     Show(WorkIdArgs),
     /// The ready frontier (read-only).
-    Ready(KeyOnly),
+    Ready(WorkReadyArgs),
     /// Create a work item with its revision-1 spec.
     Create(WorkCreateArgs),
     /// Guarded spec update (revision CAS).
@@ -1010,6 +1010,20 @@ pub struct WorkIdArgs {
     #[arg(long)]
     pub id: String,
     /// Override the derived idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+/// `work ready` flags.
+#[derive(Debug, Args)]
+pub struct WorkReadyArgs {
+    /// Return complete work-item snapshots instead of summary rows.
+    #[arg(long)]
+    pub full: bool,
+    /// Maximum ready items, 1..=500 (default 100).
+    #[arg(long)]
+    pub limit: Option<u64>,
+    /// Override the read-only idempotency key.
     #[arg(long)]
     pub idempotency_key: Option<String>,
 }
@@ -2290,7 +2304,19 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
                 "work_show",
                 request(a.idempotency_key, None, json!({"id": a.id})),
             ),
-            WorkCmd::Ready(a) => ("work_ready", request(a.idempotency_key, None, json!({}))),
+            WorkCmd::Ready(a) => {
+                let mut params = Map::new();
+                if a.full {
+                    params.insert("detail".to_owned(), json!("full"));
+                }
+                if let Some(limit) = a.limit {
+                    params.insert("limit".to_owned(), json!(limit));
+                }
+                (
+                    "work_ready",
+                    request(a.idempotency_key, None, Value::Object(params)),
+                )
+            }
             WorkCmd::Create(a) => {
                 let mut params = Map::new();
                 params.insert("id".to_owned(), json!(a.id));
