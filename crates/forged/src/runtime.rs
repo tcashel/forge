@@ -3409,6 +3409,7 @@ mod tests {
             runs_root: anvil.join("runs"),
             db_path: anvil.join("state.db"),
             config_path: anvil.join("config.yaml"),
+            config_path_override: None,
             config_file_read: false,
             config_sha256: None,
             roster: HashMap::new(),

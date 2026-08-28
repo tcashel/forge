@@ -38,6 +38,10 @@ pub struct ForgedConfig {
     pub runs_root: PathBuf,
     pub db_path: PathBuf,
     pub config_path: PathBuf,
+    /// The nonempty `FORGED_CONFIG` value resolved at process start. Keeping
+    /// selection input in the snapshot makes reloads deterministic and lets
+    /// scratch configs resolve only beneath their explicit `anvil_home`.
+    pub(crate) config_path_override: Option<PathBuf>,
     pub config_file_read: bool,
     /// The sha256 of the config file bytes this snapshot resolved from;
     /// `None` when no file was read. This is the reload fingerprint: a
@@ -375,9 +379,12 @@ fn anvil_home() -> PathBuf {
     PathBuf::from(".anvil")
 }
 
-fn config_path(anvil_home: &std::path::Path) -> PathBuf {
-    if let Some(path) = std::env::var_os("FORGED_CONFIG").filter(|v| !v.is_empty()) {
-        return PathBuf::from(path);
+fn config_path(
+    anvil_home: &std::path::Path,
+    config_path_override: Option<&std::path::Path>,
+) -> PathBuf {
+    if let Some(path) = config_path_override {
+        return path.to_path_buf();
     }
     let yaml = anvil_home.join("config.yaml");
     if yaml.exists() {
@@ -457,11 +464,18 @@ impl ForgedConfig {
     /// Load and resolve the single config snapshot for this process.
     pub fn load() -> Result<ForgedConfig, String> {
         let anvil_home = anvil_home();
-        let config_path = config_path(&anvil_home);
-        Self::load_at(anvil_home, config_path)
+        let config_path_override = std::env::var_os("FORGED_CONFIG")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from);
+        let config_path = config_path(&anvil_home, config_path_override.as_deref());
+        Self::load_at(anvil_home, config_path, config_path_override)
     }
 
-    fn load_at(anvil_home: PathBuf, config_path: PathBuf) -> Result<ForgedConfig, String> {
+    fn load_at(
+        anvil_home: PathBuf,
+        config_path: PathBuf,
+        config_path_override: Option<PathBuf>,
+    ) -> Result<ForgedConfig, String> {
         let (file, config_file_read, config_sha256) = match std::fs::read_to_string(&config_path) {
             Ok(text) => {
                 let parsed = if config_path.extension().and_then(|v| v.to_str()) == Some("json") {
@@ -516,8 +530,9 @@ impl ForgedConfig {
         admission.validate()?;
         Ok(ForgedConfig {
             runs_root: anvil_home.join("runs"),
-            db_path: forged_ledger::default_db_path(),
+            db_path: anvil_home.join("state.db"),
             config_path,
+            config_path_override,
             config_file_read,
             config_sha256,
             roster: legacy_roster,
@@ -547,7 +562,8 @@ impl ForgedConfig {
 
     /// Re-resolve this snapshot's config, refreshing every file-derived
     /// field. The file's IDENTITY is re-selected exactly as a fresh process
-    /// selects it (`FORGED_CONFIG`, then yaml-before-json under this home),
+    /// selects it (the startup `FORGED_CONFIG`, then yaml-before-json under
+    /// this home),
     /// so a `config.yaml` created — or removed over a json fallback — while
     /// a long-lived surface runs is honored, not pinned past. The identity
     /// anchors — `db_path`, `runs_root`, `beads_dir` — are preserved from
@@ -555,8 +571,12 @@ impl ForgedConfig {
     /// pricing, or admission, but it must never re-point durable state out
     /// from under an open surface.
     pub fn reload(&self) -> Result<ForgedConfig, String> {
-        let selected = config_path(&self.anvil_home);
-        let mut fresh = Self::load_at(self.anvil_home.clone(), selected)?;
+        let selected = config_path(&self.anvil_home, self.config_path_override.as_deref());
+        let mut fresh = Self::load_at(
+            self.anvil_home.clone(),
+            selected,
+            self.config_path_override.clone(),
+        )?;
         fresh.db_path = self.db_path.clone();
         fresh.runs_root = self.runs_root.clone();
         fresh.beads_dir = self.beads_dir.clone();
@@ -571,7 +591,7 @@ impl ForgedConfig {
     /// unchanged by definition — a hand-built config with no backing file
     /// never reloads over itself.
     pub fn refreshed(&self) -> Result<Option<ForgedConfig>, String> {
-        if config_path(&self.anvil_home) != self.config_path {
+        if config_path(&self.anvil_home, self.config_path_override.as_deref()) != self.config_path {
             return self.reload().map(Some);
         }
         match std::fs::read(&self.config_path) {
@@ -1270,6 +1290,11 @@ pub fn now_iso() -> String {
 
 /// A complete default config over one scratch operator scope, for unit
 /// tests that never call `load`.
+///
+/// The caller's tempdir is the config's explicit `ANVIL_HOME`, and the absent
+/// override means refreshes select only beneath it. Tests therefore never
+/// consult ambient `ANVIL_HOME` or `FORGED_CONFIG`, even when run from a live
+/// operator environment.
 #[cfg(test)]
 pub(crate) fn scratch_config(anvil_home: &std::path::Path) -> ForgedConfig {
     ForgedConfig {
@@ -1277,6 +1302,7 @@ pub(crate) fn scratch_config(anvil_home: &std::path::Path) -> ForgedConfig {
         runs_root: anvil_home.join("runs"),
         db_path: anvil_home.join("state.db"),
         config_path: anvil_home.join("config.yaml"),
+        config_path_override: None,
         config_file_read: false,
         config_sha256: None,
         roster: default_legacy_roster(),
@@ -1307,6 +1333,7 @@ mod tests {
             runs_root: PathBuf::from("/tmp/anvil/runs"),
             db_path: PathBuf::from("/tmp/anvil/state.db"),
             config_path: PathBuf::from("/tmp/anvil/config.yaml"),
+            config_path_override: None,
             config_file_read: false,
             config_sha256: None,
             roster: default_legacy_roster(),
@@ -2037,12 +2064,17 @@ mod tests {
         }
     }
 
+    // Every refresh test below binds the snapshot's ANVIL_HOME to its own
+    // tempdir and passes no FORGED_CONFIG override. This per-test discipline
+    // makes path selection independent of a populated operator environment.
+
     #[test]
     fn refreshed_reloads_only_when_the_file_content_changes() {
         let dir = tempfile::tempdir().expect("scratch scope");
         let path = dir.path().join("config.yaml");
         std::fs::write(&path, "default_profile: standard\n").expect("write config");
-        let snapshot = ForgedConfig::load_at(dir.path().to_path_buf(), path.clone()).expect("load");
+        let snapshot =
+            ForgedConfig::load_at(dir.path().to_path_buf(), path.clone(), None).expect("load");
         assert!(snapshot.config_sha256.is_some());
         assert!(snapshot.refreshed().expect("unchanged gate").is_none());
         std::fs::write(&path, "default_profile: high\n").expect("rewrite config");
@@ -2082,8 +2114,9 @@ mod tests {
             "{\"default_profile\": \"jsonprofile\"}",
         )
         .expect("write json config");
-        let selected = config_path(dir.path());
-        let snapshot = ForgedConfig::load_at(dir.path().to_path_buf(), selected).expect("load");
+        let selected = config_path(dir.path(), None);
+        let snapshot =
+            ForgedConfig::load_at(dir.path().to_path_buf(), selected, None).expect("load");
         assert_eq!(snapshot.default_profile, "jsonprofile");
         assert!(snapshot.refreshed().expect("unchanged gate").is_none());
         // A yaml appearing outranks the pinned json, exactly as a fresh
@@ -2109,7 +2142,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("scratch scope");
         let path = dir.path().join("config.yaml");
         std::fs::write(&path, "default_profile: standard\n").expect("write config");
-        let snapshot = ForgedConfig::load_at(dir.path().to_path_buf(), path.clone()).expect("load");
+        let snapshot =
+            ForgedConfig::load_at(dir.path().to_path_buf(), path.clone(), None).expect("load");
         std::fs::write(&path, "default_profile: [broken").expect("break config");
         let error = snapshot.refreshed().expect_err("malformed gate");
         assert!(error.contains("does not parse"), "{error}");
