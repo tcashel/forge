@@ -567,6 +567,9 @@ impl ForgedConfig {
             }]);
         };
         let mut errors = Vec::new();
+        // Authoring boundary: effort rules apply to the roster being frozen
+        // NOW, never to already-frozen packages (see validate_efforts).
+        errors.extend(roster.validate_efforts());
         let mut profile_catalog = BTreeMap::new();
         let mut cursor = Some((profile_name.to_owned(), profile.clone()));
         let mut seen = BTreeSet::new();
@@ -694,6 +697,10 @@ impl ForgedConfig {
                 ),
             });
         }
+        // A revision mints NEW frozen state from the current config, so the
+        // authoring-time effort rules apply here exactly as in
+        // compile_definition.
+        errors.extend(roster.validate_efforts());
         if package.profile_catalog.is_empty() {
             errors.extend(roster.validate_for(&package.profile));
         } else {
@@ -1479,6 +1486,43 @@ mod tests {
         let recompiled = compile_frozen_package(package).expect("frozen compile");
         assert_eq!(recompiled.package.profile_ref.name, "lean");
         assert_eq!(recompiled.compatibility_roster.len(), 4);
+    }
+
+    #[test]
+    fn frozen_packages_with_historical_efforts_stay_loadable() {
+        // Pre-charset versions accepted (and the claude driver ignored) a
+        // claude candidate carrying an effort. The authoring boundary now
+        // refuses one, but the SAME bytes frozen into a durable package must
+        // keep recompiling: recovery never applies authoring-time effort
+        // rules to immutable state.
+        let mut cfg = config();
+        let roster = cfg.rosters.get_mut("default").expect("default roster");
+        for candidates in roster.roles.values_mut() {
+            for candidate in candidates.iter_mut() {
+                if candidate.provider == "claude" {
+                    candidate.effort = Some("high".to_owned());
+                }
+            }
+        }
+        let authoring = cfg.compile_definition(None, None);
+        let errors = authoring.expect_err("authoring refuses claude effort");
+        assert!(errors
+            .iter()
+            .any(|error| error.message.contains("claude candidates take no effort")));
+
+        let frozen_cfg = config();
+        let mut package = frozen_cfg
+            .compile_definition(None, None)
+            .expect("baseline compile")
+            .package;
+        for candidates in package.roster.roles.values_mut() {
+            for candidate in candidates.iter_mut() {
+                if candidate.provider == "claude" {
+                    candidate.effort = Some("high".to_owned());
+                }
+            }
+        }
+        compile_frozen_package(package).expect("frozen claude effort stays loadable");
     }
 
     #[test]
