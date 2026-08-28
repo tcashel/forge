@@ -333,6 +333,9 @@ pub struct RunAdjudicateSettlementArgs {
 /// `epic` subcommands.
 #[derive(Debug, Subcommand)]
 pub enum EpicCmd {
+    /// Rehearse `epic start` read-only: every start check plus the identity
+    /// tuple it would freeze, with nothing created.
+    Preflight(EpicPreflightArgs),
     /// Freeze an epic inventory and execution defaults.
     Start(EpicStartArgs),
     /// Perform one durable scheduler action.
@@ -340,7 +343,7 @@ pub enum EpicCmd {
     /// Drive until the final draft PR or explicit input is required.
     Drive(EpicScoped),
     /// Hand the epic to a detached durable controller.
-    Submit(EpicScoped),
+    Submit(EpicSubmitArgs),
     /// Project waves, children, blockers, and the final PR (read-only).
     Status(EpicScoped),
     /// Pause scheduling after the current durable boundary.
@@ -351,6 +354,33 @@ pub enum EpicCmd {
     Resolve(EpicResolveArgs),
     /// Append a roster revision for current and future child runs.
     ReviseRoster(EpicReviseRosterArgs),
+}
+
+/// `epic preflight` flags — the same geometry `epic start` takes.
+#[derive(Debug, Args)]
+pub struct EpicPreflightArgs {
+    /// Beads epic id whose inventory/readiness is authoritative.
+    #[arg(long)]
+    pub epic: String,
+    /// Absolute target checkout path.
+    #[arg(long)]
+    pub repo: String,
+    /// Bare default-branch name existing on origin (e.g. "main"); an
+    /// `origin/` prefix is stripped. Defaults from origin/HEAD.
+    #[arg(long)]
+    pub base_ref: Option<String>,
+    /// Assurance profile inherited by child slices.
+    #[arg(long)]
+    pub profile: Option<String>,
+    /// Model roster inherited by child slices.
+    #[arg(long)]
+    pub roster: Option<String>,
+    /// Rehearse with provider-authored rolling planning authorized.
+    #[arg(long)]
+    pub rolling: bool,
+    /// Override the read-only idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
 }
 
 /// `epic start` flags.
@@ -389,6 +419,21 @@ pub struct EpicScoped {
     /// Durable epic id.
     #[arg(long)]
     pub epic: String,
+    /// Override the derived/read-only idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+/// `epic submit` flags.
+#[derive(Debug, Args)]
+pub struct EpicSubmitArgs {
+    /// Durable epic id.
+    #[arg(long)]
+    pub epic: String,
+    /// Block briefly until initial setup resolves and include the advisory
+    /// `setup` readback in the response.
+    #[arg(long)]
+    pub wait_setup: bool,
     /// Override the derived/read-only idempotency key.
     #[arg(long)]
     pub idempotency_key: Option<String>,
@@ -1367,6 +1412,7 @@ pub fn command_name(command: &Command) -> &'static str {
             RunCmd::AcceptRisk(_) => "run_accept_risk",
         },
         Command::Epic { command } => match command {
+            EpicCmd::Preflight(_) => "epic_preflight",
             EpicCmd::Start(_) => "epic_start",
             EpicCmd::Advance(_) => "epic_advance",
             EpicCmd::Drive(_) => "epic_drive",
@@ -1551,6 +1597,21 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
             ),
         },
         Command::Epic { command } => match command {
+            EpicCmd::Preflight(a) => (
+                "epic_preflight",
+                request(
+                    a.idempotency_key,
+                    Some(a.epic.clone()),
+                    json!({
+                        "epic": a.epic,
+                        "repo": a.repo,
+                        "baseRef": a.base_ref,
+                        "profile": a.profile,
+                        "roster": a.roster,
+                        "rolling": a.rolling,
+                    }),
+                ),
+            ),
             EpicCmd::Start(a) => (
                 "epic_start",
                 request(
@@ -1588,7 +1649,13 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
                 request(
                     a.idempotency_key,
                     Some(a.epic.clone()),
-                    json!({"epic": a.epic}),
+                    // The flag is omitted when unset so the fenced request
+                    // params stay byte-identical to every prior submit.
+                    if a.wait_setup {
+                        json!({"epic": a.epic, "waitSetup": true})
+                    } else {
+                        json!({"epic": a.epic})
+                    },
                 ),
             ),
             EpicCmd::Status(a) => (

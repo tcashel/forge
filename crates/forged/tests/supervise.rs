@@ -1484,3 +1484,85 @@ fn a_terminal_drive_error_records_durable_evidence() {
     assert_eq!(payload["message"], json!(message));
     ledger.close().expect("close");
 }
+
+fn controller_dead_attention(env: &TestEnv, run: &str) -> Option<Value> {
+    let (code, overview) = env.forged(&["overview"]);
+    assert_eq!(code, 0, "{overview}");
+    overview["result"]["attention"]
+        .as_array()
+        .and_then(|items| {
+            items
+                .iter()
+                .find(|item| {
+                    item["id"] == json!(run) && item["condition"] == json!("controller-dead")
+                })
+                .cloned()
+        })
+}
+
+/// A wake that is merely due — the shape every fresh submit produces — is
+/// not a dead-controller symptom; one overdue past the grace window is.
+#[test]
+fn a_due_wake_within_grace_is_not_a_dead_controller_symptom() {
+    if !require_serialized_runner() {
+        return;
+    }
+    let env = TestEnv::new("supervise-wake-grace");
+    raise_admission_limits(&env);
+    start_run(&env, "run-grace");
+    env.set_scenario("implement", "hang", 2);
+    let (code, submitted) = env.forged(&["run", "submit", "--run", "run-grace"]);
+    assert_eq!(code, 0, "submit: {submitted}");
+    // The submit readback names its phase and the minted control revision.
+    assert_eq!(submitted["result"]["phase"], json!("spawned"));
+    assert_eq!(submitted["result"]["controlRevision"], json!(1));
+    let pid = controller_pid(&submitted);
+    wait_until("provider start", || {
+        implementation_starts(&env, "run-grace") == 1
+    });
+    killpg(Pid::from_raw(pid), Signal::SIGKILL).expect("kill controller group");
+    wait_until("controller group death", || !process_group_alive(pid));
+
+    // Five seconds past due sits inside the fifteen-second grace.
+    let now = jiff::Timestamp::now();
+    let barely = jiff::Timestamp::from_nanosecond(now.as_nanosecond() - 5_000_000_000)
+        .expect("barely-due stamp")
+        .to_string();
+    let ledger = env.ledger();
+    ledger
+        .record_desired_outcome(
+            DesiredSubjectKind::Run,
+            "run-grace",
+            DesiredState::Running,
+            DesiredReconcileOutcome::Authorized,
+            Some(barely),
+            None,
+        )
+        .expect("barely-due wake");
+    ledger.close().expect("close");
+    assert!(
+        controller_dead_attention(&env, "run-grace").is_none(),
+        "a wake inside the grace mints no symptom"
+    );
+
+    let ledger = env.ledger();
+    ledger
+        .record_desired_outcome(
+            DesiredSubjectKind::Run,
+            "run-grace",
+            DesiredState::Running,
+            DesiredReconcileOutcome::Authorized,
+            Some("2000-01-01T00:00:00.000000000Z".to_owned()),
+            None,
+        )
+        .expect("far-overdue wake");
+    ledger.close().expect("close");
+    let item = controller_dead_attention(&env, "run-grace")
+        .unwrap_or_else(|| panic!("a wake overdue past the grace mints the symptom"));
+    assert!(
+        item["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("is overdue")),
+        "{item}"
+    );
+}

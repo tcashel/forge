@@ -1459,6 +1459,28 @@ async fn submit(ctx: &Ctx, req: &mut OperationRequest, scope: Scope) -> Operatio
             )
         }
     };
+    // The control revision this submit will mint. Every authorize path bumps
+    // prior + 1 (or inserts at 1), and the submit guard serializes submits
+    // per subject, so the pre-commit prediction is exact — the readback is
+    // computed here because the fenced response is stored before the bump
+    // is observable.
+    let next_control_revision = {
+        let kind = scope.desired_kind();
+        let desired_id = id.clone();
+        match on_ledger(&ctx.ledger, move |ledger| {
+            ledger.get_desired_work(kind, &desired_id)
+        })
+        .await
+        {
+            Ok(row) => row.map_or(1, |row| row.control_revision + 1),
+            Err(error) => {
+                return err_response(
+                    &derive_key(scope.operation(), Some(&id), None, None),
+                    &error,
+                )
+            }
+        }
+    };
 
     let records = match events(ctx, &id).await {
         Ok(records) => records,
@@ -1581,7 +1603,13 @@ async fn submit(ctx: &Ctx, req: &mut OperationRequest, scope: Scope) -> Operatio
                 let response = ok_response(
                     &row.operation_id,
                     false,
-                    json!({"submitted": true, "alreadyRunning": false, "controller": status}),
+                    json!({
+                        "submitted": true,
+                        "phase": "recovered",
+                        "controlRevision": next_control_revision,
+                        "alreadyRunning": false,
+                        "controller": status,
+                    }),
                 );
                 let operation_id = row.operation_id;
                 let response_for_store = response.clone();
@@ -1619,7 +1647,13 @@ async fn submit(ctx: &Ctx, req: &mut OperationRequest, scope: Scope) -> Operatio
             return ok_response(
                 &key,
                 true,
-                json!({"submitted": false, "alreadyRunning": true, "controller": status}),
+                json!({
+                    "submitted": false,
+                    "phase": "already-running",
+                    "controlRevision": next_control_revision,
+                    "alreadyRunning": true,
+                    "controller": status,
+                }),
             );
         }
         if is_unknown(&status) {
@@ -1755,6 +1789,7 @@ async fn submit(ctx: &Ctx, req: &mut OperationRequest, scope: Scope) -> Operatio
             false,
             json!({
                 "submitted": false,
+                "phase": "stopped",
                 "alreadyRunning": false,
                 "stopped": stopped,
                 "controller": latest_status,
@@ -1898,6 +1933,8 @@ async fn submit(ctx: &Ctx, req: &mut OperationRequest, scope: Scope) -> Operatio
                 move |_operation| async move {
                     Ok(json!({
                         "submitted": true,
+                        "phase": "queued",
+                        "controlRevision": next_control_revision,
                         "queued": true,
                         "alreadyRunning": false,
                         "controller": Value::Null,
@@ -2060,6 +2097,8 @@ async fn submit(ctx: &Ctx, req: &mut OperationRequest, scope: Scope) -> Operatio
                 if let Some(controller) = recovered_controller {
                     return Ok(json!({
                         "submitted": true,
+                        "phase": "recovered",
+                        "controlRevision": next_control_revision,
                         "recovered": true,
                         "alreadyRunning": false,
                         "controller": controller,
@@ -2075,7 +2114,13 @@ async fn submit(ctx: &Ctx, req: &mut OperationRequest, scope: Scope) -> Operatio
                     herdr_socket,
                 )
                 .await?;
-                Ok(json!({"submitted": true, "alreadyRunning": false, "controller": controller}))
+                Ok(json!({
+                    "submitted": true,
+                    "phase": "spawned",
+                    "controlRevision": next_control_revision,
+                    "alreadyRunning": false,
+                    "controller": controller,
+                }))
             }
         },
     )
@@ -2100,7 +2145,37 @@ pub async fn run_submit(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespo
 
 /// Detach an epic driver and return its durable controller identity.
 pub async fn epic_submit(ctx: &Ctx, req: &mut OperationRequest) -> OperationResponse {
-    submit(ctx, req, Scope::Epic).await
+    // `waitSetup` is a read-only wrapper directive: it is stripped before
+    // the fenced request so it never perturbs operation identity, and its
+    // `setup` readback is advisory — attached to the live response, never
+    // stored, absent on replay.
+    let wait_setup = match req.params.remove("waitSetup") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(value)) => value,
+        Some(_) => {
+            return err_response(
+                &derive_key("epic_submit", req.run_id.as_deref(), None, None),
+                &Failure::invalid("epic submit waitSetup must be a boolean"),
+            )
+        }
+    };
+    let mut response = submit(ctx, req, Scope::Epic).await;
+    if wait_setup && response.ok {
+        let phase = response
+            .result
+            .as_ref()
+            .and_then(|result| result.get("phase"))
+            .and_then(Value::as_str);
+        if matches!(phase, Some("spawned" | "recovered" | "already-running")) {
+            if let Ok(epic) = param_str(&req.params, "epic") {
+                let setup = super::epic::await_setup(ctx, epic).await;
+                if let Some(object) = response.result.as_mut().and_then(Value::as_object_mut) {
+                    object.insert("setup".to_owned(), setup);
+                }
+            }
+        }
+    }
+    response
 }
 
 #[cfg(test)]

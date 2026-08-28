@@ -1286,9 +1286,45 @@ fn epic_status_delivery(snapshot: &WorkObservationSnapshot) -> Result<(Value, Va
         .map(|row| row.updated_at.clone())
         .or_else(|| snapshot.events.rows.last().map(|event| event.ts.clone()))
         .unwrap_or_else(|| snapshot.identity.captured_at.clone());
+    // The latest recorded controller terminal failure, scanned from the same
+    // complete event tail the other event-derived fields use.
+    let last_controller_failure = complete_events
+        .then(|| {
+            snapshot
+                .events
+                .rows
+                .iter()
+                .rev()
+                .find(|event| event.kind == super::handoff::CONTROLLER_TERMINAL_EVENT)
+                .and_then(|event| {
+                    serde_json::from_str::<Value>(&event.payload_json)
+                        .ok()
+                        .map(|payload| super::health::controller_failure_json(&payload, &event.ts))
+                })
+        })
+        .flatten();
+    let admission_deferred = snapshot
+        .admission_decisions
+        .iter()
+        .find(|decision| {
+            decision.subject_kind == forged_types::AdmissionSubjectKind::Epic
+                && decision.subject_id == snapshot.subject.id
+        })
+        .is_some_and(|decision| decision.outcome == forged_types::AdmissionOutcome::Deferred);
+    let execution_health = super::health::execution_health(super::health::HealthInputs {
+        started: true,
+        terminal: latest_terminal_pr.is_some() || latest_assurance_completion.is_some(),
+        paused: latest_pause.is_some_and(|(kind, _)| kind == super::epic::PAUSED),
+        input_required: latest_input.is_some_and(|(kind, _)| kind == super::epic::INPUT_REQUIRED),
+        admission_deferred,
+        desired,
+        controller_live: None,
+    });
     let status = json!({
         "source": "ledger",
         "state": state,
+        "executionHealth": execution_health,
+        "lastControllerFailure": last_controller_failure,
         "desiredState": desired.map(|row| row.desired_state.as_str()),
         "controlRevision": desired.map(|row| row.control_revision),
         "lastOutcome": desired.and_then(|row| row.last_outcome.map(|value| value.as_str())),

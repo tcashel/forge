@@ -702,6 +702,68 @@ pub(super) async fn epic_submission_stop(ctx: &Ctx, epic: &str) -> Result<Option
     })
 }
 
+/// Poll the durable epic stream until initial setup resolves: the first
+/// wave started (`complete`), an unresolved input requirement or a
+/// halted/exhausted supervisor row (`failed`, with the evidence), or the
+/// bounded wait elapsed (`pending`). Read-only; the submit wrapper attaches
+/// the verdict as an advisory readback that is never stored.
+pub(super) async fn await_setup(ctx: &Ctx, epic: &str) -> Value {
+    const SETUP_WAIT_POLLS: u32 = 30;
+    const SETUP_WAIT_POLL: std::time::Duration = std::time::Duration::from_secs(1);
+    for poll in 0..SETUP_WAIT_POLLS {
+        match setup_probe(ctx, epic).await {
+            Ok(Some(verdict)) => return verdict,
+            Ok(None) => {}
+            Err(failure) => {
+                return json!({"state": "pending", "detail": failure.message});
+            }
+        }
+        if poll + 1 < SETUP_WAIT_POLLS {
+            tokio::time::sleep(SETUP_WAIT_POLL).await;
+        }
+    }
+    json!({
+        "state": "pending",
+        "detail": "setup did not resolve within the bounded wait",
+    })
+}
+
+async fn setup_probe(ctx: &Ctx, epic: &str) -> Result<Option<Value>, Failure> {
+    let events = epic_events(ctx, epic).await?;
+    let mut latest_input: Option<&forged_ledger::EventRow> = None;
+    let mut wave_started = false;
+    for row in &events {
+        match row.kind.as_str() {
+            WAVE_STARTED => wave_started = true,
+            INPUT_REQUIRED => latest_input = Some(row),
+            INPUT_RESOLVED => latest_input = None,
+            _ => {}
+        }
+    }
+    if let Some(row) = latest_input {
+        let evidence = serde_json::from_str::<Value>(&row.payload_json).unwrap_or(Value::Null);
+        return Ok(Some(json!({"state": "failed", "inputRequired": evidence})));
+    }
+    if wave_started {
+        return Ok(Some(json!({"state": "complete"})));
+    }
+    let id = epic.to_owned();
+    let desired = on_ledger(&ctx.ledger, move |ledger| {
+        ledger.get_desired_work(DesiredSubjectKind::Epic, &id)
+    })
+    .await?;
+    if let Some(row) = desired {
+        if row.exhausted_at.is_some()
+            || row.last_outcome == Some(DesiredReconcileOutcome::Exhausted)
+        {
+            return Ok(Some(
+                json!({"state": "failed", "lastError": row.last_error}),
+            ));
+        }
+    }
+    Ok(None)
+}
+
 fn is_assurance_cleanup_input(input: &Value, run_id: &str) -> bool {
     input.get("code").and_then(Value::as_str) == Some("assurance-cleanup-failed")
         && input.pointer("/evidence/runId").and_then(Value::as_str) == Some(run_id)
@@ -909,6 +971,42 @@ fn is_planning_stub(issue: &forged_beads::IssueSummary) -> bool {
         && spec_pointer(&issue.description).is_none()
         && issue.status == "blocked"
         && issue.assignee.is_none()
+}
+
+/// The frozen spec route for one epic child: `None` for a no-diff child, a
+/// bead-carried spec, or an authorized planning stub; otherwise the child's
+/// validated absolute `spec:` pointer. Shared by `epic_start` and
+/// `epic_preflight`, so the rehearsal reports exactly the refusals the
+/// freeze enforces.
+fn resolve_child_spec(
+    child: &forged_beads::IssueSummary,
+    rolling_authorized: bool,
+) -> Result<Option<String>, Failure> {
+    // The bead's own fields win, but only when they are a WHOLE spec. A
+    // child missing either required section falls back to its `spec:`
+    // pointer — the route every epic frozen before this used — rather than
+    // freezing bead-sourced around a fragment.
+    if is_no_diff(&child.issue_type)
+        || super::spec::carries_spec(child)
+        || (rolling_authorized && is_planning_stub(child))
+    {
+        return Ok(None);
+    }
+    let missing = super::spec::missing_spec_fields(child).join(", ");
+    let pointer = spec_pointer(&child.description).ok_or_else(|| {
+        Failure::invalid(format!(
+            "epic child {} has no spec: {missing} empty and it carries no \
+             spec: pointer",
+            child.id
+        ))
+    })?;
+    if !Path::new(&pointer).is_absolute() || !Path::new(&pointer).exists() {
+        return Err(Failure::invalid(format!(
+            "epic child {} spec {:?} is not an existing absolute path",
+            child.id, pointer
+        )));
+    }
+    Ok(Some(pointer))
 }
 
 fn native_fields(issue: &forged_beads::IssueSummary) -> NativeBeadSpecV1 {
@@ -1388,36 +1486,8 @@ pub async fn epic_start(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespo
                 let mut children = Vec::new();
                 let mut rolling = false;
                 for child in inventory {
-                    // The bead's own fields win, but only when they are a
-                    // WHOLE spec. A child missing either required section
-                    // falls back to its `spec:` pointer — the route every
-                    // epic frozen before this used — rather than freezing
-                    // bead-sourced around a fragment.
-                    let no_diff = is_no_diff(&child.issue_type);
-                    let carries_spec = super::spec::carries_spec(&child);
-                    let pointer = (!no_diff && !carries_spec)
-                        .then(|| spec_pointer(&child.description))
-                        .flatten();
                     let planning_stub = rolling_authorized && is_planning_stub(&child);
-                    let child_spec = if no_diff || carries_spec || planning_stub {
-                        None
-                    } else {
-                        let missing = super::spec::missing_spec_fields(&child).join(", ");
-                        let pointer = pointer.ok_or_else(|| {
-                            Failure::invalid(format!(
-                                "epic child {} has no spec: {missing} empty and it carries no \
-                                 spec: pointer",
-                                child.id
-                            ))
-                        })?;
-                        if !Path::new(&pointer).is_absolute() || !Path::new(&pointer).exists() {
-                            return Err(Failure::invalid(format!(
-                                "epic child {} spec {:?} is not an existing absolute path",
-                                child.id, pointer
-                            )));
-                        }
-                        Some(pointer)
-                    };
+                    let child_spec = resolve_child_spec(&child, rolling_authorized)?;
                     rolling |= planning_stub;
                     let frozen_fields = planning_stub.then(|| native_fields(&child));
                     let frozen_fields_sha256 =
@@ -1559,6 +1629,8 @@ struct ChildDurable<'a> {
     pr: Option<&'a Value>,
     planning_generation: Option<u32>,
     planning_blocker: Option<&'a Value>,
+    execution_health: &'static str,
+    terminal_failure: Option<&'a Value>,
 }
 
 fn child_json(
@@ -1578,9 +1650,13 @@ fn child_json(
         pr,
         planning_generation,
         planning_blocker,
+        execution_health,
+        terminal_failure,
     } = durable;
     json!({
         "id": child.id,
+        "executionHealth": execution_health,
+        "lastControllerFailure": terminal_failure,
         "identity": identity,
         "title": child.title,
         "issueType": child.issue_type,
@@ -1653,7 +1729,11 @@ async fn status_json(ctx: &Ctx, view: EpicView) -> Result<Value, Failure> {
     // single backwards-compatible liveness probe.
     let snapshot = on_ledger(&ctx.ledger, |ledger| {
         ledger.inventory_snapshot(
-            &["proto.pr", "forged.controller.started"],
+            &[
+                "proto.pr",
+                "forged.controller.started",
+                super::handoff::CONTROLLER_TERMINAL_EVENT,
+            ],
             InventoryUsageSelection::Omit,
         )
     })
@@ -1720,6 +1800,32 @@ async fn status_json(ctx: &Ctx, view: EpicView) -> Result<Value, Failure> {
     };
     let controllers = latest_payloads("forged.controller.started")?;
     let prs = latest_payloads("proto.pr")?;
+    // Latest recorded terminal failure per subject, with its timestamp: the
+    // durable "why is it not running" every health-bearing row attaches.
+    let mut terminal_failures: BTreeMap<String, Value> = BTreeMap::new();
+    for event in snapshot.events(super::handoff::CONTROLLER_TERMINAL_EVENT) {
+        let Some(run_id) = event.run_id.clone() else {
+            continue;
+        };
+        let Ok(payload) = serde_json::from_str::<Value>(&event.payload_json) else {
+            continue;
+        };
+        terminal_failures.insert(
+            run_id,
+            super::health::controller_failure_json(&payload, &event.ts),
+        );
+    }
+    let epic_desired = snapshot.desired_work.iter().find(|row| {
+        row.subject_kind == DesiredSubjectKind::Epic && row.subject_id == view.config.epic_id
+    });
+    let epic_admission_deferred = snapshot
+        .admission_decisions
+        .iter()
+        .find(|decision| {
+            decision.subject_kind == AdmissionSubjectKind::Epic
+                && decision.subject_id == view.config.epic_id
+        })
+        .is_some_and(|decision| decision.outcome == AdmissionOutcome::Deferred);
     let slot_name = format!("epic:{}", view.config.epic_id);
     let integration_owner = on_ledger(&ctx.ledger, {
         let slot_name = slot_name.clone();
@@ -1741,6 +1847,10 @@ async fn status_json(ctx: &Ctx, view: EpicView) -> Result<Value, Failure> {
         ("held", 0),
         ("merged", 0),
     ]);
+    // Deferral reasons across non-terminal children, so expected
+    // serialization (`repository-write-capacity: 1`) reads as a wave-level
+    // fact instead of a stall diffed out of two children's admission blobs.
+    let mut deferred_reasons: BTreeMap<String, u64> = BTreeMap::new();
     let mut next_wakes = Vec::new();
     let epic_context = WorkIdentityContextV1 {
         id: view.config.epic_id.clone(),
@@ -1796,6 +1906,27 @@ async fn status_json(ctx: &Ctx, view: EpicView) -> Result<Value, Failure> {
         if run_id.is_some() && !terminal && !queued && !held {
             *counts.get_mut("active").expect("active counter") += 1;
         }
+        if !terminal {
+            if let Some(decision) =
+                admission.filter(|decision| decision.outcome == AdmissionOutcome::Deferred)
+            {
+                let reason = serde_json::to_value(decision.reason)
+                    .ok()
+                    .and_then(|value| value.as_str().map(str::to_owned))
+                    .unwrap_or_else(|| "deferred".to_owned());
+                *deferred_reasons.entry(reason).or_insert(0) += 1;
+            }
+        }
+        let child_health = super::health::execution_health(super::health::HealthInputs {
+            started: run_id.is_some(),
+            terminal,
+            paused: false,
+            input_required: planning_blocker.is_some(),
+            admission_deferred: admission
+                .is_some_and(|decision| decision.outcome == AdmissionOutcome::Deferred),
+            desired,
+            controller_live: None,
+        });
         if let Some(wake) = desired
             .and_then(|row| row.next_wake_at.as_deref())
             .or_else(|| admission.and_then(|row| row.next_eligible_wake_at.as_deref()))
@@ -1849,6 +1980,8 @@ async fn status_json(ctx: &Ctx, view: EpicView) -> Result<Value, Failure> {
                 pr,
                 planning_generation: view.planning_generations.get(&child.id).copied(),
                 planning_blocker,
+                execution_health: child_health,
+                terminal_failure: run_id.and_then(|run_id| terminal_failures.get(run_id)),
             },
         ));
     }
@@ -1876,9 +2009,26 @@ async fn status_json(ctx: &Ctx, view: EpicView) -> Result<Value, Failure> {
             }),
         })
     });
+    let epic_health = super::health::execution_health(super::health::HealthInputs {
+        started: true,
+        terminal: final_pr.is_some(),
+        paused: view.paused.is_some(),
+        input_required: view.input.is_some(),
+        admission_deferred: epic_admission_deferred,
+        desired: epic_desired,
+        controller_live: match controller.get("state").and_then(Value::as_str) {
+            Some("running") => Some(true),
+            Some("exited" | "vanished" | "dead") => Some(false),
+            _ => None,
+        },
+    });
     Ok(json!({
         "schema": "forged.epic.status/1",
         "epicId": view.config.epic_id,
+        "executionHealth": epic_health,
+        "desired": desired_json(epic_desired),
+        "lastControllerFailure": terminal_failures.get(view.config.epic_id.as_str()),
+        "deferred": deferred_reasons,
         "identity": identity,
         "herdrLayout": herdr_layout,
         "title": view.config.title,
@@ -1922,6 +2072,357 @@ async fn status_json(ctx: &Ctx, view: EpicView) -> Result<Value, Failure> {
             "detail": live_error,
         },
     }))
+}
+
+/// One preflight verdict row. Failures record rather than short-circuit so
+/// a single call names every blocker at once.
+fn record_check(checks: &mut Vec<Value>, name: &str, outcome: Result<String, Failure>) {
+    let ok = outcome.is_ok();
+    let detail = match outcome {
+        Ok(detail) => detail,
+        Err(failure) => failure.message,
+    };
+    checks.push(json!({"name": name, "ok": ok, "detail": detail}));
+}
+
+/// The admission contract, front-run: a bead admits only when its
+/// `metadata.repository` literally equals the canonical target path —
+/// absence is `BeadMalformed`, difference is `RepositoryMismatch` — so a
+/// preflight that skipped this would pass an inventory whose children can
+/// never admit.
+fn check_bead_repository(
+    issue: &forged_beads::IssueSummary,
+    repo: Option<&str>,
+) -> Result<(), Failure> {
+    let Some(repo) = repo else { return Ok(()) };
+    match issue.metadata.get("repository") {
+        None => Err(Failure::invalid(format!(
+            "{} carries no repository metadata; admission treats it as malformed",
+            issue.id
+        ))),
+        Some(actual) if actual != repo => Err(Failure::invalid(format!(
+            "{} repository {actual:?} does not match the target {repo:?}",
+            issue.id
+        ))),
+        Some(_) => Ok(()),
+    }
+}
+
+/// Read-only rehearsal of `epic_start`: the geometry, definition,
+/// inventory, and tooling checks the start enforces, plus the identity
+/// tuple a start would freeze — with nothing created. No event, no
+/// operations row, no beads mutation. Two checks are deliberately stricter
+/// than the start itself: the repository path must be an existing git
+/// checkout (the start freezes a nonexistent path happily), and a
+/// DISCOVERED default base ref is probed against origin exactly like an
+/// operator-supplied one.
+pub async fn epic_preflight(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
+    read_only("epic_preflight", req, || async {
+        let epic = param_str(&req.params, "epic")?.to_owned();
+        let repo_param = param_str(&req.params, "repo")?.to_owned();
+        let rolling = match req.params.get("rolling") {
+            None | Some(Value::Null) => false,
+            Some(Value::Bool(value)) => *value,
+            Some(_) => return Err(Failure::invalid("epic preflight rolling must be a boolean")),
+        };
+        let mut checks: Vec<Value> = Vec::new();
+
+        let repo = match super::work_identity::canonical_repository(&repo_param) {
+            Ok(path) if Path::new(&path).join(".git").exists() => {
+                record_check(
+                    &mut checks,
+                    "repository",
+                    Ok(format!("git checkout at {path}")),
+                );
+                Some(path)
+            }
+            Ok(path) => {
+                record_check(
+                    &mut checks,
+                    "repository",
+                    Err(Failure::invalid(format!(
+                        "{path} is not an existing git checkout (no .git)"
+                    ))),
+                );
+                None
+            }
+            Err(error) => {
+                record_check(&mut checks, "repository", Err(error));
+                None
+            }
+        };
+
+        let base_ref = match (&repo, param_opt_str(&req.params, "baseRef")) {
+            (Some(repo), Some(requested)) => match normalize_base_ref(requested) {
+                Some(bare) => {
+                    let probe = forged_git::remote_branch_sha(Path::new(repo), bare).await;
+                    match probe {
+                        Ok(sha) => {
+                            let short = &sha[..12.min(sha.len())];
+                            record_check(
+                                &mut checks,
+                                "base-ref",
+                                Ok(format!("{bare} @ {short} on origin")),
+                            );
+                        }
+                        Err(error) => record_check(
+                            &mut checks,
+                            "base-ref",
+                            Err(Failure::invalid(format!(
+                                "baseRef {requested:?} must name a branch that exists on \
+                                 origin (pass the bare default branch name, e.g. \"main\"): \
+                                 {error}"
+                            ))),
+                        ),
+                    }
+                    Some(bare.to_owned())
+                }
+                None => {
+                    record_check(
+                        &mut checks,
+                        "base-ref",
+                        Err(Failure::invalid(format!(
+                            "baseRef {requested:?} must be a bare branch name (e.g. \"main\")"
+                        ))),
+                    );
+                    None
+                }
+            },
+            (Some(repo), None) => {
+                let discovered = super::ops::default_branch_of(repo).await;
+                let probe = forged_git::remote_branch_sha(Path::new(repo), &discovered).await;
+                match probe {
+                    Ok(sha) => {
+                        let short = &sha[..12.min(sha.len())];
+                        record_check(
+                            &mut checks,
+                            "base-ref",
+                            Ok(format!(
+                                "{discovered} @ {short} on origin (from origin/HEAD)"
+                            )),
+                        );
+                    }
+                    Err(error) => record_check(
+                        &mut checks,
+                        "base-ref",
+                        Err(Failure::invalid(format!(
+                            "discovered default branch {discovered:?} is not on origin: {error}"
+                        ))),
+                    ),
+                }
+                Some(discovered)
+            }
+            (None, _) => {
+                record_check(
+                    &mut checks,
+                    "base-ref",
+                    Err(Failure::invalid(
+                        "unresolved repository blocks the base-ref probe",
+                    )),
+                );
+                None
+            }
+        };
+
+        match forged_beads::show_issue(&ctx.config.bd_config(), &epic).await {
+            Ok(issue) if issue.issue_type == "epic" => {
+                let outcome = super::spec::resolve_issue(&issue)
+                    .map(|_| ())
+                    .and_then(|()| check_bead_repository(&issue, repo.as_deref()))
+                    .map(|()| format!("epic {epic} {:?}", issue.title));
+                record_check(&mut checks, "epic-bead", outcome);
+            }
+            Ok(issue) => record_check(
+                &mut checks,
+                "epic-bead",
+                Err(Failure::invalid(format!(
+                    "bead {epic} has issue type {:?}, not epic",
+                    issue.issue_type
+                ))),
+            ),
+            Err(error) => record_check(&mut checks, "epic-bead", Err(error.into())),
+        }
+
+        let mut children_identity: Vec<Value> = Vec::new();
+        let mut planning_stubs = 0usize;
+        match forged_beads::epic_children_with_legacy(&ctx.config.bd_config(), &epic).await {
+            Ok((inventory, _legacy)) if inventory.is_empty() => record_check(
+                &mut checks,
+                "children",
+                Err(Failure::invalid(format!(
+                    "epic {epic} has no Beads children"
+                ))),
+            ),
+            Ok((inventory, _legacy)) => {
+                let mut failures = Vec::new();
+                for child in &inventory {
+                    let planning_stub = rolling && is_planning_stub(child);
+                    planning_stubs += usize::from(planning_stub);
+                    if let Err(error) = resolve_child_spec(child, rolling) {
+                        failures.push(error.message);
+                    }
+                    if let Err(error) = check_bead_repository(child, repo.as_deref()) {
+                        failures.push(error.message);
+                    }
+                    // Generation-1 identities, exactly as `start_child`
+                    // derives them — except a no-diff child, which the
+                    // scheduler never launches (it raises the
+                    // `non-code-child` hold), so its tuple advertises no
+                    // run, branch, or worktree.
+                    children_identity.push(if is_no_diff(&child.issue_type) {
+                        json!({
+                            "id": child.id,
+                            "runId": Value::Null,
+                            "branch": Value::Null,
+                            "worktreePath": Value::Null,
+                            "noDiff": true,
+                            "planningStub": false,
+                        })
+                    } else {
+                        json!({
+                            "id": child.id,
+                            "runId": child.id,
+                            "branch": format!("forged/{}", child.id),
+                            "worktreePath": ctx.config.worktree(&child.id),
+                            "noDiff": false,
+                            "planningStub": planning_stub,
+                        })
+                    });
+                }
+                if failures.is_empty() {
+                    record_check(
+                        &mut checks,
+                        "children",
+                        Ok(format!(
+                            "{} children ({planning_stubs} planning stubs)",
+                            inventory.len()
+                        )),
+                    );
+                } else {
+                    record_check(
+                        &mut checks,
+                        "children",
+                        Err(Failure::invalid(failures.join("; "))),
+                    );
+                }
+            }
+            Err(error) => record_check(&mut checks, "children", Err(error.into())),
+        }
+
+        let compiled = match ctx.config.compile_definition(
+            param_opt_str(&req.params, "profile"),
+            param_opt_str(&req.params, "roster"),
+        ) {
+            Ok(compiled) => {
+                let sha = &compiled.package_sha256[..12.min(compiled.package_sha256.len())];
+                record_check(
+                    &mut checks,
+                    "definition",
+                    Ok(format!(
+                        "profile {} / roster {} ({sha})",
+                        compiled.package.profile_ref.name, compiled.package.roster_ref.name
+                    )),
+                );
+                Some(compiled)
+            }
+            Err(errors) => {
+                record_check(
+                    &mut checks,
+                    "definition",
+                    Err(Failure::invalid(format!(
+                        "epic child definition is invalid: {}",
+                        serde_json::to_string(&errors).unwrap_or_default()
+                    ))),
+                );
+                None
+            }
+        };
+        if rolling {
+            match &compiled {
+                Some(compiled) => {
+                    // The start compiles the planning package only when a
+                    // planning stub exists; rehearse it on the same gate.
+                    if planning_stubs > 0 {
+                        record_check(
+                            &mut checks,
+                            "planning-definition",
+                            crate::config::compile_epic_plan_package(&compiled.package)
+                                .map(|_| "planning package compiles".to_owned())
+                                .map_err(|errors| {
+                                    Failure::invalid(format!(
+                                        "epic planning definition is invalid: {}",
+                                        serde_json::to_string(&errors).unwrap_or_default()
+                                    ))
+                                }),
+                        );
+                    }
+                    record_check(
+                        &mut checks,
+                        "assurance-definition",
+                        crate::config::compile_epic_assurance_package(&compiled.package)
+                            .map(|_| "assurance package compiles".to_owned())
+                            .map_err(|errors| {
+                                Failure::invalid(format!(
+                                    "epic assurance definition is invalid: {}",
+                                    serde_json::to_string(&errors).unwrap_or_default()
+                                ))
+                            }),
+                    );
+                }
+                None => record_check(
+                    &mut checks,
+                    "assurance-definition",
+                    Err(Failure::invalid(
+                        "unresolved definition blocks the rolling package compiles",
+                    )),
+                ),
+            }
+        }
+
+        if let Some(compiled) = &compiled {
+            let providers: BTreeSet<&str> = compiled
+                .package
+                .roster
+                .roles
+                .values()
+                .flatten()
+                .map(|candidate| candidate.provider.as_str())
+                .collect();
+            for provider in providers {
+                record_check(
+                    &mut checks,
+                    &format!("provider-{provider}"),
+                    match super::ops::on_path(provider) {
+                        Some(path) => Ok(path.display().to_string()),
+                        None => Err(Failure::invalid(format!("{provider} not found on PATH"))),
+                    },
+                );
+            }
+        }
+        record_check(
+            &mut checks,
+            "gh-authenticated",
+            super::ops::gh_auth_status().await.map_err(Failure::invalid),
+        );
+
+        let ok = checks.iter().all(|check| check["ok"] == json!(true));
+        Ok(json!({
+            "schema": "forged.epic-preflight/1",
+            "ok": ok,
+            "epicId": epic,
+            "checks": checks,
+            "identities": {
+                "repo": repo,
+                "baseRef": base_ref,
+                "integrationBranch": format!("forged/epic-{epic}"),
+                "assuranceStage": if rolling { "rolling" } else { "none" },
+                "assuranceRunId": rolling.then(|| format!("{epic}-epic-assurance")),
+                "maxActiveChildren": ctx.config.admission.epic_fanout,
+                "children": children_identity,
+            },
+        }))
+    })
+    .await
 }
 
 /// Read-only epic projection.

@@ -1,5 +1,5 @@
 //! CLI/MCP parity (the two-adapters-over-one-core criterion): for each of
-//! the forty-five public core functions, the CLI path and the MCP tool path produce
+//! the forty-six public core functions, the CLI path and the MCP tool path produce
 //! identical `OperationResponse` values — modulo the minted `operationId` —
 //! from the same core call.
 
@@ -68,7 +68,7 @@ fn doctor_shape(envelope: &Value) -> Value {
 }
 
 #[test]
-fn all_forty_five_tools_match_their_cli_counterparts() {
+fn all_forty_six_tools_match_their_cli_counterparts() {
     let env = TestEnv::new("forged-parity");
     env.forged(&["init"]);
     fabricate_run(&env, "par-repository");
@@ -94,6 +94,7 @@ fn all_forty_five_tools_match_their_cli_counterparts() {
         "overview",
         "epic_advance",
         "epic_drive",
+        "epic_preflight",
         "epic_pause",
         "epic_resolve",
         "epic_resume",
@@ -127,7 +128,7 @@ fn all_forty_five_tools_match_their_cli_counterparts() {
         "work_map",
     ];
     expected.sort_unstable();
-    assert_eq!(tools, expected, "the forty-five tools, exactly");
+    assert_eq!(tools, expected, "the forty-six tools, exactly");
 
     let overview_tool = mcp.tool("overview");
     assert_eq!(
@@ -805,6 +806,31 @@ fn all_forty_five_tools_match_their_cli_counterparts() {
         }),
     );
     assert_eq!(normalized(cli), normalized(tool), "run_accept_risk parity");
+
+    // The read-only rehearsal reports a relative repo identically. (The
+    // params carry the CLI's explicit nulls so both surfaces match exactly.)
+    let cli = env
+        .forged(&[
+            "epic",
+            "preflight",
+            "--epic",
+            "absent-epic",
+            "--repo",
+            "relative",
+        ])
+        .1;
+    let tool = mcp.call_tool(
+        "epic_preflight",
+        json!({
+            "schemaVersion": 1,
+            "runId": "absent-epic",
+            "params": {
+                "epic": "absent-epic", "repo": "relative",
+                "baseRef": null, "profile": null, "roster": null, "rolling": false
+            }
+        }),
+    );
+    assert_eq!(normalized(cli), normalized(tool), "epic_preflight parity");
 
     // Epic lifecycle and control refusals have identical envelopes. The
     // start carries an explicit key: its DEFAULT key folds in the released

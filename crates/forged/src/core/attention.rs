@@ -665,10 +665,18 @@ fn collect_domain_sources(
         if desired.desired_state != DesiredState::Running {
             continue;
         }
-        let overdue = desired
-            .next_wake_at
-            .as_deref()
-            .is_some_and(|wake| wake <= as_of.as_str());
+        // A wake that is merely due is not evidence of death: authorization
+        // and every reconcile finish schedule wakes at or near now, and the
+        // supervisor polls every five seconds. Only a wake overdue by three
+        // full polls reads as a dead-controller symptom — a fresh submit's
+        // admission storm self-heals inside the grace instead of minting
+        // false positives.
+        const WAKE_OVERDUE_GRACE_SECONDS: u64 = 15;
+        let overdue = desired.next_wake_at.as_deref().is_some_and(|wake| {
+            super::supervise::deadline_after(wake, WAKE_OVERDUE_GRACE_SECONDS)
+                .map(|deadline| deadline.as_str() <= as_of.as_str())
+                .unwrap_or(wake <= as_of.as_str())
+        });
         let explicit = supervisor_attention
             .get(&desired.subject_id)
             .and_then(|event| {

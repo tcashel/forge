@@ -1,4 +1,4 @@
-//! `forged mcp` — the rmcp stdio server. Forty-four tools, each taking the same
+//! `forged mcp` — the rmcp stdio server. Forty-six tools, each taking the same
 //! operation envelope in and returning the same envelope out; every
 //! tool routes through the identical core dispatch the CLI uses, so the two
 //! surfaces are two adapters over one core.
@@ -1083,6 +1083,15 @@ impl ForgedServer {
     )]
     pub async fn run_accept_risk(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
         self.call("run_accept_risk", args.0).await
+    }
+
+    /// Read-only rehearsal of `epic_start`.
+    #[tool(
+        name = "epic_preflight",
+        description = "Rehearse epic_start read-only: every start check plus the identity tuple it would freeze, with nothing created. Required: params.epic, params.repo; optional params.baseRef, params.profile, params.roster, params.rolling."
+    )]
+    pub async fn epic_preflight(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
+        self.call("epic_preflight", args.0).await
     }
 
     /// Freeze an epic inventory and child execution defaults.
