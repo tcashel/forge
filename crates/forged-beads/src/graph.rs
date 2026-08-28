@@ -396,7 +396,20 @@ fn issue(value: &Value) -> Option<IssueSummary> {
     })
 }
 
+/// Which statuses a hydrate accepts. Plan flows stay fail-closed on the
+/// nonterminal vocabulary; the one-shot ledger import reads the WHOLE store,
+/// closed rows included.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatusVocabulary {
+    Nonterminal,
+    Any,
+}
+
 fn plan_issue(value: &Value) -> Result<PlanIssue, String> {
+    plan_issue_with(value, StatusVocabulary::Nonterminal)
+}
+
+fn plan_issue_with(value: &Value, vocab: StatusVocabulary) -> Result<PlanIssue, String> {
     let object = value
         .as_object()
         .ok_or_else(|| "hydrated issue is not an object".to_owned())?;
@@ -551,6 +564,20 @@ fn hydrated_plan_rows(
     requested_ids: &[String],
     repository: Option<&str>,
 ) -> Result<Vec<PlanIssue>, String> {
+    hydrated_plan_rows_with(
+        rows,
+        requested_ids,
+        repository,
+        StatusVocabulary::Nonterminal,
+    )
+}
+
+fn hydrated_plan_rows_with(
+    rows: &[Value],
+    requested_ids: &[String],
+    repository: Option<&str>,
+    vocab: StatusVocabulary,
+) -> Result<Vec<PlanIssue>, String> {
     let requested: BTreeSet<&str> = requested_ids.iter().map(String::as_str).collect();
     if requested.len() != requested_ids.len() {
         return Err("selected discovery ids are not unique".to_owned());
@@ -558,7 +585,7 @@ fn hydrated_plan_rows(
 
     let mut by_id = BTreeMap::new();
     for row in rows {
-        let item = plan_issue(row)?;
+        let item = plan_issue_with(row, vocab)?;
         let id = item.issue.id.clone();
         if !requested.contains(id.as_str()) {
             return Err(format!("hydrate returned unrequested issue id {id:?}"));

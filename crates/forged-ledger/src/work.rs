@@ -544,12 +544,14 @@ impl Ledger {
                     skipped_edges.push(edge.clone());
                     continue;
                 }
-                tx.execute(
+                // execute reports affected rows: a duplicate edge (the
+                // importer emits parent-child from both the dependency list
+                // and the parent field) is ignored and must not be counted.
+                inserted_edges += tx.execute(
                     "INSERT OR IGNORE INTO work_deps (from_id, to_id, kind) \
                      VALUES (?1, ?2, ?3)",
                     rusqlite::params![edge.from_id, edge.to_id, edge.kind.as_str()],
-                )?;
-                inserted_edges += 1;
+                )? as u64;
             }
             append_event_tx(
                 &tx,
@@ -1419,6 +1421,35 @@ mod tests {
             spec: spec(id),
             cause: WorkRevisionCause::Authored,
         }
+    }
+
+    #[test]
+    fn import_counts_only_edge_rows_actually_inserted() {
+        let (_dir, l) = ledger();
+        let imported = |id: &str| ImportedWorkItem {
+            work_id: id.to_string(),
+            kind: WorkKind::Task,
+            status: WorkStatus::Open,
+            priority: None,
+            assignee: None,
+            metadata: BTreeMap::new(),
+            spec: spec(id),
+        };
+        let edge = WorkDepRow {
+            from_id: "beads-imp-a".to_string(),
+            to_id: "beads-imp-b".to_string(),
+            kind: WorkDepKind::ParentChild,
+        };
+        let report = l
+            .import_work_store(
+                vec![imported("beads-imp-a"), imported("beads-imp-b")],
+                vec![edge.clone(), edge],
+            )
+            .unwrap();
+        assert_eq!(
+            report.inserted_edges, 1,
+            "a duplicate edge is ignored, never counted"
+        );
     }
 
     #[test]
