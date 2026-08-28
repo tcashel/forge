@@ -2334,6 +2334,18 @@ async fn install_with_probe<H: ServiceHost, P: ControllerProcessProbe + ?Sized>(
     process_probe: &P,
 ) -> Result<Value, Failure> {
     let source_identity = current_binary_identity()?;
+    install_from_identity_with_probe(host, paths, config, faults, process_probe, source_identity)
+        .await
+}
+
+async fn install_from_identity_with_probe<H: ServiceHost, P: ControllerProcessProbe + ?Sized>(
+    host: &H,
+    paths: &RuntimePaths,
+    config: &ForgedConfig,
+    faults: &LifecycleFaults,
+    process_probe: &P,
+    source_identity: BinaryIdentity,
+) -> Result<Value, Failure> {
     let source = PathBuf::from(&source_identity.path);
     let target = copy_content_addressed(paths, &source, &source_identity)?;
     let previous = read_manifest(paths)?;
@@ -2372,6 +2384,9 @@ async fn install_with_probe<H: ServiceHost, P: ControllerProcessProbe + ?Sized>(
     };
     if same_install {
         let previous = previous.expect("same digest implies manifest");
+        let warnings = same_install_source_warning(paths, &source_identity)
+            .into_iter()
+            .collect::<Vec<_>>();
         switch_current(paths, &target)?;
         atomic_write(
             &paths.plist,
@@ -2392,8 +2407,19 @@ async fn install_with_probe<H: ServiceHost, P: ControllerProcessProbe + ?Sized>(
             "schema": RUNTIME_OPERATION_SCHEMA,
             "action": "reconciled",
             "manifest": previous,
+            "sourcePath": source_identity.path,
+            "sourceVersion": source_identity.version,
+            "warnings": warnings,
         }));
     }
+
+    let warnings = previous
+        .as_ref()
+        .and_then(|manifest| older_source_version_warning(&source_identity, manifest))
+        .into_iter()
+        .collect::<Vec<_>>();
+    let source_path = source_identity.path.clone();
+    let source_version = source_identity.version.clone();
 
     let scan = controller_blockers_with_probe(
         &config.runs_root,
@@ -2505,7 +2531,52 @@ async fn install_with_probe<H: ServiceHost, P: ControllerProcessProbe + ?Sized>(
         "action": if previous.is_some() { "upgraded" } else { "installed" },
         "manifest": candidate,
         "repairable": scan.repairable,
+        "sourcePath": source_path,
+        "sourceVersion": source_version,
+        "warnings": warnings,
     }))
+}
+
+fn older_source_version_warning(
+    source: &BinaryIdentity,
+    previous: &RuntimeManifest,
+) -> Option<String> {
+    (parse_semver_triple(&source.version)? < parse_semver_triple(&previous.binary.version)?)
+        .then(|| {
+            format!(
+                "source version {} is older than recorded installed version {}; run the intended binary by full path; refresh the shell hash",
+                source.version, previous.binary.version
+            )
+        })
+}
+
+fn parse_semver_triple(version: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = version.split('.');
+    let parse = |part: Option<&str>| {
+        let part = part?;
+        if part.is_empty() || (part.len() > 1 && part.starts_with('0')) {
+            return None;
+        }
+        part.parse::<u64>().ok()
+    };
+    let parsed = (
+        parse(parts.next())?,
+        parse(parts.next())?,
+        parse(parts.next())?,
+    );
+    parts.next().is_none().then_some(parsed)
+}
+
+fn same_install_source_warning(paths: &RuntimePaths, source: &BinaryIdentity) -> Option<String> {
+    let source_path = Path::new(&source.path);
+    if source_path == paths.current || source_path.starts_with(&paths.bin) {
+        None
+    } else {
+        Some(format!(
+            "reinstalled the already-current version from {}; if you meant to upgrade, run the new binary by full path",
+            source.path
+        ))
+    }
 }
 
 async fn start<H: ServiceHost>(
@@ -3428,6 +3499,184 @@ mod tests {
         )
         .expect("old plist");
         manifest
+    }
+
+    fn fixture_binary_identity(path: &Path, contents: &[u8], version: &str) -> BinaryIdentity {
+        fs::create_dir_all(path.parent().expect("fixture binary parent"))
+            .expect("fixture binary dir");
+        fs::write(path, contents).expect("fixture binary");
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).expect("fixture binary mode");
+        let mut identity = binary_identity(path).expect("fixture identity");
+        identity.version = version.to_owned();
+        identity
+    }
+
+    fn seed_install(
+        config: &ForgedConfig,
+        paths: &RuntimePaths,
+        identity: &BinaryIdentity,
+    ) -> RuntimeManifest {
+        paths.ensure_layout().expect("layout");
+        let target = copy_content_addressed(paths, Path::new(&identity.path), identity)
+            .expect("publish fixture binary");
+        let manifest = new_manifest(paths, config, identity.clone()).expect("fixture manifest");
+        switch_current(paths, &target).expect("fixture current");
+        atomic_json(&paths.manifest, &manifest).expect("fixture manifest write");
+        atomic_write(
+            &paths.plist,
+            render_plist(paths, &manifest).as_bytes(),
+            0o600,
+        )
+        .expect("fixture plist");
+        manifest
+    }
+
+    #[tokio::test]
+    async fn install_warns_only_when_source_version_is_older() {
+        for (source_version, recorded_version, expected_warning) in [
+            (
+                "0.6.1",
+                "0.6.2",
+                Some(
+                    "source version 0.6.1 is older than recorded installed version 0.6.2; run the intended binary by full path; refresh the shell hash",
+                ),
+            ),
+            ("0.6.2", "0.6.2", None),
+            ("0.6.3", "0.6.2", None),
+        ] {
+            let (root, config, paths) = setup();
+            let recorded = fixture_binary_identity(
+                &root.path().join("recorded/forged"),
+                b"recorded forged executable",
+                recorded_version,
+            );
+            let previous = seed_install(&config, &paths, &recorded);
+            let host = FakeHost::default();
+            host.set_loaded(&previous);
+            let source = fixture_binary_identity(
+                &root.path().join("source/forged"),
+                b"different source forged executable",
+                source_version,
+            );
+            let source_path = source.path.clone();
+
+            let response = install_from_identity_with_probe(
+                &host,
+                &paths,
+                &config,
+                &LifecycleFaults::default(),
+                &FakeControllerProcessProbe::default(),
+                source,
+            )
+            .await
+            .expect("version comparison install");
+
+            assert_eq!(response["action"], json!("upgraded"));
+            assert_eq!(response["sourcePath"], json!(source_path));
+            assert_eq!(response["sourceVersion"], json!(source_version));
+            assert_eq!(
+                response["warnings"],
+                expected_warning.map_or_else(|| json!([]), |warning| json!([warning]))
+            );
+        }
+    }
+
+    #[test]
+    fn non_semver_versions_disable_install_staleness_comparison() {
+        let (root, config, paths) = setup();
+        let identity = fixture_binary_identity(
+            &root.path().join("recorded/forged"),
+            b"recorded forged executable",
+            "0.6.2",
+        );
+        let mut manifest = seed_install(&config, &paths, &identity);
+        for (source_version, recorded_version) in
+            [("", "0.6.2"), ("not-semver", "0.6.2"), ("0.6.1", "")]
+        {
+            let mut source = identity.clone();
+            source.version = source_version.to_owned();
+            manifest.binary.version = recorded_version.to_owned();
+            assert_eq!(older_source_version_warning(&source, &manifest), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn same_install_warns_outside_install_root_but_not_via_current_link() {
+        let (root, config, paths) = setup();
+        let source = fixture_binary_identity(
+            &root.path().join("stale-shell/forged"),
+            b"already installed forged executable",
+            "0.6.2",
+        );
+        let previous = seed_install(&config, &paths, &source);
+        let host = FakeHost::default();
+        host.set_loaded(&previous);
+        let source_path = source.path.clone();
+
+        let response = install_from_identity_with_probe(
+            &host,
+            &paths,
+            &config,
+            &LifecycleFaults::default(),
+            &FakeControllerProcessProbe::default(),
+            source.clone(),
+        )
+        .await
+        .expect("outside same install");
+        assert_eq!(response["action"], json!("reconciled"));
+        assert_eq!(response["sourcePath"], json!(source_path));
+        assert_eq!(response["sourceVersion"], json!("0.6.2"));
+        assert_eq!(
+            response["warnings"],
+            json!([format!(
+                "reinstalled the already-current version from {}; if you meant to upgrade, run the new binary by full path",
+                source.path
+            )])
+        );
+
+        let mut current_source = source;
+        current_source.path = paths.current.to_string_lossy().into_owned();
+        let response = install_from_identity_with_probe(
+            &host,
+            &paths,
+            &config,
+            &LifecycleFaults::default(),
+            &FakeControllerProcessProbe::default(),
+            current_source,
+        )
+        .await
+        .expect("current-link same install");
+        assert_eq!(response["action"], json!("reconciled"));
+        assert_eq!(response["sourcePath"], json!(paths.current));
+        assert_eq!(response["warnings"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn fresh_install_reports_source_identity_without_warning() {
+        let (root, config, paths) = setup();
+        paths.ensure_layout().expect("layout");
+        let source = fixture_binary_identity(
+            &root.path().join("fresh/forged"),
+            b"fresh forged executable",
+            "0.6.2",
+        );
+        let source_path = source.path.clone();
+
+        let response = install_from_identity_with_probe(
+            &FakeHost::default(),
+            &paths,
+            &config,
+            &LifecycleFaults::default(),
+            &FakeControllerProcessProbe::default(),
+            source,
+        )
+        .await
+        .expect("fresh install");
+
+        assert_eq!(response["action"], json!("installed"));
+        assert_eq!(response["sourcePath"], json!(source_path));
+        assert_eq!(response["sourceVersion"], json!("0.6.2"));
+        assert_eq!(response["warnings"], json!([]));
     }
 
     #[test]
