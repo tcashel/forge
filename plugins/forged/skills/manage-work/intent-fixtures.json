@@ -52,6 +52,14 @@
       "routerMutationBudget": {"approvalComments": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "controlCalls": 0, "serviceMutations": 0, "providerCalls": 0, "githubWrites": 0}
     },
     {
+      "id": "configure",
+      "request": "Point the implementation role at the model my AI gateway serves.",
+      "decision": "configure",
+      "delegate": "configure",
+      "result": "delegate",
+      "routerMutationBudget": {"approvalComments": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "controlCalls": 0, "serviceMutations": 0, "providerCalls": 0, "githubWrites": 0}
+    },
+    {
       "id": "plan-approval",
       "request": "That plan looks good.",
       "decision": "plan-approval",
