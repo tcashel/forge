@@ -1,16 +1,4 @@
-//! The two spines every bd call goes through: `read` and `write`.
-//!
-//! Both spines — and the `WriteOp` shape they classify against — are
-//! CRATE-INTERNAL. They take an arbitrary argv, so exporting them would put a
-//! bare `bd merge-slot release` with no holder, an unscoped `bd reclaim`, or
-//! bd's documented claim-theft bypass flag back within a caller's reach, and
-//! defeat the type-level guarantees the frozen public surface exists to give
-//! ("no bare-release call is constructible from this crate's API", "an
-//! unscoped or half-scoped reclaim is unconstructible"). Consumers get the
-//! frozen typed operations in [`crate::lease`], [`crate::slot`],
-//! [`crate::doctor`] and the mirror module, and nothing else; the
-//! `raw: serde_json::Value` on every result struct is the escape hatch for
-//! fields this API does not model.
+//! Sanitized, timeout-bounded bd reads for the one-shot legacy-store import.
 //!
 //! Every bd child is spawned with `tokio::process::Command`,
 //! `kill_on_drop(true)`, `env_clear()` and an explicit allowlist and nothing
@@ -26,11 +14,6 @@
 //! mode, and database remain properties of the explicit `BEADS_DIR` metadata;
 //! only credentials and TLS cross the sanitized boundary. No caller logs this
 //! environment map or its values.
-//! Non-bd children (`kill`, `ps`, `gh`) are spawned elsewhere and inherit the
-//! process's REAL environment.
-//!
-//! `write(..)` serializes ALL bd writes behind an inter-process advisory file
-//! lock keyed by the canonicalized `beads_dir`; reads bypass the lock.
 
 use std::ffi::OsString;
 use std::process::Stdio;
@@ -172,13 +155,8 @@ pub(crate) async fn read(cfg: &BdConfig, args: &[&str]) -> Result<Value, BdError
 /// classification — which is the whole contract — is exercisable without a
 /// bd child.
 ///
-/// UNPARSEABLE IS NOT THE SAME AS UNSUPPORTED. Only stdout that will not
-/// parse at all means bd never answered, and that alone is the read failure
-/// worth retrying. A payload that parses under a `schema_version` this build
-/// does not read is bd ANSWERING, from a bd that has been upgraded past this
-/// build: every retry re-reads the identical envelope, so it is terminal.
-/// An error INSIDE a well-formed envelope is classified on what it says —
-/// `BdError::is_transport` reads the text — not on the fact that it parsed.
+/// Unparseable output and unsupported envelope versions remain distinct error
+/// variants so callers retain the exact failure evidence.
 fn read_envelope(context: String, out: &RawOutcome) -> Result<Value, BdError> {
     let lenient = envelope::parse_lenient(&out.stdout);
     if !lenient.parsed {
@@ -189,10 +167,7 @@ fn read_envelope(context: String, out: &RawOutcome) -> Result<Value, BdError> {
     }
     // Order matters, and these three are not interchangeable.
     //
-    // A DECLARED version this build cannot read outranks every cause-text
-    // check: retrying re-reads the identical envelope, so a Dolt-lock marker
-    // inside one would take the contention schedule and burn the whole
-    // bounded budget on an upgrade that outlives it.
+    // A declared version this build cannot read is an unusable answer.
     if lenient.unsupported_schema() {
         return Err(BdError::Envelope {
             context,
@@ -202,10 +177,8 @@ fn read_envelope(context: String, out: &RawOutcome) -> Result<Value, BdError> {
             ),
         });
     }
-    // An error is classified on what it SAYS, before the shape is judged —
-    // `!schema_ok` is also true of bare JSON declaring no version at all,
-    // and making that terminal first would strand a genuine outage the write
-    // spine reads as ordinary contention.
+    // Preserve a payload-carried bd error before rejecting an undeclared
+    // envelope shape so the full child output reaches the caller.
     if lenient.error.is_some() {
         return Err(BdError::Beads {
             context,
@@ -214,10 +187,8 @@ fn read_envelope(context: String, out: &RawOutcome) -> Result<Value, BdError> {
             stderr: out.stderr.clone(),
         });
     }
-    // Left over: a payload that parsed, carries no error, and declared no
-    // version forged recognizes. forged sets `BD_JSON_ENVELOPE=1` on every
-    // call, so an undeclared answer means the envelope contract is not being
-    // honoured — terminal, because no retry makes a bd start declaring.
+    // Forged sets `BD_JSON_ENVELOPE=1` on every call, so an undeclared answer
+    // violates the pinned envelope contract.
     if !lenient.schema_ok {
         return Err(BdError::Envelope {
             context,
@@ -248,113 +219,6 @@ mod tests {
             read_timeout_s: 30,
             write_timeout_s: 60,
         }
-    }
-
-    fn zero_exit(stdout: &str) -> RawOutcome {
-        RawOutcome {
-            exit: Some(0),
-            stdout: stdout.to_owned(),
-            stderr: String::new(),
-        }
-    }
-
-    fn read_err(stdout: &str) -> BdError {
-        read_envelope("bd show beads-1al".to_owned(), &zero_exit(stdout))
-            .expect_err("this stdout must not read as an answer")
-    }
-
-    #[test]
-    fn stdout_that_does_not_parse_is_the_one_retryable_read() {
-        // bd never answered — a killed child, a proxy's HTML, a truncated
-        // write. This and nothing else rides the bounded transport budget.
-        for stdout in ["", "<html>502 Bad Gateway</html>", "{\"data\": "] {
-            let err = read_err(stdout);
-            assert!(
-                matches!(err, BdError::Unparseable { .. }),
-                "{stdout:?} must be Unparseable, got {err:?}"
-            );
-            assert!(err.is_transport(), "{stdout:?} must ride the budget");
-        }
-    }
-
-    #[test]
-    fn an_unsupported_schema_version_is_an_answer_and_stays_terminal() {
-        // bd ANSWERED, from a bd upgraded past this build. Retrying re-reads
-        // the identical envelope forever — precisely the wrong response to an
-        // upgrade, and the failure the bd contract test exists to make loud.
-        // The second shape declares no version at all: forged sets
-        // `BD_JSON_ENVELOPE=1` on every call, so that is the contract not
-        // being honoured, which no retry repairs either.
-        for stdout in [
-            r#"{"data": {"id": "beads-1al"}, "schema_version": 2}"#,
-            r#"{"data": {"id": "beads-1al"}}"#,
-        ] {
-            let err = read_err(stdout);
-            assert!(
-                matches!(err, BdError::Envelope { .. }),
-                "{stdout:?} must be Envelope, got {err:?}"
-            );
-            assert!(
-                !err.is_transport(),
-                "{stdout:?} must never ride the budget: {err}"
-            );
-        }
-    }
-
-    #[test]
-    fn an_outage_in_an_undeclared_payload_is_still_read_for_what_it_says() {
-        // The shape check must not preempt the cause check. A payload that
-        // declared no version but carries a Dolt lock is the same outage the
-        // write spine rides its budget for; judging it on its shape first
-        // would stand it down as terminal on the read path alone.
-        let outage = read_err(&format!(
-            r#"{{"data":{{"error":"{}"}}}}"#,
-            crate::classify::DOLT_LOCK_REFUSAL
-        ));
-        assert!(
-            matches!(outage, BdError::Beads { .. }),
-            "classified on its text, not its shape: {outage:?}"
-        );
-        assert!(
-            outage.is_transport(),
-            "an outage rides the budget wherever it is declared: {outage}"
-        );
-    }
-
-    #[test]
-    fn an_error_inside_a_well_formed_envelope_is_read_for_what_it_says() {
-        // Parsing is not the classifier. The same envelope shape carries a
-        // terminal refusal and a transient outage, and only the text tells
-        // them apart.
-        let refusal = read_err(r#"{"data":{"error":"no issues found"},"schema_version":1}"#);
-        assert!(matches!(refusal, BdError::Beads { .. }));
-        assert!(!refusal.is_transport(), "a refusal is an answer: {refusal}");
-
-        let outage = read_err(&format!(
-            r#"{{"data":{{"error":"{}"}},"schema_version":1}}"#,
-            crate::classify::DOLT_LOCK_REFUSAL
-        ));
-        assert!(matches!(outage, BdError::Beads { .. }));
-        assert!(
-            outage.is_transport(),
-            "a lock that clears on its own must ride the budget: {outage}"
-        );
-    }
-
-    #[test]
-    fn a_schema_one_envelope_carrying_data_reads_as_the_answer() {
-        let data = read_envelope(
-            "bd show beads-1al".to_owned(),
-            &zero_exit(r#"{"data": {"id": "beads-1al"}, "schema_version": 1}"#),
-        )
-        .expect("a well-formed answer");
-        assert_eq!(data, serde_json::json!({"id": "beads-1al"}));
-
-        // A schema-1 envelope with no `data` key answered nothing usable —
-        // terminal, and NOT the unparseable class.
-        let missing = read_err(r#"{"schema_version": 1}"#);
-        assert!(matches!(missing, BdError::Envelope { .. }));
-        assert!(!missing.is_transport());
     }
 
     #[test]

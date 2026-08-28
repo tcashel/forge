@@ -7,10 +7,9 @@
 //! Module map:
 //! - [`config`] — [`BdConfig`]: explicit-config resolution for the bd child.
 //! - [`envelope`] — parser for bd's JSON envelope (`BD_JSON_ENVELOPE=1`).
-//! - [`invoke`] — the read spine (and the flock write spine the reads share).
-//! - [`classify`] — [`BdError`] and the transport classifier the spine uses.
-//! - [`graph`] — the import reads: every issue id, and the status-tolerant
-//!   full hydrate with dependencies.
+//! - [`invoke`] — sanitized, timeout-bounded bd reads.
+//! - [`classify`] — [`BdError`] for child and envelope failures.
+//! - [`graph`] — import discovery and full hydration with dependencies.
 #![deny(missing_docs)]
 
 pub mod classify;

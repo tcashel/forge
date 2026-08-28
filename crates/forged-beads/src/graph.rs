@@ -1,4 +1,4 @@
-//! Typed reads and narrow writes for epic dependency graphs.
+//! Typed graph reads for the one-shot legacy-store import.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -8,8 +8,7 @@ use crate::classify::BdError;
 use crate::config::BdConfig;
 use crate::{envelope, invoke};
 
-/// The Beads fields forged consumes — the epic scheduler's inventory plus
-/// the spec body a run is built from.
+/// The Beads fields copied into the ledger-native work store.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IssueSummary {
@@ -56,24 +55,7 @@ pub struct IssueSummary {
     pub updated_at: Option<String>,
 }
 
-/// The complete provider-authored native specification written at one
-/// rolling-planning boundary.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NativeSpecUpdate {
-    /// Context and exact outcome.
-    pub description: String,
-    /// Observable completion contract.
-    pub acceptance_criteria: String,
-    /// Necessary implementation constraints.
-    pub design: String,
-    /// Instructions and explicit non-goals for the executing agent.
-    pub notes: String,
-}
-
 /// One native Beads dependency coordinate carried by a hydrated plan row.
-///
-/// This is deliberately only identity and current status. Forged does not
-/// reinterpret Beads' graph or manufacture readiness from display text.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlanDependency {
@@ -82,14 +64,10 @@ pub struct PlanDependency {
     /// Native dependency edge type from the pinned bd contract.
     pub dependency_type: PlanDependencyType,
     /// Current dependency status when the hydrated response carries it.
-    pub status: Option<PlanDependencyStatus>,
+    pub status: Option<String>,
 }
 
 /// Closed subset of pinned bd dependency kinds supported by plan inventory.
-///
-/// Only `blocks` affects scheduling readiness. The other four coordinates
-/// remain visible to consumers as hierarchy, context, or provenance without
-/// being promoted into blockers.
 ///
 /// The subset stays closed on purpose: pinned bd 1.2.1 also advertises
 /// `tracks`, `until`, `caused-by`, `validates`, and `relates-to`, and each
@@ -113,27 +91,6 @@ pub enum PlanDependencyType {
     Supersedes,
 }
 
-impl PlanDependencyType {
-    /// The native bd spelling retained on the wire.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Blocks => "blocks",
-            Self::ParentChild => "parent-child",
-            Self::Related => "related",
-            Self::DiscoveredFrom => "discovered-from",
-            Self::Supersedes => "supersedes",
-        }
-    }
-
-    /// Whether this edge can prevent the issue from being ready.
-    ///
-    /// Only `blocks` does. `supersedes` in particular points at work the
-    /// source replaced, which is routinely open or closed after the fact.
-    pub const fn blocks_readiness(self) -> bool {
-        matches!(self, Self::Blocks)
-    }
-}
-
 impl TryFrom<&str> for PlanDependencyType {
     type Error = String;
 
@@ -149,88 +106,7 @@ impl TryFrom<&str> for PlanDependencyType {
     }
 }
 
-/// Closed issue statuses carried by dependency summaries from pinned bd.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PlanDependencyStatus {
-    /// The prerequisite has not started.
-    Open,
-    /// The prerequisite is currently claimed.
-    InProgress,
-    /// The prerequisite is explicitly blocked.
-    Blocked,
-    /// The prerequisite is deferred.
-    Deferred,
-    /// The prerequisite is complete.
-    Closed,
-    /// The prerequisite is intentionally persistent.
-    Pinned,
-    /// The prerequisite is actively hooked by a worker.
-    Hooked,
-}
-
-impl PlanDependencyStatus {
-    /// The native bd spelling retained on the wire.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Open => "open",
-            Self::InProgress => "in_progress",
-            Self::Blocked => "blocked",
-            Self::Deferred => "deferred",
-            Self::Closed => "closed",
-            Self::Pinned => "pinned",
-            Self::Hooked => "hooked",
-        }
-    }
-
-    /// Whether this dependency is complete.
-    pub const fn is_closed(self) -> bool {
-        matches!(self, Self::Closed)
-    }
-}
-
-impl std::ops::Deref for PlanDependencyStatus {
-    type Target = str;
-
-    fn deref(&self) -> &Self::Target {
-        self.as_str()
-    }
-}
-
-impl TryFrom<&str> for PlanDependencyStatus {
-    type Error = String;
-
-    fn try_from(value: &str) -> Result<Self, Self::Error> {
-        match value {
-            "open" => Ok(Self::Open),
-            "in_progress" => Ok(Self::InProgress),
-            "blocked" => Ok(Self::Blocked),
-            "deferred" => Ok(Self::Deferred),
-            "closed" => Ok(Self::Closed),
-            "pinned" => Ok(Self::Pinned),
-            "hooked" => Ok(Self::Hooked),
-            other => Err(format!("unknown dependency status {other:?}")),
-        }
-    }
-}
-
-/// Readiness supported by one hydrated plan row's current facts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum PlanReadiness {
-    /// Every hard prerequisite is known closed.
-    Ready,
-    /// The issue or a hard prerequisite is known blocked.
-    Blocked,
-    /// The issue is already claimed and all hard prerequisites are closed.
-    Claimed,
-    /// The issue is explicitly deferred and all hard prerequisites are closed.
-    Deferred,
-    /// A hard prerequisite omitted the status needed to decide readiness.
-    Unknown,
-}
-
-/// One current, nonterminal Beads plan row.
+/// One hydrated Beads issue and its dependency coordinates.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlanIssue {
@@ -241,82 +117,6 @@ pub struct PlanIssue {
     pub parent: Option<String>,
     /// Bounded dependency summaries from the single hydrate call.
     pub dependencies: Vec<PlanDependency>,
-}
-
-impl PlanIssue {
-    /// Derive only readiness established by the hydrated dependency facts.
-    ///
-    /// A known non-closed `blocks` edge is conclusive even if another blocker
-    /// omitted its status. If no known blocker proves the issue blocked, any
-    /// missing hard-blocker status keeps the result unknown. Structural and
-    /// informational edges never affect readiness.
-    pub fn readiness(&self) -> PlanReadiness {
-        if self.issue.status == "blocked" {
-            return PlanReadiness::Blocked;
-        }
-
-        let blockers = self
-            .dependencies
-            .iter()
-            .filter(|dependency| dependency.dependency_type.blocks_readiness());
-        let mut missing_status = false;
-        for blocker in blockers {
-            match blocker.status {
-                Some(status) if !status.is_closed() => return PlanReadiness::Blocked,
-                Some(_) => {}
-                None => missing_status = true,
-            }
-        }
-        if missing_status {
-            return PlanReadiness::Unknown;
-        }
-
-        match self.issue.status.as_str() {
-            "open" => PlanReadiness::Ready,
-            "in_progress" => PlanReadiness::Claimed,
-            "deferred" => PlanReadiness::Deferred,
-            _ => PlanReadiness::Unknown,
-        }
-    }
-}
-
-/// The bounded live-plan inventory and its coverage truth.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PlanInventory {
-    /// Hydrated rows in discovery order.
-    pub issues: Vec<PlanIssue>,
-    /// More rows matched than the caller's display bound.
-    pub truncated: bool,
-    /// Number of rows observed by the bounded N+1 discovery call.
-    pub discovered: usize,
-}
-
-/// Scope for the Work Map's one bounded Beads graph read.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum WorkMapPlanScope {
-    /// All live operator-scoped plans.
-    Operator,
-    /// Live plans whose persisted repository metadata exactly matches.
-    Repository(String),
-    /// The named epic and its direct live children.
-    Epic(String),
-}
-
-/// Current plan rows plus exact Bead summaries needed by the shared
-/// Operations classifier. Both collections come from the same final hydrate;
-/// no separate claim/membership process is needed.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WorkMapPlanInventory {
-    /// Hydrated live plan rows selected for display.
-    pub issues: Vec<PlanIssue>,
-    /// Exact durable-linked Bead summaries available to classification.
-    pub exact_issues: Vec<IssueSummary>,
-    /// More live plan rows matched than the caller's bound.
-    pub truncated: bool,
-    /// Number of live plan rows observed before the display bound.
-    pub discovered: usize,
 }
 
 /// A `revision` exactly as bd wrote it. A JSON number is rendered back to its
@@ -396,20 +196,7 @@ fn issue(value: &Value) -> Option<IssueSummary> {
     })
 }
 
-/// Which statuses a hydrate accepts. Plan flows stay fail-closed on the
-/// nonterminal vocabulary; the one-shot ledger import reads the WHOLE store,
-/// closed rows included.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StatusVocabulary {
-    Nonterminal,
-    Any,
-}
-
 fn plan_issue(value: &Value) -> Result<PlanIssue, String> {
-    plan_issue_with(value, StatusVocabulary::Nonterminal)
-}
-
-fn plan_issue_with(value: &Value, vocab: StatusVocabulary) -> Result<PlanIssue, String> {
     let object = value
         .as_object()
         .ok_or_else(|| "hydrated issue is not an object".to_owned())?;
@@ -523,14 +310,23 @@ fn plan_issue_with(value: &Value, vocab: StatusVocabulary) -> Result<PlanIssue, 
                     })?;
                 let status = match object.get("status") {
                     None | Some(Value::Null) => None,
-                    Some(Value::String(value)) if !value.trim().is_empty() => Some(
-                        PlanDependencyStatus::try_from(value.as_str()).map_err(|detail| {
-                            format!(
-                                "hydrated issue {:?} dependency {:?} has {detail}",
-                                issue.id, id
-                            )
-                        })?,
-                    ),
+                    Some(Value::String(value))
+                        if matches!(
+                            value.as_str(),
+                            "open"
+                                | "in_progress"
+                                | "blocked"
+                                | "deferred"
+                                | "closed"
+                                | "pinned"
+                                | "hooked"
+                        ) => Some(value.clone()),
+                    Some(Value::String(value)) if !value.trim().is_empty() => {
+                        return Err(format!(
+                            "hydrated issue {:?} dependency {:?} has unknown dependency status {:?}",
+                            issue.id, id, value
+                        ));
+                    }
                     Some(_) => {
                         return Err(format!(
                             "hydrated issue {:?} dependency {:?} has malformed status",
@@ -564,20 +360,6 @@ fn hydrated_plan_rows(
     requested_ids: &[String],
     repository: Option<&str>,
 ) -> Result<Vec<PlanIssue>, String> {
-    hydrated_plan_rows_with(
-        rows,
-        requested_ids,
-        repository,
-        StatusVocabulary::Nonterminal,
-    )
-}
-
-fn hydrated_plan_rows_with(
-    rows: &[Value],
-    requested_ids: &[String],
-    repository: Option<&str>,
-    vocab: StatusVocabulary,
-) -> Result<Vec<PlanIssue>, String> {
     let requested: BTreeSet<&str> = requested_ids.iter().map(String::as_str).collect();
     if requested.len() != requested_ids.len() {
         return Err("selected discovery ids are not unique".to_owned());
@@ -585,7 +367,7 @@ fn hydrated_plan_rows_with(
 
     let mut by_id = BTreeMap::new();
     for row in rows {
-        let item = plan_issue_with(row, vocab)?;
+        let item = plan_issue(row)?;
         let id = item.issue.id.clone();
         if !requested.contains(id.as_str()) {
             return Err(format!("hydrate returned unrequested issue id {id:?}"));
@@ -624,7 +406,7 @@ fn list(value: &Value) -> Vec<IssueSummary> {
 
 /// Every issue id in the store across ALL statuses, for the one-shot
 /// ledger import. Discovery only — the importer hydrates full fields and
-/// dependencies through [`plan_issues`] afterwards.
+/// dependencies through [`all_issues_with_deps`] afterwards.
 pub async fn all_issue_ids(cfg: &BdConfig) -> Result<Vec<String>, BdError> {
     let args = [
         "list",
@@ -640,9 +422,8 @@ pub async fn all_issue_ids(cfg: &BdConfig) -> Result<Vec<String>, BdError> {
     Ok(list(&data).into_iter().map(|issue| issue.id).collect())
 }
 
-/// The import hydrate: exact rows for the one-shot ledger import, accepting
-/// EVERY status (closed included) — the only consumer allowed past the
-/// nonterminal fail-closed vocabulary the plan flows keep.
+/// Exact rows for the one-shot ledger import, accepting every supported issue
+/// status, including closed.
 pub async fn all_issues_with_deps(
     cfg: &BdConfig,
     ids: &[String],
@@ -800,7 +581,7 @@ mod tests {
     }
 
     #[test]
-    fn pinned_dependency_kinds_round_trip_without_inventing_blockers() {
+    fn pinned_dependency_kinds_round_trip() {
         let item = plan_issue(&hydrated(
             "plan-a",
             "open",
@@ -814,7 +595,6 @@ mod tests {
         ))
         .expect("the five pinned dependency kinds");
 
-        assert_eq!(item.readiness(), PlanReadiness::Ready);
         assert_eq!(
             item.dependencies
                 .iter()
@@ -840,35 +620,6 @@ mod tests {
         );
     }
 
-    /// The 2026-08-17 incident: one legitimate `supersedes` edge made the
-    /// whole repository-scoped plan source unavailable. It is provenance —
-    /// the superseded target's status is history in every shape bd emits it,
-    /// so it can never move the source off `ready`.
-    #[test]
-    fn a_supersedes_edge_is_provenance_and_never_moves_readiness() {
-        for status in [
-            json!({"id":"replaced","dependency_type":"supersedes","status":"open"}),
-            json!({"id":"replaced","dependency_type":"supersedes","status":"blocked"}),
-            json!({"id":"replaced","dependency_type":"supersedes","status":"closed"}),
-            json!({"id":"replaced","dependency_type":"supersedes"}),
-        ] {
-            let item = plan_issue(&hydrated("plan-a", "open", json!([status.clone()])))
-                .unwrap_or_else(|error| panic!("supersedes {status} was rejected: {error}"));
-            assert_eq!(
-                item.readiness(),
-                PlanReadiness::Ready,
-                "supersedes {status} changed readiness"
-            );
-            assert_eq!(item.dependencies.len(), 1, "the edge stays visible");
-            assert_eq!(
-                item.dependencies[0].dependency_type,
-                PlanDependencyType::Supersedes
-            );
-            assert!(!item.dependencies[0].dependency_type.blocks_readiness());
-            assert_eq!(item.dependencies[0].id, "replaced");
-        }
-    }
-
     /// The neighbours bd 1.2.1 also advertises are NOT admitted with it: a
     /// kind forged has not adjudicated must still fail the hydrate closed.
     #[test]
@@ -891,62 +642,6 @@ mod tests {
                 .is_err(),
                 "dependency kind {kind:?} was accepted without adjudication"
             );
-        }
-    }
-
-    #[test]
-    fn readiness_is_unknown_only_when_a_hard_blocker_lacks_status() {
-        let missing = plan_issue(&hydrated(
-            "plan-a",
-            "open",
-            json!([{"id":"hard","dependency_type":"blocks"}]),
-        ))
-        .expect("missing dependency status is bounded unknown evidence");
-        assert_eq!(missing.readiness(), PlanReadiness::Unknown);
-
-        let known_open = plan_issue(&hydrated(
-            "plan-a",
-            "open",
-            json!([
-                {"id":"unknown","dependency_type":"blocks"},
-                {"id":"open","dependency_type":"blocks","status":"open"}
-            ]),
-        ))
-        .expect("known and unknown blocker evidence");
-        assert_eq!(known_open.readiness(), PlanReadiness::Blocked);
-
-        let structural = plan_issue(&hydrated(
-            "plan-a",
-            "open",
-            json!([{"id":"epic","dependency_type":"parent-child"}]),
-        ))
-        .expect("parent-child status is not scheduling evidence");
-        assert_eq!(structural.readiness(), PlanReadiness::Ready);
-    }
-
-    #[test]
-    fn dependency_status_decoding_matches_the_pinned_bd_schema() {
-        for status in [
-            "open",
-            "in_progress",
-            "blocked",
-            "deferred",
-            "closed",
-            "pinned",
-            "hooked",
-        ] {
-            let item = plan_issue(&hydrated(
-                "plan-a",
-                "open",
-                json!([{"id":"hard","dependency_type":"blocks","status":status}]),
-            ))
-            .unwrap_or_else(|error| panic!("pinned status {status:?} was rejected: {error}"));
-            let expected = if status == "closed" {
-                PlanReadiness::Ready
-            } else {
-                PlanReadiness::Blocked
-            };
-            assert_eq!(item.readiness(), expected, "status {status:?}");
         }
     }
 

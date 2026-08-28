@@ -141,13 +141,7 @@ impl From<ProtoError> for Failure {
 
 impl From<forged_beads::BdError> for Failure {
     fn from(err: forged_beads::BdError) -> Self {
-        use forged_beads::BdError;
-        // The wire mapping the classifier documents per variant.
-        let code = match &err {
-            BdError::Contention { .. } => ErrorCode::BeadsContention,
-            BdError::LeaseHeld { .. } => ErrorCode::BeadLeaseHeld,
-            _ => ErrorCode::BeadsError,
-        };
+        let code = ErrorCode::BeadsError;
         Failure {
             code,
             message: err.to_string(),
