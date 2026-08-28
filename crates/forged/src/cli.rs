@@ -365,7 +365,8 @@ pub struct EpicStartArgs {
     /// Deprecated locked epic-map path. The epic Bead is authoritative.
     #[arg(long)]
     pub spec: Option<String>,
-    /// Default-branch target; defaults from origin/HEAD.
+    /// Bare default-branch name existing on origin (e.g. "main"); an
+    /// `origin/` prefix is stripped. Defaults from origin/HEAD.
     #[arg(long)]
     pub base_ref: Option<String>,
     /// Assurance profile inherited by child slices.
@@ -413,9 +414,10 @@ pub struct EpicResolveArgs {
     /// Durable epic id.
     #[arg(long)]
     pub epic: String,
-    /// Held child whose spec/input is now resolved.
+    /// Held child whose spec/input is now resolved. Omit to resolve an
+    /// epic-level input requirement that names no child.
     #[arg(long)]
-    pub child: String,
+    pub child: Option<String>,
     /// Resolution note recorded in the epic stream.
     #[arg(long)]
     pub note: String,
