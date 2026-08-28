@@ -3247,29 +3247,6 @@ mod settle_tests {
         }
     }
 
-    /// The one bd call this path makes is admission's exact-id READ. A stub
-    /// answering the run's native scheduling fields keeps the test off the
-    /// operator's pinned bd, and the run never reaches a bd WRITE — those
-    /// take a lock under the machine's real anvil home.
-    fn write_bd_stub(path: &Path, repository: &Path) {
-        let response = json!({
-            "schema_version": 1,
-            "data": [{
-                "id": RUN_ID,
-                "title": "settlement test",
-                "status": "open",
-                "priority": 2,
-                "issue_type": "task",
-                "revision": 1,
-                "metadata": {"repository": repository.to_string_lossy()},
-            }],
-        });
-        let response = response.to_string().replace('\'', "'\"'\"'");
-        std::fs::write(path, format!("#!/bin/sh\nprintf '%s\\n' '{response}'\n")).expect("bd stub");
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
-            .expect("bd stub mode");
-    }
-
     /// A provably dead pid: by the time an attempt settles its provider
     /// shell has exited, so the guardian's first probe ends the guardian.
     fn exited_provider_pid() -> u32 {
@@ -3440,7 +3417,6 @@ mod settle_tests {
         socket: &Path,
         budget_s: u64,
     ) -> ClaimedFixture {
-        write_bd_stub(&root.join("bd"), root);
         std::fs::create_dir_all(root.join("beads")).expect("beads dir");
 
         let ledger = Ledger::open(&root.join("state.db")).expect("open ledger");
@@ -3460,7 +3436,13 @@ mod settle_tests {
                 kind: forged_ledger::WorkKind::Task,
                 status: forged_ledger::WorkStatus::Open,
                 priority: Some(2),
-                metadata: std::collections::BTreeMap::new(),
+                // Admission refuses a bead whose repository metadata does
+                // not match the run's `repo` column — the bd stub this
+                // replaced always carried it.
+                metadata: std::collections::BTreeMap::from([(
+                    "repository".to_owned(),
+                    root.to_string_lossy().into_owned(),
+                )]),
                 spec: forged_ledger::WorkSpecFields {
                     title: RUN_ID.to_owned(),
                     description: "fixture".to_owned(),

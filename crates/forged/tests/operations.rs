@@ -82,64 +82,15 @@ fn seed_packet(env: &TestEnv, run_id: &str, seq: i64, stage: forged_types::Stage
     packet_id
 }
 
-#[tokio::test]
-async fn live_plan_discovery_reports_n_plus_one_coverage_and_hydrates_one_batch() {
-    let env = TestEnv::new("forged-operations-plan-bound");
-    for id in ["plan-a", "plan-b", "plan-c"] {
-        env.set_bead_field(id, "status", "open");
-        env.set_bead_field(id, "title", &format!("Plan {id}"));
-    }
-    let mut cfg = forged_beads::BdConfig::new(env.shim_bin.join("bd"), env.beads_dir.clone());
-    cfg.home_override = Some(env.home.clone());
-    cfg.anvil_home = env.anvil.clone();
-    cfg.work_dir = env.beads_dir.clone();
+// The bd-binary plan-inventory bound is retired: production reads the
+// in-process store. The N+1 discovery contract survives at its operator
+// surface — see work_map's graph-cap refusal, which reports exactly the
+// limit+1 probe.
 
-    let inventory = forged_beads::plan_inventory(&cfg, None, 2)
-        .await
-        .expect("bounded live-plan inventory");
-    assert_eq!(inventory.discovered, 3);
-    assert!(inventory.truncated);
-    assert_eq!(inventory.issues.len(), 2);
-
-    let calls = env.bd_calls();
-    assert_eq!(calls.len(), 2, "one discovery and one hydrate: {calls:?}");
-    assert!(calls[0].contains("--limit 3 --max-rows 3"), "{calls:?}");
-    assert!(
-        calls[1].starts_with("show plan-a plan-b --brief-deps --json"),
-        "{calls:?}"
-    );
-}
-
-#[test]
-fn malformed_hydration_fails_the_plan_source_closed_without_hiding_durable_work() {
-    let env = TestEnv::new("forged-operations-malformed-plan");
-    env.forged(&["init"]);
-    fabricate_run(&env, "durable-safe");
-    env.set_bead_field("plan-bad", "status", "open");
-    env.set_bead_field("plan-bad", "title", "Malformed dependencies");
-    env.set_bead_field("plan-bad", "dependencies", r#"{"not":"an array"}"#);
-
-    let before = env.bd_calls().len();
-    let (code, response) = env.forged(&["operations", "overview"]);
-    assert_eq!(code, 0, "durable projection remains available: {response}");
-    assert_eq!(
-        response["result"]["sourceHealth"]["beads"]["state"],
-        json!("available"),
-        "the independent exact claim batch remains usable"
-    );
-    assert_eq!(
-        response["result"]["sourceHealth"]["plan"]["state"],
-        json!("unavailable")
-    );
-    let rows = entries(&response);
-    assert!(rows.contains_key("durable-safe"), "{response}");
-    assert!(!rows.contains_key("plan-bad"), "{response}");
-    assert_eq!(
-        env.bd_calls()[before..].len(),
-        3,
-        "one claim batch plus malformed plan discovery/hydration, never per-node retries"
-    );
-}
+// Malformed wire hydration is unrepresentable: a ledger dependency is a
+// CHECK-constrained row, so the fail-closed guarantee moved from
+// parse-time to write-time. Durable-work visibility stays covered by
+// `operations_joins_one_bounded_live_plan_without_duplicate_durable_work`.
 
 #[test]
 fn operations_joins_one_bounded_live_plan_without_duplicate_durable_work() {
@@ -156,6 +107,9 @@ fn operations_joins_one_bounded_live_plan_without_duplicate_durable_work() {
     env.set_bead_field("plan-a", "status", "open");
     env.set_bead_field("plan-a", "priority", "1");
     env.set_bead_field("plan-a", "parent", "epic-a");
+    // The parent is boundary context, not an in-scope plan row: the ledger
+    // materialises every edge target, so its scope must be stated.
+    env.set_bead_repository("epic-a", "/tmp/a-different-repository");
     env.set_bead_field(
         "plan-a",
         "dependencies",
@@ -168,7 +122,6 @@ fn operations_joins_one_bounded_live_plan_without_duplicate_durable_work() {
     env.set_bead_field("plan-closed", "status", "closed");
     env.set_bead_repository("plan-closed", &repository);
 
-    let before = env.bd_calls().len();
     let (code, response) = env.forged(&[
         "operations",
         "overview",
@@ -201,9 +154,16 @@ fn operations_joins_one_bounded_live_plan_without_duplicate_durable_work() {
     assert_eq!(rows["plan-a"]["source"], json!("live-plan"));
     assert_eq!(rows["plan-a"]["detailTarget"], Value::Null);
     assert_eq!(rows["plan-a"]["plan"]["parent"], json!("epic-a"));
-    assert_eq!(
-        rows["plan-a"]["plan"]["dependencies"][0]["id"],
-        json!("foundation")
+    // The dependency list now also carries the parent-child edge (the wire
+    // gained an entry when edges became rows); search rather than index.
+    assert!(
+        rows["plan-a"]["plan"]["dependencies"]
+            .as_array()
+            .expect("dependencies")
+            .iter()
+            .any(|dep| dep["id"] == json!("foundation")
+                && dep["dependencyType"] == json!("blocks")),
+        "{rows:?}"
     );
     assert!(
         !rows.contains_key("bead-durable-a"),
@@ -218,22 +178,9 @@ fn operations_joins_one_bounded_live_plan_without_duplicate_durable_work() {
         "terminal plan rows are excluded"
     );
 
-    let calls = &env.bd_calls()[before..];
-    assert_eq!(
-        calls.len(),
-        3,
-        "one exact claim batch plus one discovery and one hydrate: {calls:?}"
-    );
-    let discovery = calls
-        .iter()
-        .find(|call| call.starts_with("list --status open,in_progress,blocked,deferred"))
-        .expect("plan discovery call");
-    assert!(discovery.contains(&format!("--metadata-field repository={repository}")));
-    assert!(calls.iter().any(|call| call.starts_with("list --id ")));
-    assert!(calls.iter().any(|call| call.starts_with("show ")));
-    assert!(!calls
-        .iter()
-        .any(|call| call.starts_with("ready") || call.contains("graph")));
+    // The bounded-read contract (one claim batch, one discovery, one
+    // hydrate, never a graph walk) is structural in the in-process store
+    // and no longer observable as argv.
 }
 
 /// The 2026-08-17 incident, at the surface that reported it: one live plan
@@ -304,44 +251,15 @@ fn a_supersedes_edge_keeps_the_repository_plan_source_available() {
 /// The control for the test above: a kind forged has NOT adjudicated still
 /// fails the plan source closed, so the fix admitted one relation rather
 /// than every string bd advertises.
-#[test]
-fn an_unadjudicated_dependency_kind_still_fails_the_plan_source_closed() {
-    let env = TestEnv::new("forged-operations-unadjudicated-kind");
-    env.forged(&["init"]);
-    fabricate_run(&env, "durable-safe");
-    env.set_bead_field("plan-tracks", "status", "open");
-    env.set_bead_field("plan-tracks", "title", "Tracks another plan");
-    env.set_bead_field(
-        "plan-tracks",
-        "dependencies",
-        r#"[{"id":"plan-tracked","dependency_type":"tracks","status":"open"}]"#,
-    );
-
-    let (code, response) = env.forged(&["operations", "overview"]);
-    assert_eq!(code, 0, "durable projection remains available: {response}");
-    assert_eq!(
-        response["result"]["sourceHealth"]["plan"]["state"],
-        json!("unavailable"),
-        "an unadjudicated relation is not silently coerced: {response}"
-    );
-    assert!(
-        response["result"]["sourceHealth"]["plan"]["error"]
-            .as_str()
-            .is_some_and(|error| error.contains("tracks")),
-        "the bounded error names the kind that failed: {response}"
-    );
-    let rows = entries(&response);
-    assert!(rows.contains_key("durable-safe"), "{response}");
-    assert!(!rows.contains_key("plan-tracks"), "{response}");
-}
+// The unadjudicated-dependency-kind guard moved to write time: the
+// work_deps CHECK rejects unknown kinds at the seam, unit-covered in
+// forged-ledger. A surface test can no longer construct the state.
 
 #[test]
-fn operations_keeps_durable_truth_when_beads_is_unavailable() {
+fn operations_reports_durable_rows_from_the_store() {
     let env = TestEnv::new("forged-operations-outage");
     env.forged(&["init"]);
     fabricate_run(&env, "durable-outage");
-    env.set_bd_list_unreachable(true);
-    env.set_bd_show_unreachable(true);
 
     let (code, response) = env.forged(&["operations", "overview"]);
     assert_eq!(
@@ -354,11 +272,11 @@ fn operations_keeps_durable_truth_when_beads_is_unavailable() {
     );
     assert_eq!(
         response["result"]["sourceHealth"]["beads"]["state"],
-        json!("unavailable")
+        json!("available")
     );
     assert_eq!(
         response["result"]["sourceHealth"]["plan"]["state"],
-        json!("unavailable")
+        json!("available")
     );
     let rows = entries(&response);
     assert_eq!(rows["durable-outage"]["source"], json!("durable"));
@@ -430,9 +348,6 @@ fn work_detail_requires_an_exact_kind_and_projects_the_shared_subject_truth() {
         })
         .expect("unpriced usage");
     ledger.close().expect("close ledger");
-    env.set_bd_list_unreachable(true);
-    let beads_before = env.bd_calls().len();
-
     let (code, response) = env.forged(&[
         "work",
         "detail",
@@ -514,11 +429,6 @@ fn work_detail_requires_an_exact_kind_and_projects_the_shared_subject_truth() {
         later_page["result"]["attentionCoverage"]["controlsComplete"], false,
         "a later page never pretends it covered older control transitions"
     );
-    assert_eq!(
-        env.bd_calls().len(),
-        beads_before + 2,
-        "native detail spends exactly one bounded read per projection"
-    );
 
     let (code, response) = env.forged(&[
         "work",
@@ -591,8 +501,6 @@ fn work_detail_captures_epic_children_from_the_atomic_ledger_subject() {
         .expect("child start");
     ledger.close().expect("close ledger");
 
-    let before = env.bd_calls().len();
-    env.set_bd_list_unreachable(true);
     let (code, response) = env.forged(&[
         "work",
         "detail",
@@ -616,11 +524,8 @@ fn work_detail_captures_epic_children_from_the_atomic_ledger_subject() {
         response["result"]["attentionCoverage"]["controlsComplete"], false,
         "the parent stream cannot prove child-run control transitions"
     );
-    assert_eq!(
-        env.bd_calls().len(),
-        before + 1,
-        "epic child capture reads the epic's own bead once and none per child"
-    );
+    // The epic child capture is one atomic ledger read; the per-projection
+    // read budget is structural now.
 }
 
 #[test]
@@ -721,7 +626,6 @@ fn work_detail_bounds_history_uses_only_manifest_metadata_and_fails_closed_on_re
         .expect("insert durable session ownership");
     transaction.commit().expect("commit fixture");
     drop(connection);
-    env.set_bd_list_unreachable(true);
 
     let (code, response) = env.forged(&[
         "work",
@@ -822,7 +726,6 @@ fn work_detail_projects_legacy_gate_prose_as_unknown_without_failed_gate_attenti
     }
     transaction.commit().expect("commit fixture");
     drop(connection);
-    env.set_bd_list_unreachable(true);
 
     let (code, response) = env.forged(&[
         "work",
@@ -1032,7 +935,6 @@ fn two_runs_sharing_one_bead_still_resolve_one_exact_claim_batch() {
     env.set_bead_field("plan-only", "title", "Never executed");
     env.set_bead_field("plan-only", "status", "open");
 
-    let before = env.bd_calls().len();
     let (code, response) = env.forged(&["operations", "overview"]);
     assert_eq!(code, 0, "operations overview: {response}");
     assert_eq!(
@@ -1058,32 +960,14 @@ fn two_runs_sharing_one_bead_still_resolve_one_exact_claim_batch() {
         );
     }
 
-    let calls = &env.bd_calls()[before..];
-    let shows = calls
-        .iter()
-        .filter(|call| call.starts_with("show ") && call.contains("--brief-deps --json"))
-        .collect::<Vec<_>>();
+    // The exact-batch dedup now lives in `Ledger::work_items`; assert it
+    // where it is observable — one plan row per bead, not two.
     assert_eq!(
-        shows.len(),
-        2,
-        "one exact claim batch and one plan hydrate: {calls:?}"
-    );
-    // The claim batch is the read built from the LEDGER's per-run bead ids;
-    // the plan hydrate is built from discovery, which already deduplicates.
-    // Asserting over the hydrate would say nothing about the repaired path,
-    // and asserting non-crash alone would still pass if someone loosened
-    // `exact_issue_rows`.
-    let claim = shows
-        .iter()
-        .find(|call| !call.contains("plan-only"))
-        .unwrap_or_else(|| panic!("the exact claim batch is not the plan hydrate: {calls:?}"));
-    assert_eq!(
-        claim
-            .split_whitespace()
-            .filter(|token| *token == "bead-shared")
+        rows.values()
+            .filter(|row| row["beadId"] == json!("bead-shared"))
             .count(),
-        1,
-        "the exact claim batch requests the shared bead exactly once: {claim}"
+        2,
+        "two runs, one shared bead, no duplicated plan row: {response}"
     );
 }
 
@@ -1289,27 +1173,7 @@ fn work_detail_titles_its_subject_and_never_titles_a_child_with_the_epic() {
         "{live}"
     );
 
-    // Work Detail is what an operator opens when something is wrong, which
-    // is exactly when Beads may be unavailable: the read is fail-soft.
-    env.set_bd_show_unreachable(true);
-    let (code, outage) = env.forged(&[
-        "work",
-        "detail",
-        "--subject-kind",
-        "run",
-        "--subject-id",
-        "title-child",
-    ]);
-    assert_eq!(code, 0, "a Beads outage cannot fail Work Detail: {outage}");
-    assert_eq!(outage["ok"], json!(true), "{outage}");
-    assert_eq!(
-        outage["result"]["titleSource"]["source"],
-        json!("unknown"),
-        "{outage}"
-    );
-    assert_eq!(outage["result"]["titleSource"]["known"], json!(false));
-    assert_eq!(
-        outage["result"]["titleSource"]["value"],
-        outage["result"]["identity"]["displayTitle"]
-    );
+    // The fail-soft outage degradation retired with the subprocess: the
+    // in-process store always answers, and the live-title half above is the
+    // proof the read reached it.
 }

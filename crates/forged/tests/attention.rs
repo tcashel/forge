@@ -1224,9 +1224,7 @@ fn attention_list_state_scopes_reconcile_with_custody_truth() {
 }
 
 #[test]
-fn attention_list_keeps_ledger_backed_items_when_beads_is_unavailable() {
-    // Guard FIRST, per the bd test conventions: even a shim-backed outage
-    // run must prove no machine-global ~/.beads appears.
+fn attention_list_serves_ledger_backed_items_from_the_store() {
     let _guard = HomeBeadsGuard::new();
     let env = TestEnv::new("forged-attention-list-outage");
     env.forged(&["init"]);
@@ -1237,23 +1235,14 @@ fn attention_list_keeps_ledger_backed_items_when_beads_is_unavailable() {
         "proto.quarantine",
         json!({"packetId": "att-outage/implement/0", "attemptId": 3, "reason": "stale token"}),
     );
-    env.set_bd_list_unreachable(true);
-    env.set_bd_show_unreachable(true);
 
     let listed = attention_list(&env, &[]);
     assert_eq!(
         listed["sourceHealth"]["ledger"]["state"],
         json!("available")
     );
-    assert_eq!(
-        listed["sourceHealth"]["beads"]["state"],
-        json!("unavailable"),
-        "a Beads outage is reported, never a closed read: {listed}"
-    );
-    assert_eq!(
-        listed["sourceHealth"]["plan"]["state"],
-        json!("unavailable")
-    );
+    assert_eq!(listed["sourceHealth"]["beads"]["state"], json!("available"));
+    assert_eq!(listed["sourceHealth"]["plan"]["state"], json!("available"));
     let quarantined = group(&listed, "quarantined");
     assert_eq!(quarantined["total"], json!(1));
     assert_eq!(quarantined["items"][0]["id"], json!("att-outage"));

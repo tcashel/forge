@@ -802,10 +802,16 @@ impl Ledger {
             }
             match before.assignee.as_deref() {
                 Some(current) if current == holder => {}
-                current => {
+                Some(current) => {
                     return Err(refused(
                         ErrorCode::BeadLeaseHeld,
                         format!("work item {work_id:?} is held by {current:?}, not {holder:?}"),
+                    ));
+                }
+                None => {
+                    return Err(refused(
+                        ErrorCode::BeadLeaseHeld,
+                        format!("work item {work_id:?} is unheld; expected holder {holder:?}"),
                     ));
                 }
             }

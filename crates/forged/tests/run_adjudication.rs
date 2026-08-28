@@ -45,14 +45,17 @@ fn adjudicate_args<'a>(run: &'a str, outcome: &'a str, rationale: &'a str) -> Ve
     ]
 }
 
-fn mutation_calls(env: &TestEnv, bead: &str) -> Vec<String> {
-    env.bd_calls()
+/// Every `work.updated` payload the ledger recorded for one work item,
+/// oldest first (coordination events carry no run id).
+fn mutation_calls(env: &TestEnv, bead: &str) -> Vec<Value> {
+    let ledger = env.ledger();
+    let events = ledger.list_events(None, 0, 65_536).expect("events");
+    ledger.close().expect("close");
+    events
         .into_iter()
-        .filter(|call| {
-            call.starts_with(&format!("update {bead} "))
-                || call.starts_with(&format!("close {bead} "))
-                || call.starts_with(&format!("comment {bead} "))
-        })
+        .filter(|event| event.kind == "work.updated")
+        .map(|event| serde_json::from_str::<Value>(&event.payload_json).expect("payload"))
+        .filter(|payload| payload["workId"] == json!(bead))
         .collect()
 }
 
@@ -400,7 +403,7 @@ fn a_closed_bead_converges_for_every_outcome() {
             json!(true),
             "{run}: {response}"
         );
-        let mutations: Vec<String> = mutation_calls(&env, &bead)
+        let mutations: Vec<Value> = mutation_calls(&env, &bead)
             .into_iter()
             .skip(before)
             .collect();
@@ -408,10 +411,20 @@ fn a_closed_bead_converges_for_every_outcome() {
         // closed Bead, and nothing else is written.
         let expected_holder = format!("forged:{bead}:0");
         assert_eq!(mutations.len(), 1, "{run}: {mutations:?}");
-        assert!(
-            mutations[0].contains("--assignee ")
-                && mutations[0].contains(&format!("--if-assignee {expected_holder}")),
+        assert_eq!(
+            mutations[0]["verb"],
+            json!("release"),
+            "{run}: the release is the custody clear alone: {mutations:?}"
+        );
+        assert_eq!(
+            mutations[0]["actor"],
+            json!(expected_holder),
             "{run}: the release is CAS-guarded on the stale holder: {mutations:?}"
+        );
+        assert_eq!(
+            mutations[0]["status"]["to"],
+            json!("closed"),
+            "{run}: releasing stale custody never reopens the closed item"
         );
         assert_eq!(
             response["result"]["bead"]["released"],

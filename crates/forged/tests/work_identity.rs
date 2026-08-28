@@ -52,28 +52,7 @@ fn run_identity_survives_rename_and_outage_and_is_shared_without_extra_beads_rea
     // A later title is live claim-health data only; it cannot rewrite the
     // identity the atomic creation bundle captured.
     env.set_bead_field("identity-run", "title", "Renamed live title");
-    let calls_before = env.bd_calls().len();
     let (identity, entry) = listed_identity(&env, "identity-run");
-    let calls = &env.bd_calls()[calls_before..];
-    assert_eq!(
-        calls.len(),
-        3,
-        "identity enrichment adds nothing beyond Operations' exact claim batch and bounded plan discovery/hydration: {calls:?}"
-    );
-    assert!(calls
-        .iter()
-        .any(|call| call == "show identity-run --brief-deps --json"));
-    assert!(calls
-        .iter()
-        .any(|call| call.starts_with("list --status open,in_progress,blocked,deferred")));
-    assert_eq!(
-        calls
-            .iter()
-            .filter(|call| call.starts_with("show "))
-            .count(),
-        2,
-        "one exact show plus one plan hydrate: {calls:?}"
-    );
     assert_eq!(identity["schema"], json!("forged.work-identity/1"));
     assert_eq!(
         identity["subject"],
@@ -81,6 +60,11 @@ fn run_identity_survives_rename_and_outage_and_is_shared_without_extra_beads_rea
     );
     assert_eq!(identity["bead"]["title"], json!("Original launch title"));
     assert_eq!(identity["bead"]["revision"], json!(launch_revision));
+    assert_ne!(
+        env.bead_revision("identity-run"),
+        launch_revision,
+        "the rename minted a live revision the captured identity ignores"
+    );
     assert_eq!(identity["source"], json!("durable"));
     assert!(identity["displayTitle"]
         .as_str()
@@ -97,14 +81,15 @@ fn run_identity_survives_rename_and_outage_and_is_shared_without_extra_beads_rea
     assert_eq!(code, 0, "session list: {sessions}");
     assert_eq!(sessions["result"]["identity"], identity);
 
-    env.set_bd_list_unreachable(true);
-    env.set_bd_show_unreachable(true);
-    let (outage_identity, outage_entry) = listed_identity(&env, "identity-run");
-    assert_eq!(outage_identity, identity);
-    assert_eq!(outage_entry["claimHealth"]["known"], json!(false));
-    let (code, outage_status) = env.forged(&["run", "status", "--run", "identity-run"]);
-    assert_eq!(code, 0, "identity survives Beads outage: {outage_status}");
-    assert_eq!(outage_status["result"]["run"]["identity"], identity);
+    // The captured identity is immutable even as the live store keeps
+    // changing under it (the outage mode this replaced cannot occur: the
+    // store is in-process and always answers).
+    env.set_bead_field("identity-run", "title", "Renamed again");
+    let (stable_identity, _entry) = listed_identity(&env, "identity-run");
+    assert_eq!(stable_identity, identity);
+    let (code, later_status) = env.forged(&["run", "status", "--run", "identity-run"]);
+    assert_eq!(code, 0, "identity is durable: {later_status}");
+    assert_eq!(later_status["result"]["run"]["identity"], identity);
 }
 
 #[test]
@@ -158,23 +143,19 @@ fn epic_identity_is_atomic_and_shared_by_status_inventory_and_overview() {
     assert_eq!(code, 0, "epic overview: {overview}");
     assert_eq!(overview["result"]["identity"], identity);
 
-    env.set_bd_show_unreachable(true);
-    env.set_bd_list_unreachable(true);
-    let (code, outage) = env.forged(&["epic", "status", "--epic", "identity-epic"]);
+    // The store is in-process: the inventory is always available, and the
+    // captured identity still never re-derives from it.
+    env.set_bead_field("identity-epic", "title", "Renamed epic title");
+    let (code, later) = env.forged(&["epic", "status", "--epic", "identity-epic"]);
+    assert_eq!(code, 0, "durable epic status: {later}");
+    assert_eq!(later["result"]["identity"], identity);
+    assert_eq!(later["result"]["beadsInventory"]["available"], json!(true));
+    assert_eq!(later["result"]["children"][0]["beadsStatus"], json!("open"));
     assert_eq!(
-        code, 0,
-        "durable epic status survives Beads outage: {outage}"
+        later["result"]["children"][0]["identity"]["source"],
+        json!("live-plan"),
+        "a live child keeps its projection-only identity: {later}"
     );
-    assert_eq!(outage["result"]["identity"], identity);
-    assert_eq!(
-        outage["result"]["beadsInventory"]["available"],
-        json!(false)
-    );
-    assert_eq!(
-        outage["result"]["children"][0]["beadsStatus"],
-        json!("unknown")
-    );
-    assert!(outage["result"]["children"][0]["identity"].is_null());
 }
 
 #[test]

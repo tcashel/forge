@@ -1566,6 +1566,14 @@ impl TestEnv {
                 .expect("set parent edge");
             }
             "dependencies" => {
+                // The shim file this replaces was overwritten wholesale, so
+                // an empty list must CLEAR the edges. Parent-child is carried
+                // by its own field and is never part of this list.
+                conn.execute(
+                    "DELETE FROM work_deps WHERE from_id = ?1 AND kind <> 'parent-child'",
+                    rusqlite::params![bead],
+                )
+                .expect("clear dependency edges");
                 let deps: Vec<serde_json::Value> =
                     serde_json::from_str(value).expect("dependencies json");
                 for dep in deps {
@@ -1624,6 +1632,39 @@ impl TestEnv {
             repository,
         )
         .expect("set bead repository");
+    }
+
+    /// The status the work store reports for a bead right now — the
+    /// ledger-native replacement for reading `shim-state/<bead>.status`.
+    pub fn bead_status(&self, bead: &str) -> String {
+        self.work_db()
+            .query_row(
+                "SELECT status FROM work_items WHERE work_id = ?1",
+                [bead],
+                |row| row.get(0),
+            )
+            .expect("work item status")
+    }
+
+    /// One spec field at the bead's current revision (`title`,
+    /// `description`, `acceptance`, `design`, `notes`).
+    pub fn bead_field(&self, bead: &str, field: &str) -> String {
+        let column = match field {
+            "acceptance" => "acceptance_criteria",
+            other => other,
+        };
+        self.work_db()
+            .query_row(
+                &format!(
+                    "SELECT r.{column} FROM work_revisions r \
+                     JOIN work_items i ON i.work_id = r.work_id \
+                        AND i.current_revision = r.revision \
+                     WHERE r.work_id = ?1"
+                ),
+                [bead],
+                |row| row.get(0),
+            )
+            .expect("work item spec field")
     }
 
     /// The revision the work store reports for a bead right now.

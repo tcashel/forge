@@ -334,24 +334,8 @@ fn the_operator_queue_is_human_named_grouped_and_honest_about_unknowns() {
         );
     }
 
-    let calls =
-        std::fs::read_to_string(env.beads_dir.join("shim-state/calls.log")).expect("bd calls");
-    assert_eq!(
-        calls
-            .lines()
-            .filter(|line| line.starts_with("list "))
-            .count(),
-        1,
-        "only bounded plan discovery remains a list call: {calls}"
-    );
-    assert_eq!(
-        calls
-            .lines()
-            .filter(|line| line.starts_with("show "))
-            .count(),
-        2,
-        "one exact claim hydrate plus one plan dependency hydrate: {calls}"
-    );
+    // The bounded-read contract is structural now: one nonterminal-plan
+    // query plus per-id hydration, with no subprocess trace to count.
 }
 
 #[test]
@@ -397,32 +381,9 @@ fn repository_scope_uses_exact_bead_metadata_for_slices_epics_and_renamed_checko
         entry(&forge_response, "repo-forge")["claimHealth"]["known"],
         json!(true)
     );
-    let calls = env.bd_calls();
-    assert_eq!(
-        calls
-            .iter()
-            .filter(|call| call.starts_with("list "))
-            .count(),
-        2,
-        "one exact membership batch plus one bounded plan discovery: {calls:?}"
-    );
-    let call = calls
-        .iter()
-        .find(|call| call.starts_with("list --id "))
-        .expect("exact metadata membership call");
-    for fragment in [
-        "--id ",
-        "--metadata-field repository=/Users/operator/repositories/forge",
-        "--limit 0",
-        "--brief",
-        "--flat",
-        "--json",
-    ] {
-        assert!(
-            call.contains(fragment),
-            "bounded native filter has {fragment:?}: {call}"
-        );
-    }
+    // The membership batch is an exact in-process metadata filter now; the
+    // argv-shape contract retired with the bd subprocess. The scoping
+    // results below are the surviving contract.
 
     assert_eq!(
         run_ids(&scoped(drover)),
@@ -480,42 +441,9 @@ fn repository_scope_uses_exact_bead_metadata_for_slices_epics_and_renamed_checko
     );
 }
 
-#[test]
-fn repository_scope_fails_closed_when_beads_cannot_establish_membership() {
-    let env = TestEnv::new("forged-work-list-repository-outage");
-    env.forged(&["init"]);
-    let forge = "/Users/operator/repositories/forge";
-    fabricate_run_in_repository(&env, "repo-outage", forge);
-    env.set_bead_repository("bead-repo-outage", forge);
-    env.set_bd_list_unreachable(true);
-
-    let (code, scoped) = env.forged(&["work", "list", "--repo", forge]);
-    assert_ne!(code, 0, "a scoped outage must not widen: {scoped}");
-    assert_eq!(scoped["ok"], json!(false));
-    assert_eq!(scoped["error"]["code"], json!("BEADS_ERROR"));
-    assert!(scoped["result"].is_null(), "no scoped rows leak: {scoped}");
-
-    // The no-selector path uses the independent exact `show` contract, so a
-    // membership-list outage cannot erase otherwise available claim facts.
-    let (code, unfiltered) = env.forged(&["work", "list"]);
-    assert_eq!(code, 0, "unfiltered compatibility: {unfiltered}");
-    assert_eq!(
-        run_ids(&unfiltered),
-        BTreeSet::from(["repo-outage".to_owned()])
-    );
-    assert_eq!(
-        entry(&unfiltered, "repo-outage")["claimHealth"]["known"],
-        json!(true)
-    );
-    assert_eq!(
-        entry(&unfiltered, "repo-outage")["repositoryScope"],
-        json!({
-            "known": true,
-            "identity": forge,
-            "source": "beads.metadata.repository",
-        })
-    );
-}
+// The bd-era scoped-membership outage has no ledger analogue; the widening
+// guard it protected is now structural (an in-process membership read
+// cannot fail partway).
 
 #[test]
 fn an_empty_repository_selector_is_refused_instead_of_widening() {
@@ -527,10 +455,8 @@ fn an_empty_repository_selector_is_refused_instead_of_widening() {
     assert_ne!(code, 0, "empty repository is invalid: {response}");
     assert_eq!(response["error"]["code"], json!("INVALID_REQUEST"));
     assert!(response["result"].is_null());
-    assert!(
-        env.bd_calls().iter().all(|call| !call.starts_with("list ")),
-        "invalid scope is refused before Beads"
-    );
+    // (The invalid scope is refused before any store read; with an
+    // in-process store there is no call trace to assert on.)
 }
 
 #[test]
@@ -869,6 +795,7 @@ fn an_id_with_a_run_row_and_a_start_event_is_one_epic_entry() {
 fn a_stopped_run_reports_its_reason() {
     let env = TestEnv::new("forged-work-list-stopped");
     assert_eq!(env.forged(&["init"]).0, 0);
+    env.seed_frontier("wl-stopped");
     let repo = env.repos.repo.to_string_lossy().into_owned();
     let spec = env.spec.to_string_lossy().into_owned();
     let (code, started) = env.forged(&[
