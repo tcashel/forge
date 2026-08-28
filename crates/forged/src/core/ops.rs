@@ -4419,6 +4419,10 @@ async fn control_attention(
         }
     };
     req.run_id = Some(subject.clone());
+    // The alias is addressing, not payload: strip it after resolution so
+    // both documented request forms canonicalize to one idempotency
+    // identity — a retry that switches forms must replay, not conflict.
+    req.params.remove("subjectId");
     let attention_id = match param_str(&req.params, "attentionId") {
         Ok(value) => value.to_owned(),
         Err(error) => return err_response(&derive_key(name, Some(&subject), None, None), &error),

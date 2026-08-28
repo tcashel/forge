@@ -1367,5 +1367,16 @@ fn attention_controls_accept_the_subject_id_alias() {
         json!({"schemaVersion": 1, "params": aliased}),
     );
     assert_eq!(acknowledged["ok"], json!(true), "{acknowledged}");
+    assert_eq!(acknowledged["reused"], json!(false), "{acknowledged}");
     assert_eq!(quarantine(&overview(&env))["state"], json!("acknowledged"));
+
+    // The two documented request forms share one idempotency identity: a
+    // retry that switches from the alias form to the envelope form replays
+    // the stored response instead of conflicting.
+    let replayed = mcp.call_tool(
+        "attention_acknowledge",
+        json!({"schemaVersion": 1, "runId": "attention-run", "params": base}),
+    );
+    assert_eq!(replayed["ok"], json!(true), "{replayed}");
+    assert_eq!(replayed["reused"], json!(true), "{replayed}");
 }
