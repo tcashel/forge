@@ -1119,7 +1119,10 @@ impl Ledger {
                  VALUES (?1, ?2, 'supersedes')",
                 rusqlite::params![successor_id, work_id],
             )?;
-            if before.status != WorkStatus::Closed {
+            // An already-closed target (importer residue can carry custody
+            // on closed rows) still clears custody and lease so the event's
+            // `assignee: {from, to: null}` never contradicts the row.
+            if before.status != WorkStatus::Closed || before.assignee.is_some() {
                 set_coordination_tx(&tx, &work_id, WorkStatus::Closed, None)?;
                 clear_lease_tx(&tx, &work_id)?;
             }
@@ -1336,7 +1339,8 @@ impl Ledger {
                    AND NOT EXISTS (SELECT 1 FROM work_leases wl \
                                    WHERE wl.work_id = wi.work_id) \
                    AND NOT EXISTS (SELECT 1 FROM runs r \
-                                   JOIN attempts a ON a.packet_id LIKE r.run_id || '/%' \
+                                   JOIN packets p ON p.run_id = r.run_id \
+                                   JOIN attempts a ON a.packet_id = p.packet_id \
                                    WHERE r.bead_id = wi.work_id \
                                      AND a.state IN ('running','revoking'))",
             )?;

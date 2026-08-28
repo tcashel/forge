@@ -615,6 +615,11 @@ impl Ledger {
             }
 
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            // Herdr pane projections hold a non-deferrable FK onto this
+            // identity; the boundary re-capture below DELETEs and re-INSERTs
+            // the same primary key, so the FK check must be deferred to
+            // commit for any epic that ever ran under Herdr.
+            tx.execute_batch("PRAGMA defer_foreign_keys = ON")?;
             // The start bundle is scoped to the current start-epoch: events
             // after the latest `forged.epic.abandoned` boundary. A fresh
             // epoch legitimately re-captures the epic's identity — the

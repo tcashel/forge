@@ -51,6 +51,36 @@ pub(crate) async fn auto_import_if_empty(ctx: &Ctx) -> Result<Option<Value>, Fai
         // Nothing to import from: a fresh operator starts empty.
         return Ok(None);
     }
+    // The one-shot marker is the durable `work.imported` event, not the
+    // item count: an imported-EMPTY store must not re-probe bd (or mint
+    // another backup) on every daemon start.
+    let already = on_ledger(&ctx.ledger, |l| {
+        Ok(!l.list_events_by_kind("work.imported")?.is_empty())
+    })
+    .await?;
+    if already {
+        return Ok(None);
+    }
+    // Probe the source BEFORE the backup: an empty bd store must not leave
+    // a pre-import snapshot behind on every daemon start.
+    let bd = ctx.config.bd_config();
+    let ids = forged_beads::all_issue_ids(&bd)
+        .await
+        .map_err(Failure::from)?;
+    if ids.is_empty() {
+        // Record the zero-item completion durably so the next pass skips
+        // straight through without consulting bd.
+        on_ledger(&ctx.ledger, |l| {
+            l.append_event(
+                None,
+                "work.imported",
+                serde_json::json!({"items": 0, "edges": 0, "skippedEdges": 0}),
+            )
+            .map(|_| ())
+        })
+        .await?;
+        return Ok(None);
+    }
     // Cutover-day backup before the one-shot import.
     let backups = ctx.config.anvil_home.join("backups");
     std::fs::create_dir_all(&backups)

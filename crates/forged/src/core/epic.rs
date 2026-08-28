@@ -147,6 +147,9 @@ struct AssuranceFinalInspection {
 
 struct EpicView {
     config: EpicConfig,
+    /// How many abandon boundaries precede this epoch (full-stream count):
+    /// epoch-scoped control keys carry it as their `e{n}` stage segment.
+    start_epoch: usize,
     integration: Option<Value>,
     waves: Vec<Value>,
     children: BTreeMap<String, ChildState>,
@@ -552,7 +555,32 @@ pub(super) async fn assurance_base_sha(ctx: &Ctx, run_id: &str) -> Result<Option
 }
 
 async fn project(ctx: &Ctx, epic: &str) -> Result<EpicView, Failure> {
-    let events = epoch_events(ctx, epic).await?;
+    let full = epic_events(ctx, epic).await?;
+    let start_epoch = full.iter().filter(|row| row.kind == ABANDONED).count();
+    let boundary = full
+        .iter()
+        .rposition(|row| row.kind == ABANDONED)
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    // The generation FLOOR reads the FULL stream: a fresh epoch's first
+    // child launch must mint the next generation (and with it a fresh run
+    // id and run_start key), never re-derive generation 1 over the
+    // abandoned epoch's stored run.
+    let mut generation_floor: BTreeMap<String, u32> = BTreeMap::new();
+    for row in &full {
+        if row.kind == CHILD_STARTED {
+            let event = payload(row)?;
+            let child = string(&event, "childId")?;
+            let generation = event
+                .get("generation")
+                .and_then(Value::as_u64)
+                .and_then(|value| u32::try_from(value).ok())
+                .unwrap_or_else(|| generation_floor.get(&child).copied().unwrap_or(0) + 1);
+            let floor = generation_floor.entry(child).or_insert(0);
+            *floor = (*floor).max(generation);
+        }
+    }
+    let events: Vec<forged_ledger::EventRow> = full.into_iter().skip(boundary).collect();
     let started = events
         .iter()
         .find(|row| row.kind == STARTED)
@@ -565,6 +593,7 @@ async fn project(ctx: &Ctx, epic: &str) -> Result<EpicView, Failure> {
     let config = parse_config(&payload(started)?, migration.as_ref())?;
     let mut view = EpicView {
         config,
+        start_epoch,
         integration: None,
         waves: Vec::new(),
         children: BTreeMap::new(),
@@ -574,7 +603,7 @@ async fn project(ctx: &Ctx, epic: &str) -> Result<EpicView, Failure> {
         assurance: None,
         assurance_finalized: None,
         assurance_completed: None,
-        child_generations: BTreeMap::new(),
+        child_generations: generation_floor,
         input: None,
         paused: None,
         pr: None,
@@ -1240,7 +1269,10 @@ async fn recover_applied_epic_resolution(
     let Some(row) = row.filter(|row| row.state == OperationState::InProgress) else {
         return Ok(None);
     };
-    let rows = epoch_events(ctx, epic).await?;
+    // The FULL stream, not the epoch: recovery of a committed operation is
+    // operation idempotency, which the abandon boundary never scopes — the
+    // match is by globally-unique operation id.
+    let rows = epic_events(ctx, epic).await?;
     for event in rows
         .iter()
         .rev()
@@ -1306,13 +1338,16 @@ async fn recover_applied_epic_start(
             "epic start key was stored with a different request",
         ));
     }
-    let events = epoch_events(ctx, epic).await?;
+    // The FULL stream: the landed STARTED may sit behind a later abandon
+    // boundary, and the match is by this operation's globally-unique id.
+    let events = epic_events(ctx, epic).await?;
     let Some(landed) = events
         .iter()
-        .find(|event| event.kind == STARTED)
+        .filter(|event| event.kind == STARTED)
         .map(payload)
-        .transpose()?
-        .filter(|value| {
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .find(|value| {
             value.get("operationId").and_then(Value::as_str) == Some(row.operation_id.as_str())
         })
     else {
@@ -1331,6 +1366,53 @@ async fn recover_applied_epic_start(
     let mut replayed = response;
     replayed.reused = true;
     Ok(Some(replayed))
+}
+
+/// Settle a committed-but-unsettled abandon before the started-epoch
+/// check: the retry of an abandon whose event landed must replay the
+/// stored outcome, not refuse with "no started epoch" while its operation
+/// row stays InProgress forever. The match is by the event's `controlId`,
+/// which carries this exact idempotency key.
+async fn recover_applied_epic_abandon(
+    ctx: &Ctx,
+    key: &str,
+    epic: &str,
+) -> Result<Option<OperationResponse>, Failure> {
+    let name = "epic_abandon".to_owned();
+    let key_owned = key.to_owned();
+    let row = on_ledger(&ctx.ledger, move |ledger| {
+        ledger.find_operation(&name, &key_owned)
+    })
+    .await?;
+    let Some(row) = row.filter(|row| row.state == OperationState::InProgress) else {
+        return Ok(None);
+    };
+    let rows = epic_events(ctx, epic).await?;
+    for event in rows.iter().rev().filter(|event| event.kind == ABANDONED) {
+        let landed = payload(event)?;
+        if landed.get("controlId").and_then(Value::as_str) != Some(key) {
+            continue;
+        }
+        let value = json!({
+            "abandoned": true,
+            "epic": epic,
+            "nextSteps": [
+                "a fresh `epic start` opens a clean epoch",
+                "started children settle through their own run lifecycles",
+            ],
+        });
+        let response = ok_response(&row.operation_id, false, value);
+        let operation_id = row.operation_id;
+        let stored = response.clone();
+        on_ledger(&ctx.ledger, move |ledger| {
+            ledger.resolve_interrupted_operation(&operation_id, &stored)
+        })
+        .await?;
+        let mut replayed = response;
+        replayed.reused = true;
+        return Ok(Some(replayed));
+    }
+    Ok(None)
 }
 
 /// The operator-facing base-ref contract: a bare branch name. `origin/<name>`
@@ -2741,8 +2823,22 @@ struct PendingWave {
     launch_order: BTreeMap<String, usize>,
 }
 
-async fn ensure_integration(ctx: &Ctx, config: &EpicConfig) -> Result<Value, Failure> {
-    let key = derive_key("epic_setup", Some(&config.epic_id), None, None);
+async fn ensure_integration(
+    ctx: &Ctx,
+    config: &EpicConfig,
+    start_epoch: usize,
+) -> Result<Value, Failure> {
+    // The setup key is epoch-scoped like epic_start's: a fresh epoch after
+    // an abandon must RE-RUN integration setup (and land its own
+    // INTEGRATION_READY in the new epoch), never replay the dead epoch's
+    // stored response into a projection that cannot see its event.
+    let stage_segment = (start_epoch > 0).then(|| format!("e{start_epoch}"));
+    let key = derive_key(
+        "epic_setup",
+        Some(&config.epic_id),
+        stage_segment.as_deref(),
+        None,
+    );
     let repo = config.repo.clone();
     let branch = config.integration_branch.clone();
     let base = config.base_ref.clone();
@@ -4819,7 +4915,7 @@ async fn advance_once(ctx: &Ctx, epic: &str) -> Result<Step, Failure> {
         // A deterministic setup refusal (hook rejection, missing base, auth)
         // repeats identically under restart; it parks as explicit input with
         // the full git diagnostic instead of consuming controller restarts.
-        return match ensure_integration(ctx, &view.config).await {
+        return match ensure_integration(ctx, &view.config, view.start_epoch).await {
             Ok(ready) => Ok(Step::Progress(ready)),
             Err(failure) if failure.recoverable => Err(failure),
             Err(failure) => {
@@ -5469,6 +5565,12 @@ async fn control_event(
     kind: &str,
     require_idle_driver: bool,
 ) -> OperationResponse {
+    // `safe_effect` rebuilds its envelope at schemaVersion 1, so the
+    // caller's version must be gated HERE or the begin-operation check the
+    // mutating contract relies on is vacuous.
+    if let Err(error) = super::check_schema_version(req) {
+        return err_response(&derive_key(name, None, None, None), &error);
+    }
     let epic = match param_str(&req.params, "epic") {
         Ok(value) => value.to_owned(),
         Err(error) => return err_response(&derive_key(name, None, None, None), &error),
@@ -5563,6 +5665,9 @@ async fn control_event(
 /// re-freezes the inventory — and started children's runs settle through
 /// their own lifecycles.
 pub async fn epic_abandon(ctx: &Ctx, req: &mut OperationRequest) -> OperationResponse {
+    if let Err(error) = super::check_schema_version(req) {
+        return err_response(&derive_key("epic_abandon", None, None, None), &error);
+    }
     let epic = match param_str(&req.params, "epic") {
         Ok(value) => value.to_owned(),
         Err(error) => return err_response(&derive_key("epic_abandon", None, None, None), &error),
@@ -5595,6 +5700,13 @@ pub async fn epic_abandon(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
         derive_key("epic_abandon", Some(&epic), None, Some(abandon_epoch)),
     );
     let key = req.idempotency_key.clone();
+    // A committed abandon whose settle was interrupted replays here, before
+    // the started-epoch check can misread the world it already changed.
+    match recover_applied_epic_abandon(ctx, &key, &epic).await {
+        Ok(Some(response)) => return response,
+        Ok(None) => {}
+        Err(error) => return err_response(&key, &error),
+    }
     // The current epoch must actually be started: abandoning nothing is a
     // refusal, not a no-op — the operator asked to end something specific.
     match epoch_events(ctx, &epic).await {
@@ -5669,6 +5781,9 @@ pub async fn epic_resume(ctx: &Ctx, req: &mut OperationRequest) -> OperationResp
 
 /// Resolve one held child after a lead session adjudicated its input/spec.
 pub async fn epic_resolve(ctx: &Ctx, req: &mut OperationRequest) -> OperationResponse {
+    if let Err(error) = super::check_schema_version(req) {
+        return err_response(&derive_key("epic_resolve", None, None, None), &error);
+    }
     let epic = match param_str(&req.params, "epic") {
         Ok(value) => value.to_owned(),
         Err(error) => return err_response(&derive_key("epic_resolve", None, None, None), &error),

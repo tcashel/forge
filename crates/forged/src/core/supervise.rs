@@ -1430,6 +1430,24 @@ async fn maybe_snapshot(ctx: &Ctx) -> Result<(), Failure> {
     Ok(())
 }
 
+/// The per-tick bootstrap duties, each warn-only: the one-shot beads
+/// import (durably marked, so a completed import costs one indexed read)
+/// and the daily snapshot.
+async fn bootstrap_pass(ctx: &Ctx) {
+    match super::work_import::auto_import_if_empty(ctx).await {
+        Ok(Some(summary)) => {
+            tracing::info!(%summary, "bootstrap: imported the beads store into the ledger");
+        }
+        Ok(None) => {}
+        Err(failure) => {
+            tracing::warn!(error = %failure.message, "bootstrap: beads import did not run");
+        }
+    }
+    if let Err(failure) = maybe_snapshot(ctx).await {
+        tracing::warn!(error = %failure.message, "bootstrap: snapshot pass failed");
+    }
+}
+
 pub async fn supervise(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
     let key = if req.idempotency_key.is_empty() {
         format!(
@@ -1462,21 +1480,12 @@ pub async fn supervise(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
             &Failure::invalid("--once cannot publish a long-running service generation"),
         );
     }
-    // Cutover bootstrap: one COUNT query per pass; imports exactly once
-    // ever (snapshotting state.db first), and keeps a daily VACUUM INTO
-    // snapshot because the store now holds both evidence and backlog.
-    match super::work_import::auto_import_if_empty(ctx).await {
-        Ok(Some(summary)) => {
-            tracing::info!(%summary, "bootstrap: imported the beads store into the ledger");
-        }
-        Ok(None) => {}
-        Err(failure) => {
-            tracing::warn!(error = %failure.message, "bootstrap: beads import did not run");
-        }
-    }
-    if let Err(failure) = maybe_snapshot(ctx).await {
-        tracing::warn!(error = %failure.message, "bootstrap: snapshot pass failed");
-    }
+    // Cutover bootstrap: cheap durable-marker checks per pass; imports
+    // exactly once ever (snapshotting state.db first), and keeps a daily
+    // VACUUM INTO snapshot because the store now holds both evidence and
+    // backlog. A failed import is transport, never terminal — the loop
+    // below retries it every tick until it lands.
+    bootstrap_pass(ctx).await;
     if once {
         // One deterministic tick: the settlement pass is joined fully.
         let mut settlement = BeadSettlementPass::new();
@@ -1529,6 +1538,10 @@ pub async fn supervise(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
                 }
             }
         }
+        // The bootstrap duties ride every tick: the import retries until
+        // its durable marker lands, and the daily snapshot fires when the
+        // day rolls over — not only on the start-up day.
+        bootstrap_pass(&live).await;
         match tick(&live, &mut settlement, false).await {
             Ok(report) => {
                 ticks = ticks.saturating_add(1);
