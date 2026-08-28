@@ -2,7 +2,8 @@
 
 Before making a work item ready, verify all of the following:
 
-- The id is caller-supplied and `ore-` prefixed.
+- A newly created id is caller-supplied and `ore-` prefixed; every existing or
+  imported stored id is preserved verbatim.
 - The title is a lowercase conventional-commit title of at most 70 characters.
 - `description` explains current context and the concrete outcome.
 - `design` fixes important decisions, seams, compatibility, and non-goals.

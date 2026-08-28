@@ -91,6 +91,19 @@ const requiredSkillText = [
 ];
 if (!requiredSkillText.every((token) => skill.includes(token))) process.exit(1);
 
+const approvalStart = skill.indexOf('## Require exact execution approval');
+const approvalEnd = skill.indexOf('## Bind every existing-work control', approvalStart);
+if (approvalStart < 0 || approvalEnd <= approvalStart) process.exit(1);
+const approvalSection = skill.slice(approvalStart, approvalEnd);
+const requiredApprovalText = [
+  'APPROVED_NOTES_PATH',
+  '[[ ! -r "$APPROVED_NOTES_PATH" || ! -s "$APPROVED_NOTES_PATH" ]]',
+  '[[ -z "$APPROVED_NOTES" ]]',
+  '--expected-revision "$OBSERVED_REVISION"',
+  '--notes="$APPROVED_NOTES"',
+];
+if (!requiredApprovalText.every((token) => approvalSection.includes(token))) process.exit(1);
+
 if (fixture.schema !== 'forged.manage-work-intent-fixtures/1' ||
     fixture.purpose !== 'validation-only' ||
     fixture.budgetScope !== 'base intent classification only; delegated skills and portfolio-control-fixtures enforce their own contracts' ||
@@ -115,7 +128,7 @@ const expected = new Map(Object.entries({
   'external-context': ['external-context', 'none', 'discuss'],
 }));
 const effectKeys = [
-  'approvalComments', 'runStarts', 'runSubmits', 'epicStarts', 'epicSubmits',
+  'workItemNotesUpdates', 'runStarts', 'runSubmits', 'epicStarts', 'epicSubmits',
   'controlCalls', 'serviceMutations', 'providerCalls', 'githubWrites',
 ].sort();
 const seen = new Set();
@@ -132,9 +145,9 @@ for (const entry of fixture.cases) {
   if (!Object.values(budget).every((value) => Number.isInteger(value) && value >= 0)) process.exit(1);
 
   const expectedNonzero = entry.id === 'execute-slice'
-    ? {approvalComments: 1, runStarts: 1, runSubmits: 1}
+    ? {workItemNotesUpdates: 1, runStarts: 1, runSubmits: 1}
     : entry.id === 'execute-epic'
-      ? {approvalComments: 1, epicStarts: 1, epicSubmits: 1}
+      ? {workItemNotesUpdates: 1, epicStarts: 1, epicSubmits: 1}
       : {};
   for (const key of effectKeys) {
     if (budget[key] !== (expectedNonzero[key] || 0)) process.exit(1);
@@ -1016,14 +1029,31 @@ for needle in 'WORK_ID="ore-' 'metadata.repository' 'description' 'design' \
   grep -Fq -- "$needle" "$plugin/skills/plan/SKILL.md" \
     && pass "native plan contract: $needle" || fail "native plan contract: $needle"
 done
+for needle in 'newly created id' 'ore-' 'existing or' \
+  'imported stored id is preserved verbatim'; do
+  grep -Fq -- "$needle" "$plugin/skills/plan/checklist.md" \
+    && pass "native id contract: $needle" || fail "native id contract: $needle"
+done
 for needle in 'forged work update' '--expected-revision' 'notes' \
-  'no separate ledger commentary operation'; do
+  'no separate ledger commentary operation' 'UPDATED_NOTES_PATH' \
+  '[[ ! -r "$UPDATED_NOTES_PATH" || ! -s "$UPDATED_NOTES_PATH" ]]' \
+  '[[ -z "$UPDATED_NOTES" ]]'; do
   grep -Fq -- "$needle" "$plugin/skills/critique/SKILL.md" \
     && pass "ledger critique contract: $needle" || fail "ledger critique contract: $needle"
 done
-for needle in 'forged work update' 'forged work reopen' 'non-atomic' 'ore-063'; do
+for needle in 'forged work update' 'forged work reopen' 'non-atomic' 'ore-063' \
+  '[[ ! -r "$FIELD_PATH" || ! -s "$FIELD_PATH" ]]' \
+  'adjudication fields must all be nonempty'; do
   grep -Fq -- "$needle" "$plugin/skills/adjudicate/SKILL.md" \
     && pass "ledger adjudication contract: $needle" || fail "ledger adjudication contract: $needle"
+done
+for needle in 'for CHILD_ID in <every exact id from preflight' \
+  'forged work show --id "$CHILD_ID"' 'each frozen child' \
+  'parent-child' '`blocks` dependency edges' \
+  'missing, extra, or contradictory'; do
+  grep -Fq -- "$needle" "$plugin/skills/run-epic/SKILL.md" \
+    && pass "epic child preflight contract: $needle" \
+    || fail "epic child preflight contract: $needle"
 done
 for needle in 'Tool rates are optional' 'default_rate_card' \
   'server-side tool use' 'custom `pricing` block replaces'; do

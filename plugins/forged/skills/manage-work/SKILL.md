@@ -169,10 +169,22 @@ existing `notes` bytes:
 ```
 
 Current main has no separate ledger commentary verb, so preserve all existing
-notes and perform one guarded update:
+notes and perform one guarded update. Fail closed before the update unless the
+combined approval notes file is readable, nonempty, and loaded successfully:
 
 ```bash
-APPROVED_NOTES="$(<"$DRAFT_DIR/notes-with-approval.md")"
+: "${DRAFT_DIR:?set DRAFT_DIR to the approval scratch directory}"
+APPROVED_NOTES_PATH="$DRAFT_DIR/notes-with-approval.md"
+if [[ ! -r "$APPROVED_NOTES_PATH" || ! -s "$APPROVED_NOTES_PATH" ]]; then
+  printf 'missing or empty combined approval notes: %s\n' \
+    "$APPROVED_NOTES_PATH" >&2
+  exit 1
+fi
+APPROVED_NOTES="$(<"$APPROVED_NOTES_PATH")" || exit 1
+if [[ -z "$APPROVED_NOTES" ]]; then
+  printf 'combined approval notes must be nonempty\n' >&2
+  exit 1
+fi
 forged work update \
   --id "$WORK_ID" \
   --expected-revision "$OBSERVED_REVISION" \
@@ -227,10 +239,22 @@ Current main does **not** expose priority mutation for an existing work item.
 Do not reference a nonexistent flag or imply that scheduling changed. Validate
 the intended numeric priority from 0 through 4 (lower numbers win), append a
 dated `Intended priority: <n>; pending ore-063 typed priority operation` line to
-the existing notes, then make one revision-CAS update:
+the existing notes, then make one revision-CAS update. Fail closed unless the
+combined notes file is readable, nonempty, and loaded successfully:
 
 ```bash
-UPDATED_NOTES="$(<"$DRAFT_DIR/notes-with-priority-intent.md")"
+: "${DRAFT_DIR:?set DRAFT_DIR to the priority-intent scratch directory}"
+UPDATED_NOTES_PATH="$DRAFT_DIR/notes-with-priority-intent.md"
+if [[ ! -r "$UPDATED_NOTES_PATH" || ! -s "$UPDATED_NOTES_PATH" ]]; then
+  printf 'missing or empty combined priority notes: %s\n' \
+    "$UPDATED_NOTES_PATH" >&2
+  exit 1
+fi
+UPDATED_NOTES="$(<"$UPDATED_NOTES_PATH")" || exit 1
+if [[ -z "$UPDATED_NOTES" ]]; then
+  printf 'combined priority notes must be nonempty\n' >&2
+  exit 1
+fi
 forged work update \
   --id "$WORK_ID" \
   --expected-revision "$OBSERVED_REVISION" \

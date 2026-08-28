@@ -34,9 +34,21 @@ Show the operator the returned `identities` tuple for approval before the
 mutating start: normalized `baseRef`, `integrationBranch`, `assuranceStage`, and
 each child's `runId`, branch, and `worktreePath`.
 
-For judgment calls preflight cannot make—real dependency edges and no
-unresolved epic-level question or critique CRUX—use bounded
-`forged work show --id "$EPIC_ID"` reads. Use preflight's frozen child inventory
+For judgment calls preflight cannot make, read the epic and every child in the
+frozen inventory with exact-id bounded reads:
+
+```bash
+forged work show --id "$EPIC_ID"
+for CHILD_ID in <every exact id from preflight's frozen child inventory>; do
+  forged work show --id "$CHILD_ID"
+done
+```
+
+Validate the epic and each frozen child's complete `notes`: no unchecked
+question and no unresolved critique CRUX may remain. Validate every child's
+reported `parent-child` and `blocks` dependency edges against the frozen
+inventory, intended waves, and ordering; a missing, extra, or contradictory
+edge fails closed before approval or execution. Use the frozen child inventory
 instead of recursive expansions that exceed host output budgets.
 
 ## Freeze a proportional profile

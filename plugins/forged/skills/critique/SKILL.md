@@ -84,12 +84,24 @@ topology: <low|normal|high and seats used>
 ```
 ````
 
-Current main has no separate ledger commentary operation. Append the complete
-block to the existing `notes` bytes, preserving everything already there, and
-perform one guarded notes update:
+Current main has no separate ledger commentary operation. Construct one
+combined notes file from the exact existing `notes` bytes plus the complete
+block, preserving everything already there. Fail closed before the update if
+the combined file cannot be read, is empty, or cannot be loaded:
 
 ```bash
-UPDATED_NOTES="$(<"$DRAFT_DIR/notes-with-critique.md")"
+: "${DRAFT_DIR:?set DRAFT_DIR to the critique scratch directory}"
+UPDATED_NOTES_PATH="$DRAFT_DIR/notes-with-critique.md"
+if [[ ! -r "$UPDATED_NOTES_PATH" || ! -s "$UPDATED_NOTES_PATH" ]]; then
+  printf 'missing or empty combined critique notes: %s\n' \
+    "$UPDATED_NOTES_PATH" >&2
+  exit 1
+fi
+UPDATED_NOTES="$(<"$UPDATED_NOTES_PATH")" || exit 1
+if [[ -z "$UPDATED_NOTES" ]]; then
+  printf 'combined critique notes must be nonempty\n' >&2
+  exit 1
+fi
 forged work update \
   --id "$WORK_ID" \
   --expected-revision "$OBSERVED_REVISION" \

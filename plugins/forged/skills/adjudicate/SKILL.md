@@ -51,9 +51,29 @@ fully dispositioned recommendation block plus a concise dated adjudication
 summary in `notes`; do not pretend a separate comment was written.
 
 Prepare complete field bodies outside the repository and make one guarded
-update. Attached values protect bullet-led Markdown:
+update. Fail closed before the update unless every scratch file is readable and
+nonempty and every body was constructed successfully. Attached values protect
+bullet-led Markdown:
 
 ```bash
+: "${DRAFT_DIR:?set DRAFT_DIR to the adjudication scratch directory}"
+for FIELD_FILE in title description design acceptance notes; do
+  FIELD_PATH="$DRAFT_DIR/$FIELD_FILE.md"
+  if [[ ! -r "$FIELD_PATH" || ! -s "$FIELD_PATH" ]]; then
+    printf 'missing or empty adjudication field: %s\n' "$FIELD_PATH" >&2
+    exit 1
+  fi
+done
+TITLE="$(<"$DRAFT_DIR/title.md")" || exit 1
+DESCRIPTION="$(<"$DRAFT_DIR/description.md")" || exit 1
+DESIGN="$(<"$DRAFT_DIR/design.md")" || exit 1
+ACCEPTANCE="$(<"$DRAFT_DIR/acceptance.md")" || exit 1
+NOTES="$(<"$DRAFT_DIR/notes.md")" || exit 1
+if [[ -z "$TITLE" || -z "$DESCRIPTION" || -z "$DESIGN" || \
+      -z "$ACCEPTANCE" || -z "$NOTES" ]]; then
+  printf 'adjudication fields must all be nonempty\n' >&2
+  exit 1
+fi
 forged work update \
   --id "$WORK_ID" \
   --expected-revision "$OBSERVED_REVISION" \
