@@ -70,6 +70,9 @@ const fixture = JSON.parse(fs.readFileSync(fixturePath, 'utf8'));
 
 const requiredSkillText = [
   'name: manage-work',
+  'Position:',
+  'Next:',
+  'Boundary:',
   '../plan/SKILL.md',
   '../configure/SKILL.md',
   '../critique/SKILL.md',
@@ -80,11 +83,26 @@ const requiredSkillText = [
   'forged definition validate',
   'forged doctor',
   'forged service status',
-  'bd comments add',
+  'forged work update',
+  'forged work show',
+  '--expected-revision',
+  'workItemId',
   'metadata.repository',
-  'BEADS_DIR',
 ];
 if (!requiredSkillText.every((token) => skill.includes(token))) process.exit(1);
+
+const approvalStart = skill.indexOf('## Require exact execution approval');
+const approvalEnd = skill.indexOf('## Bind every existing-work control', approvalStart);
+if (approvalStart < 0 || approvalEnd <= approvalStart) process.exit(1);
+const approvalSection = skill.slice(approvalStart, approvalEnd);
+const requiredApprovalText = [
+  'APPROVED_NOTES_PATH',
+  '[[ ! -r "$APPROVED_NOTES_PATH" || ! -s "$APPROVED_NOTES_PATH" ]]',
+  '[[ -z "$APPROVED_NOTES" ]]',
+  '--expected-revision "$OBSERVED_REVISION"',
+  '--notes="$APPROVED_NOTES"',
+];
+if (!requiredApprovalText.every((token) => approvalSection.includes(token))) process.exit(1);
 
 if (fixture.schema !== 'forged.manage-work-intent-fixtures/1' ||
     fixture.purpose !== 'validation-only' ||
@@ -110,7 +128,7 @@ const expected = new Map(Object.entries({
   'external-context': ['external-context', 'none', 'discuss'],
 }));
 const effectKeys = [
-  'approvalComments', 'runStarts', 'runSubmits', 'epicStarts', 'epicSubmits',
+  'workItemNotesUpdates', 'runStarts', 'runSubmits', 'epicStarts', 'epicSubmits',
   'controlCalls', 'serviceMutations', 'providerCalls', 'githubWrites',
 ].sort();
 const seen = new Set();
@@ -127,9 +145,9 @@ for (const entry of fixture.cases) {
   if (!Object.values(budget).every((value) => Number.isInteger(value) && value >= 0)) process.exit(1);
 
   const expectedNonzero = entry.id === 'execute-slice'
-    ? {approvalComments: 1, runStarts: 1, runSubmits: 1}
+    ? {workItemNotesUpdates: 1, runStarts: 1, runSubmits: 1}
     : entry.id === 'execute-epic'
-      ? {approvalComments: 1, epicStarts: 1, epicSubmits: 1}
+      ? {workItemNotesUpdates: 1, epicStarts: 1, epicSubmits: 1}
       : {};
   for (const key of effectKeys) {
     if (budget[key] !== (expectedNonzero[key] || 0)) process.exit(1);
@@ -167,10 +185,12 @@ const requiredSkillText = [
   'forged attention acknowledge',
   'forged attention resolve',
   'forged attention reopen',
-  'bd update',
-  '--priority',
-  '--if-status',
-  '--if-assignee',
+  'forged work update',
+  '--expected-revision',
+  'Current main does **not** expose priority mutation',
+  'Intended priority:',
+  'ore-063',
+  'top-level `priority` value is unchanged',
   'lower numbers win',
   'never preempts active work',
   'accepted-unknown',
@@ -190,8 +210,8 @@ if (fixture.schema !== 'forged.manage-work-portfolio-control-fixtures/1' ||
       ['cases', 'isolation', 'purpose', 'schema', 'schemas'].join('\n')) process.exit(1);
 
 const expectedIsolation = {
-  requiredTemporaryEnv: ['HOME', 'ANVIL_HOME', 'BEADS_DIR'],
-  fakeBoundaries: ['bd', 'forged-cli', 'forged-mcp', 'service', 'provider', 'git', 'github', 'app-host'],
+  requiredTemporaryEnv: ['HOME', 'ANVIL_HOME', 'FORGED_CONFIG'],
+  fakeBoundaries: ['forged-ledger', 'forged-cli', 'forged-mcp', 'service', 'provider', 'git', 'github', 'app-host'],
   liveEffects: 'forbidden',
 };
 if (JSON.stringify(fixture.isolation) !== JSON.stringify(expectedIsolation)) process.exit(1);
@@ -218,8 +238,8 @@ const expected = new Map(Object.entries({
   'spend-known': ['work-detail', 'none', 'known-spend'],
   'spend-unknown': ['work-detail', 'none', 'unknown-not-zero'],
   'plan-only-detail': ['refuse', 'not-applicable', 'plan-summary-only'],
-  'priority-change': ['bd-priority', 'none', 'priority-only-lower-wins-later-no-preemption',
-    {beadPriorityUpdates: 1}],
+  'priority-change': ['work-notes-priority-intent', 'none', 'priority-only-lower-wins-later-no-preemption',
+    {workItemNotesUpdates: 1}],
   'epic-pause': ['epic-pause', 'none', 'paused-readback', {epicPauses: 1}],
   'epic-resume': ['epic-resume', 'none', 'active-readback-no-submit', {epicResumes: 1}],
   'input-required-resume': ['work-detail', 'not-applicable', 'resolve-domain-first'],
@@ -251,7 +271,7 @@ const expected = new Map(Object.entries({
     'live-fence-run-stop-only'],
 }));
 const effectKeys = [
-  'beadClaims', 'beadPriorityUpdates', 'beadOtherWrites',
+  'workItemClaims', 'workItemNotesUpdates', 'workItemOtherWrites',
   'epicPauses', 'epicResumes', 'runStops', 'runAdjudications',
   'riskAcceptances',
   'attentionAcknowledgements', 'attentionResolutions', 'attentionReopens',
@@ -259,7 +279,7 @@ const effectKeys = [
   'serviceMutations', 'providerCalls', 'repositoryWrites', 'githubWrites',
 ].sort();
 const alwaysZero = [
-  'beadClaims', 'beadOtherWrites', 'runStarts', 'runSubmits', 'epicStarts',
+  'workItemClaims', 'workItemOtherWrites', 'runStarts', 'runSubmits', 'epicStarts',
   'epicSubmits', 'sessionStops', 'serviceMutations', 'providerCalls',
   'repositoryWrites', 'githubWrites',
 ];
@@ -550,7 +570,7 @@ const expectedForbiddenEffects = [
   'process-spawn',
   'network-access',
   'filesystem-write',
-  'beads-access',
+  'legacy-store-access',
   'ledger-access',
   'operator-state-access',
   'forged-cli-call',
@@ -873,6 +893,59 @@ check_reconnect_surface() {
   done
 }
 
+check_ready_frontier_contract() {
+  node - "$@" <<'NODE'
+const fs = require('fs');
+const paths = process.argv.slice(2);
+let callCount = 0;
+for (const path of paths) {
+  const skill = fs.readFileSync(path, 'utf8');
+  const calls = skill.split('\n').filter((line) => line.includes('forged work ready'));
+  if (!calls.length) continue;
+  callCount += calls.length;
+  if (calls.some((line) =>
+    !line.includes('--repo "$TARGET_REPO"') || !line.includes('--limit "$READY_LIMIT"'))) {
+    console.error(`${path}: every ready call must carry the exact repo and bounded limit`);
+    process.exit(1);
+  }
+  for (const token of [
+    'result.ready', 'result.totals.shown', 'result.totals.total',
+    'forged work show --id "$READY_ID"', 'maximum is 500',
+    '`id`', '`title`', '`kind`', '`status`', '`priority`', '`repository`', '`revision`',
+  ]) {
+    if (!skill.includes(token)) {
+      console.error(`${path}: missing ready-frontier contract ${token}`);
+      process.exit(1);
+    }
+  }
+  if (!/default(?: ready)? limit is 100/.test(skill)) {
+    console.error(`${path}: missing ready default limit`);
+    process.exit(1);
+  }
+}
+if (!callCount) process.exit(1);
+NODE
+}
+
+check_setup_config_precedence() {
+  node - "$1" <<'NODE'
+const fs = require('fs');
+const skill = fs.readFileSync(process.argv[2], 'utf8');
+const explicit = skill.indexOf('if [ -n "${FORGED_CONFIG:-}" ]');
+const yaml = skill.indexOf('elif [ -e "$ANVIL_HOME/config.yaml" ]', explicit);
+const json = skill.indexOf('elif [ -e "$ANVIL_HOME/config.json" ]', yaml);
+if (!(explicit >= 0 && yaml > explicit && json > yaml)) process.exit(1);
+for (const token of [
+  'an explicit `FORGED_CONFIG` wins',
+  'existing `$ANVIL_HOME/config.yaml` wins',
+  '`$ANVIL_HOME/config.json` fallback',
+  'absent-config default path is',
+]) {
+  if (!skill.includes(token)) process.exit(1);
+}
+NODE
+}
+
 required=(
   "$plugin/README.md"
   "$plugin/LEARNINGS.md"
@@ -919,6 +992,7 @@ check "manage-work dual-host registration and contract parity" check_manage_work
 skill_files=("$plugin"/skills/*/SKILL.md)
 [[ ${#skill_files[@]} -eq 9 ]] && pass "exactly nine skills" || fail "exactly nine skills"
 for path in "${skill_files[@]}"; do check "frontmatter $path" check_frontmatter "$path"; done
+check "bounded repository ready-frontier contracts" check_ready_frontier_contract "${skill_files[@]}"
 check "critic frontmatter" check_frontmatter "$plugin/agents/critic.md"
 
 check_board_skill() {
@@ -935,8 +1009,11 @@ check "board skill contract" check_board_skill
 check "bootstrap shell syntax" bash -n "$plugin/bootstrap/install-beads.sh"
 grep -Fq '../../agents/critic.md' "$plugin/skills/critique/SKILL.md" \
   && pass "critique resolves the shared critic" || fail "critique resolves the shared critic"
-grep -Fq '../../bootstrap/install-beads.sh' "$plugin/skills/setup/SKILL.md" \
-  && pass "setup resolves the shared bootstrap" || fail "setup resolves the shared bootstrap"
+if grep -Fq '../../bootstrap/install-beads.sh' "$plugin/skills/setup/SKILL.md"; then
+  fail "setup omits the deleted legacy-store bootstrap"
+else
+  pass "setup omits the deleted legacy-store bootstrap"
+fi
 
 legacy=(
   "$plugin/workflows/execute-review-fix.js"
@@ -967,7 +1044,7 @@ check "epic reconnect and resume command surface" check_reconnect_surface \
   "forged epic submit --epic"
 
 if grep -Ern --include='*.md' --include='*.sh' \
-  '(\.anvil/specs|--spec([[:space:]]|`)|bd create --repo|--(description|acceptance|notes)-file|workflows/(execute-review-fix|run-epic|plan-critique-improve)\.js|watch-epic)' \
+  '(\.anvil/specs|--spec([[:space:]]|`)|workflows/(execute-review-fix|run-epic|plan-critique-improve)\.js|watch-epic)' \
   "$plugin"; then
   fail "no legacy spec-file, repo-routing, Workflow, or watch contract"
 else
@@ -981,12 +1058,94 @@ else
   pass "no external tracker client, instructions, or credentials"
 fi
 
-for needle in 'metadata.repository' 'description' 'design' 'acceptance_criteria' 'notes' '--parent'; do
+if grep -Ern --include='*.md' --include='*.json' \
+  'BEADS_DIR|\.beads|beads-|(^|[^[:alnum:]_-])bd[[:space:]]+(create|update|show|ready|comments|where|children|init)' \
+  "$plugin/skills"; then
+  fail "skills forbid legacy-store commands, paths, and ids"
+else
+  pass "skills forbid legacy-store commands, paths, and ids"
+fi
+
+for path in "${skill_files[@]}"; do
+  for needle in 'Position:' 'Next:' 'Boundary:'; do
+    grep -Fq -- "$needle" "$path" \
+      && pass "lifecycle contract $path: $needle" \
+      || fail "lifecycle contract $path: $needle"
+  done
+done
+
+for needle in 'WORK_ID="ore-' 'metadata.repository' 'description' 'design' \
+  'acceptanceCriteria' 'notes' '--id "$WORK_ID"' '--kind task' '--status open' \
+  '--repository "$TARGET_REPO"' '--description-file "$DESCRIPTION_PATH"' \
+  '--design-file "$DESIGN_PATH"' '--acceptance-file "$ACCEPTANCE_PATH"' \
+  '--notes-file "$NOTES_PATH"' 'for DRAFT_PATH in "$DESCRIPTION_PATH"' \
+  '[ ! -s "$DRAFT_PATH" ]' 'missing, unreadable, or non-UTF-8 draft file' \
+  'Each file flag conflicts with its corresponding' \
+  'forged work create' 'forged work update' 'forged work link' \
+  'forged work reopen' 'forged work show' 'forged work ready' 'parent-child'; do
   grep -Fq -- "$needle" "$plugin/skills/plan/SKILL.md" \
     && pass "native plan contract: $needle" || fail "native plan contract: $needle"
 done
-grep -Fq 'BEADS_DIR' "$plugin/skills/setup/SKILL.md" \
-  && pass "setup preserves BEADS_DIR" || fail "setup preserves BEADS_DIR"
+if grep -Fq '$(<' "$plugin/skills/plan/SKILL.md"; then
+  fail "native plan uses direct file flags instead of shell file substitution"
+else
+  pass "native plan uses direct file flags instead of shell file substitution"
+fi
+for needle in 'newly created id' 'ore-' 'existing or' \
+  'imported stored id is preserved verbatim'; do
+  grep -Fq -- "$needle" "$plugin/skills/plan/checklist.md" \
+    && pass "native id contract: $needle" || fail "native id contract: $needle"
+done
+for needle in 'forged work update' '--expected-revision' 'notes' \
+  'no separate ledger commentary operation' 'UPDATED_NOTES_PATH' \
+  '[[ ! -r "$UPDATED_NOTES_PATH" || ! -s "$UPDATED_NOTES_PATH" ]]' \
+  '[[ -z "$UPDATED_NOTES" ]]'; do
+  grep -Fq -- "$needle" "$plugin/skills/critique/SKILL.md" \
+    && pass "ledger critique contract: $needle" || fail "ledger critique contract: $needle"
+done
+for needle in 'forged work update' 'forged work reopen' 'non-atomic' 'ore-063' \
+  '[[ ! -r "$FIELD_PATH" || ! -s "$FIELD_PATH" ]]' \
+  'adjudication fields must all be nonempty'; do
+  grep -Fq -- "$needle" "$plugin/skills/adjudicate/SKILL.md" \
+    && pass "ledger adjudication contract: $needle" || fail "ledger adjudication contract: $needle"
+done
+for needle in 'for CHILD_ID in <every exact id from preflight' \
+  'forged work show --id "$CHILD_ID"' 'each frozen child' \
+  'parent-child' '`blocks` dependency edges' \
+  'missing, extra, or contradictory'; do
+  grep -Fq -- "$needle" "$plugin/skills/run-epic/SKILL.md" \
+    && pass "epic child preflight contract: $needle" \
+    || fail "epic child preflight contract: $needle"
+done
+for path in "$plugin/skills/dispatch/SKILL.md" "$plugin/skills/run-epic/SKILL.md"; do
+  for needle in 'every finding, recommendation, CRUX, and' \
+    'accepted item must be' 'normative fields' 'rejected item must' \
+    'retain its reason' \
+    'Checkbox-free critique prose is not evidence of' \
+    '/forged:adjudicate' 'unchecked-checkbox gate'; do
+    grep -Fq -- "$needle" "$path" \
+      && pass "critique disposition gate $path: $needle" \
+      || fail "critique disposition gate $path: $needle"
+  done
+done
+check "setup config precedence mirrors runtime" check_setup_config_precedence \
+  "$plugin/skills/setup/SKILL.md"
+for needle in 'The exact error code `BEADS_CONTENTION` from `epic advance`' \
+  'contention retry/backoff path' 'live detached controller' \
+  'Retry only after durable status'; do
+  grep -Fq -- "$needle" "$plugin/skills/run-epic/SKILL.md" \
+    && pass "typed epic contention recovery: $needle" \
+    || fail "typed epic contention recovery: $needle"
+done
+for needle in 'Tool rates are optional' 'default_rate_card' \
+  'server-side tool use' 'custom `pricing` block replaces'; do
+  grep -Fq -- "$needle" "$plugin/skills/configure/SKILL.md" \
+    && pass "optional pricing contract: $needle" || fail "optional pricing contract: $needle"
+done
+for needle in 'state.db' 'forged work create' 'Never create a repository-local work store'; do
+  grep -Fq -- "$needle" "$plugin/skills/setup/SKILL.md" \
+    && pass "ledger-native setup contract: $needle" || fail "ledger-native setup contract: $needle"
+done
 grep -Fq 'ANVIL_HOME' "$plugin/skills/setup/SKILL.md" \
   && pass "setup preserves ANVIL_HOME" || fail "setup preserves ANVIL_HOME"
 

@@ -105,7 +105,7 @@
     "process-spawn",
     "network-access",
     "filesystem-write",
-    "beads-access",
+    "legacy-store-access",
     "ledger-access",
     "operator-state-access",
     "forged-cli-call",

@@ -9,7 +9,7 @@
       "decision": "observe",
       "delegate": "none",
       "result": "read-only",
-      "routerMutationBudget": {"approvalComments": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "controlCalls": 0, "serviceMutations": 0, "providerCalls": 0, "githubWrites": 0}
+      "routerMutationBudget": {"workItemNotesUpdates": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "controlCalls": 0, "serviceMutations": 0, "providerCalls": 0, "githubWrites": 0}
     },
     {
       "id": "explore",
@@ -17,7 +17,7 @@
       "decision": "explore",
       "delegate": "none",
       "result": "discuss",
-      "routerMutationBudget": {"approvalComments": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "controlCalls": 0, "serviceMutations": 0, "providerCalls": 0, "githubWrites": 0}
+      "routerMutationBudget": {"workItemNotesUpdates": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "controlCalls": 0, "serviceMutations": 0, "providerCalls": 0, "githubWrites": 0}
     },
     {
       "id": "plan",
@@ -25,31 +25,31 @@
       "decision": "plan",
       "delegate": "plan",
       "result": "delegate",
-      "routerMutationBudget": {"approvalComments": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "controlCalls": 0, "serviceMutations": 0, "providerCalls": 0, "githubWrites": 0}
+      "routerMutationBudget": {"workItemNotesUpdates": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "controlCalls": 0, "serviceMutations": 0, "providerCalls": 0, "githubWrites": 0}
     },
     {
       "id": "revise",
-      "request": "Revise the acceptance criteria on this Bead.",
+      "request": "Revise the acceptance criteria on this work item.",
       "decision": "revise",
       "delegate": "plan",
       "result": "delegate",
-      "routerMutationBudget": {"approvalComments": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "controlCalls": 0, "serviceMutations": 0, "providerCalls": 0, "githubWrites": 0}
+      "routerMutationBudget": {"workItemNotesUpdates": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "controlCalls": 0, "serviceMutations": 0, "providerCalls": 0, "githubWrites": 0}
     },
     {
       "id": "critique",
-      "request": "Critique this Bead before anyone implements it.",
+      "request": "Critique this work item before anyone implements it.",
       "decision": "critique",
       "delegate": "critique",
       "result": "delegate",
-      "routerMutationBudget": {"approvalComments": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "controlCalls": 0, "serviceMutations": 0, "providerCalls": 0, "githubWrites": 0}
+      "routerMutationBudget": {"workItemNotesUpdates": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "controlCalls": 0, "serviceMutations": 0, "providerCalls": 0, "githubWrites": 0}
     },
     {
       "id": "adjudicate",
-      "request": "Resolve the recorded critique findings for this Bead.",
+      "request": "Resolve the recorded critique findings for this work item.",
       "decision": "adjudicate",
       "delegate": "adjudicate",
       "result": "delegate",
-      "routerMutationBudget": {"approvalComments": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "controlCalls": 0, "serviceMutations": 0, "providerCalls": 0, "githubWrites": 0}
+      "routerMutationBudget": {"workItemNotesUpdates": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "controlCalls": 0, "serviceMutations": 0, "providerCalls": 0, "githubWrites": 0}
     },
     {
       "id": "configure",
@@ -57,7 +57,7 @@
       "decision": "configure",
       "delegate": "configure",
       "result": "delegate",
-      "routerMutationBudget": {"approvalComments": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "controlCalls": 0, "serviceMutations": 0, "providerCalls": 0, "githubWrites": 0}
+      "routerMutationBudget": {"workItemNotesUpdates": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "controlCalls": 0, "serviceMutations": 0, "providerCalls": 0, "githubWrites": 0}
     },
     {
       "id": "plan-approval",
@@ -65,7 +65,7 @@
       "decision": "plan-approval",
       "delegate": "none",
       "result": "no-execution",
-      "routerMutationBudget": {"approvalComments": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "controlCalls": 0, "serviceMutations": 0, "providerCalls": 0, "githubWrites": 0}
+      "routerMutationBudget": {"workItemNotesUpdates": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "controlCalls": 0, "serviceMutations": 0, "providerCalls": 0, "githubWrites": 0}
     },
     {
       "id": "execute-slice",
@@ -73,7 +73,7 @@
       "decision": "execute-slice",
       "delegate": "dispatch",
       "result": "execute-once",
-      "routerMutationBudget": {"approvalComments": 1, "runStarts": 1, "runSubmits": 1, "epicStarts": 0, "epicSubmits": 0, "controlCalls": 0, "serviceMutations": 0, "providerCalls": 0, "githubWrites": 0}
+      "routerMutationBudget": {"workItemNotesUpdates": 1, "runStarts": 1, "runSubmits": 1, "epicStarts": 0, "epicSubmits": 0, "controlCalls": 0, "serviceMutations": 0, "providerCalls": 0, "githubWrites": 0}
     },
     {
       "id": "execute-epic",
@@ -81,23 +81,23 @@
       "decision": "execute-epic",
       "delegate": "run-epic",
       "result": "execute-once",
-      "routerMutationBudget": {"approvalComments": 1, "runStarts": 0, "runSubmits": 0, "epicStarts": 1, "epicSubmits": 1, "controlCalls": 0, "serviceMutations": 0, "providerCalls": 0, "githubWrites": 0}
+      "routerMutationBudget": {"workItemNotesUpdates": 1, "runStarts": 0, "runSubmits": 0, "epicStarts": 1, "epicSubmits": 1, "controlCalls": 0, "serviceMutations": 0, "providerCalls": 0, "githubWrites": 0}
     },
     {
       "id": "ambiguous-approval",
-      "request": "Do it, but there are two possible Beads in scope.",
+      "request": "Do it, but there are two possible work items in scope.",
       "decision": "ambiguous-approval",
       "delegate": "none",
       "result": "refuse",
-      "routerMutationBudget": {"approvalComments": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "controlCalls": 0, "serviceMutations": 0, "providerCalls": 0, "githubWrites": 0}
+      "routerMutationBudget": {"workItemNotesUpdates": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "controlCalls": 0, "serviceMutations": 0, "providerCalls": 0, "githubWrites": 0}
     },
     {
       "id": "stale-approval",
-      "request": "Use my earlier approval after the Bead changed.",
+      "request": "Use my earlier approval after the work item changed.",
       "decision": "stale-approval",
       "delegate": "none",
       "result": "refuse",
-      "routerMutationBudget": {"approvalComments": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "controlCalls": 0, "serviceMutations": 0, "providerCalls": 0, "githubWrites": 0}
+      "routerMutationBudget": {"workItemNotesUpdates": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "controlCalls": 0, "serviceMutations": 0, "providerCalls": 0, "githubWrites": 0}
     },
     {
       "id": "status",
@@ -105,7 +105,7 @@
       "decision": "status",
       "delegate": "none",
       "result": "read-only",
-      "routerMutationBudget": {"approvalComments": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "controlCalls": 0, "serviceMutations": 0, "providerCalls": 0, "githubWrites": 0}
+      "routerMutationBudget": {"workItemNotesUpdates": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "controlCalls": 0, "serviceMutations": 0, "providerCalls": 0, "githubWrites": 0}
     },
     {
       "id": "control",
@@ -113,7 +113,7 @@
       "decision": "control",
       "delegate": "none",
       "result": "portfolio-control",
-      "routerMutationBudget": {"approvalComments": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "controlCalls": 0, "serviceMutations": 0, "providerCalls": 0, "githubWrites": 0}
+      "routerMutationBudget": {"workItemNotesUpdates": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "controlCalls": 0, "serviceMutations": 0, "providerCalls": 0, "githubWrites": 0}
     },
     {
       "id": "external-context",
@@ -121,7 +121,7 @@
       "decision": "external-context",
       "delegate": "none",
       "result": "discuss",
-      "routerMutationBudget": {"approvalComments": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "controlCalls": 0, "serviceMutations": 0, "providerCalls": 0, "githubWrites": 0}
+      "routerMutationBudget": {"workItemNotesUpdates": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "controlCalls": 0, "serviceMutations": 0, "providerCalls": 0, "githubWrites": 0}
     }
   ]
 }
