@@ -612,7 +612,7 @@ impl Ledger {
         self.submit(move |conn| list_live_attempts_tx(conn, run_id.as_deref()))
     }
 
-    /// Count one run's attempts carrying the exact stored revocation scope.
+    /// Count one run's terminal attempts carrying the exact stored revocation scope.
     pub fn count_attempts_with_revoke_scope(
         &self,
         run_id: &str,
@@ -623,7 +623,8 @@ impl Ledger {
             let count: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM attempts a \
                  JOIN packets p ON p.packet_id = a.packet_id \
-                 WHERE p.run_id = ?1 AND a.revoke_scope = ?2",
+                 WHERE p.run_id = ?1 AND a.revoke_scope = ?2 \
+                 AND a.state NOT IN ('running', 'revoking')",
                 rusqlite::params![run_id, scope.as_str()],
                 |row| row.get(0),
             )?;

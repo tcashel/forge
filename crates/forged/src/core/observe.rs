@@ -2470,7 +2470,13 @@ async fn project_work_detail(
     let deadline_kills = snapshot
         .attempts
         .iter()
-        .filter(|attempt| attempt.revoke_scope == Some(RevokeScope::Deadline))
+        .filter(|attempt| {
+            attempt.revoke_scope == Some(RevokeScope::Deadline)
+                && !matches!(
+                    attempt.state,
+                    AttemptState::Running | AttemptState::Revoking
+                )
+        })
         .count();
 
     Ok(json!({
