@@ -24,6 +24,7 @@ forged-provider = { path = "../forged-provider" }
 forged-proto = { path = "../forged-proto" }
 
 async-trait.workspace = true
+base64.workspace = true
 clap.workspace = true
 fs2.workspace = true
 jiff.workspace = true

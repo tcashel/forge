@@ -24,6 +24,7 @@ all = "warn"
 [workspace.dependencies]
 anyhow = "1"
 async-trait = "0.1"
+base64 = "0.23"
 clap = { version = "4", features = ["derive"] }
 fs2 = "0.4"
 jiff = "0.2"

@@ -122,7 +122,7 @@ impl WorkStatus {
 /// others; no caller needs to inspect decoded metadata to filter rows.
 #[derive(Debug, Clone, Default)]
 pub struct WorkItemFilters {
-    /// Exact `metadata.repository` identity.
+    /// Exact repository identity projected from `metadata.repository`.
     pub repository: Option<String>,
     /// Exact coordination status.
     pub status: Option<WorkStatus>,
@@ -329,6 +329,44 @@ pub struct WorkItemSnapshot {
     pub updated_at: String,
 }
 
+/// The ready frontier's stable keyset position.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkReadyAfter {
+    /// Native priority; `None` sorts after every stated priority.
+    pub priority: Option<i64>,
+    /// Stable tie-breaker for equal priorities.
+    pub work_id: String,
+}
+
+/// One bounded ready-frontier page plus its unbounded matching total.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkReadyPage {
+    /// Rows after the optional keyset, in ready-frontier order.
+    pub items: Vec<WorkItemSnapshot>,
+    /// All ready rows matching the filters, before the keyset.
+    pub total: u64,
+    /// Whether at least one matching row follows this page.
+    pub has_more: bool,
+}
+
+/// One plan item hydrated with all of its outgoing dependency statuses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkPlanRow {
+    /// Complete current work-item state.
+    pub item: WorkItemSnapshot,
+    /// Dependencies ordered by `(target id, kind)`.
+    pub dependencies: Vec<WorkDependencyStatus>,
+}
+
+/// One transaction's plan projection for a live filter and/or exact ids.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkPlanSnapshot {
+    /// Nonterminal rows matching the requested filters, priority-ordered.
+    pub matching: Vec<WorkPlanRow>,
+    /// Existing exact-id rows in caller order, including duplicates.
+    pub exact: Vec<WorkPlanRow>,
+}
+
 /// A dependency edge.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -442,6 +480,15 @@ fn collection_query(
     ids: &[String],
     filters: &WorkItemFilters,
 ) -> (String, Vec<String>) {
+    collection_query_after(collection, ids, filters, None)
+}
+
+fn collection_query_after(
+    collection: WorkItemCollection,
+    ids: &[String],
+    filters: &WorkItemFilters,
+    ready_after: Option<&WorkReadyAfter>,
+) -> (String, Vec<String>) {
     let mut clauses = Vec::new();
     let mut params = Vec::new();
     match collection {
@@ -466,10 +513,7 @@ fn collection_query(
     }
     if let Some(repository) = &filters.repository {
         params.push(repository.clone());
-        clauses.push(format!(
-            "json_extract(wi.metadata_json, '$.repository') = ?{}",
-            params.len()
-        ));
+        clauses.push(format!("wi.repository = ?{}", params.len()));
     }
     if let Some(status) = filters.status {
         params.push(status.as_str().to_owned());
@@ -478,6 +522,24 @@ fn collection_query(
     if let Some(assignee) = &filters.assignee {
         params.push(assignee.clone());
         clauses.push(format!("wi.assignee = ?{}", params.len()));
+    }
+    if let Some(after) = ready_after {
+        debug_assert!(matches!(collection, WorkItemCollection::Ready));
+        params.push(after.work_id.clone());
+        let work_id_param = params.len();
+        match after.priority {
+            Some(priority) => {
+                params.push(priority.to_string());
+                let priority_param = params.len();
+                clauses.push(format!(
+                    "(wi.priority IS NULL OR wi.priority > ?{priority_param} OR \
+                     (wi.priority = ?{priority_param} AND wi.work_id > ?{work_id_param}))"
+                ));
+            }
+            None => clauses.push(format!(
+                "wi.priority IS NULL AND wi.work_id > ?{work_id_param}"
+            )),
+        }
     }
     let where_clause = if clauses.is_empty() {
         String::new()
@@ -491,6 +553,19 @@ fn collection_query(
         WorkItemCollection::All | WorkItemCollection::ExactIds => " ORDER BY wi.work_id",
     };
     (format!("{SNAPSHOT_SQL}{where_clause}{order}"), params)
+}
+
+fn collection_count_query(
+    collection: WorkItemCollection,
+    ids: &[String],
+    filters: &WorkItemFilters,
+) -> (String, Vec<String>) {
+    let (query, params) = collection_query(collection, ids, filters);
+    let from = query
+        .find(" FROM work_items wi ")
+        .expect("snapshot query has a work-items FROM clause");
+    let order = query.find(" ORDER BY ").unwrap_or(query.len());
+    (format!("SELECT COUNT(*){}", &query[from..order]), params)
 }
 
 fn collection_tx(
@@ -507,6 +582,133 @@ fn collection_tx(
         out.push(row?);
     }
     Ok(out)
+}
+
+fn ready_page_tx(
+    conn: &mut Connection,
+    filters: &WorkItemFilters,
+    after: Option<&WorkReadyAfter>,
+    limit: usize,
+) -> Result<WorkReadyPage, LedgerError> {
+    let tx = conn.transaction()?;
+    let (count_sql, count_params) = collection_count_query(WorkItemCollection::Ready, &[], filters);
+    let total: i64 = tx.query_row(
+        &count_sql,
+        rusqlite::params_from_iter(count_params.iter()),
+        |row| row.get(0),
+    )?;
+    let (mut page_sql, page_params) =
+        collection_query_after(WorkItemCollection::Ready, &[], filters, after);
+    let fetch = limit
+        .checked_add(1)
+        .ok_or_else(|| internal("work ready page limit overflow"))?;
+    page_sql.push_str(&format!(" LIMIT {fetch}"));
+    let mut stmt = tx.prepare(&page_sql)?;
+    let rows = stmt.query_map(
+        rusqlite::params_from_iter(page_params.iter()),
+        snapshot_from_row,
+    )?;
+    let mut items = Vec::with_capacity(fetch);
+    for row in rows {
+        items.push(row?);
+    }
+    drop(stmt);
+    let has_more = items.len() > limit;
+    items.truncate(limit);
+    tx.commit()?;
+    Ok(WorkReadyPage {
+        items,
+        total: total as u64,
+        has_more,
+    })
+}
+
+fn plan_dependencies_tx(
+    conn: &Connection,
+    ids: &[String],
+) -> Result<BTreeMap<String, Vec<WorkDependencyStatus>>, LedgerError> {
+    if ids.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let ids_json = serde_json::to_string(ids)?;
+    let mut stmt = conn.prepare(
+        "SELECT d.from_id, d.to_id, d.kind, wi.status FROM work_deps d \
+         LEFT JOIN work_items wi ON wi.work_id = d.to_id \
+         WHERE d.from_id IN (SELECT value FROM json_each(?1)) \
+         ORDER BY d.from_id, d.to_id, d.kind",
+    )?;
+    let rows = stmt.query_map([ids_json], |row| {
+        let kind: String = row.get(2)?;
+        let status: Option<String> = row.get(3)?;
+        Ok((
+            row.get::<_, String>(0)?,
+            WorkDependencyStatus {
+                id: row.get(1)?,
+                kind: WorkDepKind::decode(2, &kind)?,
+                status: match status {
+                    Some(value) => Some(WorkStatus::decode(3, &value)?),
+                    None => None,
+                },
+            },
+        ))
+    })?;
+    let mut dependencies = BTreeMap::<String, Vec<WorkDependencyStatus>>::new();
+    for row in rows {
+        let (work_id, dependency) = row?;
+        dependencies.entry(work_id).or_default().push(dependency);
+    }
+    Ok(dependencies)
+}
+
+fn plan_rows(
+    items: Vec<WorkItemSnapshot>,
+    dependencies: &BTreeMap<String, Vec<WorkDependencyStatus>>,
+) -> Vec<WorkPlanRow> {
+    items
+        .into_iter()
+        .map(|item| WorkPlanRow {
+            dependencies: dependencies.get(&item.work_id).cloned().unwrap_or_default(),
+            item,
+        })
+        .collect()
+}
+
+fn work_plan_snapshot_tx(
+    conn: &mut Connection,
+    ids: &[String],
+    filters: Option<&WorkItemFilters>,
+) -> Result<WorkPlanSnapshot, LedgerError> {
+    let tx = conn.transaction()?;
+    let matching_items = match filters {
+        Some(filters) => collection_tx(&tx, WorkItemCollection::Nonterminal, &[], filters)?,
+        None => Vec::new(),
+    };
+    let exact_unique = collection_tx(
+        &tx,
+        WorkItemCollection::ExactIds,
+        ids,
+        &WorkItemFilters::default(),
+    )?;
+    let exact_by_id: BTreeMap<String, WorkItemSnapshot> = exact_unique
+        .into_iter()
+        .map(|item| (item.work_id.clone(), item))
+        .collect();
+    let exact_items: Vec<WorkItemSnapshot> = ids
+        .iter()
+        .filter_map(|id| exact_by_id.get(id).cloned())
+        .collect();
+    let mut hydration_ids: Vec<String> = matching_items
+        .iter()
+        .map(|item| item.work_id.clone())
+        .collect();
+    hydration_ids.extend(exact_by_id.keys().cloned());
+    hydration_ids.sort();
+    hydration_ids.dedup();
+    let dependencies = plan_dependencies_tx(&tx, &hydration_ids)?;
+    let matching = plan_rows(matching_items, &dependencies);
+    let exact = plan_rows(exact_items, &dependencies);
+    tx.commit()?;
+    Ok(WorkPlanSnapshot { matching, exact })
 }
 
 fn snapshot_from_row(row: &rusqlite::Row<'_>) -> Result<WorkItemSnapshot, rusqlite::Error> {
@@ -1700,6 +1902,45 @@ impl Ledger {
     ) -> Result<Vec<WorkItemSnapshot>, LedgerError> {
         self.submit(move |conn| collection_tx(conn, WorkItemCollection::Ready, &[], &filters))
     }
+
+    /// One keyset page of the filtered ready frontier. The count and page
+    /// share one read transaction, so `total` describes the same snapshot as
+    /// the returned rows.
+    pub fn ready_work_items_page_filtered(
+        &self,
+        filters: WorkItemFilters,
+        after: Option<WorkReadyAfter>,
+        limit: usize,
+    ) -> Result<WorkReadyPage, LedgerError> {
+        if limit == 0 {
+            return Err(refused(
+                ErrorCode::InvalidRequest,
+                "work ready page limit must be positive",
+            ));
+        }
+        if after
+            .as_ref()
+            .is_some_and(|cursor| cursor.work_id.trim().is_empty())
+        {
+            return Err(refused(
+                ErrorCode::InvalidRequest,
+                "work ready cursor work id must be non-empty",
+            ));
+        }
+        self.submit(move |conn| ready_page_tx(conn, &filters, after.as_ref(), limit))
+    }
+
+    /// Hydrate live filtered rows and/or exact ids with dependency statuses
+    /// in one actor submission and one read transaction. Exact ids preserve
+    /// caller order and omissions remain absent for the caller to adjudicate.
+    pub fn work_plan_snapshot(
+        &self,
+        ids: &[String],
+        filters: Option<WorkItemFilters>,
+    ) -> Result<WorkPlanSnapshot, LedgerError> {
+        let ids = ids.to_vec();
+        self.submit(move |conn| work_plan_snapshot_tx(conn, &ids, filters.as_ref()))
+    }
 }
 
 /// One work-store integrity finding, with the typed repair that clears it.
@@ -2193,7 +2434,7 @@ mod tests {
 
     #[test]
     fn work_item_filters_compose_in_one_sql_where_clause() {
-        let (_dir, l) = ledger();
+        let (dir, l) = ledger();
         let filtered_item = |id: &str, repository: &str, status: WorkStatus| {
             let mut value = item(id, status);
             value
@@ -2239,12 +2480,79 @@ mod tests {
 
         let (sql, params) = collection_query(WorkItemCollection::All, &[], &filters);
         assert!(
-            sql.contains("json_extract(wi.metadata_json, '$.repository') = ?1")
+            sql.contains("wi.repository = ?1")
                 && sql.contains("wi.status = ?2")
                 && sql.contains("wi.assignee = ?3"),
             "all filter predicates must remain in SQL: {sql}"
         );
         assert_eq!(params, ["/repo/a", "blocked", "alice"]);
+
+        l.close().expect("close ledger");
+        let conn = Connection::open(dir.path().join("state.db")).expect("raw connection");
+        let old_sql = format!(
+            "{SNAPSHOT_SQL} WHERE \
+             json_extract(wi.metadata_json, '$.repository') = ?1 \
+             AND wi.status = ?2 AND wi.assignee = ?3 ORDER BY wi.work_id"
+        );
+        let mut old_statement = conn
+            .prepare(&old_sql)
+            .expect("prepare old repository filter");
+        let old_rows = old_statement
+            .query_map(["/repo/a", "blocked", "alice"], snapshot_from_row)
+            .expect("query old repository filter")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("old repository rows");
+        assert_eq!(
+            rows, old_rows,
+            "the promoted column changes no result bytes"
+        );
+
+        let mut plan_statement = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .expect("prepare repository plan");
+        let details = plan_statement
+            .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+                row.get::<_, String>(3)
+            })
+            .expect("repository query plan")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("repository plan rows");
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("work_items_repository_status")),
+            "repository/status index is absent from plan: {details:?}"
+        );
+    }
+
+    #[test]
+    fn plan_snapshot_hydrates_two_hundred_rows_in_one_actor_read() {
+        let (_dir, l) = ledger();
+        let ids: Vec<String> = (0..200).map(|index| format!("plan-{index:03}")).collect();
+        for (index, id) in ids.iter().enumerate() {
+            let mut value = item(id, WorkStatus::Open);
+            value.priority = Some(index as i64);
+            l.create_work_item(value).unwrap();
+            if index > 0 {
+                l.add_work_dep(id, &ids[index - 1], WorkDepKind::Related)
+                    .unwrap();
+            }
+        }
+
+        let snapshot = l
+            .work_plan_snapshot(&ids, Some(WorkItemFilters::default()))
+            .expect("one hydrated plan snapshot");
+        assert_eq!(snapshot.matching.len(), 200);
+        assert_eq!(snapshot.exact.len(), 200);
+        assert_eq!(snapshot.exact[0].item.work_id, "plan-000");
+        assert!(snapshot.exact[0].dependencies.is_empty());
+        for (index, row) in snapshot.exact.iter().enumerate().skip(1) {
+            assert_eq!(row.item.work_id, ids[index]);
+            assert_eq!(row.dependencies.len(), 1);
+            assert_eq!(row.dependencies[0].id, ids[index - 1]);
+            assert_eq!(row.dependencies[0].kind, WorkDepKind::Related);
+            assert_eq!(row.dependencies[0].status, Some(WorkStatus::Open));
+        }
     }
 
     #[test]

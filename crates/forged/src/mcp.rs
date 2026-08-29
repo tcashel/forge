@@ -336,6 +336,9 @@ pub struct WorkReadyParams {
         skip_serializing_if = "Option::is_none"
     )]
     pub repo: Option<String>,
+    /// Opaque continuation cursor returned by the preceding page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
     /// Complete snapshots when full; omission returns summary rows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<WorkReadyDetailParam>,
@@ -1671,7 +1674,8 @@ impl ForgedServer {
                        blocks targets are all closed, priority-ordered. Returns summary rows \
                        by default. Optional params.repo filters exact work metadata.repository. \
                        params.detail=\"full\" restores complete snapshots; params.limit is \
-                       1..=500 and defaults to 100."
+                       1..=500 and defaults to 100. Pass the returned nextCursor as \
+                       params.cursor to continue the same priority/work-id order."
     )]
     pub async fn work_ready(&self, args: Parameters<WorkReadyArgs>) -> CallToolResult {
         self.call("work_ready", args.0.into_envelope()).await

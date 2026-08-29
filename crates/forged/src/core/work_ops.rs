@@ -8,10 +8,11 @@
 
 use std::collections::BTreeMap;
 
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use forged_ledger::{
     EffectClass, NewWorkItem, NewWorkNote, WorkDepKind, WorkItemFilters, WorkItemSnapshot,
-    WorkKind, WorkNoteKind, WorkRevisionCause, WorkSpecFields, WorkStatus, WORK_NOTE_DEFAULT_LIMIT,
-    WORK_NOTE_MAX_LIMIT,
+    WorkKind, WorkNoteKind, WorkReadyAfter, WorkRevisionCause, WorkSpecFields, WorkStatus,
+    WORK_NOTE_DEFAULT_LIMIT, WORK_NOTE_MAX_LIMIT,
 };
 use forged_types::{
     canonical_json_bytes, parse_canonical, request_sha256, ErrorCode, OperationRequest,
@@ -27,6 +28,13 @@ use crate::core::{
 const WORK_READY_DEFAULT_LIMIT: u64 = 100;
 const WORK_READY_MAX_LIMIT: u64 = 500;
 
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WorkReadyCursor {
+    priority: Option<i64>,
+    work_id: String,
+}
+
 #[derive(Clone, Copy)]
 enum WorkReadyDetail {
     Summary,
@@ -40,6 +48,47 @@ impl WorkReadyDetail {
             Self::Full => "full",
         }
     }
+}
+
+fn invalid_work_ready_cursor() -> Failure {
+    Failure::invalid(
+        "work_ready cursor is invalid; run work ready without --cursor to restart pagination",
+    )
+}
+
+fn encode_work_ready_cursor(snapshot: &WorkItemSnapshot) -> Result<String, Failure> {
+    let value = serde_json::to_value(WorkReadyCursor {
+        priority: snapshot.priority,
+        work_id: snapshot.work_id.clone(),
+    })
+    .map_err(|error| Failure::internal(format!("serialize work_ready cursor: {error}")))?;
+    let bytes = canonical_json_bytes(&value)
+        .map_err(|error| Failure::internal(format!("canonicalize work_ready cursor: {error}")))?;
+    Ok(STANDARD.encode(bytes))
+}
+
+fn decode_work_ready_cursor(value: &str) -> Result<WorkReadyAfter, Failure> {
+    if value.is_empty() || value.len() > 4_096 {
+        return Err(invalid_work_ready_cursor());
+    }
+    let bytes = STANDARD
+        .decode(value)
+        .map_err(|_| invalid_work_ready_cursor())?;
+    let cursor: WorkReadyCursor =
+        serde_json::from_slice(&bytes).map_err(|_| invalid_work_ready_cursor())?;
+    if cursor.work_id.trim().is_empty() {
+        return Err(invalid_work_ready_cursor());
+    }
+    let canonical_value = serde_json::to_value(&cursor).map_err(|_| invalid_work_ready_cursor())?;
+    let canonical_bytes =
+        canonical_json_bytes(&canonical_value).map_err(|_| invalid_work_ready_cursor())?;
+    if bytes != canonical_bytes {
+        return Err(invalid_work_ready_cursor());
+    }
+    Ok(WorkReadyAfter {
+        priority: cursor.priority,
+        work_id: cursor.work_id,
+    })
 }
 
 fn snapshot_json(snapshot: &WorkItemSnapshot, next_steps: &[&str]) -> Value {
@@ -775,6 +824,11 @@ pub async fn work_ready(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
                 "work_ready limit must be between 1 and {WORK_READY_MAX_LIMIT}"
             )));
         }
+        let cursor = match req.params.get("cursor") {
+            None => None,
+            Some(Value::String(value)) => Some(decode_work_ready_cursor(value)?),
+            Some(_) => return Err(invalid_work_ready_cursor()),
+        };
 
         let repository = super::ops::repository_selector(req, "work_ready")?;
 
@@ -782,12 +836,23 @@ pub async fn work_ready(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
             repository: repository.clone(),
             ..WorkItemFilters::default()
         };
-        let ready = on_ledger(&ctx.ledger, move |l| l.ready_work_items_filtered(filters)).await?;
-        let total = ready.len();
+        let page = on_ledger(&ctx.ledger, move |l| {
+            l.ready_work_items_page_filtered(filters, cursor, limit as usize)
+        })
+        .await?;
+        let next_cursor = if page.has_more {
+            page.items
+                .last()
+                .map(encode_work_ready_cursor)
+                .transpose()?
+        } else {
+            None
+        };
+        let total = page.total;
         let ready = match detail {
-            WorkReadyDetail::Summary => ready
+            WorkReadyDetail::Summary => page
+                .items
                 .into_iter()
-                .take(limit as usize)
                 .map(|item| {
                     json!({
                         "id": item.work_id,
@@ -800,9 +865,9 @@ pub async fn work_ready(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
                     })
                 })
                 .collect::<Vec<_>>(),
-            WorkReadyDetail::Full => ready
+            WorkReadyDetail::Full => page
+                .items
                 .into_iter()
-                .take(limit as usize)
                 .map(|item| json!(item))
                 .collect::<Vec<_>>(),
         };
@@ -820,6 +885,7 @@ pub async fn work_ready(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
                 "total": total,
             },
             "ready": ready,
+            "nextCursor": next_cursor,
         }))
     })
     .await
