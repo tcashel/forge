@@ -3420,6 +3420,8 @@ mod tests {
             gate_commands: Vec::new(),
             stage_budget_s: HashMap::new(),
             transport_retry_budget: 3,
+            transport_patterns: Vec::new(),
+            provider_transport_patterns: Default::default(),
             bd_path: anvil.join("tools/bd"),
             beads_dir: anvil.join("beads"),
             codex_home: root.join("home/.codex"),
