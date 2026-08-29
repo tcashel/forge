@@ -974,6 +974,223 @@ fn events_of_kind(events: &[(String, Value)], kind: &str) -> Vec<Value> {
 }
 
 #[test]
+fn promote_and_priority_update_preserve_revision_semantics() {
+    let env = TestEnv::new("forged-work-promote-priority");
+    assert_eq!(env.forged(&["init"]).0, 0);
+
+    let created = result(
+        &env,
+        &[
+            "work",
+            "create",
+            "--id",
+            "priority-repair",
+            "--title",
+            "Priority repair",
+            "--repository",
+            "/tmp/priority-repair",
+        ],
+    );
+    assert_eq!(created["work"]["priority"], Value::Null);
+    assert_eq!(created["work"]["revision"], json!(1));
+
+    let priority_only = result(
+        &env,
+        &[
+            "work",
+            "update",
+            "--id",
+            "priority-repair",
+            "--expected-revision",
+            "1",
+            "--priority",
+            "2",
+        ],
+    );
+    assert_eq!(priority_only["work"]["priority"], json!(2));
+    assert_eq!(
+        priority_only["work"]["revision"],
+        json!(1),
+        "priority is coordination state and must not mint"
+    );
+    let ledger = env.ledger();
+    let priority_event = ledger
+        .list_events_by_kind("work.updated")
+        .expect("work update events")
+        .into_iter()
+        .filter_map(|event| serde_json::from_str::<Value>(&event.payload_json).ok())
+        .find(|payload| payload["workId"] == json!("priority-repair"))
+        .expect("priority update event");
+    ledger.close().expect("close ledger");
+    assert_eq!(priority_event["priority"], json!({"from": null, "to": 2}));
+    assert_eq!(priority_event["revision"], json!({"from": 1, "to": 1}));
+
+    let combined = result(
+        &env,
+        &[
+            "work",
+            "update",
+            "--id",
+            "priority-repair",
+            "--expected-revision",
+            "1",
+            "--priority",
+            "1",
+            "--description",
+            "combined spec and priority write",
+        ],
+    );
+    assert_eq!(combined["work"]["priority"], json!(1));
+    assert_eq!(combined["work"]["revision"], json!(2));
+    assert_eq!(
+        combined["work"]["spec"]["description"],
+        json!("combined spec and priority write")
+    );
+    let (code, stale_priority) = env.forged(&[
+        "work",
+        "update",
+        "--id",
+        "priority-repair",
+        "--expected-revision",
+        "1",
+        "--priority",
+        "0",
+    ]);
+    assert_ne!(
+        code, 0,
+        "stale priority update must refuse: {stale_priority}"
+    );
+    assert_eq!(stale_priority["error"]["code"], json!("BEADS_CONTENTION"));
+    let unchanged = result(&env, &["work", "show", "--id", "priority-repair"]);
+    assert_eq!(unchanged["work"]["priority"], json!(1));
+    assert_eq!(unchanged["work"]["revision"], json!(2));
+
+    for (name, body) in [
+        ("description", "promoted description"),
+        ("acceptance", "promoted acceptance"),
+        ("design", "promoted design"),
+        ("notes", "promoted notes"),
+    ] {
+        std::fs::write(env.root.join(format!("{name}.md")), body).expect("write promote input");
+    }
+    result(
+        &env,
+        &[
+            "work",
+            "create",
+            "--id",
+            "blocked-stub",
+            "--title",
+            "Preserved title",
+            "--status",
+            "blocked",
+        ],
+    );
+    let description = env.root.join("description.md");
+    let acceptance = env.root.join("acceptance.md");
+    let design = env.root.join("design.md");
+    let notes = env.root.join("notes.md");
+    let promoted = result(
+        &env,
+        &[
+            "work",
+            "promote",
+            "--id",
+            "blocked-stub",
+            "--expected-revision",
+            "1",
+            "--description-file",
+            description.to_str().unwrap(),
+            "--acceptance-file",
+            acceptance.to_str().unwrap(),
+            "--design-file",
+            design.to_str().unwrap(),
+            "--notes-file",
+            notes.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(promoted["work"]["status"], json!("open"));
+    assert_eq!(promoted["work"]["revision"], json!(2));
+    assert_eq!(promoted["work"]["spec"]["title"], json!("Preserved title"));
+    assert_eq!(
+        promoted["work"]["spec"]["description"],
+        json!("promoted description")
+    );
+    assert_eq!(
+        promoted["work"]["spec"]["acceptanceCriteria"],
+        json!("promoted acceptance")
+    );
+    assert_eq!(promoted["work"]["spec"]["design"], json!("promoted design"));
+    assert_eq!(promoted["work"]["spec"]["notes"], json!("promoted notes"));
+    let conn = rusqlite::Connection::open(env.anvil.join("state.db")).expect("open ledger");
+    let cause: String = conn
+        .query_row(
+            "SELECT cause FROM work_revisions WHERE work_id = 'blocked-stub' AND revision = 2",
+            [],
+            |row| row.get(0),
+        )
+        .expect("promotion revision cause");
+    assert_eq!(cause, "planning-apply");
+
+    result(
+        &env,
+        &[
+            "work",
+            "create",
+            "--id",
+            "raced-stub",
+            "--title",
+            "Raced stub",
+            "--status",
+            "blocked",
+        ],
+    );
+    result(
+        &env,
+        &[
+            "work",
+            "update",
+            "--id",
+            "raced-stub",
+            "--expected-revision",
+            "1",
+            "--description",
+            "concurrent write",
+        ],
+    );
+    let (code, contention) = env.forged(&[
+        "work",
+        "promote",
+        "--id",
+        "raced-stub",
+        "--expected-revision",
+        "1",
+        "--description",
+        "stale plan",
+    ]);
+    assert_ne!(code, 0, "stale promotion must refuse: {contention}");
+    assert_eq!(contention["error"]["code"], json!("BEADS_CONTENTION"));
+    let raced = result(&env, &["work", "show", "--id", "raced-stub"]);
+    assert_eq!(raced["work"]["revision"], json!(2));
+    assert_eq!(raced["work"]["status"], json!("blocked"));
+
+    let (code, open_refusal) = env.forged(&[
+        "work",
+        "promote",
+        "--id",
+        "priority-repair",
+        "--expected-revision",
+        "2",
+    ]);
+    assert_ne!(code, 0, "open work must not promote: {open_refusal}");
+    let message = open_refusal["error"]["message"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(message.contains("work update"), "{message}");
+    assert!(message.contains("work reopen"), "{message}");
+}
+
+#[test]
 fn authoring_and_repair_verbs_cover_the_lifecycle() {
     let env = TestEnv::new("forged-work-ops");
     assert_eq!(env.forged(&["init"]).0, 0);

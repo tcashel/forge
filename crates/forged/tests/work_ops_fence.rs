@@ -155,6 +155,12 @@ fn malformed_params_refuse_instead_of_defaulting() {
         json!({"id": "fence-strict", "expectedRevision": 1, "title": 5}),
         "numeric title",
     );
+    refuse(
+        &mut mcp,
+        "work_update",
+        json!({"id": "fence-strict", "expectedRevision": 1, "priority": "3"}),
+        "string update priority",
+    );
     let shown = result(&env, &["work", "show", "--id", "fence-strict"]);
     assert_eq!(shown["work"]["revision"], json!(1), "no revision minted");
 }

@@ -1,5 +1,5 @@
 //! CLI/MCP parity (the two-adapters-over-one-core criterion): for each of
-//! the sixty-two public core functions, the CLI path and the MCP tool path produce
+//! the sixty-three public core functions, the CLI path and the MCP tool path produce
 //! identical `OperationResponse` values — modulo the minted `operationId` —
 //! from the same core call.
 
@@ -122,7 +122,7 @@ fn prepare_run_worktree(env: &TestEnv, run: &str) {
 }
 
 #[test]
-fn all_sixty_two_tools_match_their_cli_counterparts() {
+fn all_sixty_three_tools_match_their_cli_counterparts() {
     let env = TestEnv::new("forged-parity");
     env.forged(&["init"]);
     fabricate_run(&env, "par-repository");
@@ -189,6 +189,7 @@ fn all_sixty_two_tools_match_their_cli_counterparts() {
         "epic_abandon",
         "work_create",
         "work_update",
+        "work_promote",
         "work_note_add",
         "work_note_list",
         "work_link",
@@ -202,7 +203,7 @@ fn all_sixty_two_tools_match_their_cli_counterparts() {
         "worktree_retire",
     ];
     expected.sort_unstable();
-    assert_eq!(tools, expected, "the sixty-two tools, exactly");
+    assert_eq!(tools, expected, "the sixty-three tools, exactly");
 
     // Both MCP result paths turn a failed operation envelope into a tool
     // error without changing one byte of the CLI-compatible JSON text.
@@ -327,6 +328,34 @@ fn all_sixty_two_tools_match_their_cli_counterparts() {
         assert!(
             add_schema.get(param).is_some(),
             "work_note_add advertises params.{param}: {add_schema}"
+        );
+    }
+    let work_update = mcp.tool("work_update");
+    let update_description = work_update["description"].as_str().unwrap_or_default();
+    for statement in [
+        "priority-only write leaves revision unchanged",
+        "spec field mints exactly one revision",
+        "work_update",
+        "work_promote",
+        "work_reopen",
+    ] {
+        assert!(
+            update_description.contains(statement),
+            "work_update description states {statement:?}: {update_description}"
+        );
+    }
+    let work_promote = mcp.tool("work_promote");
+    let promote_description = work_promote["description"].as_str().unwrap_or_default();
+    for statement in [
+        "revision N+1",
+        "cause planning-apply",
+        "status open",
+        "work_update",
+        "work_reopen",
+    ] {
+        assert!(
+            promote_description.contains(statement),
+            "work_promote description states {statement:?}: {promote_description}"
         );
     }
     for kind in ["comment", "critique", "recommendation", "approval"] {
@@ -1476,6 +1505,54 @@ fn all_sixty_two_tools_match_their_cli_counterparts() {
     );
     assert_eq!(tool["operationId"], json!("op:work_note_list:read"));
     assert_eq!(normalized(cli), normalized(tool), "work_note_list parity");
+
+    let cli = env
+        .forged(&[
+            "work",
+            "update",
+            "--id",
+            "absent-priority-update",
+            "--expected-revision",
+            "1",
+            "--priority",
+            "2",
+        ])
+        .1;
+    let tool = mcp.call_tool(
+        "work_update",
+        envelope(json!({
+            "id": "absent-priority-update",
+            "expectedRevision": 1,
+            "priority": 2,
+        })),
+    );
+    assert_eq!(
+        normalized(cli),
+        normalized(tool),
+        "priority work_update parity"
+    );
+
+    let cli = env
+        .forged(&[
+            "work",
+            "promote",
+            "--id",
+            "absent-promote",
+            "--expected-revision",
+            "1",
+            "--description",
+            "planned",
+        ])
+        .1;
+    let tool = mcp.call_tool(
+        "work_promote",
+        envelope(json!({
+            "id": "absent-promote",
+            "expectedRevision": 1,
+            "description": "planned",
+        })),
+    );
+    assert_eq!(normalized(cli), normalized(tool), "work_promote parity");
 
     let cli = env
         .forged(&[

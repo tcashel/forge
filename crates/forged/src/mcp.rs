@@ -1,4 +1,4 @@
-//! `forged mcp` — the rmcp stdio server. Sixty-two tools, each taking the same
+//! `forged mcp` — the rmcp stdio server. Sixty-three tools, each taking the same
 //! operation envelope in and returning the same envelope out; every tool
 //! routes through the identical core dispatch the CLI uses, so the two
 //! surfaces are two adapters over one core. Five dispatcher operations remain
@@ -1556,16 +1556,36 @@ impl ForgedServer {
         self.call("work_create", args.0).await
     }
 
-    /// Typed work authoring: guarded spec update.
+    /// Typed work authoring: guarded spec and/or priority update.
     #[tool(
         name = "work_update",
-        description = "Guarded spec write over title/description/acceptanceCriteria/design/\
-                       notes. params: id, expectedRevision (the revision you read — the CAS \
-                       guard); omitted fields keep their bytes. A moved revision refuses \
-                       with BEADS_CONTENTION: re-read and re-apply."
+        description = "CAS-fenced update over priority and/or title/description/\
+                       acceptanceCriteria/design/notes. params: id, expectedRevision (the \
+                       revision you read), optional priority and actor; omitted spec fields \
+                       keep their bytes. Priority is coordination state: a priority-only \
+                       write leaves revision unchanged; any supplied spec field mints exactly \
+                       one revision, including when combined with priority. A moved revision \
+                       refuses with BEADS_CONTENTION. Use work_update for open-item changes, \
+                       work_promote for blocked/deferred stub promotion, and work_reopen for \
+                       closed items."
     )]
     pub async fn work_update(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
         self.call("work_update", args.0).await
+    }
+
+    /// Typed work authoring: atomic stub promotion.
+    #[tool(
+        name = "work_promote",
+        description = "Atomically promote one blocked or deferred stub. params: id, \
+                       expectedRevision (the revision you read), optional description, \
+                       acceptanceCriteria, design, notes, and actor. One fenced operation \
+                       mints revision N+1 with cause planning-apply, sets status open, and \
+                       appends its coordination event. Concurrent revision drift refuses \
+                       with BEADS_CONTENTION. Open items use work_update; closed items use \
+                       work_reopen."
+    )]
+    pub async fn work_promote(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
+        self.call("work_promote", args.0).await
     }
 
     /// Append one immutable work annotation.

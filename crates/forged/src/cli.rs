@@ -1005,8 +1005,11 @@ pub enum WorkCmd {
     },
     /// Create a work item with its revision-1 spec.
     Create(WorkCreateArgs),
-    /// Guarded spec update (revision CAS).
+    /// CAS-fenced spec/priority update; priority alone keeps the revision.
+    /// Use promote for blocked/deferred stubs and reopen for closed items.
     Update(WorkUpdateArgs),
+    /// Atomically write a stub spec revision and promote it to open.
+    Promote(WorkPromoteArgs),
     /// Add one typed dependency edge.
     Link(WorkLinkArgs),
     /// Close a work item with a recorded reason.
@@ -1187,6 +1190,53 @@ pub struct WorkUpdateArgs {
     /// Read new agent instructions verbatim from one UTF-8 file.
     #[arg(long)]
     pub notes_file: Option<PathBuf>,
+    /// Scheduling priority; coordination state that does not mint a revision.
+    #[arg(long)]
+    pub priority: Option<i64>,
+    /// Acting identity for coordination evidence (default operator).
+    #[arg(long)]
+    pub actor: Option<String>,
+    /// Override the derived idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+/// `work promote` arguments.
+#[derive(Debug, Args)]
+pub struct WorkPromoteArgs {
+    /// The blocked or deferred stub id.
+    #[arg(long)]
+    pub id: String,
+    /// The revision you read — the CAS guard.
+    #[arg(long)]
+    pub expected_revision: i64,
+    /// New description; omitted preserves the current bytes.
+    #[arg(long, allow_hyphen_values = true, conflicts_with = "description_file")]
+    pub description: Option<String>,
+    /// Read the new description verbatim from one UTF-8 file.
+    #[arg(long)]
+    pub description_file: Option<PathBuf>,
+    /// New acceptance criteria; omitted preserves the current bytes.
+    #[arg(long, allow_hyphen_values = true, conflicts_with = "acceptance_file")]
+    pub acceptance: Option<String>,
+    /// Read new acceptance criteria verbatim from one UTF-8 file.
+    #[arg(long)]
+    pub acceptance_file: Option<PathBuf>,
+    /// New design notes; omitted preserves the current bytes.
+    #[arg(long, allow_hyphen_values = true, conflicts_with = "design_file")]
+    pub design: Option<String>,
+    /// Read new design notes verbatim from one UTF-8 file.
+    #[arg(long)]
+    pub design_file: Option<PathBuf>,
+    /// New agent instructions; omitted preserves the current bytes.
+    #[arg(long, allow_hyphen_values = true, conflicts_with = "notes_file")]
+    pub notes: Option<String>,
+    /// Read new agent instructions verbatim from one UTF-8 file.
+    #[arg(long)]
+    pub notes_file: Option<PathBuf>,
+    /// Acting identity (default operator).
+    #[arg(long)]
+    pub actor: Option<String>,
     /// Override the derived idempotency key.
     #[arg(long)]
     pub idempotency_key: Option<String>,
@@ -1822,6 +1872,7 @@ pub fn command_name(command: &Command) -> &'static str {
             },
             WorkCmd::Create(_) => "work_create",
             WorkCmd::Update(_) => "work_update",
+            WorkCmd::Promote(_) => "work_promote",
             WorkCmd::Link(_) => "work_link",
             WorkCmd::Close(_) => "work_close",
             WorkCmd::Reopen(_) => "work_reopen",
@@ -2585,8 +2636,54 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
                         params.insert(name.to_owned(), json!(value));
                     }
                 }
+                if let Some(priority) = a.priority {
+                    params.insert("priority".to_owned(), json!(priority));
+                }
+                if let Some(actor) = a.actor {
+                    params.insert("actor".to_owned(), json!(actor));
+                }
                 (
                     "work_update",
+                    request(a.idempotency_key, None, Value::Object(params)),
+                )
+            }
+            WorkCmd::Promote(a) => {
+                let description = spec_field_input(
+                    a.description,
+                    a.description_file.as_deref(),
+                    "--description",
+                    "--description-file",
+                )?;
+                let acceptance = spec_field_input(
+                    a.acceptance,
+                    a.acceptance_file.as_deref(),
+                    "--acceptance",
+                    "--acceptance-file",
+                )?;
+                let design = spec_field_input(
+                    a.design,
+                    a.design_file.as_deref(),
+                    "--design",
+                    "--design-file",
+                )?;
+                let notes =
+                    spec_field_input(a.notes, a.notes_file.as_deref(), "--notes", "--notes-file")?;
+                let mut params = Map::new();
+                params.insert("id".to_owned(), json!(a.id));
+                params.insert("expectedRevision".to_owned(), json!(a.expected_revision));
+                for (name, value) in [
+                    ("description", description),
+                    ("acceptanceCriteria", acceptance),
+                    ("design", design),
+                    ("notes", notes),
+                    ("actor", a.actor),
+                ] {
+                    if let Some(value) = value {
+                        params.insert(name.to_owned(), json!(value));
+                    }
+                }
+                (
+                    "work_promote",
                     request(a.idempotency_key, None, Value::Object(params)),
                 )
             }
@@ -2786,6 +2883,19 @@ mod tests {
             "forged",
             "work",
             "update",
+            "--id",
+            "x",
+            "--expected-revision",
+            "1",
+        ]);
+    }
+
+    #[test]
+    fn work_promote_long_text_fields_accept_bullet_led_values_in_both_forms() {
+        assert_long_text_forms(&[
+            "forged",
+            "work",
+            "promote",
             "--id",
             "x",
             "--expected-revision",

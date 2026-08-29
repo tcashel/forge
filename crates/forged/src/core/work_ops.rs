@@ -137,6 +137,61 @@ fn expected_revision_of(params: &serde_json::Map<String, Value>) -> Result<i64, 
     }
 }
 
+#[derive(Default)]
+struct WorkSpecPatch {
+    title: Option<String>,
+    description: Option<String>,
+    acceptance_criteria: Option<String>,
+    design: Option<String>,
+    notes: Option<String>,
+}
+
+impl WorkSpecPatch {
+    fn parse(
+        params: &serde_json::Map<String, Value>,
+        title_supported: bool,
+    ) -> Result<Self, Failure> {
+        if !title_supported && params.get("title").is_some_and(|value| !value.is_null()) {
+            return Err(Failure::invalid(
+                "work promote preserves title; use work update to change it",
+            ));
+        }
+        let field =
+            |name: &str| param_opt_str_strict(params, name).map(|value| value.map(str::to_owned));
+        Ok(Self {
+            title: if title_supported {
+                field("title")?
+            } else {
+                None
+            },
+            description: field("description")?,
+            acceptance_criteria: field("acceptanceCriteria")?,
+            design: field("design")?,
+            notes: field("notes")?,
+        })
+    }
+
+    fn has_fields(&self) -> bool {
+        self.title.is_some()
+            || self.description.is_some()
+            || self.acceptance_criteria.is_some()
+            || self.design.is_some()
+            || self.notes.is_some()
+    }
+
+    fn apply(self, current: WorkSpecFields) -> WorkSpecFields {
+        WorkSpecFields {
+            title: self.title.unwrap_or(current.title),
+            description: self.description.unwrap_or(current.description),
+            acceptance_criteria: self
+                .acceptance_criteria
+                .unwrap_or(current.acceptance_criteria),
+            design: self.design.unwrap_or(current.design),
+            notes: self.notes.unwrap_or(current.notes),
+        }
+    }
+}
+
 fn actor_of(params: &serde_json::Map<String, Value>) -> Result<String, Failure> {
     Ok(param_opt_str_strict(params, "actor")?
         .filter(|value| !value.trim().is_empty())
@@ -311,8 +366,8 @@ pub async fn work_create(ctx: &Ctx, req: &mut OperationRequest) -> OperationResp
     .await
 }
 
-/// `work_update` — guarded spec write: revision-CAS over the five spec
-/// fields; omitted fields keep their current bytes.
+/// `work_update` — one revision-CAS over optional spec and priority writes.
+/// Priority is coordination state, so it never mints a revision.
 pub async fn work_update(ctx: &Ctx, req: &mut OperationRequest) -> OperationResponse {
     let id = match param_str(&req.params, "id") {
         Ok(value) if !value.trim().is_empty() => value.to_owned(),
@@ -333,10 +388,66 @@ pub async fn work_update(ctx: &Ctx, req: &mut OperationRequest) -> OperationResp
             return err_response(&derive_key("work_update", Some(&id), None, None), &error)
         }
     };
-    default_key(
-        req,
-        derive_key("work_update", Some(&id), None, Some(expected)),
-    );
+    let priority = match param_opt_i64_strict(&req.params, "priority") {
+        Ok(priority) => priority,
+        Err(error) => {
+            return err_response(
+                &derive_key("work_update", Some(&id), None, Some(expected)),
+                &error,
+            )
+        }
+    };
+    let actor = match actor_of(&req.params) {
+        Ok(actor) => actor,
+        Err(error) => {
+            return err_response(
+                &derive_key("work_update", Some(&id), None, Some(expected)),
+                &error,
+            )
+        }
+    };
+    req.params.insert("actor".to_owned(), json!(actor));
+    let patch = match WorkSpecPatch::parse(&req.params, true) {
+        Ok(patch) => patch,
+        Err(error) => {
+            return err_response(
+                &derive_key("work_update", Some(&id), None, Some(expected)),
+                &error,
+            )
+        }
+    };
+    let has_spec = patch.has_fields();
+    if !has_spec && priority.is_none() {
+        return err_response(
+            &derive_key("work_update", Some(&id), None, Some(expected)),
+            &Failure::invalid(
+                "work update requires a spec field or priority; use work promote for a \
+                 blocked/deferred stub or work reopen for a closed item",
+            ),
+        );
+    }
+    let default = if !has_spec {
+        // Priority does not move the revision, so include both coordination
+        // pre/post-images. This keeps null -> 2 -> 1 -> 2 as three effects
+        // instead of replaying the first response on the final transition.
+        let before = {
+            let id = id.clone();
+            on_ledger(&ctx.ledger, move |ledger| ledger.work_item(&id))
+                .await
+                .ok()
+                .flatten()
+                .and_then(|snapshot| snapshot.priority)
+                .map_or_else(|| "null".to_owned(), |value| value.to_string())
+        };
+        format!(
+            "{}:priority-{before}-to-{}",
+            derive_key("work_update", Some(&id), None, Some(expected)),
+            priority.unwrap_or_default()
+        )
+    } else {
+        derive_key("work_update", Some(&id), None, Some(expected))
+    };
+    default_key(req, default);
     fenced(
         ctx,
         "work_update",
@@ -349,33 +460,95 @@ pub async fn work_update(ctx: &Ctx, req: &mut OperationRequest) -> OperationResp
                 on_ledger(&ctx.ledger, move |l| l.work_item(&id)).await?
             }
             .ok_or_else(|| Failure::invalid(format!("work item {id:?} does not exist")))?;
-            let field = |name: &str, fallback: &str| -> Result<String, Failure> {
-                Ok(param_opt_str_strict(&req.params, name)?
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| fallback.to_owned()))
-            };
-            let spec = WorkSpecFields {
-                title: field("title", &current.spec.title)?,
-                description: field("description", &current.spec.description)?,
-                acceptance_criteria: field(
-                    "acceptanceCriteria",
-                    &current.spec.acceptance_criteria,
-                )?,
-                design: field("design", &current.spec.design)?,
-                notes: field("notes", &current.spec.notes)?,
-            };
+            let spec = has_spec.then(|| patch.apply(current.spec));
             let id_owned = id.clone();
             let snapshot = on_ledger(&ctx.ledger, move |l| {
-                l.update_work_spec(&id_owned, expected, spec, WorkRevisionCause::Authored)
+                l.update_work_item(&id_owned, expected, spec, priority, &actor)
             })
             .await?;
             Ok(snapshot_json(
                 &snapshot,
-                &["a moved revision refuses with BEADS_CONTENTION: re-read and re-apply"],
+                &[
+                    "priority-only updates leave revision unchanged; spec fields mint exactly one",
+                    "a moved revision refuses with BEADS_CONTENTION: re-read and re-apply",
+                ],
             ))
         },
     )
     .await
+}
+
+/// `work_promote` — operation-atomic planning apply for a blocked or deferred
+/// stub, guarded by the caller's observed revision.
+pub async fn work_promote(ctx: &Ctx, req: &mut OperationRequest) -> OperationResponse {
+    let id = match param_str(&req.params, "id") {
+        Ok(value) if !value.trim().is_empty() => value.to_owned(),
+        _ => {
+            return err_response(
+                &derive_key("work_promote", None, None, None),
+                &Failure::invalid("id is required"),
+            )
+        }
+    };
+    let expected = match expected_revision_of(&req.params) {
+        Ok(expected) => expected,
+        Err(error) => {
+            return err_response(&derive_key("work_promote", Some(&id), None, None), &error)
+        }
+    };
+    let actor = match actor_of(&req.params) {
+        Ok(actor) => actor,
+        Err(error) => {
+            return err_response(
+                &derive_key("work_promote", Some(&id), None, Some(expected)),
+                &error,
+            )
+        }
+    };
+    req.params.insert("actor".to_owned(), json!(actor));
+    let patch = match WorkSpecPatch::parse(&req.params, false) {
+        Ok(patch) => patch,
+        Err(error) => {
+            return err_response(
+                &derive_key("work_promote", Some(&id), None, Some(expected)),
+                &error,
+            )
+        }
+    };
+    let current_read = {
+        let id = id.clone();
+        on_ledger(&ctx.ledger, move |ledger| ledger.work_item(&id)).await
+    };
+    let current = match current_read {
+        Ok(Some(current)) => current,
+        Ok(None) => {
+            return err_response(
+                &derive_key("work_promote", Some(&id), None, Some(expected)),
+                &Failure::invalid(format!("work item {id:?} does not exist")),
+            )
+        }
+        Err(error) => {
+            return err_response(
+                &derive_key("work_promote", Some(&id), None, Some(expected)),
+                &error,
+            )
+        }
+    };
+    let spec = patch.apply(current.spec);
+    default_key(
+        req,
+        derive_key("work_promote", Some(&id), None, Some(expected)),
+    );
+    let key = req.idempotency_key.clone();
+    match on_ledger(&ctx.ledger, {
+        let request = req.clone();
+        move |ledger| ledger.apply_work_promote_operation(&request, &id, expected, &actor, spec)
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => err_response(&key, &error),
+    }
 }
 
 /// `work_note_add` — append evidence about a spec without minting a spec
