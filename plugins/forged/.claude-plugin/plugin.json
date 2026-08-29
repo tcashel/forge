@@ -1,6 +1,6 @@
 {
   "name": "forged",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "description": "Forge-owned conversational planning and portfolio control over native work and typed Forged operations.",
   "author": {
     "name": "Tripp Cashel"
