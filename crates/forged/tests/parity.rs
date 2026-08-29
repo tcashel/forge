@@ -266,6 +266,22 @@ fn all_sixty_three_tools_match_their_cli_counterparts() {
         description.contains("omitting all three projects the portfolio"),
         "overview must state that no scope is the portfolio: {description}"
     );
+    for name in [
+        "overview",
+        "operations_overview",
+        "run_status",
+        "work_show",
+        "work_list",
+        "work_detail",
+        "attention_list",
+    ] {
+        let tool = mcp.tool(name);
+        let description = tool["description"].as_str().unwrap_or_default();
+        assert!(
+            description.contains("nextActions"),
+            "{name} must advertise nextActions: {description}"
+        );
+    }
     let work_list = mcp.tool("work_list");
     let description = work_list["description"].as_str().unwrap_or_default();
     assert!(
@@ -688,6 +704,41 @@ fn all_sixty_three_tools_match_their_cli_counterparts() {
     let tool = mcp.call_tool("definition_validate", envelope(json!({})));
     assert_eq!(cli, tool, "definition_validate parity");
 
+    let cli = env.forged(&["run", "status", "--run", "par-repository"]).1;
+    let tool = mcp.call_tool(
+        "run_status",
+        json!({
+            "schemaVersion": 1,
+            "runId": "par-repository",
+            "params": {"run": "par-repository"},
+        }),
+    );
+    assert_eq!(
+        normalized(cli),
+        normalized(tool.clone()),
+        "run_status action parity"
+    );
+    assert!(
+        tool.pointer("/result/run/nextActions")
+            .is_some_and(Value::is_array),
+        "run_status keeps every old field and adds nextActions: {tool}"
+    );
+
+    let cli = env
+        .forged(&["work", "show", "--id", "bead-par-repository"])
+        .1;
+    let tool = mcp.call_tool("work_show", envelope(json!({"id": "bead-par-repository"})));
+    assert_eq!(
+        normalized(cli),
+        normalized(tool.clone()),
+        "work_show action parity"
+    );
+    assert!(
+        tool.pointer("/result/nextActions")
+            .is_some_and(Value::is_array),
+        "work_show keeps every old field and adds nextActions: {tool}"
+    );
+
     // run_start: an invalid (relative) repo path refuses identically.
     let cli = env
         .forged(&[
@@ -865,8 +916,13 @@ fn all_sixty_three_tools_match_their_cli_counterparts() {
     );
     assert_eq!(
         normalized(cli),
-        normalized(tool),
+        normalized(tool.clone()),
         "operations_overview parity"
+    );
+    assert!(
+        tool.pointer("/result/attention/0/nextActions")
+            .is_some_and(Value::is_array),
+        "attention items add nextActions without replacing legacy fields: {tool}"
     );
     let structured = mcp.call_tool_result(
         "operations_overview",

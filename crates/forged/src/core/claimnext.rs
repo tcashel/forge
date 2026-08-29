@@ -217,8 +217,9 @@ async fn claim_next_effect(ctx: &Ctx, holder: &str) -> Result<Value, Failure> {
             return Err(Failure {
                 code: forged_types::ErrorCode::OperationInProgress,
                 message: format!(
-                    "packet {} deferred by admission: {:?}",
-                    candidate.packet_id, admission.decision.reason
+                    "packet {} deferred by admission: {}",
+                    candidate.packet_id,
+                    super::admission::decision_reason(&admission.decision)
                 ),
                 recoverable: true,
             });

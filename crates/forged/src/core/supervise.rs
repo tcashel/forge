@@ -1254,7 +1254,10 @@ pub(super) async fn tick(
                 DesiredReconcileOutcome::Attention
             };
             let next_wake_at = admission.decision.next_eligible_wake_at.clone();
-            let reason = format!("admission: {:?}", admission.decision.reason);
+            let reason = format!(
+                "admission: {}",
+                super::admission::decision_reason(&admission.decision)
+            );
             let action = if admission.decision.outcome == AdmissionOutcome::Deferred {
                 "deferred"
             } else {

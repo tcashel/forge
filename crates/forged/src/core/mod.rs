@@ -35,7 +35,7 @@ pub(crate) mod workstore;
 
 use forged_ledger::{DesiredSubjectKind, EffectClass, Ledger, LedgerError, OperationOutcome};
 use forged_proto::{PortError, ProtoError};
-use forged_types::{ErrorCode, OpError, OperationRequest, OperationResponse};
+use forged_types::{ErrorCode, OpError, OperationRequest, OperationResponse, RemedyV1};
 use serde_json::{Map, Value};
 
 use crate::config::ForgedConfig;
@@ -947,6 +947,26 @@ pub fn err_response(operation_id: &str, failure: &Failure) -> OperationResponse 
             message: failure.message.clone(),
             recoverable: failure.recoverable,
             detail: None,
+        }),
+    }
+}
+
+/// Build a refusal carrying one honesty-tested structured remedy.
+pub(crate) fn remedy_response(
+    operation_id: &str,
+    failure: &Failure,
+    remedy: RemedyV1,
+) -> OperationResponse {
+    OperationResponse {
+        ok: false,
+        operation_id: operation_id.to_owned(),
+        reused: false,
+        result: None,
+        error: Some(OpError {
+            code: failure.code,
+            message: failure.message.clone(),
+            recoverable: failure.recoverable,
+            detail: Some(serde_json::to_value(remedy).expect("forged.remedy/1 always serializes")),
         }),
     }
 }

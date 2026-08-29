@@ -15,7 +15,7 @@ use forged_types::{
     AttentionAcknowledgementV1, AttentionActionCode, AttentionCondition, AttentionEvidenceKind,
     AttentionEvidenceRefV1, AttentionItemV1, AttentionOwner, AttentionRecommendedActionV1,
     AttentionResolutionDisposition, AttentionResolutionV1, AttentionSeverity, AttentionState,
-    AttentionSubjectKind, ATTENTION_ITEM_SCHEMA_V1,
+    AttentionSubjectKind, OperationActionV1, ATTENTION_ITEM_SCHEMA_V1,
 };
 use serde_json::{json, Value};
 
@@ -195,6 +195,46 @@ pub(crate) fn policy(
     )
 }
 
+/// Closed recommendation-code to domain-verb table. A new code stays
+/// non-executable until its transition has an end-to-end honesty test.
+pub(crate) fn recommendation_actions(
+    recommendation: &AttentionRecommendedActionV1,
+    work_id: Option<&str>,
+) -> Vec<OperationActionV1> {
+    use AttentionActionCode as Action;
+    let (verb, args) = match recommendation.code {
+        Action::ResolveBlocker => {
+            let Some(work_id) = work_id else {
+                return Vec::new();
+            };
+            ("work reopen", json!({"id": work_id}))
+        }
+        Action::ProvideInput
+        | Action::ReconcileWork
+        | Action::ReclaimAttempt
+        | Action::AdjudicateQuarantine
+        | Action::MergePullRequest
+        | Action::RepairPricing
+        | Action::RecoverController
+        | Action::ReauthorizeWork
+        | Action::RepairGate
+        | Action::ReviseRoster
+        | Action::WaitForProvider
+        | Action::WaitForCapacity
+        | Action::AdjudicateEffect
+        | Action::RepairEvidence
+        | Action::AdjudicateReview => return Vec::new(),
+    };
+    let Value::Object(args) = args else {
+        unreachable!("attention action args are objects")
+    };
+    vec![OperationActionV1 {
+        verb: verb.to_owned(),
+        args,
+        reason: recommendation.text.clone(),
+    }]
+}
+
 fn subject_kind(entry: &Value) -> AttentionSubjectKind {
     if entry.get("kind").and_then(Value::as_str) == Some("epic") {
         AttentionSubjectKind::Epic
@@ -292,6 +332,10 @@ fn collect_domain_sources(
         .iter()
         .filter_map(|entry| Some((entry.get("id")?.as_str()?.to_owned(), entry)))
         .collect();
+    let work_by_id: BTreeMap<&str, &IssueSummary> = work
+        .iter()
+        .map(|issue| (issue.id.as_str(), issue))
+        .collect();
     let mut raw = Vec::new();
 
     // Latest input event wins by append order. Resolution self-clears it.
@@ -353,26 +397,36 @@ fn collect_domain_sources(
             .unwrap_or_default();
         let cursor = settlement_cursor(snapshot, id);
         match outcome {
-            Some("blocked") => add_raw(
-                &mut raw,
-                &entries,
-                id,
-                AttentionCondition::Blocked,
-                updated,
-                updated,
-                cursor,
-                format!("settlement:{cursor}:blocked"),
-                format!(
-                    "run is blocked: {}",
-                    entry
-                        .get("stopReason")
-                        .and_then(Value::as_str)
-                        .unwrap_or("no reason recorded")
-                ),
-                json!({"outcome": "blocked", "reason": entry.get("stopReason")}),
-                AttentionEvidenceKind::Event,
-                cursor.to_string(),
-            ),
+            Some("blocked") => {
+                let live_status = entry
+                    .get("beadId")
+                    .and_then(Value::as_str)
+                    .and_then(|work_id| work_by_id.get(work_id))
+                    .map(|issue| issue.status.as_str());
+                if live_status.is_some_and(|status| status != "blocked") {
+                    continue;
+                }
+                add_raw(
+                    &mut raw,
+                    &entries,
+                    id,
+                    AttentionCondition::Blocked,
+                    updated,
+                    updated,
+                    cursor,
+                    format!("settlement:{cursor}:blocked"),
+                    format!(
+                        "run is blocked: {}",
+                        entry
+                            .get("stopReason")
+                            .and_then(Value::as_str)
+                            .unwrap_or("no reason recorded")
+                    ),
+                    json!({"outcome": "blocked", "reason": entry.get("stopReason")}),
+                    AttentionEvidenceKind::Event,
+                    cursor.to_string(),
+                );
+            }
             Some("input-required") => add_raw(
                 &mut raw,
                 &entries,
@@ -867,7 +921,10 @@ fn collect_domain_sources(
             updated,
             i64::from(decision.control_revision as u32),
             format!("admission:{}", decision.batch_id),
-            format!("provider admission deferred: {:?}", decision.reason),
+            format!(
+                "provider admission deferred: {}",
+                super::admission::decision_reason(decision)
+            ),
             serde_json::to_value(decision).unwrap_or(Value::Null),
             AttentionEvidenceKind::AdmissionDecision,
             &decision.batch_id,
@@ -921,8 +978,8 @@ fn collect_domain_sources(
             event.event_id,
             format!("event:{}", event.event_id),
             format!(
-                "run is parked: packet {packet_id} admission deferred ({:?})",
-                decision.reason
+                "run is parked: packet {packet_id} admission deferred ({})",
+                super::admission::decision_reason(decision)
             ),
             json!({
                 "packetId": packet_id,
@@ -1239,6 +1296,19 @@ pub(crate) fn project_all(
     work: &[IssueSummary],
 ) -> Result<Vec<AttentionItemV1>, Failure> {
     let raw = collect_domain_sources(snapshot, entries, work)?;
+    let blocked_work: BTreeSet<&str> = work
+        .iter()
+        .filter(|issue| issue.status == "blocked")
+        .map(|issue| issue.id.as_str())
+        .collect();
+    let work_by_subject: BTreeMap<&str, &str> = entries
+        .iter()
+        .filter_map(|entry| {
+            let subject = entry.get("id")?.as_str()?;
+            let work_id = entry.get("beadId")?.as_str()?;
+            blocked_work.contains(work_id).then_some((subject, work_id))
+        })
+        .collect();
     let mut buckets: BTreeMap<
         (AttentionSubjectKind, String, AttentionCondition),
         Vec<RawAttention>,
@@ -1284,6 +1354,11 @@ pub(crate) fn project_all(
         let updated_at = transition
             .updated_at
             .unwrap_or_else(|| latest.updated_at.clone());
+        let recommended_action = latest.action.clone();
+        let next_actions = recommendation_actions(
+            &recommended_action,
+            work_by_subject.get(subject_id.as_str()).copied(),
+        );
         projected.push(Projected {
             source_cursor: latest.source_cursor,
             item: AttentionItemV1 {
@@ -1313,7 +1388,8 @@ pub(crate) fn project_all(
                 },
                 evidence: latest.evidence.clone(),
                 evidence_refs,
-                recommended_action: latest.action.clone(),
+                recommended_action,
+                next_actions,
                 acknowledgement: transition.acknowledgement,
                 resolution: transition.resolution,
             },
@@ -1472,6 +1548,7 @@ mod tests {
             resource_class: AdmissionResourceClass::RepositoryWrite,
             outcome: AdmissionOutcome::Deferred,
             reason: AdmissionReason::RateLimitCeiling,
+            reason_detail: None,
             policy_revision: "policy".to_owned(),
             evidence: AdmissionCapacityV1::default(),
             next_eligible_wake_at: None,
@@ -1703,6 +1780,7 @@ mod tests {
             resource_class: AdmissionResourceClass::RepositoryWrite,
             outcome,
             reason,
+            reason_detail: None,
             policy_revision: "policy".to_owned(),
             evidence: AdmissionCapacityV1::default(),
             next_eligible_wake_at: None,
@@ -1740,7 +1818,10 @@ mod tests {
             .find(|item| item.condition == AttentionCondition::AdmissionDeferred)
             .expect("parked deferral item");
         assert_eq!(item.subject_id, "run-park");
-        assert!(item.detail.contains("RepositoryWriteCapacity"), "{item:?}");
+        assert!(
+            item.detail.contains("repository-write-capacity"),
+            "{item:?}"
+        );
 
         // The admit is the domain transition that clears the entry.
         snapshot.admission_decisions[0] = packet_decision(

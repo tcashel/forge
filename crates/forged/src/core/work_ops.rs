@@ -99,6 +99,57 @@ fn snapshot_json(snapshot: &WorkItemSnapshot, next_steps: &[&str]) -> Value {
     })
 }
 
+fn projection_actions(snapshot: &WorkItemSnapshot) -> Vec<forged_types::OperationActionV1> {
+    let actions = match snapshot.status {
+        WorkStatus::Open => {
+            let repository = snapshot.metadata.get("repository");
+            vec![
+                (
+                    "run start",
+                    json!({
+                        "work": snapshot.work_id,
+                        "repo": repository,
+                    }),
+                    if repository.is_some() {
+                        "start a run once the work specification is complete"
+                    } else {
+                        "choose the repository before starting the run"
+                    },
+                ),
+                (
+                    "work update",
+                    json!({
+                        "id": snapshot.work_id,
+                        "expectedRevision": snapshot.revision,
+                        "description": Value::Null,
+                    }),
+                    "supply at least one spec field or priority under the \
+                     current revision guard",
+                ),
+            ]
+        }
+        WorkStatus::Blocked | WorkStatus::Closed => vec![(
+            "work reopen",
+            json!({"id": snapshot.work_id}),
+            "reopen the work item before scheduling it",
+        )],
+        WorkStatus::InProgress | WorkStatus::Deferred => Vec::new(),
+    };
+    actions
+        .into_iter()
+        .map(|(verb, args, reason)| {
+            let Value::Object(args) = args else {
+                unreachable!("work next-action args are objects")
+            };
+            forged_types::OperationActionV1 {
+                verb: verb.to_owned(),
+                args,
+                reason: reason.to_owned(),
+            }
+        })
+        .collect()
+}
+
 fn metadata_of(
     params: &serde_json::Map<String, Value>,
 ) -> Result<BTreeMap<String, String>, Failure> {
@@ -974,6 +1025,7 @@ pub async fn work_show(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
             "work": snapshot,
             "dependencies": deps,
             "notesCount": notes_count,
+            "nextActions": projection_actions(&snapshot),
         }))
     })
     .await

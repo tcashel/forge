@@ -1552,6 +1552,7 @@ fn observation_attention(
     review: &ReviewProjection,
     results: &BTreeMap<i64, PacketResult>,
     subject_title: &forged_types::WorkTitleV1,
+    live_work: Option<&super::work_types::IssueSummary>,
 ) -> Result<Vec<Value>, Failure> {
     let mut sources = Vec::new();
     let artifacts = snapshot
@@ -1563,6 +1564,13 @@ fn observation_attention(
     for run in &snapshot.runs {
         let (kind, subject, repository) = attention_subject(snapshot, &run.run_id);
         let condition = match run.terminal_outcome {
+            Some(RunOutcome::Blocked)
+                if snapshot.subject.kind == forged_types::WorkIdentitySubjectKind::Run
+                    && run.run_id == snapshot.subject.id
+                    && live_work.is_some_and(|work| work.status != "blocked") =>
+            {
+                None
+            }
             Some(RunOutcome::Blocked) => Some(AttentionCondition::Blocked),
             Some(RunOutcome::InputRequired) => Some(AttentionCondition::InputRequired),
             _ => None,
@@ -1748,7 +1756,10 @@ fn observation_attention(
             snapshot.identity.captured_at.clone(),
             i64::from(decision.control_revision as u32),
             format!("admission:{}", decision.batch_id),
-            format!("provider admission deferred: {:?}", decision.reason),
+            format!(
+                "provider admission deferred: {}",
+                super::admission::decision_reason(decision)
+            ),
             serde_json::to_value(decision).map_err(|error| {
                 Failure::internal(format!("serializing admission decision: {error}"))
             })?,
@@ -1810,8 +1821,8 @@ fn observation_attention(
                         event.event_id,
                         format!("event:{}", event.event_id),
                         format!(
-                            "run is parked: packet {packet_id} admission deferred ({:?})",
-                            decision.reason
+                            "run is parked: packet {packet_id} admission deferred ({})",
+                            super::admission::decision_reason(decision)
                         ),
                         json!({
                             "packetId": packet_id,
@@ -2220,6 +2231,16 @@ fn observation_attention(
         evidence_refs.dedup();
         evidence_refs.truncate(ATTENTION_EVIDENCE_CAP);
         let (severity, owner, action) = super::attention::policy(condition);
+        let action_work_id = if condition == AttentionCondition::Blocked
+            && subject_kind == AttentionSubjectKind::Run
+            && subject_id == snapshot.subject.id
+            && live_work.is_some_and(|work| work.status == "blocked")
+        {
+            live_work.map(|work| work.id.as_str())
+        } else {
+            None
+        };
+        let next_actions = super::attention::recommendation_actions(&action, action_work_id);
         let mut item = AttentionItemV1 {
             schema: ATTENTION_ITEM_SCHEMA_V1.to_owned(),
             legacy_id: subject_id.clone(),
@@ -2258,6 +2279,7 @@ fn observation_attention(
             evidence: latest.evidence.clone(),
             evidence_refs,
             recommended_action: action,
+            next_actions,
             acknowledgement: None,
             resolution: None,
         };
@@ -2304,7 +2326,7 @@ async fn project_work_detail(
     ctx: &Ctx,
     snapshot: WorkObservationSnapshot,
 ) -> Result<Value, Failure> {
-    let live_title = crate::core::workstore::list_issues(
+    let live_work = crate::core::workstore::list_issues(
         &ctx.ledger,
         std::slice::from_ref(&snapshot.identity.work.id),
     )
@@ -2314,9 +2336,11 @@ async fn project_work_detail(
         issues
             .into_iter()
             .find(|issue| issue.id == snapshot.identity.work.id)
-    })
-    .map(|issue| issue.title);
-    let title_source = forged_types::resolve_work_title(&snapshot.identity, live_title.as_deref());
+    });
+    let title_source = forged_types::resolve_work_title(
+        &snapshot.identity,
+        live_work.as_ref().map(|issue| issue.title.as_str()),
+    );
     let work_ref = WorkRefV1::new(
         match snapshot.subject.kind {
             forged_types::WorkIdentitySubjectKind::Run => WorkRefKind::Run,
@@ -2328,7 +2352,13 @@ async fn project_work_detail(
     let decoded = decode_packets_and_results(&snapshot)?;
     let review = review_projection(&snapshot, &decoded.packets, &decoded.results);
     let gates = gate_rows(&decoded.results);
-    let attention = observation_attention(&snapshot, &review, &decoded.results, &title_source)?;
+    let attention = observation_attention(
+        &snapshot,
+        &review,
+        &decoded.results,
+        &title_source,
+        live_work.as_ref(),
+    )?;
 
     let (status, delivery) = match snapshot.subject.kind {
         forged_types::WorkIdentitySubjectKind::Run => {

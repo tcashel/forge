@@ -773,6 +773,7 @@ mod tests {
                     resource_class: AdmissionResourceClass::Read,
                     outcome: AdmissionOutcome::Admitted,
                     reason: AdmissionReason::CapacityAvailable,
+                    reason_detail: None,
                     policy_revision: "policy".to_owned(),
                     evidence: AdmissionCapacityV1::default(),
                     next_eligible_wake_at: None,
