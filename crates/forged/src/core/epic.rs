@@ -22,7 +22,7 @@ use sha2::{Digest, Sha256};
 use crate::adapters::ports::github_remote;
 use crate::core::{
     default_key, derive_key, err_response, fenced, ok_response, on_ledger, param_opt_str,
-    param_str, read_only, Ctx, Failure,
+    param_str, read_only, remedy_response, Ctx, Failure,
 };
 
 // STARTED and the three lifecycle kinds below are `pub(super)` because the
@@ -2039,10 +2039,7 @@ async fn status_json(ctx: &Ctx, view: EpicView) -> Result<Value, Failure> {
             if let Some(decision) =
                 admission.filter(|decision| decision.outcome == AdmissionOutcome::Deferred)
             {
-                let reason = serde_json::to_value(decision.reason)
-                    .ok()
-                    .and_then(|value| value.as_str().map(str::to_owned))
-                    .unwrap_or_else(|| "deferred".to_owned());
+                let reason = super::admission::decision_reason(decision);
                 *deferred_reasons.entry(reason).or_insert(0) += 1;
             }
         }
@@ -5201,9 +5198,16 @@ async fn advance_once(ctx: &Ctx, epic: &str) -> Result<Step, Failure> {
                 child.id.clone(),
                 "child-controller-held",
                 format!(
-                    "detached child cannot progress: desired={:?}, admission={:?}",
+                    "detached child cannot progress: desired={:?}, admission={}",
                     desired_row.and_then(|row| row.last_outcome),
-                    decision.map(|row| (row.outcome, row.reason))
+                    decision.map_or_else(
+                        || "none".to_owned(),
+                        |row| format!(
+                            "{:?}/{}",
+                            row.outcome,
+                            super::admission::decision_reason(row)
+                        )
+                    )
                 ),
             ));
         } else {
@@ -5673,16 +5677,18 @@ async fn control_event(
     };
     let control_epoch = match epic_events(ctx, &epic).await {
         Ok(events) => {
-            let predecessor = if kind == PAUSED { RESUMED } else { PAUSED };
-            let completed = events
+            let completed = events.iter().filter(|event| event.kind == kind).count();
+            let boundary = events
                 .iter()
-                .filter(|event| event.kind == predecessor)
-                .count();
-            let epoch = if kind == PAUSED {
-                completed.saturating_add(1)
-            } else {
-                completed
-            };
+                .rposition(|event| event.kind == ABANDONED)
+                .map(|index| index + 1)
+                .unwrap_or(0);
+            let already_current = events[boundary..]
+                .iter()
+                .rev()
+                .find(|event| event.kind == PAUSED || event.kind == RESUMED)
+                .is_some_and(|event| event.kind == kind);
+            let epoch = completed.saturating_add(usize::from(!already_current));
             i64::try_from(epoch).unwrap_or(i64::MAX)
         }
         Err(error) => return err_response(&derive_key(name, Some(&epic), None, None), &error),
@@ -5801,8 +5807,8 @@ pub async fn epic_abandon(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
     }
     // The current epoch must actually be started: abandoning nothing is a
     // refusal, not a no-op — the operator asked to end something specific.
-    match epoch_events(ctx, &epic).await {
-        Ok(events) if events.iter().any(|event| event.kind == STARTED) => {}
+    let events = match epoch_events(ctx, &epic).await {
+        Ok(events) if events.iter().any(|event| event.kind == STARTED) => events,
         Ok(_) => {
             return err_response(
                 &key,
@@ -5810,10 +5816,36 @@ pub async fn epic_abandon(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
             )
         }
         Err(error) => return err_response(&key, &error),
+    };
+    let paused = events
+        .iter()
+        .rev()
+        .find(|event| event.kind == PAUSED || event.kind == RESUMED)
+        .is_some_and(|event| event.kind == PAUSED);
+    if !paused {
+        let failure = Failure::refused(
+            ErrorCode::WorkContention,
+            format!("epic {epic:?} must be paused before it can be abandoned"),
+        );
+        let Value::Object(args) = json!({
+            "epic": epic,
+            "reason": "pause before abandoning this epic",
+        }) else {
+            unreachable!("epic pause remedy args are an object")
+        };
+        return remedy_response(
+            &key,
+            &failure,
+            forged_types::RemedyV1::from(forged_types::OperationActionV1 {
+                verb: "epic pause".to_owned(),
+                args,
+                reason: "pause the live controller before abandoning the epic".to_owned(),
+            }),
+        );
     }
-    // The driver slot is the liveness fence: a live controller holds it and
-    // this refuses with contention — stop or pause the epic first. A dead
-    // holder is force-released by acquisition itself.
+    // Pause is durable; the driver slot closes the final boundary race while
+    // the detached controller observes it and releases custody. A dead holder
+    // is force-released by acquisition itself.
     let _guard = match acquire_driver(ctx, &epic).await {
         Ok(guard) => guard,
         Err(error) => return err_response(&key, &error),

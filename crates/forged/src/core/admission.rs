@@ -336,6 +336,55 @@ fn usage_reason(
     None
 }
 
+fn reason_detail(candidate: &AdmissionCandidateV1, reason: AdmissionReason) -> Option<String> {
+    match reason {
+        AdmissionReason::WorkMalformed => {
+            let mut missing = Vec::new();
+            if candidate.priority.is_none() {
+                missing.push("priority");
+            }
+            if candidate.work_revision.is_none() {
+                missing.push("revision");
+            }
+            if candidate.repository.trim().is_empty()
+                || candidate
+                    .work_repository
+                    .as_deref()
+                    .is_none_or(str::is_empty)
+            {
+                missing.push("repository");
+            }
+            if candidate.provider.as_deref().is_none_or(str::is_empty) {
+                missing.push("provider");
+            }
+            if candidate.model.as_deref().is_none_or(str::is_empty) {
+                missing.push("model");
+            }
+            Some(if missing.is_empty() {
+                "one or more required work fields are malformed".to_owned()
+            } else {
+                format!("missing required field(s): {}", missing.join(", "))
+            })
+        }
+        AdmissionReason::WorkNotRunnable => Some(format!(
+            "status is not runnable: {}",
+            candidate.work_status.as_deref().unwrap_or("missing")
+        )),
+        _ => None,
+    }
+}
+
+pub(crate) fn decision_reason(decision: &AdmissionDecisionV1) -> String {
+    let reason = serde_json::to_value(decision.reason)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "admission-deferred".to_owned());
+    decision
+        .reason_detail
+        .as_ref()
+        .map_or(reason.clone(), |detail| format!("{reason}: {detail}"))
+}
+
 pub(crate) fn evaluate(
     mut inputs: AdmissionInputsV1,
     policy: &AdmissionPolicy,
@@ -437,6 +486,7 @@ pub(crate) fn evaluate(
             resource_class: candidate.resource_class,
             outcome,
             reason,
+            reason_detail: reason_detail(candidate, reason),
             policy_revision: inputs.policy_revision.clone(),
             evidence,
             next_eligible_wake_at: wake,
@@ -928,6 +978,60 @@ mod tests {
             assert_eq!(decisions[0].reason, reason);
             assert!(decisions[0].next_eligible_wake_at.is_some());
         }
+    }
+
+    #[test]
+    fn malformed_and_unrunnable_decisions_name_the_failing_fields() {
+        let policy = AdmissionPolicy::default();
+        let mut malformed = candidate("missing-priority", 0, "codex");
+        malformed.priority = None;
+        let inputs = AdmissionInputsV1 {
+            schema: ADMISSION_INPUTS_SCHEMA_V1.to_owned(),
+            as_of: "2030-01-01T00:00:00.000000000Z".to_owned(),
+            policy_revision: "p".to_owned(),
+            ledger_revision: "l".to_owned(),
+            candidates: vec![malformed],
+            capacity: AdmissionCapacityV1::default(),
+            spend: vec![],
+            latest_rate_limits: vec![],
+        };
+        let invalid = BTreeMap::from([(
+            (AdmissionSubjectKind::Run, "missing-priority".to_owned()),
+            AdmissionReason::WorkMalformed,
+        )]);
+        let (_, decisions) = evaluate(inputs, &policy, &invalid).expect("evaluate malformed");
+        assert_eq!(decisions[0].outcome, AdmissionOutcome::Deferred);
+        assert_eq!(decisions[0].reason, AdmissionReason::WorkMalformed);
+        assert_eq!(
+            decisions[0].reason_detail.as_deref(),
+            Some("missing required field(s): priority")
+        );
+        assert_eq!(
+            decision_reason(&decisions[0]),
+            "bead-malformed: missing required field(s): priority"
+        );
+
+        let mut unrunnable = candidate("blocked-work", 0, "codex");
+        unrunnable.work_status = Some("blocked".to_owned());
+        let inputs = AdmissionInputsV1 {
+            schema: ADMISSION_INPUTS_SCHEMA_V1.to_owned(),
+            as_of: "2030-01-01T00:00:00.000000000Z".to_owned(),
+            policy_revision: "p".to_owned(),
+            ledger_revision: "l".to_owned(),
+            candidates: vec![unrunnable],
+            capacity: AdmissionCapacityV1::default(),
+            spend: vec![],
+            latest_rate_limits: vec![],
+        };
+        let invalid = BTreeMap::from([(
+            (AdmissionSubjectKind::Run, "blocked-work".to_owned()),
+            AdmissionReason::WorkNotRunnable,
+        )]);
+        let (_, decisions) = evaluate(inputs, &policy, &invalid).expect("evaluate unrunnable");
+        assert_eq!(
+            decisions[0].reason_detail.as_deref(),
+            Some("status is not runnable: blocked")
+        );
     }
 
     #[test]

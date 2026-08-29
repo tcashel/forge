@@ -179,6 +179,10 @@ pub struct AttentionItemV1 {
     pub evidence: serde_json::Value,
     pub evidence_refs: Vec<AttentionEvidenceRefV1>,
     pub recommended_action: AttentionRecommendedActionV1,
+    /// Closed, executable mapping of `recommended_action`; empty when that
+    /// action code has no honesty-tested domain verb.
+    #[serde(default)]
+    pub next_actions: Vec<crate::OperationActionV1>,
     pub acknowledgement: Option<AttentionAcknowledgementV1>,
     pub resolution: Option<AttentionResolutionV1>,
 }

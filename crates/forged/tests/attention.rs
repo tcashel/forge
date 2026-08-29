@@ -62,6 +62,11 @@ fn attention_is_identical_across_surfaces_and_controls_are_occurrence_fenced() {
     assert_eq!(item["owner"], json!("human"));
     assert_eq!(item["severity"], json!("critical"));
     assert_eq!(item["state"], json!("open"));
+    assert_eq!(
+        item["nextActions"],
+        json!([]),
+        "unmapped recommendation codes advertise no verb"
+    );
     let attention_id = item["attentionId"].as_str().expect("attention id");
     let occurrence_id = item["occurrenceId"].as_str().expect("occurrence id");
 
@@ -147,6 +152,7 @@ fn attention_is_identical_across_surfaces_and_controls_are_occurrence_fenced() {
 fn source_backed_attention_cannot_substitute_for_domain_resolution() {
     let env = TestEnv::new("forged-attention-domain-boundary");
     env.forged(&["init"]);
+    env.set_work_field("bead-attention-blocked", "status", "blocked");
     fabricate_run(&env, "attention-blocked");
     let ledger = env.ledger();
     ledger
@@ -169,6 +175,15 @@ fn source_backed_attention_cannot_substitute_for_domain_resolution() {
                 .find(|item| item["condition"] == json!("blocked"))
         })
         .expect("blocked attention");
+    assert_eq!(
+        blocked["nextActions"],
+        json!([{
+            "verb": "work reopen",
+            "args": {"id": "bead-attention-blocked"},
+            "reason": blocked["recommendedAction"]["text"],
+        }]),
+        "the closed recommendation mapping publishes one domain verb"
+    );
     let (_, refused) = env.forged(&[
         "attention",
         "resolve",
@@ -187,7 +202,23 @@ fn source_backed_attention_cannot_substitute_for_domain_resolution() {
     ]);
     assert_eq!(refused["ok"], json!(false), "{refused}");
     assert_eq!(refused["error"]["code"], json!("INVALID_REQUEST"));
+    let remedy = &refused["error"]["detail"];
+    assert_eq!(remedy["schema"], json!("forged.remedy/1"), "{refused}");
+    assert_eq!(remedy["verb"], json!("work reopen"), "{refused}");
+    assert_eq!(remedy["args"], json!({"id": "bead-attention-blocked"}));
+    assert_eq!(
+        remedy["reason"], blocked["recommendedAction"]["text"],
+        "the remedy preserves the stored recommendation text"
+    );
     assert_eq!(overview(&env)["attentionTotal"], json!(1));
+
+    let id = remedy["args"]["id"].as_str().expect("remedy work id");
+    let (code, reopened) = env.forged(&["work", "reopen", "--id", id]);
+    assert_eq!(code, 0, "advertised work reopen succeeds: {reopened}");
+    assert!(
+        attention(&overview(&env), "attention-blocked", "blocked").is_none(),
+        "the advertised domain transition clears the condition"
+    );
 }
 
 #[test]

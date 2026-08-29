@@ -1045,8 +1045,8 @@ pub async fn execute_packet(
         return Err(Failure {
             code: ErrorCode::OperationInProgress,
             message: format!(
-                "packet {packet_id} deferred by admission: {:?}",
-                admission.decision.reason
+                "packet {packet_id} deferred by admission: {}",
+                crate::core::admission::decision_reason(&admission.decision)
             ),
             recoverable: true,
         });

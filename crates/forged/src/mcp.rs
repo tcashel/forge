@@ -1237,7 +1237,10 @@ impl ForgedServer {
     }
 
     /// Read-only run projection.
-    #[tool(name = "run_status", description = "Project a run's current state.")]
+    #[tool(
+        name = "run_status",
+        description = "Project a run's current state and honesty-tested nextActions."
+    )]
     pub async fn run_status(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
         self.call("run_status", args.0).await
     }
@@ -1359,6 +1362,7 @@ impl ForgedServer {
     #[tool(
         name = "overview",
         description = "Project one slice or epic with workers, evidence, usage, and events. \
+                       Run status and mapped attention items carry nextActions. \
                        At most one of params.run, params.epic, or params.id is accepted, and \
                        omitting all three projects the portfolio: every run and epic, newest \
                        first, with an attention rail. params.id resolves either kind and \
@@ -1374,7 +1378,7 @@ impl ForgedServer {
     /// Bounded operator queue and live-plan projection.
     #[tool(
         name = "operations_overview",
-        description = "Project bounded planned, queued, active, blocked, and mergeable work. Optional params.repo, params.group, params.source, and params.limit filters never widen on invalid input.",
+        description = "Project bounded planned, queued, active, blocked, and mergeable work. Attention items carry honesty-tested nextActions when their recommendation code has a mapped domain verb. Optional params.repo, params.group, params.source, and params.limit filters never widen on invalid input.",
         meta = operations_overview_tool_meta()
     )]
     pub async fn operations_overview(
@@ -1537,8 +1541,8 @@ impl ForgedServer {
     #[tool(
         name = "epic_abandon",
         description = "Typed terminal exit for a started epic whose start was structurally \
-                       wrong. params: epic, reason. Refuses while a live controller holds \
-                       the driver slot (stop or pause first). A fresh epic_start then opens \
+                       wrong. params: epic, reason. Refuses until epic_pause has durably \
+                       paused the current epoch. A fresh epic_start then opens \
                        a clean epoch; started children settle through their own runs."
     )]
     pub async fn epic_abandon(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
@@ -1681,8 +1685,9 @@ impl ForgedServer {
     #[tool(
         name = "work_show",
         description = "One work item's current snapshot plus hydrated dependencies — the \
-                       read-only bd show replacement. params: id. Returns notesCount but never \
-                       note bodies; retrieve those with work_note_list."
+                       read-only bd show replacement — and honesty-tested nextActions. params: \
+                       id. Returns notesCount but never note bodies; retrieve those with \
+                       work_note_list."
     )]
     pub async fn work_show(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
         self.call("work_show", args.0).await
@@ -1708,6 +1713,7 @@ impl ForgedServer {
         description = "List all forged work — every slice run and every started epic, live and \
                        historical, each labelled slice or epic. Takes no id: this is how a \
                        caller with no prior knowledge discovers the ids the other tools require. \
+                       Attention items include mapped nextActions. \
                        Optional params.repo, params.status, and params.assignee are exact, \
                        composable work-store filters."
     )]
@@ -1740,7 +1746,7 @@ impl ForgedServer {
     /// Durable subject projection for the Work Detail App.
     #[tool(
         name = "work_detail",
-        description = "Project one durable run or epic. Address it with EXACTLY one form: the exact params.subjectKind + params.subjectId pair, or a bare params.id resolved against the durable inventory (an exact id beats any prefix, a unique prefix resolves, anything else answers with resolution candidates). params.after and params.limit page its event tail.",
+        description = "Project one durable run or epic, including mapped attention nextActions. Address it with EXACTLY one form: the exact params.subjectKind + params.subjectId pair, or a bare params.id resolved against the durable inventory (an exact id beats any prefix, a unique prefix resolves, anything else answers with resolution candidates). params.after and params.limit page its event tail.",
         meta = work_detail_tool_meta()
     )]
     pub async fn work_detail(&self, args: Parameters<WorkDetailArgs>) -> CallToolResult {
@@ -1752,7 +1758,8 @@ impl ForgedServer {
     #[tool(
         name = "attention_list",
         description = "List attention items grouped by condition, decision groups before symptom \
-                       groups, items oldest first, truncation always stated. Optional exact \
+                       groups, items oldest first, truncation always stated, with nextActions \
+                       only for honesty-tested recommendation mappings. Optional exact \
                        params.repo and params.condition filters, closed params.state \
                        (active, open, all) and params.classification (decision, symptom), \
                        and params.limit up to 500."

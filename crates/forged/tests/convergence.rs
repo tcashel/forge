@@ -844,7 +844,7 @@ fn capacity_deferral_parks_the_controller_instead_of_recycling() {
     assert!(
         parked_items[0]["detail"]
             .as_str()
-            .is_some_and(|detail| detail.contains("RepositoryWriteCapacity")),
+            .is_some_and(|detail| detail.contains("repository-write-capacity")),
         "the entry names the admission reason: {parked_items:?}"
     );
 

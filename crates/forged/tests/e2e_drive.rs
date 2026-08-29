@@ -11,7 +11,7 @@ mod support;
 
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use support::{assert_no_overlap, git, render_cost, require_node, rev_parse, TestEnv};
+use support::{assert_no_overlap, git, render_cost, require_node, rev_parse, McpClient, TestEnv};
 
 fn canonical_json_and_sha(value: &Value) -> (String, String) {
     let bytes = forged_types::canonical_json_bytes(value).expect("canonical fixture JSON");
@@ -188,7 +188,15 @@ fn epic_drive_runs_ready_children_merges_integration_and_stops_at_one_draft_pr()
     assert_eq!(started["result"]["schema"], json!("forged.epic/1"));
 
     env.set_scenario("implement", "slow", 1);
-    let (code, submitted) = env.forged(&["epic", "submit", "--epic", "epic-one"]);
+    let submit_key = "epic-one-generation-one";
+    let (code, submitted) = env.forged(&[
+        "epic",
+        "submit",
+        "--epic",
+        "epic-one",
+        "--idempotency-key",
+        submit_key,
+    ]);
     assert_eq!(code, 0, "epic submit: {submitted}");
     assert_eq!(submitted["result"]["submitted"], json!(true));
     assert_eq!(submitted["result"]["controller"]["host"], json!("process"));
@@ -210,26 +218,98 @@ fn epic_drive_runs_ready_children_merges_integration_and_stops_at_one_draft_pr()
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
     assert!(provider_started, "detached epic reached a live provider");
-    let (code, paused) = env.forged(&[
+
+    let controller_pid = submitted["result"]["controller"]["driver"]["pid"]
+        .as_i64()
+        .and_then(|pid| i32::try_from(pid).ok())
+        .expect("epic controller pid");
+    nix::sys::signal::killpg(
+        nix::unistd::Pid::from_raw(controller_pid),
+        nix::sys::signal::Signal::SIGKILL,
+    )
+    .expect("kill first epic controller group");
+    wait_for(&env, &["epic", "status", "--epic", "epic-one"], |value| {
+        matches!(
+            value["result"]["controller"]["state"].as_str(),
+            Some("exited" | "vanished")
+        )
+    });
+
+    let (code, stale) = env.forged(&[
         "epic",
-        "pause",
+        "submit",
+        "--epic",
+        "epic-one",
+        "--idempotency-key",
+        submit_key,
+    ]);
+    assert_ne!(code, 0, "stale epic submit key must refuse: {stale}");
+    assert_eq!(stale["error"]["code"], json!("IDEMPOTENCY_CONFLICT"));
+    let submit_remedy = &stale["error"]["detail"];
+    assert_eq!(
+        submit_remedy,
+        &json!({
+            "schema": "forged.remedy/1",
+            "verb": "epic submit",
+            "args": {"epic": "epic-one"},
+            "reason": "omit the idempotency key so forged can mint the next controller generation",
+        })
+    );
+    env.set_scenario("implement", "slow", 1);
+    let mut mcp = McpClient::new(&env);
+    let resubmitted = mcp.call_tool(
+        "epic_submit",
+        json!({"schemaVersion": 1, "params": submit_remedy["args"]}),
+    );
+    assert_eq!(
+        resubmitted["ok"],
+        json!(true),
+        "advertised keyless epic resubmit succeeds: {resubmitted}"
+    );
+    assert_eq!(resubmitted["result"]["controller"]["generation"], json!(2));
+
+    let (code, refused) = env.forged(&[
+        "epic",
+        "abandon",
         "--epic",
         "epic-one",
         "--reason",
-        "operator checkpoint",
+        "the integration geometry is wrong",
     ]);
+    assert_ne!(code, 0, "live-controller abandon must refuse: {refused}");
+    assert_eq!(refused["error"]["code"], json!("BEADS_CONTENTION"));
+    let remedy = &refused["error"]["detail"];
     assert_eq!(
-        code, 0,
-        "out-of-band pause while controller owns slot: {paused}"
+        remedy,
+        &json!({
+            "schema": "forged.remedy/1",
+            "verb": "epic pause",
+            "args": {
+                "epic": "epic-one",
+                "reason": "pause before abandoning this epic",
+            },
+            "reason": "pause the live controller before abandoning the epic",
+        })
+    );
+    let paused = mcp.call_tool(
+        "epic_pause",
+        json!({"schemaVersion": 1, "params": remedy["args"]}),
+    );
+    assert_eq!(
+        paused["ok"],
+        json!(true),
+        "advertised epic pause succeeds: {paused}"
     );
     let held = wait_for(&env, &["epic", "status", "--epic", "epic-one"], |value| {
         value["result"]["paused"].is_object()
+            && value["result"]["controller"]["generation"] == json!(2)
             && value["result"]["controller"]["state"] == json!("exited")
     });
     assert!(
         held["result"]["finalPr"].is_null(),
         "pause precedes merge: {held}"
     );
+
     let (code, resumed) = env.forged(&[
         "epic",
         "resume",
@@ -241,7 +321,7 @@ fn epic_drive_runs_ready_children_merges_integration_and_stops_at_one_draft_pr()
     assert_eq!(code, 0, "resume: {resumed}");
     let (code, resubmitted) = env.forged(&["epic", "submit", "--epic", "epic-one"]);
     assert_eq!(code, 0, "epic resubmit: {resubmitted}");
-    assert_eq!(resubmitted["result"]["controller"]["generation"], json!(2));
+    assert_eq!(resubmitted["result"]["controller"]["generation"], json!(3));
 
     let driven = wait_for(&env, &["epic", "status", "--epic", "epic-one"], |value| {
         value["result"]["finalPr"]["number"] == json!(8)

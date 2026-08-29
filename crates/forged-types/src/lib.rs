@@ -45,7 +45,9 @@ pub use contract::{
     MODEL_VALUE_CHARSET_ERROR, PROFILE_SCHEMA_V1, RESOLVED_ROSTER_SCHEMA_V1, ROSTER_SCHEMA_V1,
 };
 pub use controller_env::{CONTROLLER_ENV, OPERATOR_STATE_ENV};
-pub use envelope::{OpError, OperationRequest, OperationResponse};
+pub use envelope::{
+    OpError, OperationActionV1, OperationRequest, OperationResponse, RemedyV1, REMEDY_SCHEMA_V1,
+};
 pub use error::ErrorCode;
 pub use herdr_layout::{
     HerdrLayoutSubjectKind, HerdrLayoutSubjectV1, HerdrLayoutV1, HerdrLayoutValidationError,

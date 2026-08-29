@@ -15,7 +15,7 @@ use nix::errno::Errno;
 use nix::sys::signal::{kill, killpg, Signal};
 use nix::unistd::Pid;
 use serde_json::{json, Value};
-use support::TestEnv;
+use support::{McpClient, TestEnv};
 
 const WAIT: Duration = Duration::from_secs(30);
 // These cases deliberately create and signal detached process groups and
@@ -1723,7 +1723,15 @@ fn nonrecoverable_terminal_halts_without_charging_the_budget() {
     raise_admission_limits(&env);
     start_run(&env, "run-halt");
     env.set_scenario("implement", "hang", 2);
-    let (code, submitted) = env.forged(&["run", "submit", "--run", "run-halt"]);
+    let submit_key = "run-halt-generation-one";
+    let (code, submitted) = env.forged(&[
+        "run",
+        "submit",
+        "--run",
+        "run-halt",
+        "--idempotency-key",
+        submit_key,
+    ]);
     assert_eq!(code, 0, "submit: {submitted}");
     let first_pid = controller_pid(&submitted);
     wait_until("first controller provider start", || {
@@ -1834,10 +1842,45 @@ fn nonrecoverable_terminal_halts_without_charging_the_budget() {
     );
     ledger.close().expect("close");
 
-    // The typed recovery: a bare resubmit authorizes the next control
-    // revision with a fresh budget.
-    let (code, resubmitted) = env.forged(&["run", "submit", "--run", "run-halt"]);
-    assert_eq!(code, 0, "resubmit after halt: {resubmitted}");
+    // Reusing the dead generation's key advertises the exact keyless
+    // recovery. Execute the advertised args unchanged through MCP.
+    let (code, refused) = env.forged(&[
+        "run",
+        "submit",
+        "--run",
+        "run-halt",
+        "--idempotency-key",
+        submit_key,
+    ]);
+    assert_ne!(code, 0, "the stale submit key must refuse: {refused}");
+    assert_eq!(refused["error"]["code"], json!("IDEMPOTENCY_CONFLICT"));
+    assert!(refused["error"]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("omit the idempotency key")));
+    assert!(!refused["error"]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("fresh key")));
+    let remedy = &refused["error"]["detail"];
+    assert_eq!(
+        remedy,
+        &json!({
+            "schema": "forged.remedy/1",
+            "verb": "run submit",
+            "args": {"run": "run-halt"},
+            "reason": "omit the idempotency key so forged can mint the next controller generation",
+        })
+    );
+    let mut mcp = McpClient::new(&env);
+    let resubmitted = mcp.call_tool(
+        "run_submit",
+        json!({"schemaVersion": 1, "params": remedy["args"]}),
+    );
+    assert_eq!(
+        resubmitted["ok"],
+        json!(true),
+        "advertised keyless resubmit succeeds: {resubmitted}"
+    );
+    assert_eq!(resubmitted["result"]["controller"]["generation"], json!(2));
     let ledger = env.ledger();
     let desired = ledger
         .get_desired_work(DesiredSubjectKind::Run, "run-halt")

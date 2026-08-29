@@ -22,8 +22,8 @@ use crate::adapters::ports::{report_json, ForgedPorts};
 use crate::config::{now_iso, stage_str};
 use crate::core::{
     default_key, derive_key, epic, err_response, fenced, key_absent, ok_response, on_ledger,
-    param_opt_str, param_str, read_only, session_claimant, split_packet_key, unfenced_write, Ctx,
-    Failure,
+    param_opt_str, param_str, read_only, remedy_response, session_claimant, split_packet_key,
+    unfenced_write, Ctx, Failure,
 };
 
 // ---------------------------------------------------------------- doctor
@@ -878,6 +878,34 @@ fn run_status_gate_state(view: &forged_proto::RunView) -> Option<&'static str> {
         .map(|(_, state)| state)
 }
 
+fn run_projection_actions(run: &forged_ledger::RunRow) -> Vec<forged_types::OperationActionV1> {
+    let (verb, args, reason) = match run.state {
+        RunState::Active => (
+            "run stop",
+            json!({"run": run.run_id, "outcome": null, "reason": null}),
+            "choose the terminal outcome and reason before stopping the run",
+        ),
+        RunState::Stopped
+            if run.terminal_outcome != Some(forged_ledger::RunOutcome::InputRequired) =>
+        {
+            (
+                "work supersede",
+                json!({"id": run.work_id, "successor": null}),
+                "create the successor first with work create",
+            )
+        }
+        RunState::Stopped => return Vec::new(),
+    };
+    let Value::Object(args) = args else {
+        unreachable!("run next-action args are objects")
+    };
+    vec![forged_types::OperationActionV1 {
+        verb: verb.to_owned(),
+        args,
+        reason: reason.to_owned(),
+    }]
+}
+
 /// `run status` — read-only projection of one run.
 pub async fn run_status(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
     read_only("run_status", req, || async {
@@ -1124,6 +1152,7 @@ pub async fn run_status(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
                     "idempotencyKey": o.idempotency_key,
                 })).collect::<Vec<_>>(),
                 "deadlineKills": deadline_kills,
+                "nextActions": run_projection_actions(&view.run),
                 "nextAction": match protocol_terminal {
                     Some(terminal) if view.accepted_risk.is_none() => json!({"stop": terminal}),
                     _ => match &action {
@@ -1649,8 +1678,8 @@ pub async fn packet_claim(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
                 return Err(Failure {
                     code: ErrorCode::OperationInProgress,
                     message: format!(
-                        "packet {packet_id} deferred by admission: {:?}",
-                        admission.decision.reason
+                        "packet {packet_id} deferred by admission: {}",
+                        super::admission::decision_reason(&admission.decision)
                     ),
                     recoverable: true,
                 });
@@ -4857,7 +4886,17 @@ async fn control_attention(
                 } else {
                     "this source-backed condition clears only through its domain transition"
                 };
-                return err_response(&operation_key, &Failure::invalid(message));
+                let failure = Failure::invalid(message);
+                return item.next_actions.first().cloned().map_or_else(
+                    || err_response(&operation_key, &failure),
+                    |action| {
+                        remedy_response(
+                            &operation_key,
+                            &failure,
+                            forged_types::RemedyV1::from(action),
+                        )
+                    },
+                );
             }
             let disposition_value = match req.params.get("disposition").cloned() {
                 Some(value) => value,

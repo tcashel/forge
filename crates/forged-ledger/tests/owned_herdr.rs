@@ -176,6 +176,7 @@ fn exact_active_controller_reservation_authorizes_pre_spawn_registration() {
         resource_class: AdmissionResourceClass::RepositoryWrite,
         outcome: AdmissionOutcome::Admitted,
         reason: AdmissionReason::CapacityAvailable,
+        reason_detail: None,
         policy_revision: "policy-v1".to_owned(),
         evidence: capacity.clone(),
         next_eligible_wake_at: None,

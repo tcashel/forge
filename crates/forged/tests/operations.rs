@@ -257,6 +257,103 @@ fn run_status_projects_live_position_and_latest_gate_outcome() {
 }
 
 #[test]
+fn run_status_next_actions_execute_after_binding_declared_placeholders() {
+    let env = TestEnv::new("forged-run-status-next-actions");
+    env.forged(&["init"]);
+    let run_id = "status-actions";
+    let work_id = "bead-status-actions";
+    env.set_work_field(work_id, "assignee", "forged:bead-status-actions:0");
+    fabricate_run(&env, run_id);
+
+    let (code, active) = env.forged(&["run", "status", "--run", run_id]);
+    assert_eq!(code, 0, "active status: {active}");
+    let action = &active["result"]["run"]["nextActions"][0];
+    assert_eq!(action["verb"], json!("run stop"));
+    assert_eq!(
+        action["args"],
+        json!({"run": run_id, "outcome": null, "reason": null})
+    );
+    assert!(action["reason"]
+        .as_str()
+        .is_some_and(|reason| reason.contains("outcome") && reason.contains("reason")));
+
+    let bound_outcome = "cancelled";
+    let bound_reason = "remedy honesty fixture";
+    let advertised_run = action["args"]["run"].as_str().expect("advertised run");
+    let (code, stopped) = env.forged(&[
+        "run",
+        "stop",
+        "--run",
+        advertised_run,
+        "--outcome",
+        bound_outcome,
+        "--reason",
+        bound_reason,
+    ]);
+    assert_eq!(code, 0, "advertised run stop succeeds: {stopped}");
+
+    let (code, terminal) = env.forged(&["run", "status", "--run", run_id]);
+    assert_eq!(code, 0, "stopped status: {terminal}");
+    let action = &terminal["result"]["run"]["nextActions"][0];
+    assert_eq!(action["verb"], json!("work supersede"));
+    assert_eq!(
+        action["args"],
+        json!({"id": work_id, "successor": null}),
+        "the successor is a declared placeholder, never a fake id"
+    );
+    assert_eq!(
+        action["reason"],
+        json!("create the successor first with work create")
+    );
+
+    let successor = "status-actions-v2";
+    let (code, created) = env.forged(&[
+        "work",
+        "create",
+        "--id",
+        successor,
+        "--title",
+        "Status action successor",
+    ]);
+    assert_eq!(code, 0, "advertised precondition succeeds: {created}");
+    let advertised_id = action["args"]["id"].as_str().expect("advertised work id");
+    let (code, superseded) = env.forged(&[
+        "work",
+        "supersede",
+        "--id",
+        advertised_id,
+        "--successor",
+        successor,
+    ]);
+    assert_eq!(
+        code, 0,
+        "advertised work supersede succeeds after binding: {superseded}"
+    );
+
+    let held_run = "status-input-required";
+    fabricate_run(&env, held_run);
+    let ledger = env.ledger();
+    ledger
+        .settle_run(
+            held_run,
+            forged_ledger::RunOutcome::InputRequired,
+            "operator input is still required".to_owned(),
+            None,
+            None,
+            None,
+        )
+        .expect("settle input-required fixture");
+    ledger.close().expect("close ledger");
+    let (code, held) = env.forged(&["run", "status", "--run", held_run]);
+    assert_eq!(code, 0, "input-required status: {held}");
+    assert_eq!(
+        held["result"]["run"]["nextActions"],
+        json!([]),
+        "input resolution stays deferred until its artifact records a verb"
+    );
+}
+
+#[test]
 fn adaptive_run_status_prefers_semantic_stage_in_every_packet_position() {
     let env = TestEnv::new("forged-run-status-adaptive-stage");
     env.forged(&["init"]);

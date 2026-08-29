@@ -19,7 +19,7 @@ use serde_json::{json, Value};
 use crate::config::{now_iso, HostPolicy};
 use crate::core::{
     default_key, derive_key, err_response, fenced_authorizing_desired, key_absent, ok_response,
-    on_ledger, param_str, Ctx, DesiredAuthorization, Failure,
+    on_ledger, param_str, remedy_response, Ctx, DesiredAuthorization, Failure,
 };
 
 const CONTROLLER_STARTED: &str = "forged.controller.started";
@@ -69,6 +69,17 @@ impl Scope {
             Scope::Epic => DesiredSubjectKind::Epic,
         }
     }
+}
+
+fn keyless_resubmit_remedy(scope: Scope, id: &str) -> forged_types::RemedyV1 {
+    let mut args = serde_json::Map::new();
+    args.insert(scope.noun().to_owned(), json!(id));
+    forged_types::RemedyV1::from(forged_types::OperationActionV1 {
+        verb: format!("{} submit", scope.noun()),
+        args,
+        reason: "omit the idempotency key so forged can mint the next controller generation"
+            .to_owned(),
+    })
 }
 
 fn payload(row: &forged_ledger::EventRow) -> Option<Value> {
@@ -1871,16 +1882,14 @@ async fn submit(ctx: &Ctx, req: &mut OperationRequest, scope: Scope) -> Operatio
                     response.reused = true;
                     return response;
                 }
-                return err_response(
-                    &key,
-                    &Failure::refused(
-                        ErrorCode::IdempotencyConflict,
-                        format!(
-                            "submit key {key:?} belongs to a controller that is no longer live; \
-                             use a fresh key to start generation {next_generation}"
-                        ),
+                let failure = Failure::refused(
+                    ErrorCode::IdempotencyConflict,
+                    format!(
+                        "submit key {key:?} belongs to a controller that is no longer live; \
+                         omit the idempotency key to start generation {next_generation}"
                     ),
                 );
+                return remedy_response(&key, &failure, keyless_resubmit_remedy(scope, &id));
             }
             Ok(_) => {}
             Err(error) => return err_response(&key, &error),
@@ -1926,10 +1935,7 @@ async fn submit(ctx: &Ctx, req: &mut OperationRequest, scope: Scope) -> Operatio
             }
             Err(error) => return err_response(&req.idempotency_key, &error),
         };
-        let reason = serde_json::to_value(admission.decision.reason)
-            .ok()
-            .and_then(|value| value.as_str().map(str::to_owned))
-            .unwrap_or_else(|| "admission-deferred".to_owned());
+        let reason = super::admission::decision_reason(&admission.decision);
         if admission.decision.outcome != AdmissionOutcome::Admitted {
             if exhausted_before_submit {
                 return err_response(

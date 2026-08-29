@@ -22,6 +22,20 @@ fn result(env: &TestEnv, args: &[&str]) -> Value {
     envelope["result"].clone()
 }
 
+fn pause_epic(env: &TestEnv, epic: &str) -> Value {
+    result(
+        env,
+        &[
+            "epic",
+            "pause",
+            "--epic",
+            epic,
+            "--reason",
+            "pause before abandoning this epic",
+        ],
+    )
+}
+
 fn seed_ready_items(env: &TestEnv, count: usize) {
     let ledger = env.ledger();
     for index in 0..count {
@@ -118,6 +132,172 @@ fn work_ready_summarizes_by_default_and_full_round_trips_complete_rows() {
         full["ready"][0], created["work"],
         "--full preserves the complete pre-summary snapshot shape and bytes"
     );
+}
+
+#[test]
+fn work_show_next_actions_execute_for_open_blocked_and_closed_states() {
+    let env = TestEnv::new("forged-work-show-next-actions");
+    assert_eq!(env.forged(&["init"]).0, 0);
+    let repository = env.repos.repo.to_string_lossy().into_owned();
+    result(
+        &env,
+        &[
+            "work",
+            "create",
+            "--id",
+            "action-open",
+            "--title",
+            "Open action fixture",
+            "--description",
+            "complete description",
+            "--acceptance",
+            "complete acceptance",
+            "--design",
+            "complete design",
+            "--notes",
+            "complete notes",
+            "--priority",
+            "2",
+            "--repository",
+            &repository,
+        ],
+    );
+
+    let shown = result(&env, &["work", "show", "--id", "action-open"]);
+    assert_eq!(
+        shown["nextActions"],
+        json!([
+            {
+                "verb": "run start",
+                "args": {"work": "action-open", "repo": repository},
+                "reason": "start a run once the work specification is complete",
+            },
+            {
+                "verb": "work update",
+                "args": {"id": "action-open", "expectedRevision": 1, "description": null},
+                "reason": "supply at least one spec field or priority under the current revision guard",
+            },
+        ])
+    );
+
+    let update = &shown["nextActions"][1];
+    let expected = update["args"]["expectedRevision"]
+        .as_i64()
+        .expect("expected revision")
+        .to_string();
+    let updated = result(
+        &env,
+        &[
+            "work",
+            "update",
+            "--id",
+            update["args"]["id"].as_str().expect("update id"),
+            "--expected-revision",
+            &expected,
+            "--description",
+            "bound placeholder description",
+        ],
+    );
+    assert_eq!(updated["work"]["revision"], json!(2));
+
+    let start = &shown["nextActions"][0];
+    let (code, started) = env.forged(&[
+        "run",
+        "start",
+        "--work",
+        start["args"]["work"].as_str().expect("start work"),
+        "--repo",
+        start["args"]["repo"].as_str().expect("start repo"),
+    ]);
+    assert_eq!(code, 0, "advertised run start succeeds: {started}");
+
+    result(
+        &env,
+        &[
+            "work",
+            "create",
+            "--id",
+            "action-repo-placeholder",
+            "--title",
+            "Repository placeholder fixture",
+            "--description",
+            "complete description",
+            "--acceptance",
+            "complete acceptance",
+            "--design",
+            "complete design",
+            "--notes",
+            "complete notes",
+            "--priority",
+            "3",
+        ],
+    );
+    let shown = result(&env, &["work", "show", "--id", "action-repo-placeholder"]);
+    let start = &shown["nextActions"][0];
+    assert_eq!(start["args"]["repo"], Value::Null);
+    assert_eq!(
+        start["reason"],
+        json!("choose the repository before starting the run")
+    );
+    let (code, started) = env.forged(&[
+        "run",
+        "start",
+        "--work",
+        start["args"]["work"].as_str().expect("start work"),
+        "--repo",
+        &repository,
+    ]);
+    assert_eq!(
+        code, 0,
+        "advertised run start succeeds after binding repo: {started}"
+    );
+
+    result(
+        &env,
+        &[
+            "work",
+            "create",
+            "--id",
+            "action-blocked",
+            "--title",
+            "Blocked action fixture",
+            "--status",
+            "blocked",
+        ],
+    );
+    let blocked = result(&env, &["work", "show", "--id", "action-blocked"]);
+    assert_eq!(
+        blocked["nextActions"],
+        json!([{
+            "verb": "work reopen",
+            "args": {"id": "action-blocked"},
+            "reason": "reopen the work item before scheduling it",
+        }])
+    );
+    let reopen_id = blocked["nextActions"][0]["args"]["id"]
+        .as_str()
+        .expect("blocked reopen id");
+    let reopened = result(&env, &["work", "reopen", "--id", reopen_id]);
+    assert_eq!(reopened["work"]["status"], json!("open"));
+
+    result(
+        &env,
+        &[
+            "work",
+            "close",
+            "--id",
+            "action-blocked",
+            "--reason",
+            "closed action fixture",
+        ],
+    );
+    let closed = result(&env, &["work", "show", "--id", "action-blocked"]);
+    assert_eq!(closed["nextActions"][0]["verb"], json!("work reopen"));
+    let reopen_id = closed["nextActions"][0]["args"]["id"]
+        .as_str()
+        .expect("closed reopen id");
+    let reopened = result(&env, &["work", "reopen", "--id", reopen_id]);
+    assert_eq!(reopened["work"]["status"], json!("open"));
 }
 
 #[test]
@@ -1400,17 +1580,30 @@ fn abandoning_a_started_epic_opens_a_clean_epoch() {
     ]);
     assert_ne!(code, 0, "{nothing}");
 
-    let abandoned = result(
-        &env,
-        &[
-            "epic",
-            "abandon",
-            "--epic",
-            "epic-doomed",
-            "--reason",
-            "the base ref was wrong; ending this epoch",
-        ],
+    let abandon = [
+        "epic",
+        "abandon",
+        "--epic",
+        "epic-doomed",
+        "--reason",
+        "the base ref was wrong; ending this epoch",
+    ];
+    let (code, refused) = env.forged(&abandon);
+    assert_ne!(code, 0, "unpaused abandon must refuse: {refused}");
+    assert_eq!(
+        refused["error"]["detail"],
+        json!({
+            "schema": "forged.remedy/1",
+            "verb": "epic pause",
+            "args": {
+                "epic": "epic-doomed",
+                "reason": "pause before abandoning this epic",
+            },
+            "reason": "pause the live controller before abandoning the epic",
+        })
     );
+    pause_epic(&env, "epic-doomed");
+    let abandoned = result(&env, &abandon);
     assert_eq!(abandoned["abandoned"], json!(true));
 
     // The epoch is over: status folds as never-started...
@@ -1466,6 +1659,7 @@ fn abandoning_a_started_epic_opens_a_clean_epoch() {
 
     // A second abandon derives a fresh key (the epoch counter), so it ends
     // the SECOND epoch rather than replaying the first abandon's response.
+    pause_epic(&env, "epic-doomed");
     let again = result(
         &env,
         &[
@@ -1508,6 +1702,7 @@ fn a_fresh_epoch_records_its_own_integration_event_with_the_base_unmoved() {
     let advanced = result(&env, &["epic", "advance", "--epic", "epic-unmoved"]);
     assert_eq!(advanced["progress"]["epoch"], json!(0), "{advanced}");
 
+    pause_epic(&env, "epic-unmoved");
     result(
         &env,
         &[
@@ -1577,6 +1772,7 @@ fn a_replayed_setup_heals_an_epoch_whose_integration_event_was_swallowed() {
 
     assert_eq!(env.forged(&start).0, 0, "epoch 0 start");
     result(&env, &["epic", "advance", "--epic", "epic-poisoned"]);
+    pause_epic(&env, "epic-poisoned");
     result(
         &env,
         &[

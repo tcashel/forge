@@ -152,6 +152,9 @@ pub struct AdmissionDecisionV1 {
     pub resource_class: AdmissionResourceClass,
     pub outcome: AdmissionOutcome,
     pub reason: AdmissionReason,
+    /// Human-readable field-level evidence for malformed or unrunnable work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason_detail: Option<String>,
     pub policy_revision: String,
     pub evidence: AdmissionCapacityV1,
     pub next_eligible_wake_at: Option<String>,

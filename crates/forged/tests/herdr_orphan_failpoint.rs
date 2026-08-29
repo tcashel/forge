@@ -204,6 +204,7 @@ fn seed_orphaned_reservation(env: &TestEnv, run: &str) {
         resource_class: AdmissionResourceClass::RepositoryWrite,
         outcome: AdmissionOutcome::Admitted,
         reason: AdmissionReason::CapacityAvailable,
+        reason_detail: None,
         policy_revision: "orphaned-submit-policy".to_owned(),
         evidence: capacity.clone(),
         next_eligible_wake_at: None,

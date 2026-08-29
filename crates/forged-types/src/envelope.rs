@@ -36,6 +36,38 @@ pub struct OpError {
     pub detail: Option<Value>,
 }
 
+/// One executable operation advertised by a subject projection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OperationActionV1 {
+    pub verb: String,
+    pub args: Map<String, Value>,
+    pub reason: String,
+}
+
+/// The structured recovery instruction carried by a refusal detail.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RemedyV1 {
+    pub schema: String,
+    pub verb: String,
+    pub args: Map<String, Value>,
+    pub reason: String,
+}
+
+pub const REMEDY_SCHEMA_V1: &str = "forged.remedy/1";
+
+impl From<OperationActionV1> for RemedyV1 {
+    fn from(action: OperationActionV1) -> Self {
+        Self {
+            schema: REMEDY_SCHEMA_V1.to_owned(),
+            verb: action.verb,
+            args: action.args,
+            reason: action.reason,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -106,5 +138,26 @@ mod tests {
         let text = serde_json::to_string(&err).expect("serializes");
         let back: OpError = serde_json::from_str(&text).expect("deserializes");
         assert_eq!(back, err);
+    }
+
+    #[test]
+    fn remedy_uses_the_closed_additive_detail_shape() {
+        let remedy = RemedyV1::from(OperationActionV1 {
+            verb: "work supersede".to_owned(),
+            args: match json!({"id": "ore-old", "successor": null}) {
+                Value::Object(args) => args,
+                _ => unreachable!("literal is an object"),
+            },
+            reason: "create the successor first with work create".to_owned(),
+        });
+        assert_eq!(
+            serde_json::to_value(remedy).expect("serializes"),
+            json!({
+                "schema": "forged.remedy/1",
+                "verb": "work supersede",
+                "args": {"id": "ore-old", "successor": null},
+                "reason": "create the successor first with work create",
+            })
+        );
     }
 }
