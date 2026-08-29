@@ -409,6 +409,10 @@ fn migration_015_uses_only_durable_events_and_child_epic_context() {
              DROP TABLE work_leases;
              DROP INDEX work_deps_to;
              DROP TABLE work_deps;
+             DROP TRIGGER work_notes_append_only_update;
+             DROP TRIGGER work_notes_append_only_delete;
+             DROP INDEX work_notes_work_kind_written_at;
+             DROP TABLE work_notes;
              DROP TRIGGER work_revisions_append_only_update;
              DROP TRIGGER work_revisions_append_only_delete;
              DROP TABLE work_revisions;
@@ -436,7 +440,7 @@ fn migration_015_uses_only_durable_events_and_child_epic_context() {
         .expect("seed v14");
     }
     let ledger = Ledger::open(&path).expect("migrate 015");
-    assert_eq!(ledger.pragmas().expect("pragmas").user_version, 22);
+    assert_eq!(ledger.pragmas().expect("pragmas").user_version, 23);
     let epic = ledger
         .get_work_identity(WorkIdentitySubjectKind::Epic, "epic-one")
         .expect("read")

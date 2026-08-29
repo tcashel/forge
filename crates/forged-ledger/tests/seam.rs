@@ -31,7 +31,7 @@ fn ledger_is_send_sync_and_arc_shareable() {
         }));
     }
     for handle in handles {
-        assert_eq!(handle.join().expect("thread"), 22);
+        assert_eq!(handle.join().expect("thread"), 23);
     }
 }
 

@@ -355,6 +355,112 @@ impl WorkReadyArgs {
     }
 }
 
+/// Closed annotation kind advertised by the MCP schema.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(rename_all = "lowercase")]
+pub enum WorkNoteKindParam {
+    Comment,
+    Critique,
+    Recommendation,
+    Approval,
+}
+
+/// Typed envelope for one append-only work annotation.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkNoteAddArgs {
+    /// Envelope schema version; always 1.
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
+    /// Caller operation identity; a canonical payload-derived key is used
+    /// when absent.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+    /// Annotation parameters.
+    pub params: WorkNoteAddParams,
+}
+
+/// Parameters for one immutable annotation.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars", inline)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkNoteAddParams {
+    /// Existing work item id.
+    pub id: String,
+    /// Closed annotation kind.
+    pub kind: WorkNoteKindParam,
+    /// Raw JSON text; the ledger stores its canonical rendering.
+    pub body_json: String,
+    /// Payload schema wire name; omission stores `<kind>/0`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<String>,
+    /// Writing identity; omission stores `operator`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
+}
+
+impl WorkNoteAddArgs {
+    fn into_envelope(self) -> EnvelopeArgs {
+        let params = match serde_json::to_value(&self.params) {
+            Ok(Value::Object(map)) => map,
+            _ => serde_json::Map::new(),
+        };
+        EnvelopeArgs {
+            schema_version: self.schema_version,
+            idempotency_key: self.idempotency_key,
+            run_id: None,
+            params,
+        }
+    }
+}
+
+/// Typed envelope for one bounded annotation listing.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkNoteListArgs {
+    /// Envelope schema version; always 1.
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
+    /// Optional read-only operation identity.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+    /// Listing parameters.
+    pub params: WorkNoteListParams,
+}
+
+/// Exact annotation selector and collection bound.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars", inline)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkNoteListParams {
+    /// Existing work item id.
+    pub id: String,
+    /// Optional exact annotation kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<WorkNoteKindParam>,
+    /// Maximum notes, 1..=500 (default 100).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u64>,
+}
+
+impl WorkNoteListArgs {
+    fn into_envelope(self) -> EnvelopeArgs {
+        let params = match serde_json::to_value(&self.params) {
+            Ok(Value::Object(map)) => map,
+            _ => serde_json::Map::new(),
+        };
+        EnvelopeArgs {
+            schema_version: self.schema_version,
+            idempotency_key: self.idempotency_key,
+            run_id: None,
+            params,
+        }
+    }
+}
+
 /// Closed attempt activity exposed in MCP discovery. These values are
 /// intentionally distinct from Herdr's `working`/`unknown` lifecycle.
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema)]
@@ -1426,6 +1532,30 @@ impl ForgedServer {
         self.call("work_update", args.0).await
     }
 
+    /// Append one immutable work annotation.
+    #[tool(
+        name = "work_note_add",
+        description = "Append evidence about a work specification without changing its \
+                       revision or coordination state. params: id, kind (comment | critique | \
+                       recommendation | approval), bodyJson (raw JSON string); optional schema \
+                       defaults to <kind>/0 and actor defaults to operator. Duplicate keys and \
+                       non-integer numbers are refused. Closed work items are accepted."
+    )]
+    pub async fn work_note_add(&self, args: Parameters<WorkNoteAddArgs>) -> CallToolResult {
+        self.call("work_note_add", args.0.into_envelope()).await
+    }
+
+    /// List immutable work annotations.
+    #[tool(
+        name = "work_note_list",
+        description = "List one work item's append-only evidence ordered by writtenAt then \
+                       noteId. params: id; optional kind exact-filter and limit 1..=500 \
+                       (default 100). Returns canonical bodyJson bytes with totals.shown/total."
+    )]
+    pub async fn work_note_list(&self, args: Parameters<WorkNoteListArgs>) -> CallToolResult {
+        self.call("work_note_list", args.0.into_envelope()).await
+    }
+
     /// Typed work authoring: dependency edge.
     #[tool(
         name = "work_link",
@@ -1494,7 +1624,8 @@ impl ForgedServer {
     #[tool(
         name = "work_show",
         description = "One work item's current snapshot plus hydrated dependencies — the \
-                       read-only bd show replacement. params: id."
+                       read-only bd show replacement. params: id. Returns notesCount but never \
+                       note bodies; retrieve those with work_note_list."
     )]
     pub async fn work_show(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
         self.call("work_show", args.0).await

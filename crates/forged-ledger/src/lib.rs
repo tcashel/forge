@@ -79,9 +79,10 @@ pub use types::{
     WorkSettlementRetryRow,
 };
 pub use work::{
-    ImportedWorkItem, NewWorkItem, WorkDepKind, WorkDepRow, WorkDependencyStatus, WorkImportReport,
-    WorkItemFilters, WorkItemSnapshot, WorkKind, WorkRevisionCause, WorkSpecFields, WorkStatus,
-    WORK_BLOCKED_CLAIM_REFUSAL, WORK_CLAIM_REFUSAL_PREFIX,
+    ImportedWorkItem, NewWorkItem, NewWorkNote, WorkDepKind, WorkDepRow, WorkDependencyStatus,
+    WorkImportReport, WorkItemFilters, WorkItemSnapshot, WorkKind, WorkNoteKind, WorkNotePage,
+    WorkNoteRow, WorkRevisionCause, WorkSpecFields, WorkStatus, WORK_BLOCKED_CLAIM_REFUSAL,
+    WORK_CLAIM_REFUSAL_PREFIX, WORK_NOTE_DEFAULT_LIMIT, WORK_NOTE_MAX_LIMIT,
 };
 pub use work_lease::{work_reclaim_older_than, WorkLeaseRow, WorkReclaimOutcome, WORK_LEASE_TTL_S};
 pub use work_settlement::{RetryErrorUpdate, WORK_SETTLEMENT_RETRY_BUDGET};

@@ -103,7 +103,7 @@ fn find_operation_tx(
         .optional()?)
 }
 
-fn replay_event_operation_tx(
+pub(crate) fn replay_ledger_operation_tx(
     conn: &Connection,
     name: &str,
     request: &OperationRequest,
@@ -438,7 +438,7 @@ impl Ledger {
                 )
             })?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            if let Some(response) = replay_event_operation_tx(&tx, &name, &request)? {
+            if let Some(response) = replay_ledger_operation_tx(&tx, &name, &request)? {
                 tx.commit()?;
                 return Ok(response);
             }
@@ -515,7 +515,7 @@ impl Ledger {
     ) -> Result<Option<OperationResponse>, LedgerError> {
         let name = name.to_owned();
         let request = request.clone();
-        self.submit(move |conn| replay_event_operation_tx(conn, &name, &request))
+        self.submit(move |conn| replay_ledger_operation_tx(conn, &name, &request))
     }
 
     /// Claim or replay an idempotent operation, in one transaction.

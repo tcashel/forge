@@ -6236,4 +6236,50 @@ mod tests {
             "an unmoved base must still yield distinct per-epoch payloads"
         );
     }
+
+    #[test]
+    fn note_added_after_child_freeze_is_outside_the_fields_digest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ledger = forged_ledger::Ledger::open(&dir.path().join("state.db")).expect("ledger");
+        let created = ledger
+            .create_work_item(forged_ledger::NewWorkItem {
+                work_id: "frozen-child".to_owned(),
+                kind: forged_ledger::WorkKind::Task,
+                status: forged_ledger::WorkStatus::Blocked,
+                priority: Some(0),
+                metadata: BTreeMap::new(),
+                spec: forged_ledger::WorkSpecFields {
+                    title: "Frozen child".to_owned(),
+                    description: "frozen description".to_owned(),
+                    acceptance_criteria: "frozen acceptance".to_owned(),
+                    design: "frozen design".to_owned(),
+                    notes: "frozen notes".to_owned(),
+                },
+                cause: forged_ledger::WorkRevisionCause::Authored,
+            })
+            .expect("create frozen child");
+        let frozen = fields_digest(&native_fields(&crate::core::workstore::issue_of(&created)))
+            .expect("frozen digest");
+
+        ledger
+            .add_work_note(forged_ledger::NewWorkNote {
+                work_id: "frozen-child".to_owned(),
+                kind: forged_ledger::WorkNoteKind::Critique,
+                schema: "critique/0".to_owned(),
+                actor: "critic".to_owned(),
+                body_json: r#"{"finding":"needs operator context"}"#.to_owned(),
+            })
+            .expect("append mid-epic evidence");
+        let current = ledger
+            .work_item("frozen-child")
+            .expect("read child")
+            .expect("child exists");
+        assert_eq!(current.revision, created.revision);
+        assert_eq!(
+            fields_digest(&native_fields(&crate::core::workstore::issue_of(&current)))
+                .expect("current digest"),
+            frozen,
+            "annotations are not frozen child fields and cannot trip the drift fence"
+        );
+    }
 }
