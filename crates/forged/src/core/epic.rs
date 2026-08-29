@@ -2043,16 +2043,14 @@ async fn status_json(ctx: &Ctx, view: EpicView) -> Result<Value, Failure> {
                 *deferred_reasons.entry(reason).or_insert(0) += 1;
             }
         }
-        let child_health = super::health::execution_health(super::health::HealthInputs {
-            started: run_id.is_some(),
-            terminal,
-            paused: false,
-            input_required: planning_blocker.is_some(),
-            admission_deferred: admission
-                .is_some_and(|decision| decision.outcome == AdmissionOutcome::Deferred),
-            desired,
-            controller_live: None,
-        });
+        let child_health =
+            super::health::execution_health(super::health::HealthInputs::frozen_child(
+                run_id.is_some(),
+                terminal,
+                planning_blocker.is_some(),
+                admission.is_some_and(|decision| decision.outcome == AdmissionOutcome::Deferred),
+                desired,
+            ));
         if let Some(wake) = desired
             .and_then(|row| row.next_wake_at.as_deref())
             .or_else(|| admission.and_then(|row| row.next_eligible_wake_at.as_deref()))
@@ -2135,19 +2133,18 @@ async fn status_json(ctx: &Ctx, view: EpicView) -> Result<Value, Failure> {
             }),
         })
     });
-    let epic_health = super::health::execution_health(super::health::HealthInputs {
-        started: true,
-        terminal: final_pr.is_some(),
-        paused: view.paused.is_some(),
-        input_required: view.input.is_some(),
-        admission_deferred: epic_admission_deferred,
-        desired: epic_desired,
-        controller_live: match controller.get("state").and_then(Value::as_str) {
+    let epic_health = super::health::execution_health(super::health::HealthInputs::epic_status(
+        final_pr.is_some(),
+        view.paused.is_some(),
+        view.input.is_some(),
+        epic_admission_deferred,
+        epic_desired,
+        match controller.get("state").and_then(Value::as_str) {
             Some("running") => Some(true),
             Some("exited" | "vanished" | "dead") => Some(false),
             _ => None,
         },
-    });
+    ));
     Ok(json!({
         "schema": "forged.epic.status/1",
         "epicId": view.config.epic_id,

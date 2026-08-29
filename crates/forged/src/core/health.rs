@@ -20,6 +20,7 @@ pub(crate) const HALTED_ERROR_PREFIX: &str = "halted after one nonrecoverable co
 /// Everything a surface knows about a subject's execution, durable-first.
 /// A surface passes only what it actually observed; absent knowledge is
 /// never guessed.
+#[derive(Clone, Copy)]
 pub(crate) struct HealthInputs<'a> {
     /// The subject has durable started state (an epic STARTED event, a run
     /// row).
@@ -39,6 +40,114 @@ pub(crate) struct HealthInputs<'a> {
     /// seat), `Some(false)` proved dead, `None` not probed. Consulted only
     /// where the durable rows alone cannot answer.
     pub controller_live: Option<bool>,
+}
+
+impl<'a> HealthInputs<'a> {
+    /// Inputs available to `epic status`: complete epic lifecycle state plus
+    /// the live controller probe. A started epic is implicit at this surface.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn epic_status(
+        terminal: bool,
+        paused: bool,
+        input_required: bool,
+        admission_deferred: bool,
+        desired: Option<&'a DesiredWorkRow>,
+        controller_live: Option<bool>,
+    ) -> Self {
+        Self {
+            started: true,
+            terminal,
+            paused,
+            input_required,
+            admission_deferred,
+            desired,
+            controller_live,
+        }
+    }
+
+    /// Inputs available to the deliberately cheap portfolio projection.
+    /// It observes terminal, admission, desired-work, and controller facts,
+    /// but deliberately degrades `paused` and `input_required` to `false`;
+    /// callers needing those verdicts use an exact observation surface.
+    pub(crate) fn portfolio(
+        terminal: bool,
+        admission_deferred: bool,
+        desired: Option<&'a DesiredWorkRow>,
+        controller_live: Option<bool>,
+    ) -> Self {
+        Self {
+            started: true,
+            terminal,
+            paused: false,
+            input_required: false,
+            admission_deferred,
+            desired,
+            controller_live,
+        }
+    }
+
+    /// Inputs derived from one exact event-tail observation snapshot. This
+    /// is the richest ledger-only constructor and the one `explain` uses.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn observation(
+        started: bool,
+        terminal: bool,
+        paused: bool,
+        input_required: bool,
+        admission_deferred: bool,
+        desired: Option<&'a DesiredWorkRow>,
+        controller_live: Option<bool>,
+    ) -> Self {
+        Self {
+            started,
+            terminal,
+            paused,
+            input_required,
+            admission_deferred,
+            desired,
+            controller_live,
+        }
+    }
+
+    /// Inputs available for one frozen epic-child row. Children observe
+    /// start, terminal, planning-input, admission, and desired-work facts;
+    /// they have neither a child pause state nor a live controller probe.
+    pub(crate) fn frozen_child(
+        started: bool,
+        terminal: bool,
+        input_required: bool,
+        admission_deferred: bool,
+        desired: Option<&'a DesiredWorkRow>,
+    ) -> Self {
+        Self {
+            started,
+            terminal,
+            paused: false,
+            input_required,
+            admission_deferred,
+            desired,
+            controller_live: None,
+        }
+    }
+
+    /// Bounded wire summary of exactly the fields the health lattice reads.
+    pub(crate) fn summary(self) -> Value {
+        json!({
+            "started": self.started,
+            "terminal": self.terminal,
+            "paused": self.paused,
+            "inputRequired": self.input_required,
+            "admissionDeferred": self.admission_deferred,
+            "desired": self.desired.map(|desired| json!({
+                "state": desired.desired_state.as_str(),
+                "lastOutcome": desired.last_outcome.map(|outcome| outcome.as_str()),
+                "exhausted": desired.exhausted_at.is_some(),
+                "halted": desired.last_error.as_deref()
+                    .is_some_and(|error| error.starts_with(HALTED_ERROR_PREFIX)),
+            })),
+            "controllerLive": self.controller_live,
+        })
+    }
 }
 
 /// The closed verdict set, in precedence order:
@@ -140,15 +249,7 @@ mod tests {
     }
 
     fn base(desired: Option<&DesiredWorkRow>) -> HealthInputs<'_> {
-        HealthInputs {
-            started: true,
-            terminal: false,
-            paused: false,
-            input_required: false,
-            admission_deferred: false,
-            desired,
-            controller_live: None,
-        }
+        HealthInputs::observation(true, false, false, false, false, desired, None)
     }
 
     #[test]
@@ -242,5 +343,54 @@ mod tests {
             }),
             "running"
         );
+    }
+
+    #[test]
+    fn surface_constructors_agree_on_every_field_they_both_observe() {
+        let desired = desired(DesiredState::Running, None, false, None);
+        let richest =
+            HealthInputs::epic_status(false, true, true, true, Some(&desired), Some(true));
+        let observation =
+            HealthInputs::observation(true, false, true, true, true, Some(&desired), Some(true));
+        let portfolio = HealthInputs::portfolio(false, true, Some(&desired), Some(true));
+        let child = HealthInputs::frozen_child(true, false, true, true, Some(&desired));
+
+        for candidate in [observation, portfolio, child] {
+            assert_eq!(candidate.started, richest.started);
+            assert_eq!(candidate.terminal, richest.terminal);
+            assert_eq!(candidate.admission_deferred, richest.admission_deferred);
+            assert!(std::ptr::eq(
+                candidate.desired.expect("desired row"),
+                richest.desired.expect("desired row")
+            ));
+        }
+        assert_eq!(observation.paused, richest.paused);
+        assert_eq!(observation.input_required, richest.input_required);
+        assert_eq!(observation.controller_live, richest.controller_live);
+        assert_eq!(child.input_required, richest.input_required);
+        assert!(!child.paused);
+        assert_eq!(child.controller_live, None);
+        assert!(!portfolio.paused);
+        assert!(!portfolio.input_required);
+        assert_eq!(portfolio.controller_live, richest.controller_live);
+    }
+
+    #[test]
+    fn health_input_literals_are_confined_to_the_constructor_module() {
+        let core = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/core");
+        for entry in std::fs::read_dir(core).expect("read core source") {
+            let path = entry.expect("core source entry").path();
+            if path.extension().and_then(|value| value.to_str()) != Some("rs")
+                || path.file_name().and_then(|value| value.to_str()) == Some("health.rs")
+            {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path).expect("read core module");
+            assert!(
+                !source.contains("HealthInputs {"),
+                "{} contains a scattered HealthInputs literal",
+                path.display()
+            );
+        }
     }
 }

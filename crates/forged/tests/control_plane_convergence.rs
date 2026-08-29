@@ -538,9 +538,10 @@ fn modern_projections_and_all_five_apps_converge_on_real_envelopes() {
     tools.sort();
     assert_eq!(
         tools.len(),
-        63,
+        64,
         "the integrated public tool inventory moved"
     );
+    assert!(tools.contains(&"explain".to_owned()));
     assert!(tools.contains(&"review_publish".to_owned()));
     assert!(tools.contains(&"session_inventory".to_owned()));
     let mut resources = mcp.list_resources();

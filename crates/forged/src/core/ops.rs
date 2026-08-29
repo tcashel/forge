@@ -878,7 +878,9 @@ fn run_status_gate_state(view: &forged_proto::RunView) -> Option<&'static str> {
         .map(|(_, state)| state)
 }
 
-fn run_projection_actions(run: &forged_ledger::RunRow) -> Vec<forged_types::OperationActionV1> {
+pub(crate) fn run_projection_actions(
+    run: &forged_ledger::RunRow,
+) -> Vec<forged_types::OperationActionV1> {
     let (verb, args, reason) = match run.state {
         RunState::Active => (
             "run stop",
@@ -3017,24 +3019,19 @@ pub(super) fn operator_queue(
             .iter()
             .find(|decision| decision.subject_id == id)
             .is_some_and(|decision| decision.outcome == forged_types::AdmissionOutcome::Deferred);
-        let execution_health = super::health::execution_health(super::health::HealthInputs {
-            started: true,
-            terminal: visibly_terminal,
-            paused: false,
-            // The portfolio row cannot cheaply distinguish an input-required
-            // stop; the drill-down surfaces (epic_status, work_detail) carry
-            // that verdict.
-            input_required: false,
-            admission_deferred: entry_deferred,
-            desired: entry_desired,
-            controller_live: if execution_live {
-                Some(true)
-            } else if dead_controller {
-                Some(false)
-            } else {
-                None
-            },
-        });
+        let execution_health =
+            super::health::execution_health(super::health::HealthInputs::portfolio(
+                visibly_terminal,
+                entry_deferred,
+                entry_desired,
+                if execution_live {
+                    Some(true)
+                } else if dead_controller {
+                    Some(false)
+                } else {
+                    None
+                },
+            ));
         if let Some(object) = entry.as_object_mut() {
             object.insert(
                 "executionHealth".to_owned(),
@@ -4711,7 +4708,7 @@ pub async fn attention_list(ctx: &Ctx, req: &OperationRequest) -> OperationRespo
     .await
 }
 
-async fn all_attention(ctx: &Ctx) -> Result<Vec<AttentionItemV1>, Failure> {
+pub(crate) async fn all_attention(ctx: &Ctx) -> Result<Vec<AttentionItemV1>, Failure> {
     let kinds: Vec<&str> = LIFECYCLE_KINDS
         .iter()
         .chain(super::attention::ATTENTION_EVENT_KINDS.iter())

@@ -99,7 +99,9 @@ fn snapshot_json(snapshot: &WorkItemSnapshot, next_steps: &[&str]) -> Value {
     })
 }
 
-fn projection_actions(snapshot: &WorkItemSnapshot) -> Vec<forged_types::OperationActionV1> {
+pub(crate) fn projection_actions(
+    snapshot: &WorkItemSnapshot,
+) -> Vec<forged_types::OperationActionV1> {
     let actions = match snapshot.status {
         WorkStatus::Open => {
             let repository = snapshot.metadata.get("repository");

@@ -595,6 +595,14 @@ impl Ledger {
         self.submit(move |conn| get_attempt_tx(conn, attempt_id))
     }
 
+    /// Find one attempt by its exact integer id; `Ok(None)` on a miss.
+    pub fn find_attempt(&self, attempt_id: i64) -> Result<Option<AttemptRow>, LedgerError> {
+        self.submit(move |conn| {
+            let sql = format!("SELECT {ATTEMPT_COLUMNS} FROM attempts WHERE attempt_id = ?1");
+            Ok(conn.query_row(&sql, [attempt_id], attempt_row).optional()?)
+        })
+    }
+
     /// Look up an attempt by its fencing token; `Ok(None)` on a miss.
     pub fn find_attempt_by_token(
         &self,
