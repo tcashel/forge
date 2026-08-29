@@ -4,6 +4,85 @@ This file records user-visible changes to Forge.
 
 ## [Unreleased]
 
+## [0.6.3] - 2026-08-29
+
+The affordance and query release (epic ore-063, PRs #213-#226): the
+surface learns to explain itself, refusals learn to teach their
+recovery, the work store gains its evidence and query layers, and the
+whole operation surface is frozen under a generated manifest.
+
+### Added
+
+- `forged explain --id <anything>`: one kind-blind read resolving work
+  items, runs, epics, attempts, and attention ids (normative
+  precedence on exact collisions) and answering what / how / next —
+  identity and lifecycle position, the execution-health verdict, and
+  typed next actions.
+- Typed next actions on `run status`, `work show`, and attention
+  items, and a structured `forged.remedy/1` on refusals: attention
+  refusals surface their stored recommended action, the stale-submit
+  conflict advises keyless resubmission, `epic abandon` names its
+  pause-first prerequisite, and admission defers name the exact
+  failing fields. Actions may carry declared placeholders (JSON null)
+  with the precondition in `reason`; every advertised action is
+  honesty-tested — the test binds placeholders and executes the verb.
+- `work note add` / `work note list`: an append-only annotation
+  surface (comment / critique / recommendation / approval) beside the
+  spec, never part of it — notes mint no revisions and stay outside
+  the frozen-digest and drift fences. Recommendation and approval
+  payloads are schema-validated wire contracts
+  (`forged.spec-recommendations/1`, `forged.execution-approval/1`);
+  the skills' critique-adjudicate-approve flows write through them.
+- `work promote`: atomic stub promotion (spec revision + open status
+  + event in one fenced operation under revision CAS); `work update
+  --priority`: CAS-fenced priority that never mints a revision —
+  closing the class where a priority-less item stalled admission
+  undetected.
+- `run adjudicate-settlement` gains the lead-finish case: a run
+  stopped by review-budget exhaustion upgrades to landed with
+  delivery PR/sha, actor, and rationale — admissible only through
+  the adjudication-authority ledger door; plain `run stop` still
+  refuses the transition.
+- Keyset cursors on `work ready` (opaque token, existing order,
+  composing with filters); the repository identity is a real indexed
+  generated column; plan hydration collapses to one transaction,
+  replacing two ledger round-trips per item.
+- `docs/reference/operation-surface.{json,md}`: the generated
+  manifest of all 69 operations — CLI verb, availability, fence
+  class, key policy — enforced by a CI drift test; the parity suite
+  and skill-verb validation consume it, so surface and skills can no
+  longer diverge silently.
+
+### Changed
+
+- MCP failures set `isError` (envelope unchanged in content);
+  `packet_show`, `gate_run`, and `worktree_retire` are exposed over
+  MCP; the two deliberately unfenced writes route through an honestly
+  named wrapper with a source-audit test pinning the tenant list.
+- `run_status` projections read their direct sources: semantic stage
+  ids for adaptive packets, terminal-only deadline-kill counts, gate
+  state from the newest gate event.
+- Provider transport classification takes operator-extensible
+  `transportPatterns` in config.yaml (global and per-provider,
+  extending the built-ins) — corpus verification found no reliable
+  structured provider failure fields, so the substring lists remain
+  the mechanism, now a config edit instead of a release.
+
+### Fixed
+
+- The `recoverable` flag tells the truth at the machine edges:
+  gh/git/gate/provider failures classify by evidence (context-guarded
+  status parsing, conservative transport signatures, transient IO
+  kinds), with deterministic refusals and unknown signatures staying
+  nonrecoverable. The supervisor halt gate is unchanged.
+- A cross-epoch pause-key replay: abandoning a paused epic could make
+  the next epoch's pause replay the old operation. Control keys still
+  count the full stream; same-kind idempotency is now scoped to the
+  current epoch and keys stay monotonic across abandon boundaries.
+- Ledger indexes for the ready frontier and operation-state reads
+  (plan-pinned), and the migration presence test now covers the
+  work-store tables.
+
 ## [0.6.2] - 2026-08-29
 
 The pile-1 core-fix release: dogfood-driven fixes from the v0.6.0/0.6.1
