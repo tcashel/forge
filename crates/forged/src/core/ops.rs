@@ -22,7 +22,8 @@ use crate::adapters::ports::{report_json, ForgedPorts};
 use crate::config::{now_iso, stage_str};
 use crate::core::{
     default_key, derive_key, epic, err_response, fenced, key_absent, ok_response, on_ledger,
-    param_opt_str, param_str, read_only, session_claimant, split_packet_key, Ctx, Failure,
+    param_opt_str, param_str, read_only, session_claimant, split_packet_key, unfenced_write, Ctx,
+    Failure,
 };
 
 // ---------------------------------------------------------------- doctor
@@ -1880,11 +1881,12 @@ pub async fn packet_fail(ctx: &Ctx, req: &mut OperationRequest) -> OperationResp
 
 // ------------------------------------------------------ packet heartbeat
 
-/// `packet heartbeat` — deliberately unfenced: carries the envelope,
-/// defaults its key the way a read does, never touches the operation
-/// store. Re-sending one is always safe.
+/// `packet heartbeat` — deliberately unfenced because a heartbeat is a
+/// naturally idempotent lease renewal. It carries the envelope, defaults its
+/// key the way a read does, and never touches the operation store; re-sending
+/// one is always safe.
 pub async fn packet_heartbeat(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
-    read_only("packet_heartbeat", req, || async {
+    unfenced_write("packet_heartbeat", req, || async {
         let claim_token = param_str(&req.params, "claimToken")?.to_owned();
         on_ledger(&ctx.ledger, move |l| l.heartbeat_attempt(&claim_token)).await?;
         Ok(json!({"renewed": true}))
@@ -2084,7 +2086,7 @@ pub async fn usage_ingest(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
             &Failure::invalid("usage ingest takes --run <id> or --all"),
         );
     }
-    read_only("usage_ingest", req, || async {
+    unfenced_write("usage_ingest", req, || async {
         let run_ids: Vec<String> = match run {
             Some(run) => vec![run],
             None => on_ledger(&ctx.ledger, |l| l.list_runs())

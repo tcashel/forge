@@ -19,7 +19,7 @@ use forged_ledger::{
 use forged_types::{OperationRequest, OperationResponse};
 use serde_json::{json, Value};
 
-use crate::core::{on_ledger, read_only, Ctx, Failure};
+use crate::core::{on_ledger, unfenced_write, Ctx, Failure};
 
 const HYDRATE_BATCH: usize = 50;
 
@@ -30,10 +30,11 @@ const META_BD_REVISION: &str = "imported:bd-revision";
 const META_ISSUE_TYPE: &str = "imported:issue-type";
 const META_SPEC_ID: &str = "imported:spec-id";
 
-/// `work_import_beads` — idempotent by its one-shot guard: an already
-/// populated store reports `alreadyImported: true` and writes nothing.
+/// `work_import_beads` — deliberately unfenced because its one-shot empty-store
+/// guard is the write's natural identity: an already populated store reports
+/// `alreadyImported: true` and writes nothing.
 pub async fn work_import_beads(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
-    read_only("work_import_beads", req, || async {
+    unfenced_write("work_import_beads", req, || async {
         import_beads(ctx).await
     })
     .await
