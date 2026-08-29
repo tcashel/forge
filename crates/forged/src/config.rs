@@ -56,6 +56,12 @@ pub struct ForgedConfig {
     pub gate_commands: Vec<String>,
     pub stage_budget_s: HashMap<Stage, u64>,
     pub transport_retry_budget: u32,
+    /// Operator-defined, case-insensitive transport substrings extending the
+    /// built-in classifier. An over-broad match can consume no more than the
+    /// existing transport retry budget frozen into the execution package.
+    pub transport_patterns: Vec<String>,
+    /// Provider-specific transport substrings appended to the global list.
+    pub(crate) provider_transport_patterns: BTreeMap<String, Vec<String>>,
     pub bd_path: PathBuf,
     pub beads_dir: PathBuf,
     pub codex_home: PathBuf,
@@ -173,6 +179,14 @@ struct ConfigFile {
     stage_budget_s: Option<HashMap<Stage, u64>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     transport_retry_budget: Option<u32>,
+    #[serde(
+        rename = "transportPatterns",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    transport_patterns: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    providers: Option<BTreeMap<String, ProviderConfigFile>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     bd_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -185,6 +199,13 @@ struct ConfigFile {
     pricing: Option<RateCard>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     admission: Option<AdmissionPolicy>,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProviderConfigFile {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    transport_patterns: Vec<String>,
 }
 
 fn hints(provider: &str, model: &str, effort: Option<&str>, sandbox: Sandbox) -> ProviderHints {
@@ -528,6 +549,13 @@ impl ForgedConfig {
             });
         let admission = file.admission.unwrap_or_default();
         admission.validate()?;
+        let transport_patterns = file.transport_patterns.unwrap_or_default();
+        let provider_transport_patterns = file
+            .providers
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(provider, config)| (provider, config.transport_patterns))
+            .collect();
         Ok(ForgedConfig {
             runs_root: anvil_home.join("runs"),
             db_path: anvil_home.join("state.db"),
@@ -547,6 +575,8 @@ impl ForgedConfig {
             transport_retry_budget: file
                 .transport_retry_budget
                 .unwrap_or(DEFAULT_TRANSPORT_RETRY_BUDGET),
+            transport_patterns,
+            provider_transport_patterns,
             bd_path,
             beads_dir,
             codex_home,
@@ -642,7 +672,7 @@ impl ForgedConfig {
                 message: format!("unknown roster {roster_name:?}"),
             }]);
         };
-        let mut errors = Vec::new();
+        let mut errors = self.transport_pattern_errors();
         // Authoring boundary: provider embedding rules apply to the roster
         // being frozen NOW, never to already-frozen packages.
         errors.extend(roster.validate_models());
@@ -750,6 +780,49 @@ impl ForgedConfig {
         })
     }
 
+    fn transport_pattern_errors(&self) -> Vec<DefinitionError> {
+        let mut errors = self
+            .transport_patterns
+            .iter()
+            .enumerate()
+            .filter(|(_, pattern)| pattern.trim().is_empty())
+            .map(|(index, _)| DefinitionError {
+                path: format!("$.transportPatterns[{index}]"),
+                message: "transport pattern must not be empty".to_owned(),
+            })
+            .collect::<Vec<_>>();
+        for (provider, patterns) in &self.provider_transport_patterns {
+            errors.extend(
+                patterns
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, pattern)| pattern.trim().is_empty())
+                    .map(|(index, _)| DefinitionError {
+                        path: format!("$.providers.{provider}.transportPatterns[{index}]"),
+                        message: "transport pattern must not be empty".to_owned(),
+                    }),
+            );
+        }
+        errors
+    }
+
+    /// Resolve the global list followed by the selected provider's extension.
+    /// Empty entries are ignored here so historical frozen runs remain safe
+    /// when current authoring config fails the definition-compile validation.
+    pub fn transport_patterns_for(&self, provider: &str) -> Vec<&str> {
+        self.transport_patterns
+            .iter()
+            .chain(
+                self.provider_transport_patterns
+                    .get(provider)
+                    .into_iter()
+                    .flatten(),
+            )
+            .map(String::as_str)
+            .filter(|pattern| !pattern.trim().is_empty())
+            .collect()
+    }
+
     /// Compile one current config roster against every profile frozen into
     /// an existing run. This is the only authoring path for explicit roster
     /// revisions; the run's topology never comes from current config.
@@ -810,6 +883,20 @@ impl ForgedConfig {
             gate_commands: Some(default_gate_commands()),
             stage_budget_s: Some(default_stage_budget_s()),
             transport_retry_budget: Some(DEFAULT_TRANSPORT_RETRY_BUDGET),
+            transport_patterns: Some(self.transport_patterns.clone()),
+            providers: (!self.provider_transport_patterns.is_empty()).then(|| {
+                self.provider_transport_patterns
+                    .iter()
+                    .map(|(provider, patterns)| {
+                        (
+                            provider.clone(),
+                            ProviderConfigFile {
+                                transport_patterns: patterns.clone(),
+                            },
+                        )
+                    })
+                    .collect()
+            }),
             bd_path: None,
             codex_home: Some(
                 std::env::var_os("HOME")
@@ -1315,6 +1402,8 @@ pub(crate) fn scratch_config(anvil_home: &std::path::Path) -> ForgedConfig {
         gate_commands: default_gate_commands(),
         stage_budget_s: default_stage_budget_s(),
         transport_retry_budget: DEFAULT_TRANSPORT_RETRY_BUDGET,
+        transport_patterns: Vec::new(),
+        provider_transport_patterns: BTreeMap::new(),
         bd_path: PathBuf::from("bd"),
         beads_dir: anvil_home.join("beads"),
         codex_home: anvil_home.join("codex-home"),
@@ -1346,6 +1435,8 @@ mod tests {
             gate_commands: default_gate_commands(),
             stage_budget_s: default_stage_budget_s(),
             transport_retry_budget: DEFAULT_TRANSPORT_RETRY_BUDGET,
+            transport_patterns: Vec::new(),
+            provider_transport_patterns: BTreeMap::new(),
             bd_path: PathBuf::from("/tmp/configured/bd"),
             beads_dir: PathBuf::from("/tmp/anvil/beads"),
             codex_home: PathBuf::from("/tmp/home/.codex"),
@@ -1370,6 +1461,98 @@ mod tests {
         let compiled = cfg.compile_definition(None, None).expect("compile");
         assert_eq!(compiled.package.profile_ref.name, "standard");
         assert_eq!(compiled.compatibility_roster.len(), 4);
+    }
+
+    #[test]
+    fn configured_transport_patterns_classify_and_provider_entries_extend_global() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("config.yaml");
+        std::fs::write(
+            &path,
+            "transportPatterns:\n  - edge veil collapsed\nproviders:\n  codex:\n    transportPatterns:\n      - vendor stream folded\n",
+        )
+        .expect("config fixture");
+        let configured = ForgedConfig::load_at(
+            directory.path().to_path_buf(),
+            path.clone(),
+            Some(path.clone()),
+        )
+        .expect("load configured patterns");
+
+        assert_eq!(
+            configured.transport_patterns_for("claude"),
+            vec!["edge veil collapsed"]
+        );
+        let codex_patterns = configured.transport_patterns_for("codex");
+        assert_eq!(
+            codex_patterns,
+            vec!["edge veil collapsed", "vendor stream folded"]
+        );
+        let global_failure = r#"{"type":"turn.failed","error":{"message":"The EDGE VEIL COLLAPSED during delivery"}}"#;
+        assert!(matches!(
+            crate::adapters::extract::harvest_codex(
+                global_failure,
+                None,
+                "forged.result.implement/1",
+                "run-1/implement/1",
+                &codex_patterns,
+            ),
+            crate::adapters::extract::Harvest::Transport(_)
+        ));
+        let failed = r#"{"type":"turn.failed","error":{"message":"The VENDOR STREAM FOLDED during delivery"}}"#;
+        assert!(matches!(
+            crate::adapters::extract::harvest_codex(
+                failed,
+                None,
+                "forged.result.implement/1",
+                "run-1/implement/1",
+                &codex_patterns,
+            ),
+            crate::adapters::extract::Harvest::Transport(_)
+        ));
+
+        std::fs::write(&path, "{}\n").expect("remove configured patterns");
+        let unconfigured =
+            ForgedConfig::load_at(directory.path().to_path_buf(), path.clone(), Some(path))
+                .expect("reload without configured patterns");
+        assert!(matches!(
+            crate::adapters::extract::harvest_codex(
+                failed,
+                None,
+                "forged.result.implement/1",
+                "run-1/implement/1",
+                &unconfigured.transport_patterns_for("codex"),
+            ),
+            crate::adapters::extract::Harvest::Semantic(_)
+        ));
+    }
+
+    #[test]
+    fn authoring_rejects_empty_transport_patterns_but_frozen_compile_bypasses_them() {
+        let package = config()
+            .compile_definition(None, None)
+            .expect("valid authoring config")
+            .package;
+        let mut invalid = config();
+        invalid.transport_patterns.push("  ".to_owned());
+        invalid
+            .provider_transport_patterns
+            .insert("codex".to_owned(), vec![String::new()]);
+
+        let errors = invalid
+            .compile_definition(None, None)
+            .expect_err("empty patterns must fail authoring");
+        assert!(errors.iter().any(|error| {
+            error.path == "$.transportPatterns[0]"
+                && error.message == "transport pattern must not be empty"
+        }));
+        assert!(errors.iter().any(|error| {
+            error.path == "$.providers.codex.transportPatterns[0]"
+                && error.message == "transport pattern must not be empty"
+        }));
+
+        compile_frozen_package(package).expect("frozen packages bypass authoring config");
+        assert!(invalid.transport_patterns_for("codex").is_empty());
     }
 
     #[test]
