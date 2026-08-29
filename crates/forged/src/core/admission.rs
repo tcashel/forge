@@ -865,7 +865,15 @@ async fn admit_packet_facts_once(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use forged_types::{AdmissionCapacityV1, AdmissionRateLimitV1, AdmissionSpendV1};
+    use std::collections::HashMap;
+
+    use forged_ledger::{Ledger, NewPacket, NewRun, NewRunDefinition, SpecFence};
+    use forged_types::{
+        AdmissionCapacityV1, AdmissionRateLimitV1, AdmissionSpendV1, ExecutionPolicyV1,
+        HostPolicyV1, ProfileDefinitionV1, ProfileRef, ProtocolRef, ResolvedRosterV1, RoleId,
+        RosterRef, RunId, Stage, DEFAULT_TERMINATION_GRACE_S, EXECUTION_PACKAGE_SCHEMA_V1,
+        PROFILE_SCHEMA_V1, RESOLVED_ROSTER_SCHEMA_V1,
+    };
 
     #[test]
     fn protocol_names_never_make_a_blocked_work_runnable() {
@@ -889,6 +897,208 @@ mod tests {
             model: Some("m".to_owned()),
             resource_class: AdmissionResourceClass::RepositoryWrite,
             authorized_at: "2030-01-01T00:00:00.000000000Z".to_owned(),
+        }
+    }
+
+    fn capacity_roster(sandbox: Sandbox, version: u32) -> ResolvedRosterV1 {
+        ResolvedRosterV1 {
+            schema: RESOLVED_ROSTER_SCHEMA_V1.to_owned(),
+            roster_ref: RosterRef {
+                name: "capacity".to_owned(),
+                version,
+            },
+            roles: BTreeMap::from([(
+                RoleId::new("implement").expect("role"),
+                vec![ProviderCandidateV1 {
+                    provider: "codex".to_owned(),
+                    model: "gpt-test".to_owned(),
+                    effort: None,
+                    sandbox,
+                    capabilities: BTreeSet::new(),
+                }],
+            )]),
+        }
+    }
+
+    fn capacity_definition(sandbox: Sandbox) -> NewRunDefinition {
+        let protocol_ref = ProtocolRef {
+            name: "slice".to_owned(),
+            version: 1,
+        };
+        let profile_ref = ProfileRef {
+            name: "capacity".to_owned(),
+            version: 1,
+        };
+        let roster = capacity_roster(sandbox, 1);
+        let profile = ProfileDefinitionV1 {
+            schema: PROFILE_SCHEMA_V1.to_owned(),
+            name: "capacity".to_owned(),
+            protocol: protocol_ref.clone(),
+            seats: Vec::new(),
+            risk_context: "test".to_owned(),
+            fix_round_budget: 0,
+            escalate_on: Vec::new(),
+            escalate_to: None,
+        };
+        let package = ExecutionPackageV1 {
+            schema: EXECUTION_PACKAGE_SCHEMA_V1.to_owned(),
+            protocol_ref,
+            profile_ref,
+            roster_ref: roster.roster_ref.clone(),
+            profile_sha256: digest(&profile).expect("profile digest"),
+            roster_sha256: digest(&roster).expect("roster digest"),
+            profile,
+            profile_catalog: BTreeMap::new(),
+            roster,
+            policy: ExecutionPolicyV1 {
+                gate_commands: Vec::new(),
+                stage_budget_s: BTreeMap::new(),
+                termination_grace_s: DEFAULT_TERMINATION_GRACE_S,
+                transport_retry_budget: 1,
+                host_policy: HostPolicyV1::Off,
+                herdr_socket: None,
+            },
+        };
+        NewRunDefinition {
+            package_sha256: digest(&package).expect("package digest"),
+            package,
+            compatibility_roster: HashMap::new(),
+        }
+    }
+
+    fn capacity_after_roster_flip(
+        suffix: &str,
+        initial: Sandbox,
+        revised: Sandbox,
+    ) -> AdmissionLedgerSnapshot {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ledger = Ledger::open(&dir.path().join("state.db")).expect("ledger");
+        let run_id = format!("run-capacity-{suffix}");
+        ledger
+            .create_run_with_definition(
+                NewRun {
+                    run_id: RunId::new(&run_id).expect("run id"),
+                    work_id: format!("bead-capacity-{suffix}"),
+                    repo: "example/repo".to_owned(),
+                    base_ref: "main".to_owned(),
+                    branch: format!("work/capacity-{suffix}"),
+                },
+                capacity_definition(initial),
+            )
+            .expect("run");
+        let packet_id = ledger
+            .open_packet(NewPacket {
+                run_id: run_id.clone(),
+                stage: Stage::Implement,
+                seq: 1,
+                spec_path: format!("specs/capacity-{suffix}.md"),
+                spec_sha256: "feed".to_owned(),
+                spec_revision: None,
+                body_json: serde_json::json!({
+                    "providerHints": {
+                        "provider": "codex",
+                        "model": "gpt-test",
+                        "sandbox": initial,
+                    },
+                    "execution": {"roleId": "implement"},
+                })
+                .to_string(),
+            })
+            .expect("packet");
+        ledger
+            .authorize_desired_work(DesiredSubjectKind::Run, &run_id, 1)
+            .expect("authorize");
+        ledger
+            .claim_packet(
+                &packet_id,
+                "codex:capacity:1",
+                &SpecFence::Sha256("feed".to_owned()),
+            )
+            .expect("reservation-less claim");
+        let before = ledger
+            .admission_snapshot_releasing_unowned(
+                Some((DesiredSubjectKind::Run, run_id.clone())),
+                vec![(AdmissionSubjectKind::Packet, packet_id.clone())],
+            )
+            .expect("snapshot before revision");
+        let roster = capacity_roster(revised, 2);
+        ledger
+            .append_roster_revision(
+                &run_id,
+                roster.clone(),
+                digest(&roster).expect("revised roster digest"),
+                "capacity class flip".to_owned(),
+                format!("operation:capacity-{suffix}"),
+            )
+            .expect("roster revision");
+        let after = ledger
+            .admission_snapshot_releasing_unowned(
+                Some((DesiredSubjectKind::Run, run_id)),
+                vec![(AdmissionSubjectKind::Packet, packet_id)],
+            )
+            .expect("snapshot after revision");
+        assert_ne!(
+            before.packet_facts[0].resource_class, after.packet_facts[0].resource_class,
+            "{suffix}"
+        );
+        after
+    }
+
+    #[test]
+    fn reservationless_capacity_uses_effective_roster_class_in_both_directions() {
+        for (suffix, initial, revised, class, charged, outcome, reason) in [
+            (
+                "write-read",
+                Sandbox::WorkspaceWrite,
+                Sandbox::ReadOnly,
+                AdmissionResourceClass::Read,
+                0,
+                AdmissionOutcome::Admitted,
+                AdmissionReason::CapacityAvailable,
+            ),
+            (
+                "read-write",
+                Sandbox::ReadOnly,
+                Sandbox::WorkspaceWrite,
+                AdmissionResourceClass::RepositoryWrite,
+                1,
+                AdmissionOutcome::Deferred,
+                AdmissionReason::RepositoryWriteCapacity,
+            ),
+        ] {
+            let snapshot = capacity_after_roster_flip(suffix, initial, revised);
+            assert!(snapshot.reservations.is_empty(), "{suffix}");
+            assert_eq!(snapshot.capacity.total_active, 1, "{suffix}");
+            assert_eq!(snapshot.packet_facts.len(), 1, "{suffix}");
+            assert_eq!(snapshot.packet_facts[0].resource_class, class, "{suffix}");
+            assert_eq!(
+                snapshot
+                    .capacity
+                    .repository_write_active
+                    .get("example/repo")
+                    .copied()
+                    .unwrap_or_default(),
+                charged,
+                "{suffix}"
+            );
+
+            let mut writer = candidate("genuine-writer", 0, "claude");
+            writer.repository = "example/repo".to_owned();
+            writer.work_repository = Some("example/repo".to_owned());
+            let inputs = AdmissionInputsV1 {
+                schema: ADMISSION_INPUTS_SCHEMA_V1.to_owned(),
+                as_of: snapshot.as_of,
+                policy_revision: "policy".to_owned(),
+                ledger_revision: snapshot.ledger_revision,
+                candidates: vec![writer],
+                capacity: snapshot.capacity,
+                spend: snapshot.spend,
+                latest_rate_limits: snapshot.latest_rate_limits,
+            };
+            let (_, decisions) =
+                evaluate(inputs, &AdmissionPolicy::default(), &BTreeMap::new()).expect("evaluate");
+            assert_eq!(decisions[0].outcome, outcome, "{suffix}");
+            assert_eq!(decisions[0].reason, reason, "{suffix}");
         }
     }
 
