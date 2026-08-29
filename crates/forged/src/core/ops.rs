@@ -23,7 +23,7 @@ use crate::config::{now_iso, stage_str};
 use crate::core::{
     default_key, derive_key, epic, err_response, fenced, key_absent, ok_response, on_ledger,
     param_opt_str, param_str, read_only, remedy_response, session_claimant, split_packet_key,
-    unfenced_write, Ctx, Failure,
+    unfenced_write, work_supersede_action, Ctx, Failure,
 };
 
 // ---------------------------------------------------------------- doctor
@@ -888,11 +888,7 @@ fn run_projection_actions(run: &forged_ledger::RunRow) -> Vec<forged_types::Oper
         RunState::Stopped
             if run.terminal_outcome != Some(forged_ledger::RunOutcome::InputRequired) =>
         {
-            (
-                "work supersede",
-                json!({"id": run.work_id, "successor": null}),
-                "create the successor first with work create",
-            )
+            return vec![work_supersede_action(&run.work_id)];
         }
         RunState::Stopped => return Vec::new(),
     };
