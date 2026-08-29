@@ -844,6 +844,35 @@ mod tests {
     use std::sync::{Arc, Barrier};
 
     #[test]
+    fn inflight_operations_plan_uses_the_state_run_index() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.db");
+        Ledger::open(&path)
+            .expect("migrate")
+            .close()
+            .expect("close");
+        let conn = Connection::open(path).expect("raw connection");
+        let sql = format!(
+            "SELECT {OPERATION_COLUMNS} FROM operations WHERE state = 'in_progress' ORDER BY rowid"
+        );
+        let mut statement = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .expect("prepare plan");
+        let details = statement
+            .query_map([], |row| row.get::<_, String>(3))
+            .expect("query plan")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("plan rows");
+
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("operations_state_run")),
+            "operation state index is absent from plan: {details:?}"
+        );
+    }
+
+    #[test]
     fn effect_class_decodes_every_check_string_and_fails_closed() {
         for (s, want) in [
             ("safe-retry", EffectClass::SafeRetry),

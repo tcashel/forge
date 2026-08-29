@@ -2614,6 +2614,8 @@ async fn run_attempt(
     .await;
 
     // 6. Harvest per the extraction contract.
+    let provider = packet.provider_hints.provider.as_str();
+    let transport_patterns = ctx.config.transport_patterns_for(provider);
     let harvest = if let Some(note) = provider_stream_transport {
         Harvest::Transport(note)
     } else {
@@ -2621,13 +2623,19 @@ async fn run_attempt(
             forged_host::Liveness::Vanished => {
                 Harvest::Transport("transport: session vanished".to_owned())
             }
-            forged_host::Liveness::Exited(_code) => match packet.provider_hints.provider.as_str() {
+            forged_host::Liveness::Exited(_code) => match provider {
                 "codex" => {
                     let last = crate::core::artifacts::read_final_message_text(&run_root, &dirs)?;
-                    harvest_codex(&out, last.as_deref(), &packet.result_schema, &packet_id)
+                    harvest_codex(
+                        &out,
+                        last.as_deref(),
+                        &packet.result_schema,
+                        &packet_id,
+                        &transport_patterns,
+                    )
                 }
-                "pi" => harvest_pi(&out, &packet.result_schema, &packet_id),
-                _ => harvest_claude(&out, &packet.result_schema, &packet_id),
+                "pi" => harvest_pi(&out, &packet.result_schema, &packet_id, &transport_patterns),
+                _ => harvest_claude(&out, &packet.result_schema, &packet_id, &transport_patterns),
             },
             forged_host::Liveness::Running => unreachable!("loop breaks only on terminal liveness"),
         }
@@ -3471,6 +3479,8 @@ mod settle_tests {
             gate_commands: Vec::new(),
             stage_budget_s: HashMap::new(),
             transport_retry_budget: 3,
+            transport_patterns: Vec::new(),
+            provider_transport_patterns: Default::default(),
             bd_path: root.join("bd"),
             beads_dir: root.join("beads"),
             codex_home: root.join("codex"),

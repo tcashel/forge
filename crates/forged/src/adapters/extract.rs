@@ -5,10 +5,10 @@
 use forged_types::PacketResult;
 use serde_json::Value;
 
-/// The closed transport-marker list: a terminal codex `turn.failed` — or a
+/// The built-in transport-marker list: a terminal codex `turn.failed` — or a
 /// claude `is_error` result — whose error message, ASCII-lowercased,
-/// contains one of these four entries is a free transport retry. The
-/// constant is the whole list; anything else is semantic.
+/// contains one of these four entries is a free transport retry. Operator
+/// config can append exact substrings without replacing these defaults.
 pub const TRANSPORT_MARKERS: [&str; 4] =
     ["rate limit", "stream disconnected", "timeout", "overloaded"];
 
@@ -24,10 +24,14 @@ pub enum Harvest {
     Semantic(String),
 }
 
-/// Whether `message`, ASCII-lowercased, carries a transport marker.
-pub fn is_transport_message(message: &str) -> bool {
+/// Whether `message` carries a built-in marker or an exact configured
+/// substring, compared ASCII-case-insensitively in that order.
+pub fn is_transport_message(message: &str, configured_patterns: &[&str]) -> bool {
     let lower = message.to_ascii_lowercase();
     TRANSPORT_MARKERS.iter().any(|m| lower.contains(m))
+        || configured_patterns.iter().any(|pattern| {
+            !pattern.trim().is_empty() && lower.contains(&pattern.to_ascii_lowercase())
+        })
 }
 
 /// Normalize the closed implement-gate vocabulary at either ingestion path.
@@ -289,9 +293,14 @@ pub fn extract_forged_result(
 /// Harvest a claude run: the final `type=result` record of the stream-json
 /// capture holds the result text. A stream with no final result record is a
 /// transport failure; an `is_error` result whose message carries a transport
-/// marker is transport and every other `is_error` result is semantic; only a
-/// non-error result falls through to extraction.
-pub fn harvest_claude(out_jsonl: &str, expected_schema: &str, packet_id: &str) -> Harvest {
+/// marker or configured pattern is transport and every other `is_error`
+/// result is semantic; only a non-error result falls through to extraction.
+pub fn harvest_claude(
+    out_jsonl: &str,
+    expected_schema: &str,
+    packet_id: &str,
+    configured_patterns: &[&str],
+) -> Harvest {
     let mut last_result: Option<Value> = None;
     for line in out_jsonl.lines() {
         if let Ok(v) = serde_json::from_str::<Value>(line) {
@@ -312,7 +321,8 @@ pub fn harvest_claude(out_jsonl: &str, expected_schema: &str, packet_id: &str) -
     if result.get("is_error").and_then(Value::as_bool) == Some(true) {
         // The marker source for an `is_error` result is `error.message`;
         // some shapes carry the same sentence in the top-level `result`
-        // text instead, so both are consulted against the closed list —
+        // text instead, so both are consulted against the built-in and
+        // configured lists —
         // mirroring the codex rule. Whichever one matched is the note.
         let error_message = result
             .get("error")
@@ -320,7 +330,7 @@ pub fn harvest_claude(out_jsonl: &str, expected_schema: &str, packet_id: &str) -
             .and_then(Value::as_str)
             .unwrap_or_default();
         for candidate in [error_message, text] {
-            if is_transport_message(candidate) {
+            if is_transport_message(candidate, configured_patterns) {
                 return Harvest::Transport(format!("transport: claude error result: {candidate}"));
             }
         }
@@ -346,6 +356,7 @@ pub fn harvest_codex(
     last_message: Option<&str>,
     expected_schema: &str,
     packet_id: &str,
+    configured_patterns: &[&str],
 ) -> Harvest {
     let mut terminal: Option<Value> = None;
     for line in out_jsonl.lines() {
@@ -367,7 +378,7 @@ pub fn harvest_codex(
             .and_then(|e| e.get("message"))
             .and_then(Value::as_str)
             .unwrap_or_default();
-        if is_transport_message(message) {
+        if is_transport_message(message, configured_patterns) {
             return Harvest::Transport(format!("transport: codex turn failed: {message}"));
         }
         return Harvest::Semantic(format!("codex turn failed: {message}"));
@@ -382,7 +393,12 @@ pub fn harvest_codex(
 /// Harvest a Pi JSON-mode run. A settled stream and its last finalized
 /// assistant message are authoritative; streaming deltas and catalogue cost
 /// never become result evidence.
-pub fn harvest_pi(out_jsonl: &str, expected_schema: &str, packet_id: &str) -> Harvest {
+pub fn harvest_pi(
+    out_jsonl: &str,
+    expected_schema: &str,
+    packet_id: &str,
+    configured_patterns: &[&str],
+) -> Harvest {
     let mut settled = false;
     let mut last_assistant: Option<Value> = None;
     for line in out_jsonl.lines() {
@@ -414,7 +430,7 @@ pub fn harvest_pi(out_jsonl: &str, expected_schema: &str, packet_id: &str) -> Ha
             .get("errorMessage")
             .and_then(Value::as_str)
             .unwrap_or(stop_reason);
-        if is_transport_message(detail) || stop_reason == "aborted" {
+        if is_transport_message(detail, configured_patterns) || stop_reason == "aborted" {
             return Harvest::Transport(format!("transport: pi {stop_reason}: {detail}"));
         }
         return Harvest::Semantic(format!("pi error: {detail}"));
@@ -449,6 +465,27 @@ mod tests {
 
     const SCHEMA: &str = "forged.result.implement/1";
     const PKT: &str = "run-1/implement/1";
+
+    fn is_transport_message(message: &str) -> bool {
+        super::is_transport_message(message, &[])
+    }
+
+    fn harvest_claude(out_jsonl: &str, expected_schema: &str, packet_id: &str) -> Harvest {
+        super::harvest_claude(out_jsonl, expected_schema, packet_id, &[])
+    }
+
+    fn harvest_codex(
+        out_jsonl: &str,
+        last_message: Option<&str>,
+        expected_schema: &str,
+        packet_id: &str,
+    ) -> Harvest {
+        super::harvest_codex(out_jsonl, last_message, expected_schema, packet_id, &[])
+    }
+
+    fn harvest_pi(out_jsonl: &str, expected_schema: &str, packet_id: &str) -> Harvest {
+        super::harvest_pi(out_jsonl, expected_schema, packet_id, &[])
+    }
 
     fn block(json: &str) -> String {
         format!("```forged-result\n{json}\n```\n")
@@ -602,7 +639,7 @@ mod tests {
     }
 
     #[test]
-    fn transport_markers_are_the_whole_closed_list() {
+    fn built_in_transport_markers_remain_unchanged() {
         for marker in TRANSPORT_MARKERS {
             assert!(is_transport_message(&format!("boom: {marker} hit")));
             assert!(is_transport_message(&marker.to_ascii_uppercase()));
@@ -663,7 +700,7 @@ mod tests {
             harvest_claude(line, SCHEMA, PKT),
             Harvest::Transport(note) if note == "transport: claude error result: Request timeout after 600s"
         ));
-        // The closed list still decides: a refusal in error.message is
+        // With no configured extension, a refusal in error.message is
         // semantic.
         let refusal = "{\"type\":\"result\",\"is_error\":true,\"result\":\"\",\
                        \"error\":{\"message\":\"policy refusal\"}}";
@@ -683,7 +720,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_turn_failed_classification_is_the_closed_list() {
+    fn codex_turn_failed_classification_uses_the_built_in_list() {
         let failed = "{\"type\":\"turn.failed\",\"error\":{\"message\":\"stream disconnected\"}}";
         assert!(matches!(
             harvest_codex(failed, None, SCHEMA, PKT),
@@ -737,7 +774,7 @@ mod tests {
     }
 
     #[test]
-    fn pi_terminal_errors_use_the_closed_transport_markers() {
+    fn pi_terminal_errors_use_the_built_in_transport_markers() {
         for (message, transport) in [("rate limit", true), ("policy refusal", false)] {
             let stream = format!(
                 "{}\n{}",

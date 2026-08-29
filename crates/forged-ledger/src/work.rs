@@ -1814,6 +1814,36 @@ pub(crate) fn ready_tx(conn: &Connection) -> Result<Vec<WorkItemSnapshot>, Ledge
 mod tests {
     use super::*;
 
+    #[test]
+    fn ready_work_items_plan_uses_the_partial_ready_index() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.db");
+        Ledger::open(&path)
+            .expect("migrate")
+            .close()
+            .expect("close");
+        let conn = Connection::open(path).expect("raw connection");
+        let (sql, params) =
+            collection_query(WorkItemCollection::Ready, &[], &WorkItemFilters::default());
+        let mut statement = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .expect("prepare plan");
+        let details = statement
+            .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+                row.get::<_, String>(3)
+            })
+            .expect("query plan")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("plan rows");
+
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("work_items_ready")),
+            "partial ready index is absent from plan: {details:?}"
+        );
+    }
+
     fn ledger() -> (tempfile::TempDir, Ledger) {
         let dir = tempfile::tempdir().expect("tempdir");
         let ledger = Ledger::open(&dir.path().join("state.db")).expect("ledger");
