@@ -1697,7 +1697,14 @@ async fn advance_once(
 /// clear by waiting, and only the deferred admission decision carries an
 /// attention projection, so parking on anything else would starve silently.
 pub async fn run_drive(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
-    let response = run_drive_loop(ctx, req).await;
+    let response = if let Some(detail) = failpoint::injected("controller.bootstrap.refuse") {
+        err_response(
+            &derive_key("run_drive", req.run_id.as_deref(), None, None),
+            &Failure::invalid(detail),
+        )
+    } else {
+        run_drive_loop(ctx, req).await
+    };
     // Every terminal error exit of the loop, present and future, records
     // durable evidence: the supervisor reads it instead of the controller's
     // process-local log.

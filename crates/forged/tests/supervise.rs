@@ -3,9 +3,13 @@
 
 mod support;
 
+#[cfg(feature = "failpoints")]
+use std::os::unix::process::CommandExt;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "failpoints")]
+use forged_ledger::DesiredReconcileUpdate;
 use forged_ledger::{DesiredReconcileOutcome, DesiredState, DesiredSubjectKind};
 use nix::errno::Errno;
 use nix::sys::signal::{kill, killpg, Signal};
@@ -1165,13 +1169,549 @@ fn raise_admission_limits(env: &TestEnv) {
 }
 
 fn terminal_marker(generation: Option<u32>, message: &str, recoverable: bool) -> Value {
+    terminal_marker_with_code(generation, "INVALID_REQUEST", message, recoverable)
+}
+
+fn terminal_marker_with_code(
+    generation: Option<u32>,
+    code: &str,
+    message: &str,
+    recoverable: bool,
+) -> Value {
     json!({
         "schemaVersion": 1,
         "generation": generation,
-        "code": "INVALID_REQUEST",
+        "code": code,
         "message": message,
         "recoverable": recoverable,
     })
+}
+
+#[cfg(feature = "failpoints")]
+fn exhaust_desired_without_controller(env: &TestEnv, run: &str, generation: u32, message: &str) {
+    let ledger = env.ledger();
+    ledger
+        .authorize_desired_work(DesiredSubjectKind::Run, run, generation)
+        .expect("authorize desired fixture");
+    ledger
+        .record_desired_outcome(
+            DesiredSubjectKind::Run,
+            run,
+            DesiredState::Running,
+            DesiredReconcileOutcome::Authorized,
+            Some("2000-01-01T00:00:00.000000000Z".to_owned()),
+            None,
+        )
+        .expect("make desired fixture due");
+    let token = format!("exhaust-{run}");
+    ledger
+        .claim_desired_work(
+            DesiredSubjectKind::Run,
+            run,
+            &token,
+            "2099-01-01T00:00:00.000000000Z",
+            "2099-01-01T00:01:00.000000000Z",
+        )
+        .expect("claim desired fixture")
+        .expect("desired fixture is claimable");
+    ledger
+        .finish_desired_reconciliation(
+            DesiredSubjectKind::Run,
+            run,
+            &token,
+            DesiredReconcileUpdate {
+                desired_state: None,
+                outcome: DesiredReconcileOutcome::Exhausted,
+                controller_generation: None,
+                predecessor_generation: None,
+                next_wake_at: None,
+                last_progress_at: None,
+                last_error: Some(format!(
+                    "halted after one nonrecoverable controller failure: {message}"
+                )),
+                attention_condition: Some("restart-budget-exhausted".to_owned()),
+            },
+        )
+        .expect("exhaust desired fixture");
+    ledger.close().expect("close");
+}
+
+#[cfg(feature = "failpoints")]
+#[test]
+fn preidentity_nonrecoverable_terminal_halts_and_resubmit_launches_next_generation() {
+    if !require_serialized_runner() {
+        return;
+    }
+    let env = TestEnv::new("supervise-halt-preidentity");
+    let run = "run-halt-preidentity";
+    start_run(&env, run);
+    let message = "failpoint controller.bootstrap.refuse: injected failure";
+    let ledger = env.ledger();
+    ledger
+        .authorize_desired_work(DesiredSubjectKind::Run, run, 1)
+        .expect("authorize generation without a controller record");
+    ledger.close().expect("close");
+
+    let controller_dir = env.anvil.join(format!("runs/{run}/controller"));
+    std::fs::create_dir_all(&controller_dir).expect("controller directory");
+    let mut bootstrap = env.forged_cmd(&["run", "drive", "--run", run]);
+    bootstrap
+        .process_group(0)
+        .env(
+            "FORGED_CONTROLLER_PID_PATH",
+            controller_dir.join("controller-1.pid"),
+        )
+        .env(
+            "FORGED_CONTROLLER_LSTART_PATH",
+            controller_dir.join("controller-1.lstart"),
+        )
+        .env("FORGED_CONTROLLER_SCOPE", "run")
+        .env("FORGED_CONTROLLER_ID", run)
+        .env("FORGED_CONTROLLER_GENERATION", "1")
+        .env("FORGED_FAILPOINT", "controller.bootstrap.refuse")
+        .env("FORGED_FAILPOINT_MODE", "fail");
+    let bootstrap = bootstrap.output().expect("bootstrap controller runs");
+    assert!(
+        !bootstrap.status.success(),
+        "injected bootstrap refusal must terminate the controller: {}",
+        String::from_utf8_lossy(&bootstrap.stdout)
+    );
+    assert!(controller_dir.join("controller-1.pid").exists());
+    assert!(controller_dir.join("controller-1.lstart").exists());
+    assert!(
+        !controller_dir.join("controller.json").exists(),
+        "the controller died before its identity record was persisted"
+    );
+    let ledger = env.ledger();
+    let terminal: Value = ledger
+        .latest_event_of_kind(run, "forged.controller.terminal")
+        .expect("terminal query")
+        .and_then(|event| serde_json::from_str(&event.payload_json).ok())
+        .expect("terminal marker");
+    assert_eq!(terminal["generation"], json!(1));
+    assert_eq!(terminal["code"], json!("INVALID_REQUEST"));
+    assert_eq!(terminal["recoverable"], json!(false));
+    ledger.close().expect("close");
+
+    let (code, tick) = env.forged(&["supervise", "--once"]);
+    assert_eq!(code, 0, "halt tick: {tick}");
+    assert_eq!(tick["result"]["subjects"][0]["action"], json!("halted"));
+
+    let ledger = env.ledger();
+    let halted = ledger
+        .get_desired_work(DesiredSubjectKind::Run, run)
+        .expect("desired query")
+        .expect("desired row");
+    assert_eq!(halted.controller_generation, 1);
+    assert_eq!(halted.restart_used, 0, "pre-identity halt is free");
+    assert!(
+        halted.exhausted_at.is_some(),
+        "pre-identity halt is durable"
+    );
+    assert!(halted.next_wake_at.is_none(), "halt has no future wake");
+    let error = halted.last_error.as_deref().expect("halt evidence");
+    assert!(error.contains("halted after one nonrecoverable"), "{error}");
+    assert!(error.contains(message), "{error}");
+    let events = ledger.list_events(Some(run), 0, 65_536).expect("events");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == "forged.controller.started")
+            .count(),
+        0,
+        "the dead generation never persisted controller identity"
+    );
+    let snapshot = ledger.admission_snapshot(None).expect("admission snapshot");
+    assert!(
+        snapshot.reservations.iter().all(|reservation| {
+            reservation.subject_kind != forged_types::AdmissionSubjectKind::Run
+                || reservation.subject_id != run
+        }),
+        "the halt releases its admission reservation"
+    );
+    let halted_at = halted.exhausted_at.clone();
+    ledger.close().expect("close");
+
+    env.set_scenario("implement", "hang", 1);
+    let submit_args = [
+        "run",
+        "submit",
+        "--run",
+        run,
+        "--idempotency-key",
+        "preidentity-halt-resubmit",
+    ];
+    let (code, submitted) = env.forged(&submit_args);
+    assert_eq!(code, 0, "resubmit halted subject: {submitted}");
+    assert_eq!(submitted["result"]["controller"]["generation"], json!(2));
+    let second_pid = controller_pid(&submitted);
+    wait_until("resubmitted provider start", || {
+        implementation_starts(&env, run) == 1
+    });
+    assert!(process_group_alive(second_pid), "generation 2 is live");
+    let record: Value = serde_json::from_slice(
+        &std::fs::read(
+            env.anvil
+                .join(format!("runs/{run}/controller/controller.json")),
+        )
+        .expect("generation 2 controller record"),
+    )
+    .expect("controller JSON");
+    assert_eq!(record["generation"], json!(2));
+
+    let ledger = env.ledger();
+    let relaunched = ledger
+        .get_desired_work(DesiredSubjectKind::Run, run)
+        .expect("desired query")
+        .expect("desired row");
+    assert_eq!(relaunched.controller_generation, 2);
+    assert_eq!(relaunched.control_revision, 2);
+    assert!(relaunched.exhausted_at.is_none(), "real launch clears halt");
+    assert_ne!(halted_at, relaunched.exhausted_at);
+    ledger.close().expect("close");
+
+    let (code, replayed) = env.forged(&submit_args);
+    assert_eq!(code, 0, "replay successful resubmit: {replayed}");
+    assert_eq!(replayed["reused"], json!(true));
+    let ledger = env.ledger();
+    let replay_row = ledger
+        .get_desired_work(DesiredSubjectKind::Run, run)
+        .expect("desired query")
+        .expect("desired row");
+    assert_eq!(replay_row.control_revision, 2, "halt clears exactly once");
+    assert!(replay_row.exhausted_at.is_none());
+    ledger.close().expect("close");
+
+    let refused_run = "run-halt-refused";
+    start_run(&env, refused_run);
+    exhaust_desired_without_controller(&env, refused_run, 1, "fixture refusal");
+    let ledger = env.ledger();
+    let before_refusal = ledger
+        .get_desired_work(DesiredSubjectKind::Run, refused_run)
+        .expect("desired query")
+        .expect("desired row");
+    ledger.close().expect("close");
+    let (code, refused) = env.forged(&[
+        "run",
+        "submit",
+        "--run",
+        refused_run,
+        "--idempotency-key",
+        "preidentity-halt-refused",
+    ]);
+    assert_ne!(code, 0, "capacity-blocked resubmit must refuse: {refused}");
+    assert_eq!(refused["error"]["code"], json!("OPERATION_IN_PROGRESS"));
+    assert_eq!(refused["error"]["recoverable"], json!(true));
+    let ledger = env.ledger();
+    let after_refusal = ledger
+        .get_desired_work(DesiredSubjectKind::Run, refused_run)
+        .expect("desired query")
+        .expect("desired row");
+    assert_eq!(after_refusal.exhausted_at, before_refusal.exhausted_at);
+    assert_eq!(
+        after_refusal.control_revision,
+        before_refusal.control_revision
+    );
+    assert_eq!(
+        after_refusal.controller_generation,
+        before_refusal.controller_generation
+    );
+    ledger.close().expect("close");
+    assert!(
+        !env.anvil
+            .join(format!("runs/{refused_run}/controller/controller.json"))
+            .exists(),
+        "refused submit launches no controller"
+    );
+
+    stop_until_lands(
+        &env,
+        run,
+        "pre-identity halt fixture cleanup",
+        "pre-identity halt cleanup lands",
+    );
+    wait_until("resubmitted controller group death", || {
+        !process_group_alive(second_pid)
+    });
+}
+
+#[cfg(feature = "failpoints")]
+fn current_controller_identity(env: &TestEnv, run: &str) -> (u32, i32) {
+    let record: Value = serde_json::from_slice(
+        &std::fs::read(
+            env.anvil
+                .join(format!("runs/{run}/controller/controller.json")),
+        )
+        .expect("controller record"),
+    )
+    .expect("controller JSON");
+    let generation = record["generation"]
+        .as_u64()
+        .and_then(|generation| u32::try_from(generation).ok())
+        .expect("controller generation");
+    let pid = record["driver"]["pid"]
+        .as_i64()
+        .and_then(|pid| i32::try_from(pid).ok())
+        .expect("controller pid");
+    (generation, pid)
+}
+
+#[cfg(feature = "failpoints")]
+fn kill_controller_and_make_due(
+    env: &TestEnv,
+    run: &str,
+    generation: u32,
+    code: &str,
+    message: &str,
+    recoverable: bool,
+) {
+    let (recorded_generation, pid) = current_controller_identity(env, run);
+    assert_eq!(recorded_generation, generation);
+    killpg(Pid::from_raw(pid), Signal::SIGKILL).expect("kill controller group");
+    wait_until("controller group death", || !process_group_alive(pid));
+    let ledger = env.ledger();
+    ledger
+        .append_event(
+            Some(run),
+            "forged.controller.terminal",
+            terminal_marker_with_code(Some(generation), code, message, recoverable),
+        )
+        .expect("terminal marker");
+    ledger
+        .record_desired_outcome(
+            DesiredSubjectKind::Run,
+            run,
+            DesiredState::Running,
+            DesiredReconcileOutcome::Authorized,
+            Some("2000-01-01T00:00:00.000000000Z".to_owned()),
+            None,
+        )
+        .expect("make dead controller due");
+    ledger.close().expect("close");
+}
+
+#[cfg(feature = "failpoints")]
+#[test]
+fn stale_nonrecoverable_terminal_without_identity_takes_the_restart_path() {
+    if !require_serialized_runner() {
+        return;
+    }
+    let env = TestEnv::new("supervise-stale-preidentity-terminal");
+    let run = "run-stale-preidentity";
+    start_run(&env, run);
+    env.set_scenario("implement", "hang", 1);
+    let ledger = env.ledger();
+    ledger
+        .authorize_desired_work(DesiredSubjectKind::Run, run, 2)
+        .expect("authorize recordless generation 2");
+    ledger
+        .append_event(
+            Some(run),
+            "forged.controller.terminal",
+            terminal_marker(Some(1), "stale deterministic refusal", false),
+        )
+        .expect("stale terminal marker");
+    ledger.close().expect("close");
+
+    let (code, tick) = env.forged(&["supervise", "--once"]);
+    assert_eq!(code, 0, "restart tick: {tick}");
+    assert_eq!(tick["result"]["subjects"][0]["action"], json!("restarted"));
+    let ledger = env.ledger();
+    let desired = ledger
+        .get_desired_work(DesiredSubjectKind::Run, run)
+        .expect("desired query")
+        .expect("desired row");
+    assert_eq!(desired.controller_generation, 3);
+    assert_eq!(desired.restart_used, 1);
+    assert!(desired.exhausted_at.is_none(), "stale marker never halts");
+    ledger.close().expect("close");
+    let (generation, pid) = current_controller_identity(&env, run);
+    assert_eq!(generation, 3);
+    stop_until_lands(
+        &env,
+        run,
+        "recordless stale fixture cleanup",
+        "recordless stale fixture stop lands",
+    );
+    wait_until("recordless stale replacement death", || {
+        !process_group_alive(pid)
+    });
+}
+
+#[cfg(feature = "failpoints")]
+#[test]
+fn stale_nonrecoverable_terminal_with_identity_takes_the_restart_path() {
+    if !require_serialized_runner() {
+        return;
+    }
+    let env = TestEnv::new("supervise-stale-recorded-terminal");
+    raise_admission_limits(&env);
+    let run = "run-stale-recorded";
+    start_run(&env, run);
+    env.set_scenario("implement", "hang", 3);
+    let (code, submitted) = env.forged(&["run", "submit", "--run", run]);
+    assert_eq!(code, 0, "submit: {submitted}");
+    wait_until("first controller provider start", || {
+        implementation_starts(&env, run) == 1
+    });
+    kill_controller_and_make_due(
+        &env,
+        run,
+        1,
+        "INVALID_REQUEST",
+        "recoverable first death",
+        true,
+    );
+    let (code, first_restart) = env.forged(&["supervise", "--once"]);
+    assert_eq!(code, 0, "first restart: {first_restart}");
+    assert_eq!(
+        first_restart["result"]["subjects"][0]["action"],
+        json!("restarted")
+    );
+
+    let (generation, second_pid) = current_controller_identity(&env, run);
+    assert_eq!(generation, 2);
+    killpg(Pid::from_raw(second_pid), Signal::SIGKILL).expect("kill generation 2");
+    wait_until("generation 2 death", || !process_group_alive(second_pid));
+    let ledger = env.ledger();
+    ledger
+        .append_event(
+            Some(run),
+            "forged.controller.terminal",
+            terminal_marker(Some(1), "stale deterministic refusal", false),
+        )
+        .expect("stale nonrecoverable terminal");
+    ledger
+        .record_desired_outcome(
+            DesiredSubjectKind::Run,
+            run,
+            DesiredState::Running,
+            DesiredReconcileOutcome::Authorized,
+            Some("2000-01-01T00:00:00.000000000Z".to_owned()),
+            None,
+        )
+        .expect("make generation 2 due");
+    ledger.close().expect("close");
+
+    let (code, second_restart) = env.forged(&["supervise", "--once"]);
+    assert_eq!(code, 0, "second restart: {second_restart}");
+    assert_eq!(
+        second_restart["result"]["subjects"][0]["action"],
+        json!("restarted")
+    );
+    let ledger = env.ledger();
+    let desired = ledger
+        .get_desired_work(DesiredSubjectKind::Run, run)
+        .expect("desired query")
+        .expect("desired row");
+    assert_eq!(desired.controller_generation, 3);
+    assert_eq!(desired.restart_used, 2);
+    assert!(desired.exhausted_at.is_none(), "stale marker never halts");
+    ledger.close().expect("close");
+    let (_, third_pid) = current_controller_identity(&env, run);
+    stop_until_lands(
+        &env,
+        run,
+        "recorded stale fixture cleanup",
+        "recorded stale fixture stop lands",
+    );
+    wait_until("recorded stale replacement death", || {
+        !process_group_alive(third_pid)
+    });
+}
+
+#[cfg(feature = "failpoints")]
+#[test]
+fn nonrecoverable_gh_error_consumes_backoff_budget_instead_of_halting() {
+    if !require_serialized_runner() {
+        return;
+    }
+    let env = TestEnv::new("supervise-gh-error-budget");
+    raise_admission_limits(&env);
+    let run = "run-gh-error-budget";
+    start_run(&env, run);
+    env.set_scenario("implement", "hang", 8);
+    let (code, submitted) = env.forged(&[
+        "run",
+        "submit",
+        "--run",
+        run,
+        "--idempotency-key",
+        "gh-budget-first-submit",
+    ]);
+    assert_eq!(code, 0, "submit: {submitted}");
+    wait_until("first controller provider start", || {
+        implementation_starts(&env, run) == 1
+    });
+
+    for generation in 1..=6 {
+        let message = format!("transient gh outage at generation {generation}");
+        kill_controller_and_make_due(&env, run, generation, "GH_ERROR", &message, false);
+        let (code, tick) = env.forged(&["supervise", "--once"]);
+        assert_eq!(code, 0, "generation {generation} tick: {tick}");
+        let ledger = env.ledger();
+        let desired = ledger
+            .get_desired_work(DesiredSubjectKind::Run, run)
+            .expect("desired query")
+            .expect("desired row");
+        if generation <= 5 {
+            assert_eq!(
+                tick["result"]["subjects"][0]["action"],
+                json!("restarted"),
+                "GH_ERROR must never halt"
+            );
+            assert_eq!(desired.restart_used, generation);
+            assert_eq!(desired.controller_generation, generation + 1);
+            assert!(desired.exhausted_at.is_none());
+            let expected_backoff = 5_u64.saturating_mul(2_u64.pow(generation - 1));
+            let wake = desired.next_wake_at.as_deref().expect("restart wake");
+            assert!(
+                seconds_between(&desired.updated_at, wake) >= expected_backoff as f64 - 1.0,
+                "generation {generation} follows backoff {expected_backoff}s: {} -> {wake}",
+                desired.updated_at
+            );
+        } else {
+            assert_eq!(tick["result"]["subjects"][0]["action"], json!("exhausted"));
+            assert_eq!(desired.restart_used, 5);
+            assert_eq!(desired.controller_generation, 6);
+            assert!(desired.exhausted_at.is_some());
+            assert_eq!(
+                desired.last_outcome,
+                Some(DesiredReconcileOutcome::Exhausted)
+            );
+        }
+        ledger.close().expect("close");
+    }
+
+    let (code, resubmitted) = env.forged(&[
+        "run",
+        "submit",
+        "--run",
+        run,
+        "--idempotency-key",
+        "gh-budget-resubmit",
+    ]);
+    assert_eq!(code, 0, "resubmit after bounded exhaustion: {resubmitted}");
+    assert_eq!(resubmitted["result"]["controller"]["generation"], json!(7));
+    let seventh_pid = controller_pid(&resubmitted);
+    let ledger = env.ledger();
+    let desired = ledger
+        .get_desired_work(DesiredSubjectKind::Run, run)
+        .expect("desired query")
+        .expect("desired row");
+    assert_eq!(desired.controller_generation, 7);
+    assert_eq!(desired.restart_used, 0);
+    assert!(desired.exhausted_at.is_none());
+    ledger.close().expect("close");
+    stop_until_lands(
+        &env,
+        run,
+        "GH_ERROR budget fixture cleanup",
+        "GH_ERROR budget fixture stop lands",
+    );
+    wait_until("generation 7 controller death", || {
+        !process_group_alive(seventh_pid)
+    });
 }
 
 #[test]
@@ -1333,7 +1873,7 @@ fn nonrecoverable_terminal_halts_without_charging_the_budget() {
 }
 
 #[test]
-fn recoverable_terminal_restarts_with_evidence_and_backoff() {
+fn mutable_host_invalid_request_restarts_with_evidence_and_backoff() {
     if !require_serialized_runner() {
         return;
     }
@@ -1357,7 +1897,10 @@ fn recoverable_terminal_restarts_with_evidence_and_backoff() {
         .append_event(
             Some("run-backoff"),
             "forged.controller.terminal",
-            terminal_marker(Some(1), "transient boot failure", true),
+            // HostError::SessionNotFound retains INVALID_REQUEST on the
+            // public wire but is normalized recoverable before this terminal
+            // envelope is recorded.
+            terminal_marker(Some(1), "session not found: pane-session-1", true),
         )
         .expect("terminal marker");
     ledger
@@ -1384,8 +1927,8 @@ fn recoverable_terminal_restarts_with_evidence_and_backoff() {
     assert_eq!(desired.controller_generation, 2);
     assert_eq!(
         desired.last_error.as_deref(),
-        Some("restarted after controller failure: transient boot failure"),
-        "a recoverable death restarts WITH its evidence preserved"
+        Some("restarted after controller failure: session not found: pane-session-1"),
+        "a mutable host-session loss restarts WITH its evidence preserved"
     );
     let wake = desired.next_wake_at.as_deref().expect("restart wake");
     assert!(

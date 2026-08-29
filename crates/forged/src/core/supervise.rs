@@ -853,19 +853,27 @@ async fn reconcile_claimed(
         .await;
     }
 
-    // A death whose own terminal record says `recoverable: false` is
-    // deterministic configuration/setup truth, not a liveness blip: a
-    // restart replays it byte-for-byte. Halt after this first death — no
-    // budget charge, no respawn — and surface the recorded failure with the
-    // typed resubmit recovery. Only a terminal matching the exact dead
-    // generation gates; a generation-less or stale marker never halts.
+    // A death whose own terminal record says `recoverable: false` and carries
+    // a deterministic refusal code is configuration/setup truth, not a
+    // liveness blip: a restart replays it byte-for-byte. Halt after this first
+    // death — no budget charge, no respawn — and surface the recorded failure
+    // with the typed resubmit recovery. Only a terminal matching the exact
+    // dead generation gates; a generation-less or stale marker never halts.
+    // Before controller.json exists, the desired row is the supervisor's own
+    // spawn-generation authority. Once a record exists, keep using only that
+    // observed identity as the fence.
+    let terminal_generation = if record.is_some() {
+        observed_generation
+    } else {
+        row.controller_generation
+    };
     let terminal = latest_controller_terminal(ctx, &row.subject_id)
         .await?
         .filter(|terminal| {
-            observed_generation > 0 && terminal.generation == Some(observed_generation)
+            terminal_generation > 0 && terminal.generation == Some(terminal_generation)
         });
     if let Some(terminal) = terminal.as_ref() {
-        if !terminal.recoverable {
+        if !terminal.recoverable && terminal.code.is_some_and(deterministic_terminal_refusal) {
             // The halt parks the subject with no future wake, so this tick
             // is the last chance to release the reservation: left held, one
             // halted subject pins its repository/provider capacity until an
@@ -1018,8 +1026,20 @@ async fn reconcile_claimed(
 /// unparseable payloads read as "recoverable, unknown generation".
 struct ControllerTerminal {
     generation: Option<u32>,
+    code: Option<ErrorCode>,
     message: String,
     recoverable: bool,
+}
+
+fn deterministic_terminal_refusal(code: ErrorCode) -> bool {
+    // A nonrecoverable INVALID_REQUEST is the controller's closed
+    // malformed-request/config refusal, while SPEC_DRIFT is the closed
+    // persisted-spec mismatch. Producers must normalize mutable failures
+    // before recording the terminal: HostError::SessionNotFound retains the
+    // INVALID_REQUEST wire code for compatibility but is recoverable. Every
+    // other ErrorCode can name mutable repository, GitHub, provider, host, or
+    // transport state and therefore must consume the bounded restart path.
+    matches!(code, ErrorCode::InvalidRequest | ErrorCode::SpecDrift)
 }
 
 async fn latest_controller_terminal(
@@ -1038,6 +1058,10 @@ async fn latest_controller_terminal(
                 .get("generation")
                 .and_then(Value::as_u64)
                 .and_then(|value| u32::try_from(value).ok()),
+            code: payload
+                .get("code")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok()),
             message: payload
                 .get("message")
                 .and_then(Value::as_str)

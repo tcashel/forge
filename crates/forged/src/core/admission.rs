@@ -255,7 +255,7 @@ fn project_candidates(
             && durable.desired_state != DesiredState::Running
         {
             Some(AdmissionReason::DesiredNotRunning)
-        } else if durable.exhausted {
+        } else if durable.exhausted && !is_explicit {
             Some(AdmissionReason::Exhausted)
         } else if input_error.is_some() || issue.is_none() {
             Some(AdmissionReason::BeadUnavailable)

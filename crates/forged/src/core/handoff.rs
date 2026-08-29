@@ -1464,7 +1464,7 @@ async fn submit(ctx: &Ctx, req: &mut OperationRequest, scope: Scope) -> Operatio
     // per subject, so the pre-commit prediction is exact — the readback is
     // computed here because the fenced response is stored before the bump
     // is observable.
-    let next_control_revision = {
+    let desired_before = {
         let kind = scope.desired_kind();
         let desired_id = id.clone();
         match on_ledger(&ctx.ledger, move |ledger| {
@@ -1472,7 +1472,7 @@ async fn submit(ctx: &Ctx, req: &mut OperationRequest, scope: Scope) -> Operatio
         })
         .await
         {
-            Ok(row) => row.map_or(1, |row| row.control_revision + 1),
+            Ok(row) => row,
             Err(error) => {
                 return err_response(
                     &derive_key(scope.operation(), Some(&id), None, None),
@@ -1481,6 +1481,12 @@ async fn submit(ctx: &Ctx, req: &mut OperationRequest, scope: Scope) -> Operatio
             }
         }
     };
+    let next_control_revision = desired_before
+        .as_ref()
+        .map_or(1, |row| row.control_revision + 1);
+    let exhausted_before_submit = desired_before
+        .as_ref()
+        .is_some_and(|row| row.exhausted_at.is_some());
 
     let records = match events(ctx, &id).await {
         Ok(records) => records,
@@ -1498,6 +1504,15 @@ async fn submit(ctx: &Ctx, req: &mut OperationRequest, scope: Scope) -> Operatio
         .map(|value| generation(&value))
         .max()
         .unwrap_or(0);
+    // A pre-identity controller can die after the supervisor minted its
+    // desired generation but before controller.json or controller.started
+    // exists. That desired generation remains authoritative history: a fresh
+    // submit must advance past it, never replay it as a control-only bump.
+    max_generation = max_generation.max(
+        desired_before
+            .as_ref()
+            .map_or(0, |row| row.controller_generation),
+    );
     let mut latest_status = Value::Null;
     if let Ok(Some(record)) = latest_record(ctx, &id).await {
         max_generation = max_generation.max(generation(&record));
@@ -1916,6 +1931,19 @@ async fn submit(ctx: &Ctx, req: &mut OperationRequest, scope: Scope) -> Operatio
             .and_then(|value| value.as_str().map(str::to_owned))
             .unwrap_or_else(|| "admission-deferred".to_owned());
         if admission.decision.outcome != AdmissionOutcome::Admitted {
+            if exhausted_before_submit {
+                return err_response(
+                    &req.idempotency_key,
+                    &Failure {
+                        code: ErrorCode::OperationInProgress,
+                        message: format!(
+                            "{} {id} remains exhausted because fresh submission was not admitted: {reason}",
+                            scope.noun()
+                        ),
+                        recoverable: true,
+                    },
+                );
+            }
             let queued_until = admission.decision.next_eligible_wake_at.clone();
             let decision = admission.decision;
             return fenced_authorizing_desired(
