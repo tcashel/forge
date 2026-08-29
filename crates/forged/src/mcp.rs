@@ -1,16 +1,14 @@
-//! `forged mcp` — the rmcp stdio server. Sixty-four tools, each taking the same
-//! operation envelope in and returning the same envelope out; every tool
+//! `forged mcp` — the rmcp stdio server. Each tool takes the same operation
+//! envelope in and returns the same envelope out; every tool
 //! routes through the identical core dispatch the CLI uses, so the two
-//! surfaces are two adapters over one core. Five dispatcher operations remain
-//! deliberately CLI-only: `init` owns local setup, `supervise` is the daemon
-//! entry point, `work_import_beads` is a legacy import, `packet_heartbeat` is
-//! controller-internal, and foreground `run_drive` is omitted because this
-//! detached-first surface exposes `run_submit` instead.
+//! surfaces are two adapters over one core. The CLI-only set is generated in
+//! the operation-surface manifest rather than repeated here.
 //!
 //! rmcp 3.x idioms (operator-adjudicated): `ContentBlock` for tool results,
 //! `ServerInfo::default()` then mutate for the server declaration, and the
 //! `tool_router` macro for tool registration.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -101,8 +99,8 @@ pub struct EnvelopeArgs {
     /// Envelope schema version; always 1.
     #[serde(default = "default_schema_version")]
     pub schema_version: u32,
-    /// The idempotency key; derived (mutating) or defaulted (read-only)
-    /// when absent, exactly three operations require it explicitly.
+    /// The idempotency key; derived (mutating) or defaulted (read-only) when
+    /// absent. Explicit-key exceptions are generated in the surface manifest.
     #[serde(default)]
     pub idempotency_key: Option<String>,
     /// The run the operation addresses, when any.
@@ -1237,6 +1235,15 @@ impl ForgedServer {
         result.structured_content = structured;
         result
     }
+}
+
+/// Return the registered tool names without constructing a server transport.
+pub(crate) fn tool_names() -> BTreeSet<String> {
+    ForgedServer::tool_router()
+        .list_all()
+        .into_iter()
+        .map(|tool| tool.name.into_owned())
+        .collect()
 }
 
 #[tool_router(router = tool_router)]

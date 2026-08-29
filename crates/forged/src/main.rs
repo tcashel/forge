@@ -14,6 +14,7 @@ mod failpoint;
 mod mcp;
 mod pricing;
 mod runtime;
+mod surface;
 
 use std::sync::Arc;
 
@@ -28,6 +29,15 @@ fn main() {
         std::process::exit(code);
     }
     let args = cli::Cli::parse();
+    if matches!(&args.command, cli::Command::GenerateSurfaceManifest) {
+        return match surface::regenerate() {
+            Ok(()) => {}
+            Err(message) => {
+                eprintln!("forged: {message}");
+                std::process::exit(1);
+            }
+        };
+    }
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_max_level(tracing::Level::WARN)
