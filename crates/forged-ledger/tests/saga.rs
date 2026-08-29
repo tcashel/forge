@@ -912,6 +912,41 @@ fn containment_refusing_settlement_loses_to_an_admitted_ticket_in_transaction() 
 }
 
 #[test]
+fn blocked_to_landed_requires_the_adjudication_settlement_door() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ledger = Ledger::open(&dir.path().join("state.db")).expect("open");
+    let run = make_run(&ledger, "run-lead-finish-door");
+    block_after_review_exhaustion(&ledger, &run, 2);
+    let settlement = || RunSettlement {
+        outcome: RunOutcome::Landed,
+        reason: "lead recorded the merged delivery".to_owned(),
+        delivery_pr: Some(212),
+        delivery_sha: Some("d".repeat(40)),
+        superseded_by: None,
+    };
+
+    let refused = ledger
+        .settle_run_fencing_controller(&run, settlement(), 4)
+        .expect_err("plain run stop must not widen blocked to landed");
+    assert_eq!(refused.code(), ErrorCode::InvalidRequest);
+    assert_eq!(
+        ledger.get_run(&run).expect("run").terminal_outcome,
+        Some(RunOutcome::Blocked)
+    );
+
+    let landed = ledger
+        .adjudicate_run_settlement_fencing_controller_refusing_machine_effects(
+            &run,
+            settlement(),
+            4,
+        )
+        .expect("the distinct adjudication door admits lead delivery evidence");
+    assert_eq!(landed.terminal_outcome, Some(RunOutcome::Landed));
+    assert_eq!(landed.delivery_pr, Some(212));
+    ledger.close().expect("close");
+}
+
+#[test]
 fn foreground_machine_ticket_is_not_mistaken_for_a_killed_generation() {
     let dir = tempfile::tempdir().expect("tempdir");
     let ledger = Ledger::open(&dir.path().join("state.db")).expect("open");

@@ -1,7 +1,6 @@
-//! `run adjudicate-settlement`: the typed, explicitly destructive settlement
-//! of a run whose latest controller record lacks durable driver identity.
-//! The fence stays closed for `run stop`; the adjudication substitutes an
-//! auditable human assertion for the verified-kill step and nothing else.
+//! `run adjudicate-settlement`: typed abandoned-run rescue and review-budget
+//! lead finish. The ordinary `run stop` transition lattice stays closed; the
+//! adjudication records the human evidence the machine could not establish.
 
 mod support;
 
@@ -24,6 +23,55 @@ fn seed_legacy(env: &TestEnv, run: &str) -> String {
             json!({"scope": "run", "id": run, "generation": 1}),
         )
         .expect("legacy controller record");
+    ledger.close().expect("close");
+    work
+}
+
+fn seed_review_budget_stop(env: &TestEnv, run: &str, full_driver_identity: bool) -> String {
+    let work = seed_legacy(env, run);
+    let ledger = env.ledger();
+    if full_driver_identity {
+        ledger
+            .append_event(
+                Some(run),
+                "forged.controller.started",
+                json!({
+                    "scope": "run",
+                    "id": run,
+                    "generation": 2,
+                    "driver": {
+                        "pid": 4_000_000,
+                        "lstart": "Mon Jan  5 09:00:00 2026",
+                    },
+                }),
+            )
+            .expect("full controller record");
+    }
+    ledger
+        .append_event_kind_once(
+            run,
+            "run.protocol-terminal",
+            json!({
+                "schemaVersion": 1,
+                "terminal": {
+                    "reviewBudgetExhausted": {
+                        "reviewRounds": 2,
+                        "finalVerdict": "requestChanges",
+                    }
+                }
+            }),
+        )
+        .expect("review-budget terminal");
+    ledger
+        .settle_run(
+            run,
+            forged_ledger::RunOutcome::Blocked,
+            "review budget exhausted after 2 rounds with verdict requestChanges".to_owned(),
+            None,
+            None,
+            None,
+        )
+        .expect("blocked settlement");
     ledger.close().expect("close");
     work
 }
@@ -174,6 +222,212 @@ fn legacy_record_settles_with_revocation_terminal_and_adjudication_event() {
         serde_json::from_str(&revoked.payload_json).expect("revocation payload");
     assert_eq!(revoked_payload["generation"], json!(1), "{revoked_payload}");
     ledger.close().expect("close");
+}
+
+#[test]
+fn review_budget_lead_finish_requires_delivery_evidence() {
+    let env = TestEnv::new("forged-adjudicate-lead-evidence");
+    env.forged(&["init"]);
+    let run = "adj-lead-evidence";
+    seed_review_budget_stop(&env, run, true);
+
+    let (_, response) = env.forged(&[
+        "run",
+        "adjudicate-settlement",
+        "--run",
+        run,
+        "--outcome",
+        "landed",
+        "--actor",
+        "lead-agent",
+        "--rationale",
+        "the run branch was merged after lead fixes",
+        "--evidence-gap",
+        "the controller could not verify the out-of-band merge",
+    ]);
+    assert_eq!(response["ok"], json!(false), "{response}");
+    let message = response["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("PR number"), "{response}");
+    assert!(message.contains("commit SHA"), "{response}");
+
+    let ledger = env.ledger();
+    assert_eq!(
+        ledger.get_run(run).expect("run").terminal_outcome,
+        Some(forged_ledger::RunOutcome::Blocked)
+    );
+    assert!(ledger
+        .list_events(Some(run), 0, 4096)
+        .expect("events")
+        .iter()
+        .all(|event| event.kind != "forged.settlement-adjudication"));
+    ledger.close().expect("close");
+}
+
+#[test]
+fn ordinary_run_stop_cannot_upgrade_review_budget_blocked_to_landed() {
+    let env = TestEnv::new("forged-adjudicate-ordinary-door");
+    env.forged(&["init"]);
+    let run = "adj-ordinary-door";
+    seed_review_budget_stop(&env, run, true);
+    let sha = "a".repeat(40);
+
+    let (_, response) = env.forged(&[
+        "run",
+        "stop",
+        "--run",
+        run,
+        "--outcome",
+        "landed",
+        "--reason",
+        "lead recorded the merged delivery",
+        "--pr",
+        "312",
+        "--sha",
+        &sha,
+    ]);
+    assert_eq!(response["ok"], json!(false), "{response}");
+    assert_eq!(response["error"]["code"], json!("INVALID_REQUEST"));
+    assert!(response["error"]["message"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("already stopped with outcome"));
+
+    let ledger = env.ledger();
+    assert_eq!(
+        ledger.get_run(run).expect("run").terminal_outcome,
+        Some(forged_ledger::RunOutcome::Blocked)
+    );
+    assert!(ledger
+        .list_events(Some(run), 0, 4096)
+        .expect("events")
+        .iter()
+        .all(|event| event.kind != "forged.settlement-adjudication"));
+    ledger.close().expect("close");
+}
+
+#[test]
+fn stopped_non_review_refusal_teaches_work_supersession() {
+    let env = TestEnv::new("forged-adjudicate-stopped-remedy");
+    env.forged(&["init"]);
+    let run = "adj-stopped-remedy";
+    let work = format!("bead-{run}");
+    fabricate_run(&env, run);
+    env.set_work_field(&work, "status", "in_progress");
+    env.set_assignee(&work, &format!("forged:{work}:0"));
+    let (code, stopped) = env.forged(&[
+        "run",
+        "stop",
+        "--run",
+        run,
+        "--outcome",
+        "cancelled",
+        "--reason",
+        "operator cancelled",
+    ]);
+    assert_eq!(code, 0, "operator stop: {stopped}");
+    let sha = "b".repeat(40);
+
+    let (_, response) = env.forged(&[
+        "run",
+        "adjudicate-settlement",
+        "--run",
+        run,
+        "--outcome",
+        "landed",
+        "--pr",
+        "412",
+        "--sha",
+        &sha,
+        "--actor",
+        "lead-agent",
+        "--rationale",
+        "a different terminal assertion",
+        "--evidence-gap",
+        "the machine did not record delivery",
+    ]);
+    assert_eq!(response["ok"], json!(false), "{response}");
+    assert_eq!(
+        response["error"]["detail"],
+        json!({
+            "schema": "forged.remedy/1",
+            "verb": "work supersede",
+            "args": {"id": work, "successor": null},
+            "reason": "create the successor first with work create",
+        })
+    );
+}
+
+#[test]
+fn review_budget_lead_finish_refuses_superseded_or_accepted_risk_state_without_an_event() {
+    let env = TestEnv::new("forged-adjudicate-lead-current-state");
+    env.forged(&["init"]);
+    let sha = "c".repeat(40);
+    for (run, accepted_risk) in [("adj-lead-superseded", false), ("adj-lead-risk", true)] {
+        seed_review_budget_stop(&env, run, false);
+        let ledger = env.ledger();
+        if accepted_risk {
+            ledger
+                .accept_review_risk(
+                    run,
+                    2,
+                    forged_types::AcceptedRisk {
+                        accepted_by: "lead-agent".to_owned(),
+                        rationale: "bounded risk".to_owned(),
+                        findings: Vec::new(),
+                    },
+                )
+                .expect("accepted-risk transition");
+        } else {
+            ledger
+                .settle_run(
+                    run,
+                    forged_ledger::RunOutcome::Superseded,
+                    "replaced by a successor".to_owned(),
+                    None,
+                    None,
+                    Some("adj-lead-successor".to_owned()),
+                )
+                .expect("superseded transition");
+        }
+        ledger.close().expect("close");
+
+        let (_, response) = env.forged(&[
+            "run",
+            "adjudicate-settlement",
+            "--run",
+            run,
+            "--outcome",
+            "landed",
+            "--pr",
+            "512",
+            "--sha",
+            &sha,
+            "--actor",
+            "lead-agent",
+            "--rationale",
+            "the run branch was merged after lead fixes",
+            "--evidence-gap",
+            "the controller could not verify the out-of-band merge",
+        ]);
+        assert_eq!(response["ok"], json!(false), "{run}: {response}");
+        assert_eq!(response["error"]["code"], json!("INVALID_REQUEST"));
+
+        let ledger = env.ledger();
+        assert!(
+            ledger
+                .list_events(Some(run), 0, 4096)
+                .expect("events")
+                .iter()
+                .all(|event| event.kind != "forged.settlement-adjudication"),
+            "{run}: current-state refusal appends no adjudication event"
+        );
+        assert!(ledger
+            .list_inflight_operations(None)
+            .expect("inflight")
+            .iter()
+            .all(|operation| operation.name != "run_adjudicate_settlement"));
+        ledger.close().expect("close");
+    }
 }
 
 #[test]

@@ -77,6 +77,12 @@ const EFFECTIVE_DEFINITION_COLUMNS: &str = "d.run_id, d.protocol_ref_json, d.pro
 const EXECUTION_POLICY_MIGRATION: &str = "forged.run.execution-policy/1";
 const CONTROLLER_REVOKED: &str = "forged.controller.revoked";
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SettlementAuthority {
+    Ordinary,
+    Adjudication,
+}
+
 struct ReviewRiskTerminal {
     review_rounds: u8,
     blocked_reason: String,
@@ -1146,6 +1152,7 @@ impl Ledger {
             },
             None,
             false,
+            SettlementAuthority::Ordinary,
         )
     }
 
@@ -1158,7 +1165,13 @@ impl Ledger {
         settlement: RunSettlement,
         controller_generation: u32,
     ) -> Result<RunRow, LedgerError> {
-        self.settle_run_inner(run_id, settlement, Some(controller_generation), false)
+        self.settle_run_inner(
+            run_id,
+            settlement,
+            Some(controller_generation),
+            false,
+            SettlementAuthority::Ordinary,
+        )
     }
 
     /// [`Ledger::settle_run_fencing_controller`] for callers with no
@@ -1173,7 +1186,32 @@ impl Ledger {
         settlement: RunSettlement,
         controller_generation: u32,
     ) -> Result<RunRow, LedgerError> {
-        self.settle_run_inner(run_id, settlement, Some(controller_generation), true)
+        self.settle_run_inner(
+            run_id,
+            settlement,
+            Some(controller_generation),
+            true,
+            SettlementAuthority::Ordinary,
+        )
+    }
+
+    /// Admit the lead's adjudicated delivery evidence after review-budget
+    /// exhaustion. This is the sole `blocked -> landed` settlement door;
+    /// ordinary controller and operator settlement retain the closed
+    /// transition whitelist.
+    pub fn adjudicate_run_settlement_fencing_controller_refusing_machine_effects(
+        &self,
+        run_id: &str,
+        settlement: RunSettlement,
+        controller_generation: u32,
+    ) -> Result<RunRow, LedgerError> {
+        self.settle_run_inner(
+            run_id,
+            settlement,
+            Some(controller_generation),
+            true,
+            SettlementAuthority::Adjudication,
+        )
     }
 
     fn settle_run_inner(
@@ -1182,6 +1220,7 @@ impl Ledger {
         settlement: RunSettlement,
         controller_generation: Option<u32>,
         refuse_uncontained_machine_effects: bool,
+        authority: SettlementAuthority,
     ) -> Result<RunRow, LedgerError> {
         let RunSettlement {
             outcome,
@@ -1276,22 +1315,27 @@ impl Ledger {
                     tx.commit()?;
                     return Ok(current);
                 }
-                let advances = matches!(
-                    (current.terminal_outcome, outcome),
-                    (
-                        Some(RunOutcome::Clean | RunOutcome::AcceptedRisk),
-                        RunOutcome::Landed
-                    ) | (Some(RunOutcome::Blocked), RunOutcome::AcceptedRisk)
-                        | (
-                            Some(
-                                RunOutcome::Clean
-                                    | RunOutcome::Blocked
-                                    | RunOutcome::InputRequired
-                                    | RunOutcome::Cancelled
-                            ),
-                            RunOutcome::Superseded
-                        )
-                );
+                let advances = (authority == SettlementAuthority::Adjudication
+                    && matches!(
+                        (current.terminal_outcome, outcome),
+                        (Some(RunOutcome::Blocked), RunOutcome::Landed)
+                    ))
+                    || matches!(
+                        (current.terminal_outcome, outcome),
+                        (
+                            Some(RunOutcome::Clean | RunOutcome::AcceptedRisk),
+                            RunOutcome::Landed
+                        ) | (Some(RunOutcome::Blocked), RunOutcome::AcceptedRisk)
+                            | (
+                                Some(
+                                    RunOutcome::Clean
+                                        | RunOutcome::Blocked
+                                        | RunOutcome::InputRequired
+                                        | RunOutcome::Cancelled
+                                ),
+                                RunOutcome::Superseded
+                            )
+                    );
                 if !advances {
                     return Err(refused(
                         ErrorCode::InvalidRequest,

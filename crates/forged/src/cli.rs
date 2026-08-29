@@ -277,9 +277,9 @@ pub struct RunStopArgs {
     pub idempotency_key: Option<String>,
 }
 
-/// `run adjudicate-settlement` outcomes: the abandoned-run terminal set.
-/// Clean, blocked, and input-required describe live protocol states, which
-/// an evidence-gap adjudication has no business asserting.
+/// `run adjudicate-settlement` outcomes for abandoned-run rescue and
+/// review-budget lead finish. Clean, blocked, and input-required describe
+/// protocol states that this evidence adjudication cannot assert.
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum RunAdjudicateOutcome {
     /// Landed, with PR and exact merge SHA evidence.
@@ -303,7 +303,7 @@ impl RunAdjudicateOutcome {
 /// `run adjudicate-settlement` flags.
 #[derive(Debug, Args)]
 pub struct RunAdjudicateSettlementArgs {
-    /// Run whose latest controller record lacks durable driver identity.
+    /// Abandoned run, or stopped review-budget run the lead finished.
     #[arg(long)]
     pub run: String,
     /// Adjudicated terminal outcome.
@@ -321,10 +321,10 @@ pub struct RunAdjudicateSettlementArgs {
     /// Human identity asserting this explicitly destructive settlement.
     #[arg(long)]
     pub actor: String,
-    /// Why this run may settle without verified controller death.
+    /// Why the abandoned run may settle, or why the lead finished delivery.
     #[arg(long)]
     pub rationale: String,
-    /// Exactly which durable evidence is missing — the gap being adjudicated.
+    /// Exactly which delivery or controller evidence the machine could not verify.
     #[arg(long)]
     pub evidence_gap: String,
     /// Override the derived idempotency key.

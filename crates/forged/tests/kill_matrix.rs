@@ -699,6 +699,119 @@ fn settlement_kills_draft_pr_generation_before_gh_can_fire() {
 
 // ------------------------------------------- settlement adjudication saga
 
+#[test]
+fn review_budget_stop_with_full_controller_record_can_be_finished_by_lead_evidence() {
+    let env = TestEnv::new("km-adjudicate-lead-finish");
+    let run = "adj-lead-finish";
+    let work = format!("bead-{run}");
+    let (code, init) = env.forged(&["init"]);
+    assert_eq!(code, 0, "init: {init}");
+    support::fabricate_run(&env, run);
+    env.set_work_field(&work, "status", "in_progress");
+    env.set_assignee(&work, &format!("forged:{work}:0"));
+    let ledger = env.ledger();
+    let record = json!({
+        "schemaVersion": 2,
+        "scope": "run",
+        "id": run,
+        "generation": 1,
+        "host": "herdr",
+        "sessionId": "test-session",
+        "socketPath": "/tmp/test-herdr.sock",
+        "attachHint": format!("forged controller status --run {run}"),
+        "driver": {"pid": 4_000_000, "lstart": "Mon Jan  5 09:00:00 2026"},
+        "binary": {"sha256": "f".repeat(64)},
+        "pidPath": "/tmp/controller.pid",
+        "lstartPath": "/tmp/controller.lstart",
+        "statusPath": "/tmp/controller.status",
+        "ownershipId": "test-ownership",
+        "layoutId": "test-layout",
+        "outputPath": "/tmp/controller.log",
+        "submittedAt": "2026-08-29T12:00:00Z",
+    });
+    ledger
+        .append_event(Some(run), "forged.controller.started", record.clone())
+        .expect("full controller record");
+    ledger
+        .append_event_kind_once(
+            run,
+            "run.protocol-terminal",
+            json!({
+                "schemaVersion": 1,
+                "terminal": {
+                    "reviewBudgetExhausted": {
+                        "reviewRounds": 2,
+                        "finalVerdict": "requestChanges",
+                    }
+                }
+            }),
+        )
+        .expect("review-budget terminal");
+    ledger
+        .settle_run_fencing_controller(
+            run,
+            forged_ledger::RunSettlement {
+                outcome: forged_ledger::RunOutcome::Blocked,
+                reason: "review budget exhausted after 2 rounds with verdict requestChanges"
+                    .to_owned(),
+                delivery_pr: None,
+                delivery_sha: None,
+                superseded_by: None,
+            },
+            1,
+        )
+        .expect("fenced review-budget stop");
+    ledger.close().expect("close");
+    assert!(record.pointer("/driver/pid").is_some(), "{record}");
+    assert!(record.pointer("/driver/lstart").is_some(), "{record}");
+
+    let sha = "e".repeat(40);
+    let (code, settled) = env.forged(&[
+        "run",
+        "adjudicate-settlement",
+        "--run",
+        run,
+        "--outcome",
+        "landed",
+        "--pr",
+        "612",
+        "--sha",
+        &sha,
+        "--actor",
+        "lead-agent",
+        "--rationale",
+        "lead fixes passed CI and the delivery PR merged",
+        "--evidence-gap",
+        "the stopped controller could not observe the later lead merge",
+    ]);
+    assert_eq!(code, 0, "lead finish: {settled}");
+    assert_eq!(settled["result"]["outcome"], json!("landed"));
+    assert_eq!(
+        settled["result"]["adjudication"]["actor"],
+        json!("lead-agent")
+    );
+    assert_eq!(
+        settled["result"]["adjudication"]["rationale"],
+        json!("lead fixes passed CI and the delivery PR merged")
+    );
+
+    let (code, status) = env.forged(&["run", "status", "--run", run]);
+    assert_eq!(code, 0, "status: {status}");
+    assert_eq!(status["result"]["run"]["outcome"], json!("landed"));
+    assert_eq!(status["result"]["run"]["delivery"]["pr"], json!(612));
+    let (code, detail) = env.forged(&[
+        "work",
+        "detail",
+        "--subject-kind",
+        "run",
+        "--subject-id",
+        run,
+    ]);
+    assert_eq!(code, 0, "work detail: {detail}");
+    assert_eq!(detail["result"]["status"]["outcome"], json!("landed"));
+    assert_eq!(detail["result"]["delivery"]["pr"], json!(612), "{detail}");
+}
+
 /// A run whose work is claimable plus a legacy `forged.controller.started`
 /// record with a generation but no durable driver identity, and the exact
 /// re-assertable adjudication arguments for it.

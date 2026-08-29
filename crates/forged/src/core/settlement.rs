@@ -14,7 +14,7 @@ use crate::adapters::ports::ForgedPorts;
 use crate::config::now_iso;
 use crate::core::{
     default_key, derive_key, err_response, fenced, lease_identity, ok_response, on_ledger,
-    param_opt_str, param_str, run_holder, Ctx, Failure,
+    param_opt_str, param_str, remedy_response, run_holder, work_supersede_action, Ctx, Failure,
 };
 
 /// One validated whole-run settlement request.
@@ -584,6 +584,50 @@ struct Adjudication {
     evidence_gap: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdjudicableCase {
+    AbandonedRun,
+    ReviewBudgetLeadFinish,
+}
+
+struct VerifiedAdjudication {
+    generation: u32,
+    case: AdjudicableCase,
+}
+
+struct VerificationFailure {
+    failure: Failure,
+    supersede_work_id: Option<String>,
+}
+
+impl VerificationFailure {
+    fn stopped(run: &RunRow) -> Self {
+        Self {
+            failure: Failure::refused(
+                ErrorCode::InvalidRequest,
+                format!(
+                    "run {:?} is already stopped with outcome {:?}",
+                    run.run_id, run.terminal_outcome
+                ),
+            ),
+            supersede_work_id: Some(run.work_id.clone()),
+        }
+    }
+
+    fn into_failure(self) -> Failure {
+        self.failure
+    }
+}
+
+impl From<Failure> for VerificationFailure {
+    fn from(failure: Failure) -> Self {
+        Self {
+            failure,
+            supersede_work_id: None,
+        }
+    }
+}
+
 fn required_trimmed<'p>(
     params: &'p serde_json::Map<String, Value>,
     key: &str,
@@ -613,7 +657,7 @@ fn parse_adjudication(req: &OperationRequest) -> Result<(String, Adjudication), 
         RunOutcome::Landed | RunOutcome::Superseded | RunOutcome::Cancelled
     ) {
         return Err(Failure::invalid(
-            "settlement adjudication settles an abandoned run as landed, superseded, or cancelled",
+            "settlement adjudication settles an abandoned run or a review-budget lead finish as landed, superseded, or cancelled",
         ));
     }
     let actor = required_trimmed(&req.params, "actor")?.to_owned();
@@ -675,36 +719,68 @@ fn parse_adjudication(req: &OperationRequest) -> Result<(String, Adjudication), 
     ))
 }
 
-/// Verify the run is exactly the case adjudication exists for: a recorded
-/// controller generation whose durable driver identity (pid AND lstart) is
-/// gone, so the normal fence can never verify its death. A record that CAN
-/// be fenced is refused — `run stop` stays the only path for fenceable runs
-/// — and recorded machine effects without containment refuse outright:
-/// adjudicating identity absence never authorizes ignoring them.
+async fn has_review_budget_exhaustion(ctx: &Ctx, run_id: &str) -> Result<bool, Failure> {
+    let run_id = run_id.to_owned();
+    on_ledger(&ctx.ledger, move |ledger| {
+        for event in ledger.list_events(Some(&run_id), 0, 4096)? {
+            if event.kind != "run.protocol-terminal" {
+                continue;
+            }
+            let payload: Value = serde_json::from_str(&event.payload_json)?;
+            if payload
+                .get("terminal")
+                .and_then(Value::as_object)
+                .is_some_and(|terminal| terminal.contains_key("reviewBudgetExhausted"))
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    })
+    .await
+}
+
+/// Verify one of the two adjudicable cases: an abandoned run whose recorded
+/// controller generation lacks durable driver identity, or a stopped
+/// review-budget run whose lead supplies landed delivery evidence. The
+/// latter relies on the stop path's already-confirmed death, but both cases
+/// retain the generation and machine-containment guards.
 async fn verify_adjudicable(
     ctx: &Ctx,
     run_id: &str,
     adjudication: &Adjudication,
-) -> Result<(RunRow, u32), Failure> {
+) -> Result<VerifiedAdjudication, VerificationFailure> {
     let run = {
         let run_id = run_id.to_owned();
         on_ledger(&ctx.ledger, move |ledger| ledger.get_run(&run_id)).await?
     };
-    if run.state == RunState::Stopped {
-        let settlement = &adjudication.settlement;
+    let settlement = &adjudication.settlement;
+    let review_budget_lead_finish = run.state == RunState::Stopped
+        && settlement.outcome == RunOutcome::Landed
+        && has_review_budget_exhaustion(ctx, run_id).await?;
+    if review_budget_lead_finish {
+        if run.terminal_outcome != Some(RunOutcome::Blocked) || run.superseded_by.is_some() {
+            return Err(VerificationFailure::stopped(&run));
+        }
+        if settlement.delivery_pr.is_none() || settlement.delivery_sha.is_none() {
+            return Err(Failure::invalid(
+                "review-budget lead finish requires delivery.pr and delivery.sha",
+            )
+            .into());
+        }
+        if adjudication.actor.trim().is_empty() || adjudication.rationale.trim().is_empty() {
+            return Err(
+                Failure::invalid("review-budget lead finish requires actor and rationale").into(),
+            );
+        }
+    } else if run.state == RunState::Stopped {
         let identical = run.terminal_outcome == Some(settlement.outcome)
             && run.stop_reason.as_deref() == Some(settlement.reason.as_str())
             && run.delivery_pr == settlement.delivery_pr
             && run.delivery_sha == settlement.delivery_sha
             && run.superseded_by == settlement.superseded_by;
         if !identical {
-            return Err(Failure::refused(
-                ErrorCode::InvalidRequest,
-                format!(
-                    "run {run_id:?} is already stopped with outcome {:?}",
-                    run.terminal_outcome
-                ),
-            ));
+            return Err(VerificationFailure::stopped(&run));
         }
     }
     let record = super::handoff::latest_record(ctx, run_id)
@@ -719,16 +795,18 @@ async fn verify_adjudicable(
             )
         })?;
     let (pid, lstart) = super::handoff::record_driver_identity(&record);
-    if pid.is_some() && lstart.is_some() {
+    if !review_budget_lead_finish && pid.is_some() && lstart.is_some() {
         return Err(Failure::refused(
             ErrorCode::InvalidRequest,
             format!(
                 "run {run_id:?} controller record carries durable driver identity; run stop owns fencing it"
             ),
-        ));
+        )
+        .into());
     }
-    // No controller death was ever confirmed, so NO generation is contained:
-    // any in-flight machine ticket refuses the adjudication outright.
+    // The abandoned case has no confirmed death; the lead-finish case relies
+    // on the earlier fenced stop. Neither permits an uncontained machine
+    // ticket to survive the adjudication.
     let unsafe_operations = {
         let run_id = run_id.to_owned();
         on_ledger(&ctx.ledger, move |ledger| {
@@ -744,9 +822,17 @@ async fn verify_adjudicable(
                 unsafe_operations.join(", ")
             ),
             recoverable: true,
-        });
+        }
+        .into());
     }
-    Ok((run, super::handoff::generation(&record)))
+    Ok(VerifiedAdjudication {
+        generation: super::handoff::generation(&record),
+        case: if review_budget_lead_finish {
+            AdjudicableCase::ReviewBudgetLeadFinish
+        } else {
+            AdjudicableCase::AbandonedRun
+        },
+    })
 }
 
 /// The standing adjudication event, if one was ever durably recorded.
@@ -820,16 +906,11 @@ async fn record_adjudication(
     Ok(payload)
 }
 
-/// Settle a run whose controller record cannot be fenced. The reclaim-saga
-/// ordering is preserved with ONE substitution: the recorded human
-/// adjudication stands in for the verified-kill step, because no durable
-/// driver identity exists to verify. Everything else is the fenced
-/// settlement path: the recorded generation is durably revoked in the same
-/// transaction as the terminal projection, and that transaction refuses
-/// while any machine effect lacks containment — no confirmed kill exists to
-/// contain a ticket admitted after the precheck, so admission racing that
-/// precheck must lose to the terminal write itself, never be discovered
-/// after it commits.
+/// Settle an abandoned run or upgrade a review-budget stop with lead delivery
+/// evidence. The human adjudication either substitutes for an impossible
+/// verified-kill step or records the evidence the earlier fenced stop could
+/// not establish. The recorded generation and terminal projection still
+/// commit together, and the transaction refuses uncontained machine effects.
 ///
 /// The caller holds the run submit singleton for the WHOLE window — from the
 /// operation-row probe through this effect — so a concurrent same-key retry
@@ -840,7 +921,10 @@ async fn adjudicate_locked(
     adjudication: Adjudication,
     operation_id: &str,
 ) -> Result<Value, Failure> {
-    let (_run, generation) = verify_adjudicable(ctx, run_id, &adjudication).await?;
+    let verified = verify_adjudicable(ctx, run_id, &adjudication)
+        .await
+        .map_err(VerificationFailure::into_failure)?;
+    let generation = verified.generation;
     let recorded =
         record_adjudication(ctx, run_id, &adjudication, generation, operation_id).await?;
     crate::failpoint::hit("run.adjudicate.recorded.after");
@@ -849,17 +933,22 @@ async fn adjudicate_locked(
         let run_id = run_id.to_owned();
         let settlement = settlement.clone();
         on_ledger(&ctx.ledger, move |ledger| {
-            ledger.settle_run_fencing_controller_refusing_machine_effects(
-                &run_id,
-                RunSettlement {
-                    outcome: settlement.outcome,
-                    reason: settlement.reason,
-                    delivery_pr: settlement.delivery_pr,
-                    delivery_sha: settlement.delivery_sha,
-                    superseded_by: settlement.superseded_by,
-                },
-                generation,
-            )
+            let settlement = RunSettlement {
+                outcome: settlement.outcome,
+                reason: settlement.reason,
+                delivery_pr: settlement.delivery_pr,
+                delivery_sha: settlement.delivery_sha,
+                superseded_by: settlement.superseded_by,
+            };
+            if verified.case == AdjudicableCase::ReviewBudgetLeadFinish {
+                ledger.adjudicate_run_settlement_fencing_controller_refusing_machine_effects(
+                    &run_id, settlement, generation,
+                )
+            } else {
+                ledger.settle_run_fencing_controller_refusing_machine_effects(
+                    &run_id, settlement, generation,
+                )
+            }
         })
         .await
         .map_err(|mut failure| {
@@ -989,10 +1078,10 @@ async fn probe_existing(
     Ok(Some(response))
 }
 
-/// `run adjudicate-settlement` — the explicitly destructive settlement of a
-/// run whose latest controller record lacks durable driver identity. A
-/// distinct operation with its own name and human-ambiguous effect class,
-/// never a flag on `run stop`: the live fence path is not weakened.
+/// `run adjudicate-settlement` — explicitly settle an abandoned run lacking
+/// durable driver identity or finish a review-budget stop with lead delivery
+/// evidence. It remains a distinct human-ambiguous operation, never a flag on
+/// `run stop`: the ordinary settlement path is not widened.
 pub async fn run_adjudicate_settlement(ctx: &Ctx, req: &mut OperationRequest) -> OperationResponse {
     // The envelope gate runs BEFORE the operation-store probe: an
     // unsupported schemaVersion must not execute, resume, or replay a
@@ -1059,7 +1148,20 @@ pub async fn run_adjudicate_settlement(ctx: &Ctx, req: &mut OperationRequest) ->
     // permanent attention noise. The effect re-verifies under the submit
     // singleton, so this early pass is a clean refusal, not the authority.
     if let Err(error) = verify_adjudicable(ctx, &run_id, &adjudication).await {
-        return err_response(&req.idempotency_key, &error);
+        let VerificationFailure {
+            failure,
+            supersede_work_id,
+        } = error;
+        return supersede_work_id.map_or_else(
+            || err_response(&req.idempotency_key, &failure),
+            |work_id| {
+                remedy_response(
+                    &req.idempotency_key,
+                    &failure,
+                    forged_types::RemedyV1::from(work_supersede_action(&work_id)),
+                )
+            },
+        );
     }
     fenced(
         ctx,

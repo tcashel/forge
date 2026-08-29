@@ -35,7 +35,9 @@ pub(crate) mod workstore;
 
 use forged_ledger::{DesiredSubjectKind, EffectClass, Ledger, LedgerError, OperationOutcome};
 use forged_proto::{PortError, ProtoError};
-use forged_types::{ErrorCode, OpError, OperationRequest, OperationResponse, RemedyV1};
+use forged_types::{
+    ErrorCode, OpError, OperationActionV1, OperationRequest, OperationResponse, RemedyV1,
+};
 use serde_json::{Map, Value};
 
 use crate::config::ForgedConfig;
@@ -968,6 +970,18 @@ pub(crate) fn remedy_response(
             recoverable: failure.recoverable,
             detail: Some(serde_json::to_value(remedy).expect("forged.remedy/1 always serializes")),
         }),
+    }
+}
+
+/// The one operator action for a terminal run that cannot be rewritten.
+pub(crate) fn work_supersede_action(work_id: &str) -> OperationActionV1 {
+    let Value::Object(args) = serde_json::json!({"id": work_id, "successor": null}) else {
+        unreachable!("work supersede remedy args are an object")
+    };
+    OperationActionV1 {
+        verb: "work supersede".to_owned(),
+        args,
+        reason: "create the successor first with work create".to_owned(),
     }
 }
 

@@ -1254,10 +1254,10 @@ impl ForgedServer {
         self.call("run_stop", args.0).await
     }
 
-    /// Explicitly destructive settlement of an unfenceable legacy run.
+    /// Explicitly destructive settlement or review-budget lead finish.
     #[tool(
         name = "run_adjudicate_settlement",
-        description = "Explicitly destructive: settle a run whose latest controller record lacks durable driver identity (no pid and lstart to fence), recording actor, rationale, and the evidence gap as a durable adjudication event. Refuses runs the normal fence can settle and runs with uncontained machine effects."
+        description = "Explicitly destructive: settle an abandoned run whose controller lacks durable driver identity, or finish a review-budget-exhausted run as landed with lead-supplied PR and SHA evidence. Records actor, rationale, and the machine evidence gap as a durable adjudication event; refuses uncontained machine effects."
     )]
     pub async fn run_adjudicate_settlement(
         &self,
