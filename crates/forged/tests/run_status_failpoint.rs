@@ -25,7 +25,7 @@ fn start_run(env: &TestEnv, run_id: &str) {
     let (code, started) = env.forged(&[
         "run",
         "start",
-        "--bead",
+        "--work",
         run_id,
         "--repo",
         &repo,

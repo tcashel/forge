@@ -117,7 +117,7 @@ fn round_of(view: &RunView, step: MachineStage) -> u32 {
 /// The spec source recorded at run start (the `forged.run.spec` event).
 ///
 /// A payload carrying `specPath` is the deprecated file route — including
-/// every run started before the bead became the source of truth, which is
+/// every run started before the work became the source of truth, which is
 /// why the path is still read first.
 pub async fn spec_source_of(ctx: &Ctx, run_id: &str) -> Result<SpecSource, Failure> {
     let run_id_owned = run_id.to_owned();
@@ -131,8 +131,8 @@ pub async fn spec_source_of(ctx: &Ctx, run_id: &str) -> Result<SpecSource, Failu
                 if let Some(path) = payload.get("specPath").and_then(Value::as_str) {
                     return Ok(SpecSource::File(path.to_owned()));
                 }
-                if let Some(bead) = payload.get("beadId").and_then(Value::as_str) {
-                    return Ok(SpecSource::Bead(bead.to_owned()));
+                if let Some(work) = payload.get("beadId").and_then(Value::as_str) {
+                    return Ok(SpecSource::Work(work.to_owned()));
                 }
             }
         }
@@ -841,7 +841,7 @@ async fn honor_await(
         let packet = stored_packet_for_attempt(view, packet_id)?;
         // `execute_packet` owns everything that happens before an attempt
         // row exists on this path: it re-pins the packet to the spec it just
-        // read (a bead edited underneath an open packet would otherwise
+        // read (a work edited underneath an open packet would otherwise
         // refuse `SpecDrift` on every retry, forever) and charges a
         // pre-claim bd outage to the packet's bounded retry budget.
         let outcome = execute_packet(ctx, ports, &exec, &packet).await?;
@@ -1042,7 +1042,7 @@ async fn assurance_evidence(
         SpecSource::File(path) => std::fs::read_to_string(&path).map_err(|error| {
             Failure::internal(format!("reading assurance root contract {path:?}: {error}"))
         })?,
-        SpecSource::Bead(_) => {
+        SpecSource::Work(_) => {
             return Err(Failure::internal(
                 "epic-assurance/v1 must use its frozen internal root contract",
             ))
@@ -1269,9 +1269,9 @@ async fn machine_op(ctx: &Ctx, view: &RunView, step: MachineStage) -> Result<(),
         MachineStage::Resolve => obj(json!({
             // The request descriptor names the DERIVED holder: params are
             // hashed for idempotency, so this must not vary with whatever
-            // the bead happens to be held under at the moment of a redo.
+            // the work happens to be held under at the moment of a redo.
             // The identity actually taken is reported in the result.
-            "leaseHolder": run_holder(&run.bead_id),
+            "leaseHolder": run_holder(&run.work_id),
             "repo": run.repo,
             "base": run.base_ref,
             "branch": run.branch,
@@ -1388,7 +1388,7 @@ async fn machine_effect(
                 Err(forged_git::GitError::WorktreeExists { .. }) => None,
                 Err(e) => return Err(e.into()),
             };
-            // ONE lease identity end to end: a bead already held under the
+            // ONE lease identity end to end: a work already held under the
             // pre-run identity a fresh `claim-next` claimed it with — or
             // under this run's derived holder from an earlier pass — IS this
             // run's lease. Claim under that string rather than a second,
@@ -1399,9 +1399,9 @@ async fn machine_effect(
                 None
             } else {
                 let holder =
-                    crate::core::lease_identity(&ctx.ledger, &run.bead_id, &run.run_id).await?;
+                    crate::core::lease_identity(&ctx.ledger, &run.work_id, &run.run_id).await?;
                 failpoint::hit("work.claim.before");
-                crate::core::workstore::claim_specific(&ctx.ledger, &run.bead_id, &holder).await?;
+                crate::core::workstore::claim_specific(&ctx.ledger, &run.work_id, &holder).await?;
                 failpoint::hit("work.claim.after");
                 Some(holder)
             };
@@ -1515,10 +1515,10 @@ async fn machine_effect(
             let remote = github_remote(std::path::Path::new(&run.repo))
                 .await
                 .map_err(Failure::from)?;
-            let title = format!("{}: {}", run.bead_id, run.branch);
+            let title = format!("{}: {}", run.work_id, run.branch);
             let body = format!(
-                "Draft PR opened by forged for run {} (bead {}).",
-                run.run_id, run.bead_id
+                "Draft PR opened by forged for run {} (work {}).",
+                run.run_id, run.work_id
             );
             let gh = GhClient::new().with_host_opt(remote.gh_host());
             failpoint::hit("gh.call.before");
@@ -1693,7 +1693,7 @@ async fn advance_once(
 /// made the supervisor read ordinary capacity queuing as a dead controller,
 /// charging `restart_used` and recycling the pane out from under live
 /// seats. Every other recoverable `OperationInProgress` keeps the exit:
-/// non-capacity deferral reasons (`BeadMalformed`, `Superseded`, ...) never
+/// non-capacity deferral reasons (`WorkMalformed`, `Superseded`, ...) never
 /// clear by waiting, and only the deferred admission decision carries an
 /// attention projection, so parking on anything else would starve silently.
 pub async fn run_drive(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {

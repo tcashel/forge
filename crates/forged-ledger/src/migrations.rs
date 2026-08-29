@@ -186,7 +186,7 @@ const MIGRATION_006: &str = "
 ALTER TABLE usage ADD COLUMN web_search_requests INTEGER;
 ";
 
-/// Migration 007: the bead revision a packet's spec is pinned to.
+/// Migration 007: the work revision a packet's spec is pinned to.
 ///
 /// NULL means file-sourced — every packet opened before this column existed,
 /// plus the deprecated `--spec <path>` route — and those keep `spec_sha256`
@@ -261,7 +261,7 @@ ALTER TABLE runs ADD COLUMN superseded_by TEXT;
 
 /// Migration 011: operator-authorized desired work and its reconciliation
 /// fence. A row exists only after a successful submit; the supervisor never
-/// infers authorization from a runnable Bead or an existing run row.
+/// infers authorization from a runnable Work or an existing run row.
 const MIGRATION_011: &str = "
 CREATE TABLE desired_work (
   subject_kind          TEXT NOT NULL CHECK (subject_kind IN ('run','epic')),
@@ -509,7 +509,7 @@ END;
 ";
 
 /// Migration 015: immutable human-readable identity captured from durable
-/// launch evidence. Planned Beads are deliberately absent: `live-plan` is a
+/// launch evidence. Planned work is deliberately absent: `live-plan` is a
 /// projection-only source and the table's closed source vocabulary rejects
 /// it. Existing rows are populated by Rust immediately after this DDL inside
 /// the same migration transaction so path/title derivation uses the shared
@@ -931,11 +931,11 @@ CREATE INDEX review_finding_delivery_state
   ON review_finding_deliveries(run_id, snapshot_sha256, state, delivery_lease_until);
 ";
 
-/// Migration 020: the durable mirror of pending whole-run bead settlement.
+/// Migration 020: the durable mirror of pending whole-run work settlement.
 ///
 /// The budget bounds MUTATING retries only; the read-only convergence probe
 /// runs regardless of `used`, throttled by `probe_wake_at` and reset to the
-/// floor whenever the live bead differs from the `last_observed_*` snapshot.
+/// floor whenever the live work differs from the `last_observed_*` snapshot.
 /// The claim columns are the same cross-process singleton fence
 /// `desired_work` carries, so two concurrent tick executors cannot
 /// double-comment or double-charge. `event_id` is the episode watermark:
@@ -1762,7 +1762,7 @@ mod tests {
         let ledger = Ledger::open(&path).expect("migrate");
         assert_eq!(ledger.pragmas().expect("pragmas").user_version, 22);
         let old = ledger.get_run("old-run").expect("old run");
-        assert_eq!(old.bead_id, "old-bead");
+        assert_eq!(old.work_id, "old-bead");
         assert_eq!(old.stop_reason.as_deref(), Some("legacy stop"));
         assert_eq!(old.terminal_outcome, None, "migration invents no outcome");
         assert!(ledger

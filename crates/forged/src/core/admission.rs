@@ -1,5 +1,5 @@
 //! Pure admission projection/evaluation over one ledger snapshot and one
-//! exact-ID Beads batch. No portfolio, controller files, process table, Herdr,
+//! exact-ID work batch. No portfolio, controller files, process table, Herdr,
 //! or filesystem state participates in scheduling.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -41,7 +41,7 @@ pub(crate) struct AdmissionResult {
 pub(crate) struct PacketAdmission {
     pub(crate) packet_id: String,
     pub(crate) run_id: String,
-    pub(crate) bead_id: String,
+    pub(crate) work_id: String,
 }
 
 impl From<&forged_types::WorkPacket> for PacketAdmission {
@@ -49,7 +49,7 @@ impl From<&forged_types::WorkPacket> for PacketAdmission {
         Self {
             packet_id: packet.packet_id.clone(),
             run_id: packet.run_id.clone(),
-            bead_id: packet.bead_id.clone(),
+            work_id: packet.work_id.clone(),
         }
     }
 }
@@ -204,9 +204,9 @@ fn project_candidates(
         .filter(|row| targets.contains(&(row.subject_kind, row.subject_id.clone())))
     {
         let issue = durable
-            .bead_id
+            .work_id
             .as_deref()
-            .and_then(|bead_id| issues.get(bead_id).copied());
+            .and_then(|work_id| issues.get(work_id).copied());
         let facts = durable_facts(durable);
         let (repository, provider, model, resource_class) = facts.clone().map_or_else(
             || {
@@ -226,20 +226,20 @@ fn project_candidates(
                 )
             },
         );
-        let bead_repository = issue.and_then(|issue| issue.metadata.get("repository").cloned());
+        let work_repository = issue.and_then(|issue| issue.metadata.get("repository").cloned());
         let candidate = AdmissionCandidateV1 {
             subject_kind: subject_kind(durable.subject_kind),
             subject_id: durable.subject_id.clone(),
             control_revision: durable.control_revision,
-            bead_id: durable
-                .bead_id
+            work_id: durable
+                .work_id
                 .clone()
                 .unwrap_or_else(|| durable.subject_id.clone()),
-            bead_revision: issue.and_then(|issue| issue.revision.clone()),
-            bead_status: issue.map(|issue| issue.status.clone()),
+            work_revision: issue.and_then(|issue| issue.revision.clone()),
+            work_status: issue.map(|issue| issue.status.clone()),
             priority: issue.and_then(|issue| issue.priority),
             repository: repository.clone(),
-            bead_repository: bead_repository.clone(),
+            work_repository: work_repository.clone(),
             input_error: input_error.map(str::to_owned),
             desired_wake_at: durable.next_wake_at.clone(),
             provider,
@@ -258,16 +258,16 @@ fn project_candidates(
         } else if durable.exhausted && !is_explicit {
             Some(AdmissionReason::Exhausted)
         } else if input_error.is_some() || issue.is_none() {
-            Some(AdmissionReason::BeadUnavailable)
+            Some(AdmissionReason::WorkUnavailable)
         } else if issue.is_some_and(|issue| {
-            issue.priority.is_none() || issue.revision.is_none() || bead_repository.is_none()
+            issue.priority.is_none() || issue.revision.is_none() || work_repository.is_none()
         }) {
-            Some(AdmissionReason::BeadMalformed)
+            Some(AdmissionReason::WorkMalformed)
         } else if issue.is_some_and(|issue| !runnable(&issue.status)) {
-            Some(AdmissionReason::BeadNotRunnable)
+            Some(AdmissionReason::WorkNotRunnable)
         } else if facts.is_none() || candidate.provider.is_none() || candidate.model.is_none() {
-            Some(AdmissionReason::BeadMalformed)
-        } else if bead_repository.as_deref() != Some(repository.as_str()) {
+            Some(AdmissionReason::WorkMalformed)
+        } else if work_repository.as_deref() != Some(repository.as_str()) {
             Some(AdmissionReason::RepositoryMismatch)
         } else {
             None
@@ -485,7 +485,7 @@ async fn admit_once(
         })
         .await?
     };
-    // Only an owned effect identity can enter recovery without a new Beads
+    // Only an owned effect identity can enter recovery without a new work
     // and policy decision. Ownerless reservations were released atomically
     // before this snapshot because they prove no effect transfer occurred.
     let mut recovered = Vec::new();
@@ -523,19 +523,19 @@ async fn admit_once(
     if fresh_targets.is_empty() {
         return Ok(recovered);
     }
-    let bead_ids = snapshot
+    let work_ids = snapshot
         .candidates
         .iter()
         .filter(|candidate| {
             fresh_targets.contains(&(candidate.subject_kind, candidate.subject_id.clone()))
         })
-        .filter_map(|candidate| candidate.bead_id.clone())
+        .filter_map(|candidate| candidate.work_id.clone())
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
     // Exactly one bounded read, regardless of candidate count.
     let (issues, input_error) =
-        match crate::core::workstore::list_issues(&ctx.ledger, &bead_ids).await {
+        match crate::core::workstore::list_issues(&ctx.ledger, &work_ids).await {
             Ok(issues) => (issues, None),
             Err(error) => (Vec::new(), Some(bounded_input_error(error))),
         };
@@ -674,7 +674,7 @@ async fn admit_packet_facts_once(
         .iter()
         .find(|facts| facts.packet_id == packet.packet_id)
         .ok_or_else(|| Failure::internal("packet vanished from admission snapshot"))?;
-    if packet_facts.run_id != packet.run_id || packet_facts.bead_id != packet.bead_id {
+    if packet_facts.run_id != packet.run_id || packet_facts.work_id != packet.work_id {
         return Err(Failure::refused(
             forged_types::ErrorCode::OperationInProgress,
             "packet identity changed before admission",
@@ -712,26 +712,26 @@ async fn admit_packet_facts_once(
     }
     let (issues, input_error) = match crate::core::workstore::list_issues(
         &ctx.ledger,
-        std::slice::from_ref(&packet.bead_id),
+        std::slice::from_ref(&packet.work_id),
     )
     .await
     {
         Ok(issues) => (issues, None),
         Err(error) => (Vec::new(), Some(bounded_input_error(error))),
     };
-    let issue = issues.iter().find(|issue| issue.id == packet.bead_id);
+    let issue = issues.iter().find(|issue| issue.id == packet.work_id);
     let repository = packet_facts.repository.clone();
-    let bead_repository = issue.and_then(|issue| issue.metadata.get("repository").cloned());
+    let work_repository = issue.and_then(|issue| issue.metadata.get("repository").cloned());
     let candidate = AdmissionCandidateV1 {
         subject_kind: AdmissionSubjectKind::Packet,
         subject_id: packet.packet_id.clone(),
         control_revision: durable.control_revision,
-        bead_id: packet.bead_id.clone(),
-        bead_revision: issue.and_then(|issue| issue.revision.clone()),
-        bead_status: issue.map(|issue| issue.status.clone()),
+        work_id: packet.work_id.clone(),
+        work_revision: issue.and_then(|issue| issue.revision.clone()),
+        work_status: issue.map(|issue| issue.status.clone()),
         priority: issue.and_then(|issue| issue.priority),
         repository: repository.clone(),
-        bead_repository: bead_repository.clone(),
+        work_repository: work_repository.clone(),
         input_error: input_error.clone(),
         desired_wake_at: durable.next_wake_at.clone(),
         provider: (!packet_facts.provider.is_empty()).then(|| packet_facts.provider.clone()),
@@ -746,16 +746,16 @@ async fn admit_packet_facts_once(
     } else if durable.exhausted {
         Some(AdmissionReason::Exhausted)
     } else if input_error.is_some() || issue.is_none() {
-        Some(AdmissionReason::BeadUnavailable)
+        Some(AdmissionReason::WorkUnavailable)
     } else if issue.is_some_and(|issue| {
-        issue.priority.is_none() || issue.revision.is_none() || bead_repository.is_none()
+        issue.priority.is_none() || issue.revision.is_none() || work_repository.is_none()
     }) {
-        Some(AdmissionReason::BeadMalformed)
+        Some(AdmissionReason::WorkMalformed)
     } else if issue.is_some_and(|issue| !runnable(&issue.status)) {
-        Some(AdmissionReason::BeadNotRunnable)
+        Some(AdmissionReason::WorkNotRunnable)
     } else if candidate.provider.is_none() || candidate.model.is_none() {
-        Some(AdmissionReason::BeadMalformed)
-    } else if bead_repository.as_deref() != Some(repository.as_str()) {
+        Some(AdmissionReason::WorkMalformed)
+    } else if work_repository.as_deref() != Some(repository.as_str()) {
         Some(AdmissionReason::RepositoryMismatch)
     } else {
         None
@@ -818,7 +818,7 @@ mod tests {
     use forged_types::{AdmissionCapacityV1, AdmissionRateLimitV1, AdmissionSpendV1};
 
     #[test]
-    fn protocol_names_never_make_a_blocked_bead_runnable() {
+    fn protocol_names_never_make_a_blocked_work_runnable() {
         assert!(!runnable("blocked"));
     }
 
@@ -827,12 +827,12 @@ mod tests {
             subject_kind: AdmissionSubjectKind::Run,
             subject_id: id.to_owned(),
             control_revision: 1,
-            bead_id: id.to_owned(),
-            bead_revision: Some("r".to_owned()),
-            bead_status: Some("open".to_owned()),
+            work_id: id.to_owned(),
+            work_revision: Some("r".to_owned()),
+            work_status: Some("open".to_owned()),
             priority: Some(priority),
             repository: format!("/{id}"),
-            bead_repository: Some(format!("/{id}")),
+            work_repository: Some(format!("/{id}")),
             input_error: None,
             desired_wake_at: Some("2030-01-01T00:00:00.000000000Z".to_owned()),
             provider: Some(provider.to_owned()),
@@ -905,11 +905,11 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_and_closed_beads_defer_with_a_durable_wake() {
+    fn unavailable_and_closed_work_defer_with_a_durable_wake() {
         let policy = AdmissionPolicy::default();
         for reason in [
-            AdmissionReason::BeadUnavailable,
-            AdmissionReason::BeadNotRunnable,
+            AdmissionReason::WorkUnavailable,
+            AdmissionReason::WorkNotRunnable,
             AdmissionReason::RepositoryMismatch,
         ] {
             let inputs = AdmissionInputsV1 {
@@ -931,7 +931,7 @@ mod tests {
     }
 
     #[test]
-    fn bounded_beads_error_is_sanitized_for_persisted_evidence() {
+    fn bounded_work_error_is_sanitized_for_persisted_evidence() {
         let error = format!("{}\nsecret\tline", "x".repeat(600));
         let bounded = bounded_input_error(error);
         assert_eq!(bounded.len(), 512);

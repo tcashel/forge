@@ -34,7 +34,7 @@ pub enum Command {
         #[command(subcommand)]
         command: RunCmd,
     },
-    /// Durable epic/wave scheduling over Beads readiness.
+    /// Durable epic/wave scheduling over work readiness.
     Epic {
         /// The epic subcommand.
         #[command(subcommand)]
@@ -63,7 +63,7 @@ pub enum Command {
         #[command(subcommand)]
         command: SessionCmd,
     },
-    /// Resume a ledger run or claim the next ready bead (explicit
+    /// Resume a ledger run or claim the next ready work (explicit
     /// idempotency key required).
     ClaimNext(ClaimNextArgs),
     /// Gate execution.
@@ -197,7 +197,7 @@ pub struct ServiceStopArgs {
 /// `run` subcommands.
 #[derive(Debug, Subcommand)]
 pub enum RunCmd {
-    /// Create a run for a bead.
+    /// Create a run for a work item.
     Start(RunStartArgs),
     /// One project → advance → honor iteration.
     Advance(RunScoped),
@@ -229,7 +229,7 @@ pub enum RunStopOutcome {
     Blocked,
     /// Waiting for an operator answer.
     InputRequired,
-    /// Cancelled without declaring the Bead complete.
+    /// Cancelled without declaring the Work complete.
     Cancelled,
     /// Replaced by a named successor run.
     Superseded,
@@ -285,7 +285,7 @@ pub enum RunAdjudicateOutcome {
     Landed,
     /// Replaced by a named successor run.
     Superseded,
-    /// Cancelled without declaring the Bead complete.
+    /// Cancelled without declaring the Work complete.
     Cancelled,
 }
 
@@ -362,7 +362,7 @@ pub enum EpicCmd {
 /// `epic preflight` flags — the same geometry `epic start` takes.
 #[derive(Debug, Args)]
 pub struct EpicPreflightArgs {
-    /// Beads epic id whose inventory/readiness is authoritative.
+    /// Work epic id whose inventory/readiness is authoritative.
     #[arg(long)]
     pub epic: String,
     /// Absolute target checkout path.
@@ -389,13 +389,13 @@ pub struct EpicPreflightArgs {
 /// `epic start` flags.
 #[derive(Debug, Args)]
 pub struct EpicStartArgs {
-    /// Beads epic id whose inventory/readiness is authoritative.
+    /// Work epic id whose inventory/readiness is authoritative.
     #[arg(long)]
     pub epic: String,
     /// Absolute target checkout path.
     #[arg(long)]
     pub repo: String,
-    /// Deprecated locked epic-map path. The epic Bead is authoritative.
+    /// Deprecated locked epic-map path. The epic Work is authoritative.
     #[arg(long)]
     pub spec: Option<String>,
     /// Bare default-branch name existing on origin (e.g. "main"); an
@@ -459,7 +459,7 @@ pub struct EpicReasonArgs {
 /// `epic abandon` arguments.
 #[derive(Debug, Args)]
 pub struct EpicAbandonArgs {
-    /// The epic bead id.
+    /// The epic work id.
     #[arg(long)]
     pub epic: String,
     /// Why this epoch ends (recorded in the boundary event).
@@ -563,13 +563,13 @@ pub struct DefinitionValidateArgs {
 /// `run start` flags.
 #[derive(Debug, Args)]
 pub struct RunStartArgs {
-    /// The bead the run implements (also mints the run id).
+    /// The work item the run implements (also mints the run id).
     #[arg(long)]
-    pub bead: String,
+    pub work: String,
     /// Absolute path of the target checkout.
     #[arg(long)]
     pub repo: String,
-    /// DEPRECATED: path of a spec file. Omit it — the bead's own fields are
+    /// DEPRECATED: path of a spec file. Omit it — the work's own fields are
     /// the spec. Honored for one release so in-flight runs keep working.
     #[arg(long)]
     pub spec: Option<String>,
@@ -816,8 +816,8 @@ pub struct SessionMessageArgs {
 /// `session stop` flags.
 ///
 /// ATTEMPT-LOCAL: this settles one attempt at `stopped` and leaves the
-/// bead's work lease with `run_holder`, where a successor on the same packet
-/// claims under it immediately. Releasing the bead's lease is a different
+/// work's work lease with `run_holder`, where a successor on the same packet
+/// claims under it immediately. Releasing the work's lease is a different
 /// operation with a different fence.
 #[derive(Debug, Args)]
 pub struct SessionStopArgs {
@@ -1779,8 +1779,10 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
                 request(
                     a.idempotency_key,
                     None,
+                    // Operation envelopes are persisted and replayed. The
+                    // CLI flag is `--work`, but this key is a frozen contract.
                     json!({
-                        "bead": a.bead,
+                        "bead": a.work,
                         "repo": a.repo,
                         "spec": a.spec,
                         "baseRef": a.base_ref,

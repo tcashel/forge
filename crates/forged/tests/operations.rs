@@ -1,6 +1,6 @@
 //! The split operator surfaces: one bounded Operations inventory and one
 //! exact Work Detail projection. Live-plan discovery remains a two-call,
-//! read-only Beads join; durable rows survive a Beads outage unchanged.
+//! read-only work-store join; durable rows survive a live-read outage unchanged.
 
 mod support;
 
@@ -39,7 +39,7 @@ fn seed_packet(env: &TestEnv, run_id: &str, seq: i64, stage: forged_types::Stage
         schema: "forged.packet/1".to_owned(),
         packet_id: packet_id.clone(),
         run_id: run_id.to_owned(),
-        bead_id: format!("bead-{run_id}"),
+        work_id: format!("bead-{run_id}"),
         stage,
         execution: None,
         lane_seq: None,
@@ -240,28 +240,28 @@ fn operations_joins_one_bounded_live_plan_without_duplicate_durable_work() {
     let repository = env.repos.repo.to_string_lossy().into_owned();
 
     fabricate_run(&env, "durable-a");
-    env.set_bead_field("bead-durable-a", "title", "Already executing");
-    env.set_bead_field("bead-durable-a", "status", "in_progress");
-    env.set_bead_repository("bead-durable-a", &repository);
+    env.set_work_field("bead-durable-a", "title", "Already executing");
+    env.set_work_field("bead-durable-a", "status", "in_progress");
+    env.set_work_repository("bead-durable-a", &repository);
 
-    env.set_bead_field("plan-a", "title", "Planned next slice");
-    env.set_bead_field("plan-a", "status", "open");
-    env.set_bead_field("plan-a", "priority", "1");
-    env.set_bead_field("plan-a", "parent", "epic-a");
+    env.set_work_field("plan-a", "title", "Planned next slice");
+    env.set_work_field("plan-a", "status", "open");
+    env.set_work_field("plan-a", "priority", "1");
+    env.set_work_field("plan-a", "parent", "epic-a");
     // The parent is boundary context, not an in-scope plan row: the ledger
     // materialises every edge target, so its scope must be stated.
-    env.set_bead_repository("epic-a", "/tmp/a-different-repository");
-    env.set_bead_field(
+    env.set_work_repository("epic-a", "/tmp/a-different-repository");
+    env.set_work_field(
         "plan-a",
         "dependencies",
         r#"[{"id":"foundation","dependency_type":"blocks","status":"closed"}]"#,
     );
-    env.set_bead_repository("plan-a", &repository);
+    env.set_work_repository("plan-a", &repository);
 
-    env.set_bead_field("plan-other", "status", "open");
-    env.set_bead_repository("plan-other", "/tmp/a-different-repository");
-    env.set_bead_field("plan-closed", "status", "closed");
-    env.set_bead_repository("plan-closed", &repository);
+    env.set_work_field("plan-other", "status", "open");
+    env.set_work_repository("plan-other", "/tmp/a-different-repository");
+    env.set_work_field("plan-closed", "status", "closed");
+    env.set_work_repository("plan-closed", &repository);
 
     let (code, response) = env.forged(&[
         "operations",
@@ -335,17 +335,17 @@ fn a_supersedes_edge_keeps_the_repository_plan_source_available() {
     env.forged(&["init"]);
     let repository = env.repos.repo.to_string_lossy().into_owned();
 
-    env.set_bead_field("plan-replacement", "title", "Replacement slice");
-    env.set_bead_field("plan-replacement", "status", "open");
-    env.set_bead_field(
+    env.set_work_field("plan-replacement", "title", "Replacement slice");
+    env.set_work_field("plan-replacement", "status", "open");
+    env.set_work_field(
         "plan-replacement",
         "dependencies",
         r#"[{"id":"plan-superseded","dependency_type":"supersedes","status":"open"}]"#,
     );
-    env.set_bead_repository("plan-replacement", &repository);
-    env.set_bead_field("plan-superseded", "title", "Superseded slice");
-    env.set_bead_field("plan-superseded", "status", "open");
-    env.set_bead_repository("plan-superseded", &repository);
+    env.set_work_repository("plan-replacement", &repository);
+    env.set_work_field("plan-superseded", "title", "Superseded slice");
+    env.set_work_field("plan-superseded", "status", "open");
+    env.set_work_repository("plan-superseded", &repository);
 
     let (code, response) = env.forged(&["operations", "overview", "--repo", &repository]);
     assert_eq!(code, 0, "operations overview: {response}");
@@ -1046,7 +1046,7 @@ fn packet_complete_rejects_a_non_closed_gate_state_by_field_and_value() {
     ledger.close().expect("close ledger");
 }
 
-/// Two runs legitimately share one Bead — a resubmission, a superseded
+/// Two runs legitimately share one Work — a resubmission, a superseded
 /// attempt, an epic child re-driven. The exact-hydrate contract requires one
 /// row per requested id, so an undeduplicated projection failed the WHOLE
 /// live read closed and reported every row as claim-unknown.
@@ -1055,7 +1055,7 @@ fn packet_complete_rejects_a_non_closed_gate_state_by_field_and_value() {
 /// never reaches the uniqueness guard, so a scoped fixture would be a green
 /// test over an unfixed path.
 #[test]
-fn two_runs_sharing_one_bead_still_resolve_one_exact_claim_batch() {
+fn two_runs_sharing_one_work_still_resolve_one_exact_claim_batch() {
     let env = TestEnv::new("forged-operations-shared-bead");
     env.forged(&["init"]);
     let ledger = env.ledger();
@@ -1063,7 +1063,7 @@ fn two_runs_sharing_one_bead_still_resolve_one_exact_claim_batch() {
         ledger
             .create_run(forged_ledger::NewRun {
                 run_id: forged_types::RunId::new(run_id).expect("run id"),
-                bead_id: "bead-shared".to_owned(),
+                work_id: "bead-shared".to_owned(),
                 repo: env.repos.repo.to_string_lossy().into_owned(),
                 base_ref: env.repos.base.clone(),
                 branch: format!("forged/{run_id}"),
@@ -1071,10 +1071,10 @@ fn two_runs_sharing_one_bead_still_resolve_one_exact_claim_batch() {
             .expect("create run");
     }
     ledger.close().expect("close ledger");
-    env.set_bead_field("bead-shared", "title", "Shared by two runs");
-    env.set_bead_field("bead-shared", "status", "open");
-    env.set_bead_field("plan-only", "title", "Never executed");
-    env.set_bead_field("plan-only", "status", "open");
+    env.set_work_field("bead-shared", "title", "Shared by two runs");
+    env.set_work_field("bead-shared", "status", "open");
+    env.set_work_field("plan-only", "title", "Never executed");
+    env.set_work_field("plan-only", "status", "open");
 
     let (code, response) = env.forged(&["operations", "overview"]);
     assert_eq!(code, 0, "operations overview: {response}");
@@ -1102,7 +1102,7 @@ fn two_runs_sharing_one_bead_still_resolve_one_exact_claim_batch() {
     }
 
     // The exact-batch dedup now lives in `Ledger::work_items`; assert it
-    // where it is observable — one plan row per bead, not two.
+    // where it is observable — one plan row per work, not two.
     assert_eq!(
         rows.values()
             .filter(|row| row["beadId"] == json!("bead-shared"))
@@ -1120,8 +1120,8 @@ fn a_titleless_frozen_identity_gains_a_live_title_without_rewriting_launch_evide
     let env = TestEnv::new("forged-operations-title-source");
     env.forged(&["init"]);
     fabricate_run(&env, "titleless");
-    env.set_bead_field("bead-titleless", "title", "Repair the bead read");
-    env.set_bead_field("bead-titleless", "status", "closed");
+    env.set_work_field("bead-titleless", "title", "Repair the bead read");
+    env.set_work_field("bead-titleless", "status", "closed");
 
     let (code, response) = env.forged(&["operations", "overview"]);
     assert_eq!(code, 0, "operations overview: {response}");
@@ -1142,7 +1142,7 @@ fn a_titleless_frozen_identity_gains_a_live_title_without_rewriting_launch_evide
             .contains("Repair the bead read"),
         "{row}"
     );
-    // The frozen pair is untouched, and a closed bead is absent from plan
+    // The frozen pair is untouched, and a closed work is absent from plan
     // discovery — it carries a title only because the exact read repaired.
     assert_eq!(row["title"], row["identity"]["displayTitle"], "{row}");
     assert_eq!(
@@ -1162,8 +1162,8 @@ fn a_titleless_frozen_identity_gains_a_live_title_without_rewriting_launch_evide
     );
 }
 
-/// Work Detail spends exactly one bounded read on its OWN bead, and an epic
-/// never stamps its title or its bead id onto a child run's attention item.
+/// Work Detail spends exactly one bounded read on its OWN work, and an epic
+/// never stamps its title or its work id onto a child run's attention item.
 ///
 /// `attention_subject` answers `(Run, <child run id>, ...)` for every run in
 /// the snapshot, so an unconditional fill would contradict `subjectId` on the
@@ -1237,8 +1237,8 @@ fn work_detail_titles_its_subject_and_never_titles_a_child_with_the_epic() {
         })
         .expect("unpriced child usage");
     ledger.close().expect("close ledger");
-    env.set_bead_field("title-epic", "title", "Epic bead title");
-    env.set_bead_field("bead-title-child", "title", "Child bead title");
+    env.set_work_field("title-epic", "title", "Epic bead title");
+    env.set_work_field("bead-title-child", "title", "Child bead title");
 
     let (code, response) = env.forged(&[
         "work",
@@ -1284,7 +1284,7 @@ fn work_detail_titles_its_subject_and_never_titles_a_child_with_the_epic() {
         );
     }
 
-    // The success path must prove the bounded read reached Beads with the
+    // The success path must prove the bounded read reached the work store with the
     // live value: a wrong id or a never-matching join would leave every
     // call-count assertion green while the spent 0->1 budget buys nothing.
     let (code, live) = env.forged(&[

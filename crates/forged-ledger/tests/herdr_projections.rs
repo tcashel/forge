@@ -23,7 +23,7 @@ fn seed(ledger: &Ledger) -> (String, i64, String) {
     ledger
         .create_run(NewRun {
             run_id: RunId::new(run).unwrap(),
-            bead_id: "bead-projection".into(),
+            work_id: "bead-projection".into(),
             repo: "/repo/forge".into(),
             base_ref: "main".into(),
             branch: "work/projection".into(),
@@ -37,7 +37,7 @@ fn seed(ledger: &Ledger) -> (String, i64, String) {
         schema: "forged.packet/1".into(),
         packet_id: packet_id.clone(),
         run_id: run.into(),
-        bead_id: "bead-projection".into(),
+        work_id: "bead-projection".into(),
         stage: Stage::Implement,
         execution: None,
         lane_seq: None,

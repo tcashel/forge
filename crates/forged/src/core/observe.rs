@@ -1526,7 +1526,7 @@ fn apply_observed_attention_transitions(
 ///
 /// `attention_subject` answers `(Run, <child run id>, ...)` for every child
 /// of an epic, so filling from `snapshot.identity` unconditionally would
-/// stamp the epic's title and bead id onto an item naming a child run.
+/// stamp the epic's title and work id onto an item naming a child run.
 fn observed_subject_title(
     snapshot: &WorkObservationSnapshot,
     subject_kind: AttentionSubjectKind,
@@ -2051,8 +2051,8 @@ fn observation_attention(
                         latest_quarantine.insert(run_id.clone(), event);
                     }
                 }
-                super::attention::BEAD_SETTLEMENT_PENDING
-                | super::attention::BEAD_SETTLEMENT_SUCCEEDED => latest_settlement = Some(event),
+                super::attention::WORK_SETTLEMENT_PENDING
+                | super::attention::WORK_SETTLEMENT_SUCCEEDED => latest_settlement = Some(event),
                 "run.protocol-terminal" => {
                     if let Some(run_id) = event.run_id.as_ref() {
                         latest_terminal.insert(run_id.clone(), event);
@@ -2093,7 +2093,7 @@ fn observation_attention(
             );
         }
         if let Some(event) = latest_settlement
-            .filter(|event| event.kind == super::attention::BEAD_SETTLEMENT_PENDING)
+            .filter(|event| event.kind == super::attention::WORK_SETTLEMENT_PENDING)
         {
             let payload: Value = serde_json::from_str(&event.payload_json).map_err(|error| {
                 Failure::internal(format!(
@@ -2114,7 +2114,7 @@ fn observation_attention(
                     .repository
                     .as_ref()
                     .map(|repository| repository.path.clone()),
-                AttentionCondition::BeadsSettlementPending,
+                AttentionCondition::WorkSettlementPending,
                 &event.ts,
                 &event.ts,
                 event.event_id,
@@ -2122,7 +2122,7 @@ fn observation_attention(
                 payload
                     .get("error")
                     .and_then(Value::as_str)
-                    .unwrap_or("Beads settlement is pending"),
+                    .unwrap_or("Work settlement is pending"),
                 payload.clone(),
                 AttentionEvidenceKind::Event,
                 event.event_id.to_string(),
@@ -2291,12 +2291,12 @@ fn observation_attention(
         .collect()
 }
 
-/// Project exact Work Detail, spending ONE bounded Beads read on the
-/// subject's own bead so the drill-down destination every other App links to
+/// Project exact Work Detail, spending ONE bounded work read on the
+/// subject's own work so the drill-down destination every other App links to
 /// can state what the work is called.
 ///
 /// The read is fail-soft on purpose: Work Detail is what an operator opens
-/// when something is wrong, which is exactly when Beads may be unavailable.
+/// when something is wrong, which is exactly when work may be unavailable.
 /// A failed or empty read reports `source: "unknown"` and the projection
 /// returns normally; the error is never propagated and this schema carries
 /// no `sourceHealth`.
@@ -2306,14 +2306,14 @@ async fn project_work_detail(
 ) -> Result<Value, Failure> {
     let live_title = crate::core::workstore::list_issues(
         &ctx.ledger,
-        std::slice::from_ref(&snapshot.identity.bead.id),
+        std::slice::from_ref(&snapshot.identity.work.id),
     )
     .await
     .ok()
     .and_then(|issues| {
         issues
             .into_iter()
-            .find(|issue| issue.id == snapshot.identity.bead.id)
+            .find(|issue| issue.id == snapshot.identity.work.id)
     })
     .map(|issue| issue.title);
     let title_source = forged_types::resolve_work_title(&snapshot.identity, live_title.as_deref());

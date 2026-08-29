@@ -493,9 +493,9 @@ impl ForgedPorts {
     /// identity the run's lease is held under, for the run the session
     /// names. `None` when the string is not a session claimant — then it is
     /// already whatever identity the caller meant, and is used verbatim.
-    async fn lease_holder_of(&self, bead: &str, session: &str) -> Option<String> {
+    async fn lease_holder_of(&self, work: &str, session: &str) -> Option<String> {
         let run_id = run_of_session(session)?;
-        crate::core::lease_identity(&self.ledger, bead, &run_id)
+        crate::core::lease_identity(&self.ledger, work, &run_id)
             .await
             .ok()
     }
@@ -760,7 +760,7 @@ impl ReconcilePorts for ForgedPorts {
 
     async fn reclaim_lease(
         &self,
-        bead: &str,
+        work: &str,
         holder: &str,
         older_than_s: u64,
     ) -> Result<LeaseReclaim, PortError> {
@@ -773,11 +773,11 @@ impl ReconcilePorts for ForgedPorts {
         // `previous_owner` against the claimant it passed reads a truthful
         // "the lease was taken from the identity you named". A holder that
         // is not a session claimant passes through untouched.
-        let lease_holder = self.lease_holder_of(bead, holder).await;
+        let lease_holder = self.lease_holder_of(work, holder).await;
         let store_holder = lease_holder.as_deref().unwrap_or(holder);
         failpoint::hit("work.reclaim.before");
         let previous_owner =
-            crate::core::workstore::reclaim(&self.ledger, bead, store_holder, older_than_s)
+            crate::core::workstore::reclaim(&self.ledger, work, store_holder, older_than_s)
                 .await
                 .map_err(|e| PortError::Unavailable(e.message))?;
         failpoint::hit("work.reclaim.after");
@@ -865,7 +865,7 @@ impl ReconcilePorts for ForgedPorts {
     async fn resolve_state(&self, run_id: &str) -> Result<ResolveState, PortError> {
         let run = self.run_row(run_id).await?;
         let worktree_present = self.config.worktree(run_id).exists();
-        let lease_holder = crate::core::workstore::lease_holder(&self.ledger, &run.bead_id)
+        let lease_holder = crate::core::workstore::lease_holder(&self.ledger, &run.work_id)
             .await
             .map_err(|e| PortError::Unavailable(e.message))?;
         Ok(ResolveState {
@@ -949,7 +949,7 @@ mod tests {
         ledger
             .create_run(forged_ledger::NewRun {
                 run_id: forged_types::RunId::new("run-orphan").expect("run id"),
-                bead_id: "run-orphan".to_owned(),
+                work_id: "run-orphan".to_owned(),
                 repo: root.to_string_lossy().into_owned(),
                 base_ref: "main".to_owned(),
                 branch: "forged/run-orphan".to_owned(),

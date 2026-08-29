@@ -19,7 +19,6 @@
 mod admission;
 mod artifacts;
 mod attempts;
-mod bead_settlement;
 mod desired;
 mod error;
 mod events;
@@ -43,8 +42,8 @@ mod usage;
 mod work;
 mod work_identity;
 mod work_lease;
+mod work_settlement;
 
-pub use bead_settlement::{RetryErrorUpdate, BEAD_SETTLEMENT_RETRY_BUDGET};
 pub use error::LedgerError;
 pub use herdr_layouts::HERDR_LAYOUT_CLEANUP_RETRY_BUDGET;
 pub use herdr_projections::{ClaimedHerdrProjectionEffect, HERDR_PROJECTION_RETRY_BUDGET};
@@ -63,20 +62,21 @@ pub use provider_session_inventory::{
 pub use types::{
     AdmissionBatchWrite, AdmissionDurableCandidate, AdmissionLedgerSnapshot,
     AdmissionReservationRow, AdmissionReservationState, AttemptArtifactCompactionRow,
-    AttemptArtifactRow, AttemptRow, AttemptState, BeadSettlementRetryRow, ClaimedAttempt,
-    DesiredReconcileOutcome, DesiredReconcileUpdate, DesiredRestartReservation, DesiredState,
-    DesiredSubjectKind, DesiredWorkRow, EffectClass, EventRow, HerdrLayoutCleanupReason,
-    HerdrLayoutCleanupRelease, HerdrLayoutCleanupRetry, HerdrLayoutCleanupState,
-    HerdrLayoutCreation, HerdrLayoutDegradationReason, HerdrLayoutLifecycleState, HerdrLayoutRow,
+    AttemptArtifactRow, AttemptRow, AttemptState, ClaimedAttempt, DesiredReconcileOutcome,
+    DesiredReconcileUpdate, DesiredRestartReservation, DesiredState, DesiredSubjectKind,
+    DesiredWorkRow, EffectClass, EventRow, HerdrLayoutCleanupReason, HerdrLayoutCleanupRelease,
+    HerdrLayoutCleanupRetry, HerdrLayoutCleanupState, HerdrLayoutCreation,
+    HerdrLayoutDegradationReason, HerdrLayoutLifecycleState, HerdrLayoutRow,
     HerdrPaneProjectionRow, HerdrProjectionChannel, HerdrProjectionPublicationState, MergeSlotRow,
     NewAttemptArtifact, NewPacket, NewReviewFindingDelivery, NewRun, NewRunDefinition, NewUsage,
     OperationOutcome, OperationRow, OperationState, OperationTicket, OwnedHerdrCleanupReason,
     OwnedHerdrCleanupRelease, OwnedHerdrCleanupRetry, OwnedHerdrCleanupState,
     OwnedHerdrLifecycleState, OwnedHerdrOwnerKind, OwnedHerdrSessionRow, PacketRow,
-    PendingBeadSettlementRow, Pragmas, ReviewFindingDeliveryClaim, ReviewFindingDeliveryKey,
+    PendingWorkSettlementRow, Pragmas, ReviewFindingDeliveryClaim, ReviewFindingDeliveryKey,
     ReviewFindingDeliveryOutcome, ReviewFindingDeliveryRow, ReviewFindingDeliveryState,
     ReviewPublicationSource, RevokeScope, RosterRevisionBatch, RosterRevisionRow, RunDefinitionRow,
     RunOutcome, RunRow, RunSettlement, RunState, SlotOutcome, SpecFence, UsageRecord, UsageTotals,
+    WorkSettlementRetryRow,
 };
 pub use work::{
     ImportedWorkItem, NewWorkItem, WorkDepKind, WorkDepRow, WorkDependencyStatus, WorkImportReport,
@@ -84,3 +84,4 @@ pub use work::{
     WORK_BLOCKED_CLAIM_REFUSAL, WORK_CLAIM_REFUSAL_PREFIX,
 };
 pub use work_lease::{work_reclaim_older_than, WorkLeaseRow, WorkReclaimOutcome, WORK_LEASE_TTL_S};
+pub use work_settlement::{RetryErrorUpdate, WORK_SETTLEMENT_RETRY_BUDGET};

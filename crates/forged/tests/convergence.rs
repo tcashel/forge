@@ -70,7 +70,7 @@ fn start_run(env: &TestEnv, run: &str) {
     let (code, started) = env.forged(&[
         "run",
         "start",
-        "--bead",
+        "--work",
         run,
         "--repo",
         &repo,
@@ -459,9 +459,9 @@ fn non_runnable_status_defers_only_that_row_in_a_mixed_admission_batch() {
     let open = "adm-open";
     start_run(&env, custom);
     start_run(&env, open);
-    env.set_bead_field(custom, "status", "deferred");
-    env.set_bead_field(custom, "priority", "0");
-    env.set_bead_field(open, "priority", "1");
+    env.set_work_field(custom, "status", "deferred");
+    env.set_work_field(custom, "priority", "0");
+    env.set_work_field(open, "priority", "1");
     env.authorize_run(custom);
     env.authorize_run(open);
     env.set_scenario("implement", "hang", 1);
@@ -486,7 +486,7 @@ fn non_runnable_status_defers_only_that_row_in_a_mixed_admission_batch() {
         .find(|decision| decision.subject_id == custom)
         .expect("custom-status decision");
     assert_eq!(custom_decision.outcome, AdmissionOutcome::Deferred);
-    assert_eq!(custom_decision.reason, AdmissionReason::BeadNotRunnable);
+    assert_eq!(custom_decision.reason, AdmissionReason::WorkNotRunnable);
     let open_decision = decisions
         .iter()
         .find(|decision| decision.subject_id == open)
@@ -522,7 +522,7 @@ fn malformed_packet_facts_defer_without_reservation_or_provider_effect() {
 
     // Controller admission consumes the healthy row; the packet's own exact
     // admission read then finds it malformed (a NULL priority is the
-    // BeadMalformed arm). The controller is frozen across the injection so
+    // WorkMalformed arm). The controller is frozen across the injection so
     // the two admissions cannot race.
     let (code, submitted) = env.forged(&[
         "run",
@@ -546,7 +546,7 @@ fn malformed_packet_facts_defer_without_reservation_or_provider_effect() {
         nix::sys::signal::Signal::SIGSTOP,
     )
     .expect("freeze the controller before injecting malformed facts");
-    env.set_bead_field(run, "priority", "");
+    env.set_work_field(run, "priority", "");
     nix::sys::signal::killpg(
         nix::unistd::Pid::from_raw(frozen),
         nix::sys::signal::Signal::SIGCONT,
@@ -561,7 +561,7 @@ fn malformed_packet_facts_defer_without_reservation_or_provider_effect() {
             .any(|decision| {
                 decision.subject_id == format!("{run}/implementation/0")
                     && decision.outcome == AdmissionOutcome::Deferred
-                    && decision.reason == AdmissionReason::BeadMalformed
+                    && decision.reason == AdmissionReason::WorkMalformed
             });
         ledger.close().expect("close ledger");
         found
@@ -571,7 +571,7 @@ fn malformed_packet_facts_defer_without_reservation_or_provider_effect() {
         "revision-less packet admission must have zero provider effect"
     );
 
-    // Only the capacity reason family parks. A BeadMalformed deferral never
+    // Only the capacity reason family parks. A WorkMalformed deferral never
     // clears by waiting, so the controller keeps the exit contract instead
     // of parking into a silent starve.
     let controller = submitted["result"]["controller"]["pid"]
@@ -841,7 +841,7 @@ fn capacity_deferral_parks_while_a_sibling_seat_runs() {
     let (code, started) = env.forged(&[
         "run",
         "start",
-        "--bead",
+        "--work",
         run,
         "--repo",
         &repo,
@@ -1105,12 +1105,12 @@ fn convergence_authorization_admission_and_fanout() {
             ("conv-child-dependent", &fanout_spec, false),
         ],
     );
-    fanout.set_bead_field("conv-child-a", "priority", "0");
-    fanout.set_bead_field("conv-child-b", "priority", "1");
-    fanout.set_bead_field("conv-child-c", "priority", "9");
+    fanout.set_work_field("conv-child-a", "priority", "0");
+    fanout.set_work_field("conv-child-b", "priority", "1");
+    fanout.set_work_field("conv-child-c", "priority", "9");
     // Readiness is a store query now: the dependent child is withheld by a
     // real open blocker, not the retired `ready: false` flag.
-    fanout.set_bead_field(
+    fanout.set_work_field(
         "conv-child-dependent",
         "dependencies",
         r#"[{"id":"conv-fanout-blocker","dependency_type":"blocks","status":"open"}]"#,
@@ -1960,7 +1960,7 @@ fn convergence_review_and_attention_are_bounded() {
     let (code, started) = reviews.forged(&[
         "run",
         "start",
-        "--bead",
+        "--work",
         "conv-review-budget",
         "--repo",
         &repo,

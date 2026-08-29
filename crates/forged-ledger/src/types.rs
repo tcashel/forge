@@ -199,11 +199,11 @@ pub struct DesiredReconcileUpdate {
     pub attention_condition: Option<String>,
 }
 
-/// One durable retry record for a pending whole-run bead settlement. The
+/// One durable retry record for a pending whole-run work settlement. The
 /// budget bounds MUTATING retries only; the read-only convergence probe is
 /// not charged and outlives exhaustion.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BeadSettlementRetryRow {
+pub struct WorkSettlementRetryRow {
     pub run_id: String,
     pub budget: u32,
     pub used: u32,
@@ -218,7 +218,7 @@ pub struct BeadSettlementRetryRow {
     /// The read-only probe's next due time; `None` means never probed.
     pub probe_wake_at: Option<String>,
     /// The backoff interval that produced `probe_wake_at`: 60s doubling,
-    /// capped at 480s, reset to the floor when the live bead differs from
+    /// capped at 480s, reset to the floor when the live work differs from
     /// the stored observation.
     pub probe_interval_s: Option<u32>,
     pub last_observed_status: Option<String>,
@@ -228,10 +228,10 @@ pub struct BeadSettlementRetryRow {
     pub updated_at: String,
 }
 
-/// One run whose LATEST bead-settlement event is still pending — the durable
+/// One run whose LATEST work-settlement event is still pending — the durable
 /// promise `run stop` recorded and never delivered.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PendingBeadSettlementRow {
+pub struct PendingWorkSettlementRow {
     pub run_id: String,
     /// The latest pending event's append position.
     pub event_id: i64,
@@ -314,7 +314,7 @@ pub struct AdmissionDurableCandidate {
     pub authorized_at: String,
     pub exhausted: bool,
     pub repository: Option<String>,
-    pub bead_id: Option<String>,
+    pub work_id: Option<String>,
     pub packet_id: Option<String>,
     pub packet_body_json: Option<String>,
     pub package_json: Option<String>,
@@ -334,7 +334,7 @@ pub struct AdmissionDurableCandidate {
 pub struct AdmissionPacketFacts {
     pub packet_id: String,
     pub run_id: String,
-    pub bead_id: String,
+    pub work_id: String,
     pub repository: String,
     pub provider: String,
     pub model: String,
@@ -1045,7 +1045,7 @@ pub enum RunOutcome {
     Blocked,
     /// The run needs an explicit operator answer.
     InputRequired,
-    /// The operator cancelled this run without declaring the Bead complete.
+    /// The operator cancelled this run without declaring the Work complete.
     Cancelled,
     /// The operator accepted a documented residual risk.
     AcceptedRisk,
@@ -1144,7 +1144,7 @@ pub enum AttemptState {
     /// Kill-confirmed and externally reclaimed; a successor may claim.
     Reclaimed,
     /// Kill-confirmed and settled by an operator's attempt-local stop. The
-    /// bead's work lease is deliberately untouched — it is bead-scoped and
+    /// work's work lease is deliberately untouched — it is work-scoped and
     /// shared with every sibling generation — so a successor claims under
     /// the same `run_holder` with no waiting period.
     Stopped,
@@ -1153,17 +1153,17 @@ pub enum AttemptState {
 /// Which scope a `revoking` marker was committed under — the durable record
 /// of WHOSE revocation this is, and therefore which terminal exit resumes it.
 ///
-/// `revoking` alone cannot say: a bead-scoped saga revocation and an
+/// `revoking` alone cannot say: a work-scoped saga revocation and an
 /// attempt-local operator stop write the identical state, so a stop whose
 /// `kill_confirmed` failed would otherwise be indistinguishable from a dead
-/// worker and get resumed through the bead-scoped reclaim it exists to
+/// worker and get resumed through the work-scoped reclaim it exists to
 /// avoid. Written once, when the marker commits, and never changed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RevokeScope {
     /// The reclaim saga: a dead or hung worker, whose work lease the run wants
     /// back. Resumes through the full revoke order and ends at
     /// [`AttemptState::Reclaimed`].
-    Bead,
+    Work,
     /// An operator's stop of ONE attempt. Resumes through confirmed death
     /// alone and ends at [`AttemptState::Stopped`], touching no lease.
     Attempt,
@@ -1178,7 +1178,7 @@ impl RevokeScope {
     /// The DDL string, the only spelling stored.
     pub fn as_str(self) -> &'static str {
         match self {
-            RevokeScope::Bead => "bead",
+            RevokeScope::Work => "bead",
             RevokeScope::Attempt => "attempt",
             RevokeScope::Deadline => "deadline",
         }
@@ -1190,7 +1190,7 @@ impl TryFrom<&str> for RevokeScope {
 
     fn try_from(s: &str) -> Result<Self, Self::Error> {
         match s {
-            "bead" => Ok(RevokeScope::Bead),
+            "bead" => Ok(RevokeScope::Work),
             "attempt" => Ok(RevokeScope::Attempt),
             "deadline" => Ok(RevokeScope::Deadline),
             other => Err(refused(
@@ -1335,8 +1335,8 @@ pub(crate) fn stage_from_db(s: &str) -> Result<Stage, LedgerError> {
 pub struct RunRow {
     /// `runs.run_id`.
     pub run_id: String,
-    /// `runs.bead_id`.
-    pub bead_id: String,
+    /// `runs.work_id`.
+    pub work_id: String,
     /// `runs.repo`.
     pub repo: String,
     /// `runs.base_ref`.
@@ -1421,7 +1421,7 @@ pub struct PacketRow {
     pub spec_path: String,
     /// `packets.spec_sha256`.
     pub spec_sha256: String,
-    /// `packets.spec_revision` — the pinned bead revision, `None` on a
+    /// `packets.spec_revision` — the pinned work revision, `None` on a
     /// file-sourced packet.
     pub spec_revision: Option<String>,
     /// `packets.body_json` — stored verbatim, never parsed by the ledger.
@@ -1447,7 +1447,7 @@ pub struct AttemptRow {
     pub revoke_reason: Option<String>,
     /// `attempts.revoke_scope` — `None` until a `revoking` marker commits,
     /// and on every row written before the column existed. A reader that
-    /// must route on it treats `None` as [`RevokeScope::Bead`]: the
+    /// must route on it treats `None` as [`RevokeScope::Work`]: the
     /// attempt-local stop did not exist when those rows were written, so
     /// every one of them is a saga revocation.
     pub revoke_scope: Option<RevokeScope>,
@@ -1663,8 +1663,8 @@ pub struct EventRow {
 pub struct NewRun {
     /// The validated run id.
     pub run_id: RunId,
-    /// The bead this run implements.
-    pub bead_id: String,
+    /// The work this run implements.
+    pub work_id: String,
     /// Target repository.
     pub repo: String,
     /// Base ref the run branches from.
@@ -1694,7 +1694,7 @@ pub struct NewPacket {
     pub spec_path: String,
     /// Content hash of that spec.
     pub spec_sha256: String,
-    /// The bead revision this packet pins, `None` when the spec came from a
+    /// The work revision this packet pins, `None` when the spec came from a
     /// file. A non-`None` value is the packet's drift fence.
     pub spec_revision: Option<String>,
     /// Caller-serialized `WorkPacket` minus the columns above, stored
@@ -1704,7 +1704,7 @@ pub struct NewPacket {
 
 /// What a packet's spec is pinned to — the value `claim_packet` compares.
 ///
-/// The two arms are NOT interchangeable: a bead-sourced packet is fenced on
+/// The two arms are NOT interchangeable: a work-sourced packet is fenced on
 /// its rendered body, a file-sourced one on the file's content hash, and a
 /// claim presenting the wrong ARM is drift just as surely as one presenting
 /// the wrong value.
@@ -1713,7 +1713,7 @@ pub enum SpecFence {
     /// A file-sourced spec (the deprecated `--spec <path>` route), pinned by
     /// the file's SHA-256.
     Sha256(String),
-    /// A bead-sourced spec.
+    /// A work-sourced spec.
     ///
     /// DRIFT IS JUDGED ON `body_sha256`, NEVER on `revision`. bd's revision
     /// is a WRITE TOKEN, not a spec digest: `bd update --claim`, a status

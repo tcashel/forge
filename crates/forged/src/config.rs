@@ -1925,7 +1925,7 @@ mod tests {
         let ledger = forged_ledger::Ledger::open(&dir.path().join("state.db")).expect("ledger");
         let new_run = |name: &str| forged_ledger::NewRun {
             run_id: forged_types::RunId::new(name).expect("run id"),
-            bead_id: name.to_owned(),
+            work_id: name.to_owned(),
             repo: "/tmp/repo".to_owned(),
             base_ref: "main".to_owned(),
             branch: format!("forged/{name}"),
@@ -1984,7 +1984,7 @@ mod tests {
             .create_run_with_definition(
                 forged_ledger::NewRun {
                     run_id: forged_types::RunId::new("child-a").expect("run id"),
-                    bead_id: "child-a".to_owned(),
+                    work_id: "child-a".to_owned(),
                     repo: "/tmp/repo".to_owned(),
                     base_ref: "main".to_owned(),
                     branch: "forged/child-a".to_owned(),

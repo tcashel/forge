@@ -19,7 +19,7 @@ pub fn sample_packet() -> WorkPacket {
         schema: "forged.packet/1".to_owned(),
         packet_id: "pkt-1".to_owned(),
         run_id: "run-1".to_owned(),
-        bead_id: "bead-1".to_owned(),
+        work_id: "bead-1".to_owned(),
         stage: Stage::Implement,
         execution: None,
         lane_seq: None,

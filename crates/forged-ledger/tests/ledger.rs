@@ -12,7 +12,7 @@ fn make_run(ledger: &Ledger, id: &str) -> String {
     ledger
         .create_run(NewRun {
             run_id: RunId::new(id).expect("valid run id"),
-            bead_id: "bead-1".to_owned(),
+            work_id: "bead-1".to_owned(),
             repo: "example/repo".to_owned(),
             base_ref: "main".to_owned(),
             branch: format!("feat/{id}"),
@@ -142,7 +142,7 @@ fn duplicate_run_and_missing_run_refuse() {
     let err = ledger
         .create_run(NewRun {
             run_id: RunId::new(run.as_str()).expect("valid"),
-            bead_id: "b".to_owned(),
+            work_id: "b".to_owned(),
             repo: "r".to_owned(),
             base_ref: "main".to_owned(),
             branch: "f".to_owned(),

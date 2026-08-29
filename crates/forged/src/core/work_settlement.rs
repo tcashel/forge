@@ -1,27 +1,27 @@
-//! Supervisor-owned retry of pending whole-run bead settlement.
+//! Supervisor-owned retry of pending whole-run work settlement.
 //!
-//! `run stop` records `run.bead-settlement.pending` when the terminal Beads
+//! `run stop` records the frozen `run.bead-settlement.pending` event when work
 //! write fails, and its stored response replays verbatim forever after —
 //! nothing inside the operation fence ever retries the promise. This pass
 //! does, in two strictly separated halves:
 //!
-//! - a READ-ONLY convergence probe, forever: re-read the live bead and,
+//! - a READ-ONLY convergence probe, forever: re-read the live work and,
 //!   when reality already matches the promised outcome, record
-//!   `run.bead-settlement.succeeded` without mutating the bead. Convergence
+//!   `run.bead-settlement.succeeded` without mutating the work. Convergence
 //!   tests CUSTODY ALONE: a blocked/input-required promise converges over an
-//!   open bead, and the promised status is forfeited along with the marker
+//!   open work, and the promised status is forfeited along with the marker
 //!   comment — the settlement's job is custody and status, and writing
 //!   either would make convergence a mutation. Foreign custody converges
 //!   the release-shaped outcomes and hands off — a successor's claim is
 //!   never touched. Probes are throttled per run: 60s doubling capped at
-//!   480s, reset to the floor whenever the live bead differs from the
+//!   480s, reset to the floor whenever the live work differs from the
 //!   stored observation, at most [`PROBE_BATCH`] due runs per pass.
 //! - MUTATING retries under a persisted bounded budget with per-run
 //!   claim/lease fencing, charge-before-mutate, and 30s-doubling backoff
 //!   capped at 8 minutes. The budget is per pending EPISODE: a fresh
 //!   `run stop`-minted pending event resets it (watermarked by event id),
 //!   while the pass's own re-records never do. Exhaustion stops mutation
-//!   only; the probe outlives it and still converges a bead repaired by
+//!   only; the probe outlives it and still converges a work repaired by
 //!   hand.
 //!
 //! Custody epochs are discriminated by RECORDED data, never by the holder
@@ -34,20 +34,20 @@
 //! `observedHolder`) is foreign: release-shaped outcomes converge and hand
 //! off; Landed/Clean/AcceptedRisk neither converge nor mutate — they report
 //! `frontier-held`, charge no budget, and the standing attention item keeps
-//! carrying them. Documented residual risk, accepted: a bead whose custody
+//! carrying them. Documented residual risk, accepted: a work whose custody
 //! was frontier at pend time, then released, then re-claimed by a LATER
 //! claim-next while the pending still stands is indistinguishable by
 //! string; that window needs a terminal run's settlement to still be
-//! pending while the bead re-enters the ready frontier, and this pass
+//! pending while the work re-enters the ready frontier, and this pass
 //! settles it under the frontier identity rather than guessing.
 //!
 //! This is an internal supervisor pass with no operation row: every bd write
 //! it can reach is CAS-guarded and idempotent, and `run stop`'s derived key
 //! and replay semantics are untouched. The pass runs beside the supervisor
-//! tick, decoupled from it — see `BeadSettlementPass` in `supervise`.
+//! tick, decoupled from it — see `WorkSettlementPass` in `supervise`.
 
 use crate::core::work_types::IssueSummary;
-use forged_ledger::{PendingBeadSettlementRow, RetryErrorUpdate, RunOutcome};
+use forged_ledger::{PendingWorkSettlementRow, RetryErrorUpdate, RunOutcome};
 use serde_json::{json, Value};
 
 use crate::config::now_iso;
@@ -95,7 +95,7 @@ fn backoff_seconds(used: u32) -> u64 {
         .min(BACKOFF_CAP_SECONDS)
 }
 
-/// What the read-only probe concluded about the live bead.
+/// What the read-only probe concluded about the live work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Probe {
     /// Reality already matches the promise: record succeeded, mutate nothing.
@@ -123,7 +123,7 @@ enum Probe {
 /// this settlement's OWN identity only when the pending payload recorded it
 /// at pend time (`observedHolder`). Unrecorded frontier custody is a LATER
 /// claim-next's live claim: foreign for the release-shaped outcomes, and
-/// [`Probe::FrontierHeld`] for Landed/Clean/AcceptedRisk over an open bead,
+/// [`Probe::FrontierHeld`] for Landed/Clean/AcceptedRisk over an open work,
 /// which must neither record success over work nobody delivered nor mutate
 /// a claim this settlement never held.
 fn custody_probe(
@@ -176,16 +176,16 @@ fn custody_probe(
     }
 }
 
-/// One supervisor pass over the DUE runs whose latest bead-settlement event
+/// One supervisor pass over the DUE runs whose latest work-settlement event
 /// is still pending: probe schedule due (or never probed), at most
 /// [`PROBE_BATCH`] per pass by earliest `probe_wake_at` (ties by run id),
 /// with the overflow reported as `truncated`. Deferred rows keep their
 /// older wake and therefore sort to the front of the next pass. Per-run
 /// failures are report entries, never a pass failure.
 pub(super) async fn reconcile(ctx: &Ctx) -> Result<Value, Failure> {
-    let pending = on_ledger(&ctx.ledger, |ledger| ledger.list_pending_bead_settlements()).await?;
+    let pending = on_ledger(&ctx.ledger, |ledger| ledger.list_pending_work_settlements()).await?;
     let now = now_iso();
-    let mut due: Vec<&PendingBeadSettlementRow> = pending
+    let mut due: Vec<&PendingWorkSettlementRow> = pending
         .iter()
         .filter(|row| {
             !row.probe_wake_at
@@ -229,10 +229,10 @@ fn entry(run_id: &str, action: &str) -> serde_json::Map<String, Value> {
     map
 }
 
-async fn reconcile_run(ctx: &Ctx, pending: &PendingBeadSettlementRow) -> Result<Value, Failure> {
+async fn reconcile_run(ctx: &Ctx, pending: &PendingWorkSettlementRow) -> Result<Value, Failure> {
     let run_id = pending.run_id.clone();
     let payload: Value = serde_json::from_str(&pending.payload_json).unwrap_or(Value::Null);
-    let Some(bead_id) = payload
+    let Some(work_id) = payload
         .get("beadId")
         .and_then(Value::as_str)
         .map(str::to_owned)
@@ -259,7 +259,7 @@ async fn reconcile_run(ctx: &Ctx, pending: &PendingBeadSettlementRow) -> Result<
         .get("expectedAssignee")
         .and_then(Value::as_str)
         .map(str::to_owned)
-        .unwrap_or_else(|| run_holder(&bead_id));
+        .unwrap_or_else(|| run_holder(&work_id));
     // The custody epoch recorded at pend time. Absent on legacy payloads,
     // which get the conservative rule: frontier custody is foreign.
     let observed_holder = payload
@@ -275,7 +275,7 @@ async fn reconcile_run(ctx: &Ctx, pending: &PendingBeadSettlementRow) -> Result<
         let run = run_id.clone();
         let latest = pending.event_id;
         on_ledger(&ctx.ledger, move |ledger| {
-            ledger.reset_bead_settlement_retry_for_new_episode(&run, latest)
+            ledger.reset_work_settlement_retry_for_new_episode(&run, latest)
         })
         .await?
     };
@@ -297,7 +297,7 @@ async fn reconcile_run(ctx: &Ctx, pending: &PendingBeadSettlementRow) -> Result<
     if observed_holder.is_none()
         && payload.get("observedHolderUnresolved") == Some(&Value::Bool(true))
     {
-        if let Ok(actor) = lease_identity(&ctx.ledger, &bead_id, &run_id).await {
+        if let Ok(actor) = lease_identity(&ctx.ledger, &work_id, &run_id).await {
             let mut stamped = payload.clone();
             stamped["observedHolder"] = json!(actor);
             if let Some(map) = stamped.as_object_mut() {
@@ -307,7 +307,7 @@ async fn reconcile_run(ctx: &Ctx, pending: &PendingBeadSettlementRow) -> Result<
                 let run = run_id.clone();
                 let pending_event = pending.event_id;
                 on_ledger(&ctx.ledger, move |ledger| {
-                    ledger.append_bead_settlement_pending_if_pending(&run, pending_event, stamped)
+                    ledger.append_work_settlement_pending_if_pending(&run, pending_event, stamped)
                 })
                 .await?
             };
@@ -318,7 +318,7 @@ async fn reconcile_run(ctx: &Ctx, pending: &PendingBeadSettlementRow) -> Result<
         }
     }
     let frontier_recorded = observed_holder.as_deref() == Some(FRONTIER_HOLDER);
-    let issue = match super::workstore::show_issue(&ctx.ledger, &bead_id).await {
+    let issue = match super::workstore::show_issue(&ctx.ledger, &work_id).await {
         Ok(issue) => issue,
         Err(error) => {
             // A failed read is not a mutating attempt: no charge, no event —
@@ -352,14 +352,14 @@ async fn reconcile_run(ctx: &Ctx, pending: &PendingBeadSettlementRow) -> Result<
     crate::failpoint::hit("bead-settlement.read.after");
 
     // Advance the probe schedule from this observation: double while the
-    // bead holds still, back to the floor the moment it moves. The standing
+    // work holds still, back to the floor the moment it moves. The standing
     // row also carries the mutating budget read below; the probe upsert
     // never touches those fields.
     let now = now_iso();
     let standing = {
         let run = run_id.clone();
         on_ledger(&ctx.ledger, move |ledger| {
-            ledger.get_bead_settlement_retry(&run)
+            ledger.get_work_settlement_retry(&run)
         })
         .await?
     };
@@ -385,7 +385,7 @@ async fn reconcile_run(ctx: &Ctx, pending: &PendingBeadSettlementRow) -> Result<
         let assignee = issue.assignee.clone();
         let revision = issue.revision.clone();
         on_ledger(&ctx.ledger, move |ledger| {
-            ledger.record_bead_settlement_probe(
+            ledger.record_work_settlement_probe(
                 &run,
                 &wake,
                 probe_interval,
@@ -400,10 +400,10 @@ async fn reconcile_run(ctx: &Ctx, pending: &PendingBeadSettlementRow) -> Result<
     if decision == Probe::Converged {
         let appended = {
             let run = run_id.clone();
-            let event = settlement::succeeded_payload(&bead_id, outcome);
+            let event = settlement::succeeded_payload(&work_id, outcome);
             let pending_event = pending.event_id;
             on_ledger(&ctx.ledger, move |ledger| {
-                ledger.append_bead_settlement_succeeded_if_pending(&run, pending_event, event)
+                ledger.append_work_settlement_succeeded_if_pending(&run, pending_event, event)
             })
             .await?
         };
@@ -443,7 +443,7 @@ async fn reconcile_run(ctx: &Ctx, pending: &PendingBeadSettlementRow) -> Result<
                 let run = run_id.clone();
                 let pending_event = pending.event_id;
                 on_ledger(&ctx.ledger, move |ledger| {
-                    ledger.append_bead_settlement_pending_if_pending(&run, pending_event, repended)
+                    ledger.append_work_settlement_pending_if_pending(&run, pending_event, repended)
                 })
                 .await?
             };
@@ -491,7 +491,7 @@ async fn reconcile_run(ctx: &Ctx, pending: &PendingBeadSettlementRow) -> Result<
                 let run = run_id.clone();
                 let pending_event = pending.event_id;
                 on_ledger(&ctx.ledger, move |ledger| {
-                    ledger.append_bead_settlement_pending_if_pending(&run, pending_event, evidence)
+                    ledger.append_work_settlement_pending_if_pending(&run, pending_event, evidence)
                 })
                 .await?
             };
@@ -518,7 +518,7 @@ async fn reconcile_run(ctx: &Ctx, pending: &PendingBeadSettlementRow) -> Result<
         let claim_token = token.clone();
         let claim_now = now.clone();
         on_ledger(&ctx.ledger, move |ledger| {
-            ledger.claim_bead_settlement_retry(&run, &claim_token, &claim_now, &lease)
+            ledger.claim_work_settlement_retry(&run, &claim_token, &claim_now, &lease)
         })
         .await?
     };
@@ -572,7 +572,7 @@ async fn reconcile_run(ctx: &Ctx, pending: &PendingBeadSettlementRow) -> Result<
             let charge_token = token.clone();
             let pending_event = pending.event_id;
             on_ledger(&ctx.ledger, move |ledger| {
-                ledger.charge_bead_settlement_retry(
+                ledger.charge_work_settlement_retry(
                     &run,
                     &charge_token,
                     &wake,
@@ -590,7 +590,7 @@ async fn reconcile_run(ctx: &Ctx, pending: &PendingBeadSettlementRow) -> Result<
             Err(MutationFailure::Retry(Failure::internal(detail)))
         } else {
             match decision {
-                Probe::ReleaseHeldClosed => release_held_closed(ctx, &bead_id, &actor)
+                Probe::ReleaseHeldClosed => release_held_closed(ctx, &work_id, &actor)
                     .await
                     .map_err(MutationFailure::Retry),
                 _ => {
@@ -598,7 +598,7 @@ async fn reconcile_run(ctx: &Ctx, pending: &PendingBeadSettlementRow) -> Result<
                         return Err(Failure::internal(detail));
                     }
                     // Rebuild the settlement from the run row; the pending
-                    // payload contributes only beadId/outcome/
+                    // payload contributes only workId/outcome/
                     // expectedAssignee/observedHolder.
                     let run = {
                         let run = run_id.clone();
@@ -612,7 +612,7 @@ async fn reconcile_run(ctx: &Ctx, pending: &PendingBeadSettlementRow) -> Result<
                         superseded_by: run.superseded_by,
                     };
                     // A landed promise over a BLOCKED-UNASSIGNED residue or
-                    // an operator-unblocked OPEN-UNASSIGNED bead takes
+                    // an operator-unblocked OPEN-UNASSIGNED work takes
                     // guarded custody first — and ONLY over those two
                     // shapes: any other unassigned status (deferred,
                     // pinned, hooked) is state this settlement must not
@@ -620,7 +620,7 @@ async fn reconcile_run(ctx: &Ctx, pending: &PendingBeadSettlementRow) -> Result<
                     // Assignee and status move together under BOTH guards
                     // (`--if-assignee ''` plus `--if-status <observed>`),
                     // so a status that moved after the probe refuses. A
-                    // crash after the update leaves a held in_progress bead
+                    // crash after the update leaves a held in_progress work
                     // the next attempt's close path already converges.
                     let reclaimed = if outcome == RunOutcome::Landed && issue.assignee.is_none() {
                         if !matches!(issue.status.as_str(), "blocked" | "open") {
@@ -632,7 +632,7 @@ async fn reconcile_run(ctx: &Ctx, pending: &PendingBeadSettlementRow) -> Result<
                         } else {
                             match super::workstore::assign_unassigned_issue(
                                 &ctx.ledger,
-                                &bead_id,
+                                &work_id,
                                 &expected,
                                 &issue.status,
                             )
@@ -657,7 +657,7 @@ async fn reconcile_run(ctx: &Ctx, pending: &PendingBeadSettlementRow) -> Result<
                             if reclaimed {
                                 crate::failpoint::hit("bead-settlement.landed-custody.after");
                             }
-                            settlement::settle_bead(ctx, &run_id, &bead_id, &settlement, &actor)
+                            settlement::settle_work(ctx, &run_id, &work_id, &settlement, &actor)
                                 .await
                                 .map(|_| ())
                                 .map_err(MutationFailure::Retry)
@@ -677,10 +677,10 @@ async fn reconcile_run(ctx: &Ctx, pending: &PendingBeadSettlementRow) -> Result<
                 }
                 let appended = {
                     let run = run_id.clone();
-                    let event = settlement::succeeded_payload(&bead_id, outcome);
+                    let event = settlement::succeeded_payload(&work_id, outcome);
                     let pending_event = pending.event_id;
                     on_ledger(&ctx.ledger, move |ledger| {
-                        ledger.append_bead_settlement_succeeded_if_pending(
+                        ledger.append_work_settlement_succeeded_if_pending(
                             &run,
                             pending_event,
                             event,
@@ -698,7 +698,7 @@ async fn reconcile_run(ctx: &Ctx, pending: &PendingBeadSettlementRow) -> Result<
                 let refusal = refusal.as_str();
                 let mut repended = json!({
                     "schemaVersion": 1,
-                    "beadId": bead_id,
+                    "beadId": work_id,
                     "outcome": outcome.as_str(),
                     "expectedAssignee": expected,
                     "settled": false,
@@ -719,7 +719,7 @@ async fn reconcile_run(ctx: &Ctx, pending: &PendingBeadSettlementRow) -> Result<
                     let run = run_id.clone();
                     let pending_event = pending.event_id;
                     on_ledger(&ctx.ledger, move |ledger| {
-                        ledger.append_bead_settlement_pending_if_pending(
+                        ledger.append_work_settlement_pending_if_pending(
                             &run,
                             pending_event,
                             repended,
@@ -736,7 +736,7 @@ async fn reconcile_run(ctx: &Ctx, pending: &PendingBeadSettlementRow) -> Result<
             Err(MutationFailure::Retry(error)) => {
                 let mut repended = json!({
                     "schemaVersion": 1,
-                    "beadId": bead_id,
+                    "beadId": work_id,
                     "outcome": outcome.as_str(),
                     "expectedAssignee": expected,
                     "settled": false,
@@ -760,7 +760,7 @@ async fn reconcile_run(ctx: &Ctx, pending: &PendingBeadSettlementRow) -> Result<
                     let run = run_id.clone();
                     let pending_event = pending.event_id;
                     on_ledger(&ctx.ledger, move |ledger| {
-                        ledger.append_bead_settlement_pending_if_pending(
+                        ledger.append_work_settlement_pending_if_pending(
                             &run,
                             pending_event,
                             repended,
@@ -794,21 +794,21 @@ async fn reconcile_run(ctx: &Ctx, pending: &PendingBeadSettlementRow) -> Result<
     }
 }
 
-/// The one guarded release for a closed-but-held bead, under `actor` — the
+/// The one guarded release for a closed-but-held work, under `actor` — the
 /// custody identity the probe observed, one of this settlement's own
 /// recorded identities, never a re-derived or live-adopted one. The result
 /// is revalidated: the release CAS fences the assignee alone, so a reopen
 /// landing between the closed probe and the write yields an open,
-/// unassigned bead — not the promised settled shape — and must fail the
+/// unassigned work — not the promised settled shape — and must fail the
 /// attempt rather than record success over it.
-async fn release_held_closed(ctx: &Ctx, bead_id: &str, actor: &str) -> Result<(), Failure> {
-    let released = super::workstore::release_issue(&ctx.ledger, bead_id, actor).await?;
+async fn release_held_closed(ctx: &Ctx, work_id: &str, actor: &str) -> Result<(), Failure> {
+    let released = super::workstore::release_issue(&ctx.ledger, work_id, actor).await?;
     if released.status != "closed" {
         return Err(Failure {
-            code: forged_types::ErrorCode::BeadsContention,
+            code: forged_types::ErrorCode::WorkContention,
             message: format!(
-                "guarded release of {bead_id} observed status {:?}: a concurrent reopen \
-                 outran the closed-bead probe",
+                "guarded release of {work_id} observed status {:?}: a concurrent reopen \
+                 outran the closed-work probe",
                 released.status
             ),
             recoverable: true,
@@ -826,7 +826,7 @@ async fn defer_failed_probe(ctx: &Ctx, run_id: &str) -> Result<String, Failure> 
     let standing = {
         let run = run_id.to_owned();
         on_ledger(&ctx.ledger, move |ledger| {
-            ledger.get_bead_settlement_retry(&run)
+            ledger.get_work_settlement_retry(&run)
         })
         .await?
     };
@@ -841,7 +841,7 @@ async fn defer_failed_probe(ctx: &Ctx, run_id: &str) -> Result<String, Failure> 
         let run = run_id.to_owned();
         let wake_at = wake.clone();
         on_ledger(&ctx.ledger, move |ledger| {
-            ledger.defer_bead_settlement_probe(&run, &wake_at, interval)
+            ledger.defer_work_settlement_probe(&run, &wake_at, interval)
         })
         .await?;
     }
@@ -854,11 +854,11 @@ async fn finish(ctx: &Ctx, run_id: &str, token: &str, last_error: RetryErrorUpda
     let run = run_id.to_owned();
     let claim_token = token.to_owned();
     if let Err(error) = on_ledger(&ctx.ledger, move |ledger| {
-        ledger.finish_bead_settlement_retry(&run, &claim_token, last_error)
+        ledger.finish_work_settlement_retry(&run, &claim_token, last_error)
     })
     .await
     {
-        tracing::warn!(run_id, %error, "could not release a bead settlement retry claim");
+        tracing::warn!(run_id, %error, "could not release a work settlement retry claim");
     }
 }
 
@@ -896,7 +896,7 @@ mod tests {
         assert_eq!(backoff_seconds(3), 240);
         assert_eq!(backoff_seconds(4), 480);
         assert_eq!(backoff_seconds(7), 480);
-        let total: u64 = (0..forged_ledger::BEAD_SETTLEMENT_RETRY_BUDGET)
+        let total: u64 = (0..forged_ledger::WORK_SETTLEMENT_RETRY_BUDGET)
             .map(backoff_seconds)
             .sum();
         assert!(
@@ -906,7 +906,7 @@ mod tests {
     }
 
     #[test]
-    fn a_closed_bead_converges_every_outcome_and_own_custody_permits_one_release() {
+    fn a_closed_work_converges_every_outcome_and_own_custody_permits_one_release() {
         for outcome in [
             RunOutcome::Landed,
             RunOutcome::Clean,

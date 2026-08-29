@@ -441,7 +441,7 @@ pub(crate) fn packet_effective_facts_tx(
     conn: &Connection,
     packet_id: &str,
 ) -> Result<AdmissionPacketFacts, LedgerError> {
-    let (run_id, bead_id, repository, body_json, package_json) = conn
+    let (run_id, work_id, repository, body_json, package_json) = conn
         .query_row(
             "SELECT p.run_id, r.bead_id, r.repo, p.body_json, \
                     COALESCE(m.package_json, d.package_json) \
@@ -566,7 +566,7 @@ pub(crate) fn packet_effective_facts_tx(
     Ok(AdmissionPacketFacts {
         packet_id: packet_id.to_owned(),
         run_id,
-        bead_id,
+        work_id,
         repository,
         provider: selected.0,
         model: selected.1,
@@ -680,7 +680,7 @@ fn durable_candidates(
     for (kind_raw, id, state_raw, revision, wake, authorized_at, exhausted) in rows {
         let kind = DesiredSubjectKind::try_from(kind_raw.as_str())?;
         let state = DesiredState::try_from(state_raw.as_str())?;
-        let (repository, bead_id, packet_id, packet_body_json, package_json) = match kind {
+        let (repository, work_id, packet_id, packet_body_json, package_json) = match kind {
             DesiredSubjectKind::Run => conn
                 .query_row(
                     "SELECT r.repo, r.bead_id, p.packet_id, p.body_json, \
@@ -747,7 +747,7 @@ fn durable_candidates(
             authorized_at,
             exhausted,
             repository,
-            bead_id,
+            work_id,
             packet_id,
             packet_body_json,
             package_json,
@@ -1228,7 +1228,7 @@ impl Ledger {
     }
 
     /// One bounded transaction-consistent read. `extra` adds exactly the
-    /// explicit submit subject without making any other Bead eligible.
+    /// explicit submit subject without making any other Work eligible.
     pub fn admission_snapshot(
         &self,
         extra: Option<(DesiredSubjectKind, String)>,
@@ -1559,7 +1559,7 @@ mod tests {
         ledger
             .create_run(NewRun {
                 run_id: RunId::new(&run_id).expect("run id"),
-                bead_id: format!("bead-{suffix}"),
+                work_id: format!("bead-{suffix}"),
                 repo: "example/repo".to_owned(),
                 base_ref: "main".to_owned(),
                 branch: format!("work/{suffix}"),
@@ -1613,16 +1613,16 @@ mod tests {
             subject_kind,
             subject_id: subject_id.to_owned(),
             control_revision,
-            bead_id: format!("bead-{subject_id}"),
-            bead_revision: Some("revision-current".to_owned()),
-            bead_status: Some(if reason == AdmissionReason::BeadNotRunnable {
+            work_id: format!("bead-{subject_id}"),
+            work_revision: Some("revision-current".to_owned()),
+            work_status: Some(if reason == AdmissionReason::WorkNotRunnable {
                 "closed".to_owned()
             } else {
                 "open".to_owned()
             }),
             priority: Some(1),
             repository: "example/repo".to_owned(),
-            bead_repository: Some(
+            work_repository: Some(
                 if reason == AdmissionReason::RepositoryMismatch {
                     "different/repo"
                 } else {
@@ -2109,12 +2109,12 @@ mod tests {
             subject_kind: AdmissionSubjectKind::Run,
             subject_id: "run-1".to_owned(),
             control_revision: 0,
-            bead_id: "bead-1".to_owned(),
-            bead_revision: Some("1".to_owned()),
-            bead_status: Some("open".to_owned()),
+            work_id: "bead-1".to_owned(),
+            work_revision: Some("1".to_owned()),
+            work_status: Some("open".to_owned()),
             priority: Some(0),
             repository: "/repo".to_owned(),
-            bead_repository: Some("/repo".to_owned()),
+            work_repository: Some("/repo".to_owned()),
             input_error: None,
             desired_wake_at: None,
             provider: Some("codex".to_owned()),
@@ -2188,14 +2188,14 @@ mod tests {
                 "UPDATE runs SET repo = 'changed/repo' WHERE run_id = ?1",
                 [&run_id],
             )
-            .expect("move repository during Beads read");
+            .expect("move repository during work read");
         connection
             .execute(
                 "UPDATE packets SET body_json = json_set(body_json, '$.providerHints.model', \
                  'changed-model') WHERE packet_id = ?1",
                 [&packet_id],
             )
-            .expect("move packet facts during Beads read");
+            .expect("move packet facts during work read");
         let error = ledger
             .commit_admission_batch(write)
             .expect_err("mutable scheduler inputs invalidate the batch");
@@ -2235,7 +2235,7 @@ mod tests {
                  'operator revision', '2030-01-01T00:00:00.000000000Z')",
                 [&run_id],
             )
-            .expect("append roster revision during Beads read");
+            .expect("append roster revision during work read");
         let error = ledger
             .commit_admission_batch(write)
             .expect_err("roster changes invalidate the batch");
@@ -2276,15 +2276,15 @@ mod tests {
                 revision,
                 "batch-run-closed",
                 AdmissionOutcome::Deferred,
-                AdmissionReason::BeadNotRunnable,
+                AdmissionReason::WorkNotRunnable,
                 "9999-01-01T00:00:00.000000000Z",
             ))
-            .expect("persist closed-bead decision");
+            .expect("persist closed-work decision");
         let latest = ledger
             .latest_admission_decisions(Some(AdmissionSubjectKind::Run), Some(&run_id))
             .expect("latest run decision");
         assert_eq!(latest.len(), 1);
-        assert_eq!(latest[0].reason, AdmissionReason::BeadNotRunnable);
+        assert_eq!(latest[0].reason, AdmissionReason::WorkNotRunnable);
 
         reserve(
             &ledger,

@@ -343,25 +343,25 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
 .wave:first-child { border-top: 0; }
 .wave__head { display: flex; align-items: baseline; gap: calc(var(--u) * 2); margin-bottom: calc(var(--u) * 2.5); }
 .wave__head b { font: 500 12px/1 var(--font-mono); }
-.beads { display: grid; gap: calc(var(--u) * 2); grid-template-columns: repeat(auto-fill, minmax(228px, 1fr)); }
-.bead { border: var(--rule); border-left: 4px solid transparent; border-radius: var(--border-radius-md); padding: calc(var(--u) * 2.5); display: flex; flex-direction: column; gap: var(--u); }
-.bead.semantic--attend { border-left-color: var(--state-attend); }
-.bead.semantic--running { border-left-color: var(--state-running); }
-.bead.semantic--stalled { border-left-color: var(--state-stalled); }
-.bead.semantic--landed { border-left-color: var(--state-landed); }
-.bead.semantic--dormant { border-left-color: var(--state-dormant); }
-.bead__top { display: flex; align-items: center; justify-content: space-between; gap: var(--u); }
-.bead__id { font: 500 11px/1 var(--font-mono); }
-.bead__title { font-size: 12px; line-height: 1.4; }
-.bead__foot { font-family: var(--font-mono); font-size: 10.5px; color: var(--color-text-tertiary); display: flex; gap: calc(var(--u) * 2); flex-wrap: wrap; }
+.work-grid { display: grid; gap: calc(var(--u) * 2); grid-template-columns: repeat(auto-fill, minmax(228px, 1fr)); }
+.work-card { border: var(--rule); border-left: 4px solid transparent; border-radius: var(--border-radius-md); padding: calc(var(--u) * 2.5); display: flex; flex-direction: column; gap: var(--u); }
+.work-card.semantic--attend { border-left-color: var(--state-attend); }
+.work-card.semantic--running { border-left-color: var(--state-running); }
+.work-card.semantic--stalled { border-left-color: var(--state-stalled); }
+.work-card.semantic--landed { border-left-color: var(--state-landed); }
+.work-card.semantic--dormant { border-left-color: var(--state-dormant); }
+.work-card__top { display: flex; align-items: center; justify-content: space-between; gap: var(--u); }
+.work-card__id { font: 500 11px/1 var(--font-mono); }
+.work-card__title { font-size: 12px; line-height: 1.4; }
+.work-card__foot { font-family: var(--font-mono); font-size: 10.5px; color: var(--color-text-tertiary); display: flex; gap: calc(var(--u) * 2); flex-wrap: wrap; }
 .semantic-chip { display: inline-flex; align-items: center; gap: 5px; font: 500 10px/1.4 var(--font-sans); text-transform: uppercase; letter-spacing: .08em; }
 .semantic-chip::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
 .age--quiet { color: var(--color-text-tertiary); }
 .age--amber { color: var(--color-text-warning); }
 .age--loud { color: var(--color-text-danger); font-weight: 600; }
 .cost { font-variant-numeric: tabular-nums; }
-/* A candidate is a bead card the operator can pick. */
-.bead--pick { text-align: left; width: 100%; }
+/* A candidate is a work card the operator can pick. */
+.work-card--pick { text-align: left; width: 100%; }
 
 /* ------------------------------------------------------------- utilities */
 .empty { padding: calc(var(--u) * 8) calc(var(--u) * 3); text-align: center; color: var(--color-text-tertiary); font-size: 12px; }
@@ -492,7 +492,7 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
   function conditionRows(value, all=[]) { const own=arr(value?.attention?.items??value?.attentionItems?.items??value?.attention);if(own.length)return own;const id=value?.subjectId||value?.id||value?.runId||value?.workRef?.id;return id?arr(all).filter(item=>(item?.subjectId||item?.id)===id):[]; }
   function semanticState(value, group, conditions=conditionRows(value)) { const queue=String(group||value?.queueGroup||value?.queue?.group||"").toLowerCase().replace(/\s+/g,"-");const outcome=value?.outcome||value?.terminalOutcome||value?.execution?.outcome||value?.status?.outcome||value?.status?.terminalOutcome;const attempt=value?.attempt?.activity||value?.attempt?.state||value?.runState;const merged=[value?.merged,value?.execution?.merged,value?.status?.merged].some(item=>item===true||(item&&typeof item==="object"));const names=conditions.map(item=>typeof item==="string"?item:item?.condition).filter(Boolean);if(["needs-me","ready-to-merge"].includes(queue)||["clean","accepted-risk","input-required"].includes(outcome)||names.some(name=>DECISION_CONDITIONS.includes(name)))return "attend";if(queue==="running"||["running","active"].includes(attempt)||names.includes("revoking"))return "running";if(outcome==="landed"||merged)return "landed";if(["cancelled","superseded"].includes(outcome))return "dormant";if(queue==="stalled-or-recoverable"||outcome==="blocked"||names.some(name=>name!=="revoking"&&SYMPTOM_CONDITIONS.includes(name)))return "stalled";if(queue==="planned"||value?.source==="live-plan"||value?.workRef?.kind==="plan")return "dormant";return "dormant"; }
   function semanticLabel(value, conditions, semantic=semanticState(value,null,conditions)) { return semantic==="running"&&conditions.some(item=>(typeof item==="string"?item:item?.condition)==="revoking")?"recovering":semantic; }
-  function degradedSources(data) { const degraded=[];for(const name of ["ledger","beads","plan"]){const source=data?.sourceHealth?.[name];if(!source)continue;const state=source.state||"unknown";if(state!=="available")degraded.push(`${name} ${state}`);}return degraded; }
+  function degradedSources(data) { const degraded=[];for(const name of ["ledger","beads","plan"]){const source=data?.sourceHealth?.[name];if(!source)continue;const state=source.state||"unknown";if(state!=="available")degraded.push(`${name==="beads"?"work":name} ${state}`);}return degraded; }
   function queueCount(data, code, label) { const group=arr(data?.queue?.groups).find(row=>row?.code===code||row?.label===label||row?.name===label);return group?num(group.total??group.count):null; }
   function spendText(spend) { if(!spend||(!Object.hasOwn(spend,"costUsdKnown")&&!Object.hasOwn(spend,"rowsMissingCost")))return null;const known=num(spend.costUsdKnown),missing=num(spend.rowsMissingCost);if(missing>0&&known===0)return "?";return `$${known.toFixed(2)}${missing>0?` + ${int(missing)} unpriced`:""}`; }
   function fullHeadline(data) { const hasAttention=Array.isArray(data?.attention),items=arr(data?.attention),total=typeof data?.attentionTotal==="number"?data.attentionTotal:typeof data?.counts?.attention==="number"?data.counts.attention:items.length;const decisions=items.filter(item=>DECISION_CONDITIONS.includes(item?.condition));const symptoms=new Map();for(const item of items)if(SYMPTOM_CONDITIONS.includes(item?.condition))symptoms.set(item.condition,(symptoms.get(item.condition)||0)+1);const oldest=decisions.map(item=>item?.openedAt).filter(Boolean).sort()[0];const parts=[];const degraded=degradedSources(data);if(degraded.length)parts.push(`Degraded sources: ${degraded.join(", ")}`);if(hasAttention)parts.push(`${int(decisions.length)} decision${decisions.length===1?"":"s"}${oldest?`, oldest ${ago(oldest)}`:""}`);const running=queueCount(data,"running","Running");if(running!=null)parts.push(`${int(running)} running`);const ready=queueCount(data,"ready-to-merge","Ready to merge");if(ready!=null)parts.push(`${int(ready)} ready to merge`);const grouped=[...symptoms].sort(([a],[b])=>a.localeCompare(b)).map(([name,count])=>`${name.replace(/-/g," ")} ${int(count)}`).join(", ");if(hasAttention)parts.push(grouped?`symptoms: ${grouped}`:"0 symptoms");if(data?.spend){const known=num(data.spend.costUsdKnown),missing=num(data.spend.rowsMissingCost);parts.push(missing>0&&known===0?`? known spend (${int(missing)} unpriced)`:`$${known.toFixed(2)} known spend${missing?` + ${int(missing)} unpriced`:""}`);}if(hasAttention&&total>items.length)parts.push(`${int(items.length)} of ${int(total)} attention conditions classified (capped)`);return `${parts.join("; ")}.`; }
@@ -885,7 +885,7 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
       ["repo", status.repo],
       ["branch", status.branch || status.integrationBranch],
       ["base", status.baseRef],
-      ["bead", status.beadId],
+      ["work", status.beadId],
     ]));
     cols.append(kv([
       ["gates", (() => {
@@ -1348,7 +1348,7 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
     const waves = arr(status.waves);
     const byId = new Map(children.map((c) => [c.id, c]));
 
-    const box = panel("Waves", `${children.length} bead${children.length === 1 ? "" : "s"}`);
+    const box = panel("Waves", `${children.length} work item${children.length === 1 ? "" : "s"}`);
     const body = box.flush();
     if (!children.length) {
       body.append(el("div", "empty", "The epic inventory is empty."));
@@ -1367,16 +1367,16 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
         const merged = group.ids.filter((id) => byId.get(id)?.merged).length;
         head.append(el("span", "panel__note", `${merged}/${group.ids.length} merged`));
         wave.append(head);
-        const beads = el("div", "beads");
+        const workGrid = el("div", "work-grid");
         for (const id of group.ids) {
           const child = byId.get(id);
           if (!child) continue;
           const conditions = conditionRows(child, data.attention);
           const semantic = semanticState(child, child.queueGroup, conditions);
-          const card = el("div", `bead semantic--${semantic}`);
-          const top = el("div", "bead__top");
+          const card = el("div", `work-card semantic--${semantic}`);
+          const top = el("div", "work-card__top");
           top.append(chip(child.id, "id"));
-          // Beads status outranks "has a run": a blocked bead with a live run
+          // Work status outranks "has a run": blocked work with a live run
           // is still blocked, and the operator needs to see that first.
           const held = at(status, "inputRequired.childId") === child.id;
           const [label, tone] = child.merged ? ["merged", "pass"]
@@ -1386,20 +1386,20 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
             : [child.beadsStatus || "unknown", "idle"];
           top.append(el("span", `semantic-chip semantic-chip--${semantic}`, semanticLabel(child, conditions, semantic)));
           card.append(top);
-          card.append(el("div", "bead__title", child.title || ""));
-          const foot = el("div", "bead__foot");
+          card.append(el("div", "work-card__title", child.title || ""));
+          const foot = el("div", "work-card__foot");
           foot.append(el("span", `chip chip--${tone}`, label));
           const recovering = conditions.find((item) => item?.condition === "revoking");
           const recoveryReason = recovering?.evidence?.reason || recovering?.detail;
           if (recoveryReason) foot.append(el("span", "", recoveryReason));
-          if (child.beadsStatus && child.beadsStatus !== label) foot.append(el("span", "", `bd ${child.beadsStatus}`));
+          if (child.beadsStatus && child.beadsStatus !== label) foot.append(el("span", "", `work ${child.beadsStatus}`));
           if (child.runId && child.runId !== child.id) foot.append(el("span", "trunc", child.runId));
           if (child.generation) foot.append(el("span", "", `gen ${child.generation}`));
           if (at(child, "merged.pr")) foot.append(el("span", "", `PR #${at(child, "merged.pr")}`));
           card.append(foot);
-          beads.append(card);
+          workGrid.append(card);
         }
-        wave.append(beads);
+        wave.append(workGrid);
         body.append(wave);
       }
     }
@@ -1738,31 +1738,31 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
     // only the chooser would leave every portfolio row firing a call
     // the host refuses.
     const canPick = !!host.capabilities.serverTools;
-    const grid = el("div", "beads");
+    const grid = el("div", "work-grid");
     for (const entry of entries) {
       const conditions = conditionRows(entry, attentionItems);
       const semantic = semanticState(entry, groupName, conditions);
-      const card = el("button", `${canPick ? "bead bead--pick" : "bead"} semantic--${semantic}`);
+      const card = el("button", `${canPick ? "work-card work-card--pick" : "work-card"} semantic--${semantic}`);
       card.type = "button";
       card.disabled = !canPick;
       // The display title leads the card. The canonical id keeps its place
       // beside the kind, because it is what addresses the next call — but a
       // queue of ids names nothing, and the title is what names the work.
       const displayTitle = (entry.titleSource && entry.titleSource.value) || (entry.identity && entry.identity.displayTitle) || entry.title || entry.beadId || entry.id || "";
-      card.append(el("div", "bead__title", displayTitle));
-      const top = el("div", "bead__top");
+      card.append(el("div", "work-card__title", displayTitle));
+      const top = el("div", "work-card__top");
       top.append(chip(entry.id, "id"));
       top.append(el("span", `semantic-chip semantic-chip--${semantic}`, semanticLabel(entry, conditions, semantic)));
       card.append(top);
       // The title states its authority: an id form reads as an id, and a
-      // current Beads read is marked live rather than as launch evidence.
+      // current work read is marked live rather than as launch evidence.
       const titleMark = entry.titleSource
         ? (entry.titleSource.known === false ? "untitled id"
           : entry.titleSource.source === "beads.title" ? "live title" : "")
         : "";
       if (titleMark) card.append(el("div", "muted", titleMark));
       if (entry.beadId && displayTitle) card.append(el("div", "muted", entry.beadId));
-      const foot = el("div", "bead__foot");
+      const foot = el("div", "work-card__foot");
       // Staleness is presentation only: the row keeps its true ledger state
       // and gains the age beside it, never a derived `stale` condition.
       foot.append(el("span", "", entry.state || "unknown"));
@@ -1840,7 +1840,7 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
     if (groups.length) {
       for (const group of groups) {
         const grouped = arr(group.entries);
-        const heading = el("div", "bead__top");
+        const heading = el("div", "work-card__top");
         heading.append(el("strong", "", group.name || "Work"));
         heading.append(el("span", "", `${int(group.count)} total`));
         body.append(heading);
@@ -2050,7 +2050,7 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
     nodes.subident.append(upToPortfolio());
     const bits = data.kind === "epic"
       ? [["kind", "epic"], ["branch", at(data, "status.integrationBranch")], ["cursor", data.cursor]]
-      : [["kind", "slice"], ["bead", at(data, "status.beadId")], ["branch", at(data, "status.branch")], ["cursor", data.cursor]];
+      : [["kind", "slice"], ["work", at(data, "status.beadId")], ["branch", at(data, "status.branch")], ["cursor", data.cursor]];
     for (const [label, value] of bits) {
       if (value === undefined || value === null || value === "") continue;
       const span = el("span", "trunc");

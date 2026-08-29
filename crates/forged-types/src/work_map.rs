@@ -1,6 +1,6 @@
 //! Bounded cross-authority work graph contracts.
 //!
-//! The graph relates current Beads plan truth to immutable durable execution
+//! The graph relates current work-plan truth to immutable durable execution
 //! without collapsing either authority. Values that remain owned by an
 //! existing contract are embedded as their typed JSON representation instead
 //! of being redefined here.
@@ -122,7 +122,8 @@ pub struct WorkMapScopeV1 {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WorkMapCapturedAtV1 {
     pub ledger: String,
-    pub beads: Option<String>,
+    #[serde(rename = "beads")]
+    pub work: Option<String>,
     pub history: Option<String>,
 }
 

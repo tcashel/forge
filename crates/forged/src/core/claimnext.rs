@@ -1,7 +1,7 @@
 //! `claim-next` — ledger-first porcelain, the stateless resume verb. Order
 //! is load-bearing: resume from forged's own ledger first; only when no
 //! ledger run is resumable pull the fresh bd frontier. A claim-next that
-//! pulls a fresh bead while a resumable run sits in the ledger is a
+//! pulls a fresh work while a resumable run sits in the ledger is a
 //! BLOCKER-severity bug.
 //!
 //! "No ledger run is resumable" means the scan was EXHAUSTED, not that its
@@ -23,7 +23,7 @@ use crate::failpoint;
 /// One resumable candidate found in the ledger.
 struct Resumable {
     run_id: String,
-    bead_id: String,
+    work_id: String,
     packet_id: String,
     spec: forged_types::SpecRef,
     stage_key: String,
@@ -34,7 +34,7 @@ struct Resumable {
     admission: super::admission::PacketAdmission,
 }
 
-/// What a reclaim outcome plus the bead's current lease holder mean for one
+/// What a reclaim outcome plus the work's current lease holder mean for one
 /// candidate — the operator-adjudicated refusal semantics (2026-08-12),
 /// stated once so it can be tested without bd.
 ///
@@ -80,7 +80,7 @@ fn resume_decision(
 /// Plural by contract: a candidate whose lease turns out to be live under
 /// another worker is skipped and the scan continues, so the fresh bd
 /// frontier is reached only when NO resumable ledger run remains. Returning
-/// the first candidate alone would pull a fresh bead past a resumable run
+/// the first candidate alone would pull a fresh work past a resumable run
 /// sitting behind a refusal — the BLOCKER-severity failure this verb exists
 /// to rule out.
 async fn find_resumables(ctx: &Ctx) -> Result<Vec<Resumable>, Failure> {
@@ -128,11 +128,11 @@ async fn find_resumables(ctx: &Ctx) -> Result<Vec<Resumable>, Failure> {
         let admission = super::admission::PacketAdmission {
             packet_id: packet_id.clone(),
             run_id: run.run_id.clone(),
-            bead_id: run.bead_id.clone(),
+            work_id: run.work_id.clone(),
         };
         resumables.push(Resumable {
             run_id: run.run_id,
-            bead_id: run.bead_id,
+            work_id: run.work_id,
             packet_id,
             spec: forged_proto::packet_spec(&packet),
             stage_key,
@@ -164,10 +164,10 @@ async fn claim_next_effect(ctx: &Ctx, holder: &str) -> Result<Value, Failure> {
             super::handoff::acquire_packet_submit(ctx, &candidate.packet_id, &candidate.run_id)
                 .await?;
         // The ONE lease identity for this run: whatever forged already holds
-        // the bead under, else the derived holder. Never a second, differing
+        // the work under, else the derived holder. Never a second, differing
         // identity of our own making.
         let run_holder_id =
-            lease_identity(&ctx.ledger, &candidate.bead_id, &candidate.run_id).await?;
+            lease_identity(&ctx.ledger, &candidate.work_id, &candidate.run_id).await?;
         let older_than = forged_ledger::work_reclaim_older_than(candidate.stage_budget_s);
 
         // Scoped reclaim — `--id` and `--assignee` both mandatory; an
@@ -177,7 +177,7 @@ async fn claim_next_effect(ctx: &Ctx, holder: &str) -> Result<Value, Failure> {
         failpoint::hit("work.reclaim.before");
         let previous_owner = crate::core::workstore::reclaim(
             &ctx.ledger,
-            &candidate.bead_id,
+            &candidate.work_id,
             &run_holder_id,
             older_than,
         )
@@ -188,7 +188,7 @@ async fn claim_next_effect(ctx: &Ctx, holder: &str) -> Result<Value, Failure> {
         let current = if previous_owner.is_some() {
             None
         } else {
-            crate::core::workstore::lease_holder(&ctx.ledger, &candidate.bead_id).await?
+            crate::core::workstore::lease_holder(&ctx.ledger, &candidate.work_id).await?
         };
         let retake = match resume_decision(
             previous_owner.as_deref(),
@@ -204,7 +204,7 @@ async fn claim_next_effect(ctx: &Ctx, holder: &str) -> Result<Value, Failure> {
         if retake {
             // (Re-)take the lease under that same one identity.
             failpoint::hit("work.claim.before");
-            crate::core::workstore::claim_specific(&ctx.ledger, &candidate.bead_id, &run_holder_id)
+            crate::core::workstore::claim_specific(&ctx.ledger, &candidate.work_id, &run_holder_id)
                 .await?;
             failpoint::hit("work.claim.after");
         }
@@ -236,7 +236,7 @@ async fn claim_next_effect(ctx: &Ctx, holder: &str) -> Result<Value, Failure> {
         // one. One spec read per claim, fencing on whatever the packet pins.
         //
         // This read happens AFTER the reclaim and the (re-)claim above, both
-        // of which write the bead and so mint a fresh bd revision. That is
+        // of which write the work and so mint a fresh bd revision. That is
         // exactly why the fence is the rendered body and not the revision:
         // fenced on the write token, a crash resume would be refused for
         // forged's own lease write.
@@ -248,7 +248,7 @@ async fn claim_next_effect(ctx: &Ctx, holder: &str) -> Result<Value, Failure> {
         // and `claim-next` is the path an operator retries by hand, so
         // "for free, forever" is a loop with a human in it.
         let resolved =
-            match crate::core::spec::resolve_for_packet(ctx, &candidate.spec, &candidate.bead_id)
+            match crate::core::spec::resolve_for_packet(ctx, &candidate.spec, &candidate.work_id)
                 .await
             {
                 Ok(resolved) => resolved,
@@ -264,7 +264,7 @@ async fn claim_next_effect(ctx: &Ctx, holder: &str) -> Result<Value, Failure> {
                 }
                 Err(failure) => return Err(failure),
             };
-        // Re-pin BEFORE claiming. A bead edited under this open packet leaves
+        // Re-pin BEFORE claiming. A work edited under this open packet leaves
         // the row pinned to bytes no seat can reach, and `claim_packet` would
         // refuse the current body as drift — forever, since nothing else on
         // this path ever moves the pin. `run advance` re-pins on its
@@ -333,7 +333,7 @@ async fn claim_next_effect(ctx: &Ctx, holder: &str) -> Result<Value, Failure> {
     //
     // The bd actor is the DERIVED pre-run identity, never the caller's
     // `--holder`: `bd ready --claim` needs its actor before it says which
-    // bead it gave us, and a lease taken under the operator's own string
+    // work it gave us, and a lease taken under the operator's own string
     // would be refused to `run drive`'s Resolve minutes later as a claim by
     // a stranger. `--holder` names the caller for its own bookkeeping; it
     // never reaches bd.
@@ -347,10 +347,10 @@ async fn claim_next_effect(ctx: &Ctx, holder: &str) -> Result<Value, Failure> {
     failpoint::hit("work.claim.after");
     Ok(match claimed {
         None => json!({"claimed": null}),
-        Some(bead) => json!({
+        Some(work) => json!({
             "claimed": {
                 "run_id": null,
-                "bead_id": bead.id,
+                "bead_id": work.id,
                 "packet_id": null,
                 "attempt_id": null,
                 "claim_token": null,

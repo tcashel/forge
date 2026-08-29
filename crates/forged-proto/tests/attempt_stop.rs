@@ -1,7 +1,7 @@
 //! The attempt-local stop: `revoking → stopped`, fenced by confirmed death
 //! and reclaiming no bd lease.
 //!
-//! The lease is bead-scoped — `run_holder` is the same string for every
+//! The lease is work-scoped — `run_holder` is the same string for every
 //! generation of a run — so these tests assert the absence of
 //! `reclaim_lease` as hard as they assert the presence of `kill_confirmed`.
 
@@ -34,7 +34,7 @@ fn seed_run(ledger: &Ledger) -> String {
     ledger
         .create_run(NewRun {
             run_id: RunId::new(RUN).expect("run id"),
-            bead_id: "bead-stop".to_owned(),
+            work_id: "bead-stop".to_owned(),
             repo: "octo/demo".to_owned(),
             base_ref: "main".to_owned(),
             branch: "feat/stop".to_owned(),
@@ -297,7 +297,7 @@ async fn reconcile_leaves_a_stopped_attempt_alone() {
 async fn reconcile_resumes_a_failed_stop_as_a_stop_and_never_reclaims() {
     // The defect this guards: a stop whose `kill_confirmed` failed leaves a
     // `revoking` row, and a `revoking` row alone cannot say whose revocation
-    // it is. Resumed through the bead-scoped order it would reclaim the
+    // it is. Resumed through the work-scoped order it would reclaim the
     // shared lease on an attempt-local operation's behalf — the exact bug
     // the split removes, re-armed by the recovery path.
     let dir = tempfile::tempdir().expect("tempdir");
@@ -356,7 +356,7 @@ async fn reconcile_resumes_a_failed_stop_as_a_stop_and_never_reclaims() {
 }
 
 #[tokio::test]
-async fn reconcile_still_reclaims_a_bead_scoped_marker() {
+async fn reconcile_still_reclaims_a_work_scoped_marker() {
     // The other half of the routing: the saga's own marker is untouched by
     // the split, and still ends at `reclaimed` with the scoped reclaim.
     let dir = tempfile::tempdir().expect("tempdir");
@@ -373,7 +373,7 @@ async fn reconcile_still_reclaims_a_bead_scoped_marker() {
             .get_attempt(claim.attempt_id)
             .expect("get")
             .revoke_scope,
-        Some(RevokeScope::Bead),
+        Some(RevokeScope::Work),
         "the saga's own entry point is bead-scoped"
     );
 

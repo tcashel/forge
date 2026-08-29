@@ -964,7 +964,7 @@ mod tests {
             schema: "forged.packet/1".to_owned(),
             packet_id: packet_id.clone(),
             run_id: run_id.to_owned(),
-            bead_id: "bead".to_owned(),
+            work_id: "bead".to_owned(),
             stage: Stage::ReviewClaude,
             execution: Some(SeatExecutionV1 {
                 stage_id: stage_id.to_owned(),

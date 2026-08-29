@@ -301,7 +301,7 @@ pub(super) async fn acquire_submit(
                 }
                 if started.elapsed() >= SUBMIT_LOCK_WAIT {
                     return Err(Failure::refused(
-                        ErrorCode::BeadsContention,
+                        ErrorCode::WorkContention,
                         format!(
                             "{} {id} controller submission is still owned by {}",
                             scope.noun(),
@@ -2060,7 +2060,7 @@ async fn submit(ctx: &Ctx, req: &mut OperationRequest, scope: Scope) -> Operatio
                     Err(error) => return err_response(&req.idempotency_key, &error),
                 }
                 // The exact effect identity is confirmed absent. Release its
-                // old authority and loop through a current Beads/policy read;
+                // old authority and loop through a current work/policy read;
                 // never turn a stale admitted decision directly into a spawn.
                 if let Err(error) = on_ledger(&ctx.ledger, {
                     let observed = reservation.clone();

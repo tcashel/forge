@@ -1,4 +1,4 @@
-//! `epic/v1`: an event-sourced scheduler over Beads readiness and slice/v1.
+//! `epic/v1`: an event-sourced scheduler over work readiness and slice/v1.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
@@ -13,7 +13,7 @@ use forged_ledger::{
 use forged_proto::{machine_idempotency_key, MachineStage, NextAction, ProtoEvent, Terminal};
 use forged_types::{
     AdmissionDecisionV1, AdmissionOutcome, AdmissionSubjectKind, ErrorCode, ExecutionPackageV1,
-    NativeBeadSpecV1, OperationRequest, OperationResponse, RosterRevisionV1, SeatPurpose, Severity,
+    NativeWorkSpecV1, OperationRequest, OperationResponse, RosterRevisionV1, SeatPurpose, Severity,
     Verdict, WorkIdentityContextV1, WorkIdentitySubjectKind,
 };
 use serde_json::{json, Map, Value};
@@ -61,17 +61,17 @@ struct FrozenChild {
     title: String,
     issue_type: String,
     /// The child's frozen spec FILE, when it has one. `None` is the
-    /// bead-sourced child: its run start reads the spec from the bead.
+    /// work-sourced child: its run start reads the spec from the work.
     spec_path: Option<String>,
     initially_closed: bool,
     /// New rolling epics may freeze an incomplete, blocked, unassigned stub.
     planning_stub: bool,
-    frozen_fields: Option<NativeBeadSpecV1>,
+    frozen_fields: Option<NativeWorkSpecV1>,
     frozen_fields_sha256: Option<String>,
     frozen_revision: Option<String>,
     blockers: Vec<String>,
     /// Frozen compatibility membership for dependency-linked children which
-    /// predate native Beads parent edges.
+    /// predate native work parent edges.
     legacy_non_parent: bool,
 }
 
@@ -103,7 +103,7 @@ struct EpicConfig {
     /// structural identity, this prevents a later planning cycle from making
     /// an intervening root edit its new baseline.
     root_revision: Option<String>,
-    root_fields: Option<NativeBeadSpecV1>,
+    root_fields: Option<NativeWorkSpecV1>,
     children: Vec<FrozenChild>,
 }
 
@@ -330,7 +330,7 @@ fn parse_config(value: &Value, migration: Option<&Value>) -> Result<EpicConfig, 
             })?,
         rolling_authorized: rolling_authorized(value),
         legacy_membership_recorded,
-        // Bead revisions are opaque strings end to end, but legacy events
+        // Work revisions are opaque strings end to end, but legacy events
         // carried bd's raw numeric form; both must hydrate (the sibling
         // readers in the ledger already accept both).
         root_revision: value.get("specRevision").and_then(|value| match value {
@@ -1030,7 +1030,7 @@ fn is_planning_stub(issue: &crate::core::work_types::IssueSummary) -> bool {
 }
 
 /// The frozen spec route for one epic child: `None` for a no-diff child, a
-/// bead-carried spec, or an authorized planning stub; otherwise the child's
+/// work-carried spec, or an authorized planning stub; otherwise the child's
 /// validated absolute `spec:` pointer. Shared by `epic_start` and
 /// `epic_preflight`, so the rehearsal reports exactly the refusals the
 /// freeze enforces.
@@ -1038,10 +1038,10 @@ fn resolve_child_spec(
     child: &crate::core::work_types::IssueSummary,
     rolling_authorized: bool,
 ) -> Result<Option<String>, Failure> {
-    // The bead's own fields win, but only when they are a WHOLE spec. A
+    // The work's own fields win, but only when they are a WHOLE spec. A
     // child missing either required section falls back to its `spec:`
     // pointer — the route every epic frozen before this used — rather than
-    // freezing bead-sourced around a fragment.
+    // freezing work-sourced around a fragment.
     if is_no_diff(&child.issue_type)
         || super::spec::carries_spec(child)
         || (rolling_authorized && is_planning_stub(child))
@@ -1065,8 +1065,8 @@ fn resolve_child_spec(
     Ok(Some(pointer))
 }
 
-fn native_fields(issue: &crate::core::work_types::IssueSummary) -> NativeBeadSpecV1 {
-    NativeBeadSpecV1 {
+fn native_fields(issue: &crate::core::work_types::IssueSummary) -> NativeWorkSpecV1 {
+    NativeWorkSpecV1 {
         description: issue.description.clone(),
         acceptance_criteria: issue.acceptance_criteria.clone(),
         design: issue.design.clone(),
@@ -1074,7 +1074,7 @@ fn native_fields(issue: &crate::core::work_types::IssueSummary) -> NativeBeadSpe
     }
 }
 
-fn fields_digest(fields: &NativeBeadSpecV1) -> Result<String, Failure> {
+fn fields_digest(fields: &NativeWorkSpecV1) -> Result<String, Failure> {
     let value = serde_json::to_value(fields)
         .map_err(|error| Failure::internal(format!("cannot encode native spec fields: {error}")))?;
     let bytes = forged_types::canonical_json_bytes(&value).map_err(|error| {
@@ -1092,7 +1092,7 @@ fn bytes_digest(bytes: &[u8]) -> String {
     out
 }
 
-fn complete_native_fields(fields: &NativeBeadSpecV1) -> bool {
+fn complete_native_fields(fields: &NativeWorkSpecV1) -> bool {
     [
         &fields.description,
         &fields.acceptance_criteria,
@@ -1205,7 +1205,7 @@ async fn acquire_driver(ctx: &Ctx, epic: &str) -> Result<DriverGuard, Failure> {
             }
             _ => {
                 return Err(Failure::refused(
-                    forged_types::ErrorCode::BeadsContention,
+                    forged_types::ErrorCode::WorkContention,
                     format!("epic {epic} is already driven by {}", row.holder),
                 ))
             }
@@ -1315,7 +1315,7 @@ async fn recover_applied_epic_resolution(
 }
 
 /// Settle the applied side of an interrupted atomic epic creation before
-/// any current Beads read. The start event carries this exact operation id
+/// any current work read. The start event carries this exact operation id
 /// and commits with the identity, so together they are sufficient recovery
 /// evidence rather than a reason to rebuild from mutable authoring state.
 async fn recover_applied_epic_start(
@@ -1362,7 +1362,7 @@ async fn recover_applied_epic_start(
     else {
         return Ok(None);
     };
-    // Absence is a torn/corrupt bundle. Never fall through to current Beads
+    // Absence is a torn/corrupt bundle. Never fall through to current work
     // and silently manufacture a different display identity.
     super::work_identity::load(ctx, WorkIdentitySubjectKind::Epic, epic).await?;
     let response = ok_response(&row.operation_id, false, landed);
@@ -1466,7 +1466,7 @@ async fn validate_requested_base_ref(
     Ok(bare.to_owned())
 }
 
-/// Freeze the Beads inventory and child execution defaults.
+/// Freeze the work inventory and child execution defaults.
 pub async fn epic_start(ctx: &Ctx, req: &mut OperationRequest) -> OperationResponse {
     let epic = match param_str(&req.params, "epic") {
         Ok(value) => value.to_owned(),
@@ -1552,7 +1552,7 @@ pub async fn epic_start(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespo
                         // The start event and identity commit together. A
                         // response lost after that commit replays from those
                         // durable bytes without re-reading a renamed, deleted,
-                        // or unavailable Bead.
+                        // or unavailable Work.
                         return Ok(landed);
                     }
                     return status_json(ctx, project(ctx, &epic).await?).await;
@@ -1581,7 +1581,7 @@ pub async fn epic_start(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespo
                 let issue = super::workstore::show_issue(&ctx.ledger, &epic).await?;
                 if issue.issue_type != "epic" {
                     return Err(Failure::invalid(format!(
-                        "bead {epic} has issue type {:?}, not epic",
+                        "work {epic} has issue type {:?}, not epic",
                         issue.issue_type
                     )));
                 }
@@ -1591,7 +1591,7 @@ pub async fn epic_start(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespo
                     super::workstore::epic_children_with_legacy(&ctx.ledger, &epic).await?;
                 if inventory.is_empty() {
                     return Err(Failure::invalid(format!(
-                        "epic {epic} has no Beads children"
+                        "epic {epic} has no work children"
                     )));
                 }
                 let planning_ids = inventory
@@ -1763,7 +1763,7 @@ fn child_json(
     state: Option<&ChildState>,
     planning: Option<&PlanningState>,
     run_id: Option<&str>,
-    bead_status: &str,
+    work_status: &str,
     identity: Value,
     durable: ChildDurable<'_>,
 ) -> Value {
@@ -1786,7 +1786,7 @@ fn child_json(
         "title": child.title,
         "issueType": child.issue_type,
         "specPath": child.spec_path,
-        "beadsStatus": bead_status,
+        "beadsStatus": work_status,
         "phase": if planning.is_some() { "planning" } else if state.is_some() { "implementation" } else { "unstarted" },
         "runId": run_id,
         "wave": state.map(|value| value.wave),
@@ -1983,7 +1983,7 @@ async fn status_json(ctx: &Ctx, view: EpicView) -> Result<Value, Failure> {
     let mut next_wakes = Vec::new();
     let epic_context = WorkIdentityContextV1 {
         id: view.config.epic_id.clone(),
-        title: identity.bead.title.clone(),
+        title: identity.work.title.clone(),
     };
     let mut children = Vec::with_capacity(view.config.children.len());
     for child in &view.config.children {
@@ -2214,12 +2214,12 @@ fn record_check(checks: &mut Vec<Value>, name: &str, outcome: Result<String, Fai
     checks.push(json!({"name": name, "ok": ok, "detail": detail}));
 }
 
-/// The admission contract, front-run: a bead admits only when its
+/// The admission contract, front-run: a work admits only when its
 /// `metadata.repository` literally equals the canonical target path —
-/// absence is `BeadMalformed`, difference is `RepositoryMismatch` — so a
+/// absence is `WorkMalformed`, difference is `RepositoryMismatch` — so a
 /// preflight that skipped this would pass an inventory whose children can
 /// never admit.
-fn check_bead_repository(
+fn check_work_repository(
     issue: &crate::core::work_types::IssueSummary,
     repo: Option<&str>,
 ) -> Result<(), Failure> {
@@ -2240,7 +2240,7 @@ fn check_bead_repository(
 /// Read-only rehearsal of `epic_start`: the geometry, definition,
 /// inventory, and tooling checks the start enforces, plus the identity
 /// tuple a start would freeze — with nothing created. No event, no
-/// operations row, no beads mutation. Two checks are deliberately stricter
+/// operations row, no work mutation. Two checks are deliberately stricter
 /// than the start itself: the repository path must be an existing git
 /// checkout (the start freezes a nonexistent path happily), and a
 /// DISCOVERED default base ref is probed against origin exactly like an
@@ -2357,7 +2357,7 @@ pub async fn epic_preflight(ctx: &Ctx, req: &OperationRequest) -> OperationRespo
             Ok(issue) if issue.issue_type == "epic" => {
                 let outcome = super::spec::resolve_issue(&issue)
                     .map(|_| ())
-                    .and_then(|()| check_bead_repository(&issue, repo.as_deref()))
+                    .and_then(|()| check_work_repository(&issue, repo.as_deref()))
                     .map(|()| format!("epic {epic} {:?}", issue.title));
                 record_check(&mut checks, "epic-bead", outcome);
             }
@@ -2365,7 +2365,7 @@ pub async fn epic_preflight(ctx: &Ctx, req: &OperationRequest) -> OperationRespo
                 &mut checks,
                 "epic-bead",
                 Err(Failure::invalid(format!(
-                    "bead {epic} has issue type {:?}, not epic",
+                    "work {epic} has issue type {:?}, not epic",
                     issue.issue_type
                 ))),
             ),
@@ -2379,7 +2379,7 @@ pub async fn epic_preflight(ctx: &Ctx, req: &OperationRequest) -> OperationRespo
                 &mut checks,
                 "children",
                 Err(Failure::invalid(format!(
-                    "epic {epic} has no Beads children"
+                    "epic {epic} has no work children"
                 ))),
             ),
             Ok((inventory, _legacy)) => {
@@ -2390,7 +2390,7 @@ pub async fn epic_preflight(ctx: &Ctx, req: &OperationRequest) -> OperationRespo
                     if let Err(error) = resolve_child_spec(child, rolling) {
                         failures.push(error.message);
                     }
-                    if let Err(error) = check_bead_repository(child, repo.as_deref()) {
+                    if let Err(error) = check_work_repository(child, repo.as_deref()) {
                         failures.push(error.message);
                     }
                     // Generation-1 identities, exactly as `start_child`
@@ -3197,7 +3197,7 @@ async fn capture_planning_checkpoint(
         "revision": root.issue.revision,
         "fields": native_fields(&root.issue),
     });
-    // A Beads revision is an opaque per-write provenance token, not a content
+    // A work revision is an opaque per-write provenance token, not a content
     // fence. Retain both revisions in the evidence above, but freeze only the
     // semantic root contract that rolling planning is authorized to preserve.
     let semantic_root_keys = ["title", "issueType", "fields"];
@@ -3315,7 +3315,7 @@ async fn start_planning(
     if target
         .get("fields")
         .cloned()
-        .map(serde_json::from_value::<NativeBeadSpecV1>)
+        .map(serde_json::from_value::<NativeWorkSpecV1>)
         .transpose()
         .map_err(|error| Failure::internal(format!("invalid target checkpoint fields: {error}")))?
         .as_ref()
@@ -3448,7 +3448,7 @@ fn checkpoint_drift(
         .get("fields")
         .cloned()
         .ok_or_else(|| "live target snapshot has no fields".to_owned())?;
-    let current_fields: NativeBeadSpecV1 = serde_json::from_value(current_fields)
+    let current_fields: NativeWorkSpecV1 = serde_json::from_value(current_fields)
         .map_err(|error| format!("live target fields are invalid: {error}"))?;
     let current_digest = fields_digest(&current_fields).map_err(|error| error.message)?;
     let recovered_post = current_digest == post_digest
@@ -4878,7 +4878,7 @@ async fn planning_after_completed_wave(
                 &view.config.epic_id,
                 "planning-stub-missing",
                 Some(&child.id),
-                "frozen planning stub is absent from Beads",
+                "frozen planning stub is absent from the work store",
             )
             .await?;
             return Ok(Some(Step::Stop(input)));
@@ -5039,7 +5039,7 @@ async fn advance_once(ctx: &Ctx, epic: &str) -> Result<Step, Failure> {
 
     // A planning run is internal cognition owned by the epic controller.
     // Reconcile it before opening another wave; a clean reviewed candidate
-    // crosses the separate guarded Beads apply seam, while every failure
+    // crosses the separate guarded work apply seam, while every failure
     // names its stub. No second controller or manual child dispatch exists.
     for child in &view.config.children {
         let Some(planning) = view
@@ -5386,7 +5386,7 @@ async fn advance_once(ctx: &Ctx, epic: &str) -> Result<Step, Failure> {
                     "no-ready-children",
                     child,
                     format!(
-                        "Beads frontier contains none of the unresolved children: {unresolved:?}"
+                        "Work frontier contains none of the unresolved children: {unresolved:?}"
                     ),
                 )
                 .await?;
@@ -5442,7 +5442,7 @@ async fn advance_once(ctx: &Ctx, epic: &str) -> Result<Step, Failure> {
             child.id.clone(),
             "non-code-child",
             format!(
-                "{} is a no-diff {} Bead; complete it directly in Beads, then resolve this hold",
+                "{} is a no-diff {} work item; complete it directly in the work store, then resolve this hold",
                 child.id, child.issue_type
             ),
         ));
@@ -5939,7 +5939,7 @@ pub async fn epic_resolve(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
             resolved_object.insert("resolutionId".to_owned(), json!(operation));
             // Parent then child is the control order shared with launch. The
             // child fence joins any still-running terminal settlement before
-            // reopening its Bead, preventing the old generation from
+            // reopening its Work, preventing the old generation from
             // re-blocking it after resolution has already landed.
             let _parent_guard =
                 super::handoff::acquire_submit(ctx, &epic, super::handoff::Scope::Epic).await?;

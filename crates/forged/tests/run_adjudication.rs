@@ -8,14 +8,14 @@ mod support;
 use serde_json::{json, Value};
 use support::{fabricate_run, McpClient, TestEnv};
 
-/// A run whose bead is claimable plus a `forged.controller.started` record
+/// A run whose work is claimable plus a `forged.controller.started` record
 /// carrying a generation but NO durable driver identity — the exact legacy
 /// shape that predates durable pid/lstart publication.
 fn seed_legacy(env: &TestEnv, run: &str) -> String {
-    let bead = format!("bead-{run}");
+    let work = format!("bead-{run}");
     fabricate_run(env, run);
-    env.set_bead_field(&bead, "status", "in_progress");
-    env.set_assignee(&bead, &format!("forged:{bead}:0"));
+    env.set_work_field(&work, "status", "in_progress");
+    env.set_assignee(&work, &format!("forged:{work}:0"));
     let ledger = env.ledger();
     ledger
         .append_event(
@@ -25,7 +25,7 @@ fn seed_legacy(env: &TestEnv, run: &str) -> String {
         )
         .expect("legacy controller record");
     ledger.close().expect("close");
-    bead
+    work
 }
 
 fn adjudicate_args<'a>(run: &'a str, outcome: &'a str, rationale: &'a str) -> Vec<&'a str> {
@@ -47,7 +47,7 @@ fn adjudicate_args<'a>(run: &'a str, outcome: &'a str, rationale: &'a str) -> Ve
 
 /// Every `work.updated` payload the ledger recorded for one work item,
 /// oldest first (coordination events carry no run id).
-fn mutation_calls(env: &TestEnv, bead: &str) -> Vec<Value> {
+fn mutation_calls(env: &TestEnv, work: &str) -> Vec<Value> {
     let ledger = env.ledger();
     let events = ledger.list_events(None, 0, 65_536).expect("events");
     ledger.close().expect("close");
@@ -55,7 +55,7 @@ fn mutation_calls(env: &TestEnv, bead: &str) -> Vec<Value> {
         .into_iter()
         .filter(|event| event.kind == "work.updated")
         .map(|event| serde_json::from_str::<Value>(&event.payload_json).expect("payload"))
-        .filter(|payload| payload["workId"] == json!(bead))
+        .filter(|payload| payload["workId"] == json!(work))
         .collect()
 }
 
@@ -64,7 +64,7 @@ fn legacy_record_settles_with_revocation_terminal_and_adjudication_event() {
     let env = TestEnv::new("forged-adjudicate-legacy");
     env.forged(&["init"]);
     let run = "adj-legacy";
-    let bead = seed_legacy(&env, run);
+    let work = seed_legacy(&env, run);
     let sha = "b".repeat(40);
 
     // The fence is right to fail closed: the normal path cannot settle this.
@@ -117,7 +117,7 @@ fn legacy_record_settles_with_revocation_terminal_and_adjudication_event() {
         json!("operator")
     );
     assert_eq!(response["result"]["bead"]["closed"], json!(true));
-    assert_eq!(env.assignee(&bead), None);
+    assert_eq!(env.assignee(&work), None);
 
     let ledger = env.ledger();
     let row = ledger.get_run(run).expect("run");
@@ -379,12 +379,12 @@ fn replay_reuses_the_stored_response_and_a_different_assertion_conflicts() {
     ledger.close().expect("close");
 }
 
-/// A closed Bead reads as already converged for EVERY adjudicated outcome:
-/// eleven of the twelve legacy beads are closed, and an adjudication that
+/// A closed Work reads as already converged for EVERY adjudicated outcome:
+/// eleven of the twelve legacy work items are closed, and an adjudication that
 /// errored on them would mint the exact settlement-pending noise this
 /// operation exists to clear.
 #[test]
-fn a_closed_bead_converges_for_every_outcome() {
+fn a_closed_work_converges_for_every_outcome() {
     let env = TestEnv::new("forged-adjudicate-closed-bead");
     env.forged(&["init"]);
     let sha = "d".repeat(40);
@@ -400,9 +400,9 @@ fn a_closed_bead_converges_for_every_outcome() {
         ("adj-closed-cancelled", vec!["--outcome", "cancelled"]),
     ];
     for (run, outcome_args) in cases {
-        let bead = seed_legacy(&env, run);
-        env.set_bead_field(&bead, "status", "closed");
-        let before = mutation_calls(&env, &bead).len();
+        let work = seed_legacy(&env, run);
+        env.set_work_field(&work, "status", "closed");
+        let before = mutation_calls(&env, &work).len();
 
         let mut args = vec!["run", "adjudicate-settlement", "--run", run];
         args.extend(outcome_args);
@@ -427,13 +427,13 @@ fn a_closed_bead_converges_for_every_outcome() {
             json!(true),
             "{run}: {response}"
         );
-        let mutations: Vec<Value> = mutation_calls(&env, &bead)
+        let mutations: Vec<Value> = mutation_calls(&env, &work)
             .into_iter()
             .skip(before)
             .collect();
         // The one guarded release: forged's stale custody comes off the
-        // closed Bead, and nothing else is written.
-        let expected_holder = format!("forged:{bead}:0");
+        // closed Work, and nothing else is written.
+        let expected_holder = format!("forged:{work}:0");
         assert_eq!(mutations.len(), 1, "{run}: {mutations:?}");
         assert_eq!(
             mutations[0]["verb"],
@@ -460,7 +460,7 @@ fn a_closed_bead_converges_for_every_outcome() {
             json!(null),
             "{run}: {response}"
         );
-        assert_eq!(env.assignee(&bead), None, "{run}: custody is released");
+        assert_eq!(env.assignee(&work), None, "{run}: custody is released");
 
         let ledger = env.ledger();
         let row = ledger.get_run(run).expect("run");
@@ -476,7 +476,7 @@ fn a_closed_bead_converges_for_every_outcome() {
             events
                 .iter()
                 .all(|event| event.kind != "run.bead-settlement.pending"),
-            "{run}: a closed Bead never pends"
+            "{run}: closed work never pends"
         );
         ledger.close().expect("close");
     }

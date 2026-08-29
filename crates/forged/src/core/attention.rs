@@ -26,16 +26,16 @@ use super::{epic, split_packet_key, Failure};
 pub(crate) const ACKNOWLEDGED: &str = "forged.attention.acknowledged";
 pub(crate) const RESOLVED: &str = "forged.attention.resolved";
 pub(crate) const REOPENED: &str = "forged.attention.reopened";
-pub(crate) const BEAD_SETTLEMENT_PENDING: &str = "run.bead-settlement.pending";
-pub(crate) const BEAD_SETTLEMENT_SUCCEEDED: &str = "run.bead-settlement.succeeded";
+pub(crate) const WORK_SETTLEMENT_PENDING: &str = "run.bead-settlement.pending";
+pub(crate) const WORK_SETTLEMENT_SUCCEEDED: &str = "run.bead-settlement.succeeded";
 
 /// Event vocabulary needed in addition to the inventory lifecycle events.
 pub(crate) const ATTENTION_EVENT_KINDS: [&str; 13] = [
     epic::INPUT_REQUIRED,
     epic::INPUT_RESOLVED,
     "proto.quarantine",
-    BEAD_SETTLEMENT_PENDING,
-    BEAD_SETTLEMENT_SUCCEEDED,
+    WORK_SETTLEMENT_PENDING,
+    WORK_SETTLEMENT_SUCCEEDED,
     "run.protocol-terminal",
     "proto.gate",
     "proto.review",
@@ -95,11 +95,11 @@ pub(crate) fn policy(
             Action::ResolveBlocker,
             "Resolve the authoritative blocker before resuming work",
         ),
-        Condition::BeadsSettlementPending => (
+        Condition::WorkSettlementPending => (
             Severity::Medium,
             Owner::LeadAgent,
-            Action::ReconcileBeads,
-            "Retry the exact Beads settlement promise",
+            Action::ReconcileWork,
+            "Retry the exact work settlement promise",
         ),
         Condition::Revoking => (
             Severity::Medium,
@@ -204,7 +204,7 @@ fn subject_kind(entry: &Value) -> AttentionSubjectKind {
 }
 
 /// The row's already-resolved title. Attention never re-derives the
-/// precedence rule and never reads Beads itself.
+/// precedence rule and never reads work itself.
 fn subject_title(entry: &Value) -> Option<forged_types::WorkTitleV1> {
     serde_json::from_value(entry.get("titleSource")?.clone()).ok()
 }
@@ -277,7 +277,7 @@ fn settlement_cursor(snapshot: &InventorySnapshot, id: &str) -> i64 {
 fn collect_domain_sources(
     snapshot: &InventorySnapshot,
     entries_slice: &[Value],
-    beads: &[IssueSummary],
+    work: &[IssueSummary],
 ) -> Result<Vec<RawAttention>, Failure> {
     let InventoryUsage::Included {
         totals: usage_totals,
@@ -447,13 +447,13 @@ fn collect_domain_sources(
         }
     }
 
-    // Live Beads is authoritative for a blocked issue.
-    let by_bead: BTreeMap<&str, &str> = entries_slice
+    // Live work is authoritative for a blocked issue.
+    let by_work: BTreeMap<&str, &str> = entries_slice
         .iter()
         .filter_map(|entry| Some((entry.get("beadId")?.as_str()?, entry.get("id")?.as_str()?)))
         .collect();
-    for issue in beads.iter().filter(|issue| issue.status == "blocked") {
-        let Some(id) = by_bead.get(issue.id.as_str()) else {
+    for issue in work.iter().filter(|issue| issue.status == "blocked") {
+        let Some(id) = by_work.get(issue.id.as_str()) else {
             continue;
         };
         let entry = entries[id.to_owned()];
@@ -475,47 +475,47 @@ fn collect_domain_sources(
             updated,
             0,
             source,
-            "Bead is blocked in the authoritative live store",
+            "Work is blocked in the authoritative live store",
             json!({"beadId": issue.id, "status": issue.status, "revision": issue.revision}),
-            AttentionEvidenceKind::Bead,
+            AttentionEvidenceKind::Work,
             &issue.id,
         );
     }
 
     // A later success clears the exact pending reconciliation promise.
-    let mut bead_settlement: BTreeMap<String, (&str, &forged_ledger::EventRow)> = BTreeMap::new();
-    for kind in [BEAD_SETTLEMENT_PENDING, BEAD_SETTLEMENT_SUCCEEDED] {
+    let mut work_settlement: BTreeMap<String, (&str, &forged_ledger::EventRow)> = BTreeMap::new();
+    for kind in [WORK_SETTLEMENT_PENDING, WORK_SETTLEMENT_SUCCEEDED] {
         for event in snapshot.events(kind) {
             let Some(id) = event.run_id.as_ref() else {
                 continue;
             };
-            if bead_settlement
+            if work_settlement
                 .get(id)
                 .is_none_or(|(_, seen)| seen.event_id < event.event_id)
             {
-                bead_settlement.insert(id.clone(), (kind, event));
+                work_settlement.insert(id.clone(), (kind, event));
             }
         }
     }
-    for (id, (kind, event)) in bead_settlement {
-        if kind != BEAD_SETTLEMENT_PENDING {
+    for (id, (kind, event)) in work_settlement {
+        if kind != WORK_SETTLEMENT_PENDING {
             continue;
         }
         let payload = event_value(&event.payload_json);
         let error = payload
             .get("error")
             .and_then(Value::as_str)
-            .unwrap_or("unknown Beads error");
+            .unwrap_or("unknown work error");
         add_raw(
             &mut raw,
             &entries,
             &id,
-            AttentionCondition::BeadsSettlementPending,
+            AttentionCondition::WorkSettlementPending,
             &event.ts,
             &event.ts,
             event.event_id,
             format!("event:{}", event.event_id),
-            format!("Beads reconciliation is pending: {error}"),
+            format!("Work reconciliation is pending: {error}"),
             payload,
             AttentionEvidenceKind::Event,
             event.event_id.to_string(),
@@ -1222,7 +1222,7 @@ pub(crate) fn classification(condition: AttentionCondition) -> AttentionClass {
         | Condition::RestartBudgetExhausted
         | Condition::MissingEvidence => AttentionClass::Decision,
         Condition::Blocked
-        | Condition::BeadsSettlementPending
+        | Condition::WorkSettlementPending
         | Condition::Revoking
         | Condition::ControllerDead
         | Condition::FailedGate
@@ -1236,9 +1236,9 @@ pub(crate) fn classification(condition: AttentionCondition) -> AttentionClass {
 pub(crate) fn project_all(
     snapshot: &InventorySnapshot,
     entries: &[Value],
-    beads: &[IssueSummary],
+    work: &[IssueSummary],
 ) -> Result<Vec<AttentionItemV1>, Failure> {
-    let raw = collect_domain_sources(snapshot, entries, beads)?;
+    let raw = collect_domain_sources(snapshot, entries, work)?;
     let mut buckets: BTreeMap<
         (AttentionSubjectKind, String, AttentionCondition),
         Vec<RawAttention>,
@@ -1341,9 +1341,9 @@ pub(crate) fn project_all(
 pub(crate) fn project_active(
     snapshot: &InventorySnapshot,
     entries: &[Value],
-    beads: &[IssueSummary],
+    work: &[IssueSummary],
 ) -> Result<Vec<AttentionItemV1>, Failure> {
-    Ok(project_all(snapshot, entries, beads)?
+    Ok(project_all(snapshot, entries, work)?
         .into_iter()
         .filter(|item| item.state != AttentionState::Resolved)
         .collect())
@@ -1403,7 +1403,7 @@ mod tests {
     fn run_row(id: &str, state: RunState, terminal_outcome: Option<RunOutcome>) -> RunRow {
         RunRow {
             run_id: id.to_owned(),
-            bead_id: "bead-gate".to_owned(),
+            work_id: "bead-gate".to_owned(),
             repo: "/repo".to_owned(),
             base_ref: "main".to_owned(),
             branch: "forged/bead-gate".to_owned(),
@@ -1654,7 +1654,7 @@ mod tests {
         ];
         let symptoms = [
             Condition::Blocked,
-            Condition::BeadsSettlementPending,
+            Condition::WorkSettlementPending,
             Condition::Revoking,
             Condition::ControllerDead,
             Condition::FailedGate,

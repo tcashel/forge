@@ -22,7 +22,7 @@ sibling Smithy experiment into the current Forge tree for its next containing
 release. Claude and Codex load one shared skill tree from this repository.
 Smithy remains historical evidence and is neither an installation dependency
 nor a second workflow authority. The move changes distribution and ownership
-only: the lead agent still performs cognition, native Bead fields remain the
+only: the lead agent still performs cognition, native work fields remain the
 editable specification, and Forged remains the durable execution control
 plane.
 
@@ -124,7 +124,7 @@ consequential security, data, migration, financial, or irreversible-operation
 risk; reviewer disagreement never promotes a standard run into it. A profile's
 `fixRoundBudget` is the only review-loop limit: after the initial review, each
 budgeted remediation is followed by another review, and exhaustion is reported
-as `reviewBudgetExhausted` rather than starting a successor run or Bead.
+as `reviewBudgetExhausted` rather than starting a successor run or work item.
 Run start freezes the resolved package and hashes, including gate commands,
 stage and transport budgets, and Herdr host policy. Editing authoring YAML
 affects later runs only; recovery and detached controllers continue from the
@@ -163,7 +163,7 @@ an observable pane.
 ## Submit a slice
 
 ```sh
-forged run start --bead <id> --repo /absolute/repo \
+forged run start --work <id> --repo /absolute/repo \
   --profile standard --roster default
 forged run submit --run <id>
 ```
@@ -205,9 +205,9 @@ forged run stop --run <run-id> --outcome landed --reason '<verification>' \
 
 The whole-run stop first makes the state machine terminal, then durably
 revokes and confirms death for every live attempt. `blocked` and
-`input-required` return the Bead to blocked/unassigned; `cancelled` and
+`input-required` return the work item to blocked/unassigned; `cancelled` and
 `superseded` return it open/unassigned; `clean` preserves its claim while the
-reviewed PR awaits delivery. Only `landed` closes the Bead, clears its
+reviewed PR awaits delivery. Only `landed` closes the work item, clears its
 assignment, and retires a clean worktree. The stored PR and full SHA make a
 clean squash-merged worktree safe to retire without pretending the topic
 branch is an ancestor of the base. Dirty or unresolved worktrees remain for
@@ -218,11 +218,11 @@ controller record carries no durable driver identity, so no death fence is
 possible — the settlement path is `run adjudicate-settlement`: an explicitly
 destructive operator adjudication of the evidence gap that records the
 decision durably and settles the run (`landed`/`superseded`/`cancelled`),
-converging an already-closed Bead and releasing forged's stale custody on
+converging an already-closed work item and releasing forged's stale custody on
 it. It refuses any run the normal fence can settle.
 
 `run status` reports the terminal outcome, delivery evidence, successor, and
-`claimHealth`. An `in_progress` Bead with neither a live controller nor a live
+`claimHealth`. An `in_progress` work item with neither a live controller nor a live
 attempt is marked `staleInProgress: true` instead of silently looking active.
 
 ## Submit an epic
@@ -233,7 +233,7 @@ forged epic start --epic <epic-id> --repo /absolute/repo \
 forged epic submit --epic <epic-id>
 ```
 
-The epic Bead is the plan map and the frozen child inventory is read from its
+The epic work item is the plan map and the frozen child inventory is read from its
 native parent links; there is no second editable epic spec file. The old
 `--spec <absolute-path>` flag remains readable for one release and is recorded
 as deprecated provenance only.
@@ -241,7 +241,7 @@ as deprecated provenance only.
 Code-producing children (`bug`, `feature`, `task`, `story`, and `spike`) run
 through `slice/v1`. No-diff children (`chore`, `decision`, and `milestone`)
 become one explicit `inputRequired` action: complete the work directly in
-Beads, close the child, then `epic resolve`. Forged never manufactures an
+work store, close the child, then `epic resolve`. Forged never manufactures an
 empty commit or PR for them, and a child closed after epic start counts as
 accounted work.
 
@@ -250,7 +250,7 @@ epic projection. The next wave starts a fresh child run generation (for
 example, `<child>-g2`) from the adjudicated spec; it never reuses or silently
 accepts the unclean terminal run.
 
-Forged freezes the Beads inventory, drives ready children in waves, and
+Forged freezes the work store inventory, drives ready children in waves, and
 squash-merges only mechanically clean slices into
 `forged/epic-<epic-id>`. It never merges that branch to the default branch. A
 completed epic ends at one draft PR; ambiguity/no-ready/non-clean work becomes
@@ -274,7 +274,7 @@ forged epic submit --epic <epic-id>
 ## Reconnect from any agent harness
 
 Start with `operations overview`. It is the bounded operator surface over
-durable work plus the current nonterminal Beads plan. `work list` remains the
+durable work plus the current nonterminal work store plan. `work list` remains the
 compatibility inventory and `overview` remains the compatibility reconnect
 facade. Exact subject detail requires both kind and canonical id; it never
 guesses or widens by prefix:
@@ -321,32 +321,32 @@ command remains visible to the lead agent. Plan-only rows deliberately have
 no detail target until durable execution exists.
 
 `work map` returns `forged.work-map/1` and renders through
-`ui://forged/work-map.html`. It keeps current Beads plans and durable run or
+`ui://forged/work-map.html`. It keeps current work store plans and durable run or
 epic executions as distinct nodes, joined by explicit `execution-of` edges;
-multiple executions of one Bead never overwrite each other. Native dependency
+multiple executions of one work item never overwrite each other. Native dependency
 edges run from dependent to prerequisite, parent edges run child to parent,
 and filtered or cross-scope coordinates are bounded `contextOnly` nodes.
 Cycles, missing blocker status, and genuinely unavailable targets remain
-visible in graph health. Operator and repository scope use at most two Beads
+visible in graph health. Operator and repository scope use at most two work store
 processes; epic scope uses at most three. Graphs over `maxNodes` refuse with
 `GRAPH_SCOPE_TOO_LARGE` rather than returning a misleading partial graph.
 
 Queue and attention fields use the same pure classifier as Operations, while
 desired/admission facts remain on their exact durable subjects. Work Map adds
 one bounded history projection and reports unattached subjects explicitly;
-plan-only nodes never inherit execution spend. Ledger, Beads, plan, and
+plan-only nodes never inherit execution spend. Ledger, work store, plan, and
 history captures and health remain separate because the sources are not one
 cross-system transaction. Selecting a durable App node calls Work Detail with
 its exact `{subjectKind, subjectId}`; plan nodes expose no execution control.
 
 The repository selector performs one native, id-bounded
-`metadata.repository` Beads query and reuses its rows for claim-health and
-queue enrichment. Missing metadata and deleted or unreadable Beads are
+`metadata.repository` work store query and reuses its rows for claim-health and
+queue enrichment. Missing metadata and deleted or unreadable work store are
 reported as `repositoryScope.known: false` in the operator-wide view and are
 never guessed into a scoped result; an unavailable authoritative read fails a
 scoped request closed. The operator-database storage and repository-identity
-decision is recorded in Bead `beads-zws.17`. The selector changes only the
-query projection: one operator-scoped Beads database remains authoritative.
+decision is recorded in work item `beads-zws.17`. The selector changes only the
+query projection: one operator-scoped work store database remains authoritative.
 
 `overview` with no scope answers with the portfolio: `kind: "portfolio"` on
 the same `forged.overview/1` schema, carrying the inventory entries newest
@@ -358,7 +358,7 @@ derive a second classification. The `attention` rail names each
 active condition with a closed severity, owner (`human` or `lead-agent`),
 stable `attentionId`, occurrence-fenced `occurrenceId`, bounded durable
 evidence references, and a typed recommended action. The shared projector
-covers input and terminal blockers, Beads settlement, revocation and
+covers input and terminal blockers, work store settlement, revocation and
 quarantine custody, merge approval, partial cost, controller/restart
 failure, abandoned gates/retries, typed provider degradation, ambiguous
 effects, missing attempt evidence, and reviewer disagreement. Routine
@@ -370,16 +370,16 @@ Acknowledgement records custody and stays visible. Resolve is accepted only
 for explicitly adjudicable custody conditions; source-backed operational
 conditions clear through their own domain transition. A later causal source
 keeps the stable attention id but receives a new occurrence id, so a stale
-control cannot dismiss a recurrence. These controls never resume work,
-release capacity, retry an effect, settle Beads, or merge a PR.
+control cannot dismiss a recurrence. These controls never resume work, release
+capacity, retry an effect, settle a work item, or merge a PR.
 
-Each queue/inventory entry carries a live Bead title (with a deterministic
+Each queue/inventory entry carries a live work item title (with a deterministic
 legacy fallback), durable launch repository and base branch, authoritative
 `repositoryScope`, current stage/seat, last
 progress timestamp plus the clock used for age, exact blocker and next
 action, PR delivery, explicitly-known-or-unknown CI, spend, verified
-controller identity, and Bead `claimHealth`. Beads enrichment is one bounded
-read for the exact ledger ids, not one subprocess per row. A shell or Herdr
+controller identity, and work item `claimHealth`. Work-store enrichment is one
+bounded read for the exact ledger ids, not one subprocess per row. A shell or Herdr
 pane is never enough to classify an entry as Running; a verified driver
 identity or live attempt is required. An
 epic's lifecycle is derived from its durable events — `active` until
@@ -392,7 +392,7 @@ a `run.settled` event records them. CI remains `unknown` unless durable
 evidence exists; the queue does not turn an unavailable GitHub lookup into a
 green check. `run status` and queue entries use the same `claimHealth` shape
 (`known`, status, assignee, expected assignee, stale-in-progress flag, and
-detail), so abandoned Bead ownership is visible instead of silently trusted.
+detail), so abandoned work-item ownership is visible instead of silently trusted.
 A clean or accepted-risk run deliberately retains its claim while its reviewed
 PR awaits delivery and is reported as awaiting delivery, not as stale.
 
@@ -405,7 +405,7 @@ projection and renders it through `ui://forged/overview.html`.
 ## Bounded work history
 
 `work history` projects durable cross-run throughput, rework, settlement, and
-spend without consulting Beads, the filesystem, providers, GitHub, or live
+spend without consulting work store, the filesystem, providers, GitHub, or live
 services. The CLI and MCP tool return the same `forged.work-history/1`
 contract:
 
@@ -447,7 +447,7 @@ ledger did not record:
 | Cost | What the run spent. Per-seat tokens, web-search calls, and money, with each cost labelled `billed` (the provider charged it) or `imputed` (derived from the rate card), and superseded attempts marked as rework. |
 | Ledger | The raw event stream, filterable by kind and payload text, with payloads on demand. |
 
-Epics swap Flow's matrix for a **Waves** board: every frozen child bead by
+Epics swap Flow's matrix for a **Waves** board: every frozen child work item by
 wave, with its work status, run, merge state, and the child that is holding
 for input.
 
@@ -518,7 +518,7 @@ boundary.
 
 The current Forge tree now carries the six lead-agent capabilities in
 `plugins/forged` with Claude and Codex manifests over one shared tree. The
-plugin writes complete native Bead fields and parent links, then invokes the
+plugin writes complete native work item fields and parent links, then invokes the
 typed commands above; it does not carry the removed execution Workflow/watch
 stack. Smithy Anvil 0.3.1 is archival migration input only.
 

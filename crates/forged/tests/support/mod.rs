@@ -155,8 +155,8 @@ pub fn init_store(bd: &Path, s: &Scratch) {
     );
 }
 
-/// Create a bead in the scratch store and return its id.
-pub fn create_bead(bd: &Path, s: &Scratch, title: &str) -> String {
+/// Create a work in the scratch store and return its id.
+pub fn create_work(bd: &Path, s: &Scratch, title: &str) -> String {
     let out = raw_bd(bd, s, &["create", title, "--json"])
         .output()
         .expect("spawning bd create");
@@ -174,9 +174,9 @@ pub fn create_bead(bd: &Path, s: &Scratch, title: &str) -> String {
         .to_string()
 }
 
-/// Read a bead through a RAW `bd show <id> --json`, returning its first
+/// Read a work through a RAW `bd show <id> --json`, returning its first
 /// data object.
-pub fn show_bead(bd: &Path, s: &Scratch, id: &str) -> Value {
+pub fn show_work(bd: &Path, s: &Scratch, id: &str) -> Value {
     let out = raw_bd(bd, s, &["show", id, "--json"])
         .output()
         .expect("spawning bd show");
@@ -1342,20 +1342,20 @@ impl TestEnv {
     /// Seed an epic plus child inventory/status/spec pointers in the bd shim.
     pub fn seed_epic(&self, epic: &str, children: &[(&str, &Path, bool)]) {
         self.ensure_work_item(epic);
-        self.set_bead_field(epic, "type", "epic");
-        self.set_bead_field(epic, "title", "Test epic");
-        self.set_bead_field(
+        self.set_work_field(epic, "type", "epic");
+        self.set_work_field(epic, "title", "Test epic");
+        self.set_work_field(
             epic,
             "description",
             "## Context\n\nThe epic Bead is the canonical plan map.",
         );
-        self.set_bead_field(epic, "acceptance", "- every child is accounted for");
+        self.set_work_field(epic, "acceptance", "- every child is accounted for");
         for (id, spec, _ready) in children {
             self.ensure_work_item(id);
-            self.set_bead_field(id, "title", &format!("Child {id}"));
-            self.set_bead_field(id, "description", &format!("spec: {}", spec.display()));
-            self.set_bead_field(id, "status", "open");
-            self.set_bead_field(id, "parent", epic);
+            self.set_work_field(id, "title", &format!("Child {id}"));
+            self.set_work_field(id, "description", &format!("spec: {}", spec.display()));
+            self.set_work_field(id, "status", "open");
+            self.set_work_field(id, "parent", epic);
             // Readiness is a store query now: an open, unassigned, unblocked
             // child IS the frontier; the `ready` flag kept its meaning by
             // children that other fixture calls block or claim afterwards.
@@ -1401,8 +1401,8 @@ impl TestEnv {
     /// Seed the ready frontier: ensure a ledger work item exists, open and
     /// unassigned (the shim-file frontier this replaces was consumed by
     /// `bd ready --claim`; the ledger frontier is a query).
-    pub fn seed_frontier(&self, bead: &str) {
-        self.ensure_work_item(bead);
+    pub fn seed_frontier(&self, work: &str) {
+        self.ensure_work_item(work);
     }
 
     /// Open the raw state.db for direct test shaping — the ledger-native
@@ -1424,7 +1424,7 @@ impl TestEnv {
 
     /// Ensure a work item row exists with the shim-default shape: title =
     /// id, open task, priority 2, repository metadata, revision 1.
-    pub fn ensure_work_item(&self, bead: &str) {
+    pub fn ensure_work_item(&self, work: &str) {
         let conn = self.work_db();
         let now = "2026-08-14T00:00:00.000000000Z";
         let metadata = json!({"repository": self.repos.repo.to_string_lossy()}).to_string();
@@ -1433,7 +1433,7 @@ impl TestEnv {
              (work_id, kind, status, priority, assignee, metadata_json, \
               current_revision, created_at, updated_at) \
              VALUES (?1, 'task', 'open', 2, NULL, ?2, 1, ?3, ?3)",
-            rusqlite::params![bead, metadata, now],
+            rusqlite::params![work, metadata, now],
         )
         .expect("ensure work item");
         conn.execute(
@@ -1441,15 +1441,15 @@ impl TestEnv {
              (work_id, revision, title, description, acceptance_criteria, \
               design, notes, cause, written_at) \
              VALUES (?1, 1, ?1, '', '', '', '', 'import', ?2)",
-            rusqlite::params![bead, now],
+            rusqlite::params![work, now],
         )
         .expect("ensure work revision");
     }
 
-    fn current_work_revision(&self, conn: &rusqlite::Connection, bead: &str) -> i64 {
+    fn current_work_revision(&self, conn: &rusqlite::Connection, work: &str) -> i64 {
         conn.query_row(
             "SELECT current_revision FROM work_items WHERE work_id = ?1",
-            [bead],
+            [work],
             |row| row.get(0),
         )
         .expect("current revision")
@@ -1460,8 +1460,8 @@ impl TestEnv {
     /// `type`, `metadata`, `parent`, `dependencies`). Spec fields mint a
     /// new revision, exactly as guarded writes do; coordination fields
     /// never do. `revision` pinning has no ledger analogue and is a no-op.
-    pub fn set_bead_field(&self, bead: &str, field: &str, value: &str) {
-        self.ensure_work_item(bead);
+    pub fn set_work_field(&self, work: &str, field: &str, value: &str) {
+        self.ensure_work_item(work);
         let conn = self.work_db();
         let now = "2026-08-14T00:00:00.000000000Z";
         match field {
@@ -1477,7 +1477,7 @@ impl TestEnv {
                     "acceptance" => "acceptance_criteria",
                     other => other,
                 };
-                let current = self.current_work_revision(&conn, bead);
+                let current = self.current_work_revision(&conn, work);
                 let next = current + 1;
                 conn.execute(
                     &format!(
@@ -1494,20 +1494,20 @@ impl TestEnv {
                                 'authored', ?4 \
                          FROM work_revisions WHERE work_id = ?1 AND revision = ?5"
                     ),
-                    rusqlite::params![bead, next, value, now, current],
+                    rusqlite::params![work, next, value, now, current],
                 )
                 .expect("mint shaped revision");
                 conn.execute(
                     "UPDATE work_items SET current_revision = ?2, updated_at = ?3 \
                      WHERE work_id = ?1",
-                    rusqlite::params![bead, next, now],
+                    rusqlite::params![work, next, now],
                 )
                 .expect("bump revision pointer");
             }
             "status" => {
                 conn.execute(
                     "UPDATE work_items SET status = ?2, updated_at = ?3 WHERE work_id = ?1",
-                    rusqlite::params![bead, value, now],
+                    rusqlite::params![work, value, now],
                 )
                 .expect("set status");
             }
@@ -1515,7 +1515,7 @@ impl TestEnv {
                 let assignee = if value.is_empty() { None } else { Some(value) };
                 conn.execute(
                     "UPDATE work_items SET assignee = ?2, updated_at = ?3 WHERE work_id = ?1",
-                    rusqlite::params![bead, assignee, now],
+                    rusqlite::params![work, assignee, now],
                 )
                 .expect("set assignee");
             }
@@ -1523,7 +1523,7 @@ impl TestEnv {
                 let priority = value.parse::<i64>().ok();
                 conn.execute(
                     "UPDATE work_items SET priority = ?2, updated_at = ?3 WHERE work_id = ?1",
-                    rusqlite::params![bead, priority, now],
+                    rusqlite::params![work, priority, now],
                 )
                 .expect("set priority");
             }
@@ -1533,14 +1533,14 @@ impl TestEnv {
                 let kind = if value == "epic" { "epic" } else { "task" };
                 conn.execute(
                     "UPDATE work_items SET kind = ?2, updated_at = ?3 WHERE work_id = ?1",
-                    rusqlite::params![bead, kind, now],
+                    rusqlite::params![work, kind, now],
                 )
                 .expect("set kind");
                 if kind != value {
                     let metadata: String = conn
                         .query_row(
                             "SELECT metadata_json FROM work_items WHERE work_id = ?1",
-                            [bead],
+                            [work],
                             |row| row.get(0),
                         )
                         .expect("metadata read");
@@ -1549,7 +1549,7 @@ impl TestEnv {
                     parsed.insert("imported:issue-type".to_owned(), json!(value));
                     conn.execute(
                         "UPDATE work_items SET metadata_json = ?2 WHERE work_id = ?1",
-                        rusqlite::params![bead, serde_json::Value::Object(parsed).to_string()],
+                        rusqlite::params![work, serde_json::Value::Object(parsed).to_string()],
                     )
                     .expect("kind provenance");
                 }
@@ -1558,7 +1558,7 @@ impl TestEnv {
                 conn.execute(
                     "UPDATE work_items SET metadata_json = ?2, updated_at = ?3 \
                      WHERE work_id = ?1",
-                    rusqlite::params![bead, value, now],
+                    rusqlite::params![work, value, now],
                 )
                 .expect("set metadata");
             }
@@ -1567,7 +1567,7 @@ impl TestEnv {
                 conn.execute(
                     "INSERT OR IGNORE INTO work_deps (from_id, to_id, kind) \
                      VALUES (?1, ?2, 'parent-child')",
-                    rusqlite::params![bead, value],
+                    rusqlite::params![work, value],
                 )
                 .expect("set parent edge");
             }
@@ -1577,7 +1577,7 @@ impl TestEnv {
                 // by its own field and is never part of this list.
                 conn.execute(
                     "DELETE FROM work_deps WHERE from_id = ?1 AND kind <> 'parent-child'",
-                    rusqlite::params![bead],
+                    rusqlite::params![work],
                 )
                 .expect("clear dependency edges");
                 let deps: Vec<serde_json::Value> =
@@ -1604,7 +1604,7 @@ impl TestEnv {
                     conn.execute(
                         "INSERT OR IGNORE INTO work_deps (from_id, to_id, kind) \
                          VALUES (?1, ?2, ?3)",
-                        rusqlite::params![bead, id, kind],
+                        rusqlite::params![work, id, kind],
                     )
                     .expect("dependency edge");
                 }
@@ -1617,44 +1617,44 @@ impl TestEnv {
                 // (e.g. race markers); harmless once nothing reads them.
                 let state = self.beads_dir.join("shim-state");
                 std::fs::create_dir_all(&state).expect("shim state");
-                std::fs::write(state.join(format!("{bead}.{other}")), value)
+                std::fs::write(state.join(format!("{work}.{other}")), value)
                     .expect("set shim field");
             }
         }
     }
 
-    /// Set the authoritative Beads `metadata.repository` identity used by
+    /// Set the authoritative work-store `metadata.repository` identity used by
     /// native repository-filter tests.
-    pub fn set_bead_repository(&self, bead: &str, repository: &str) {
-        self.set_bead_field(
-            bead,
+    pub fn set_work_repository(&self, work: &str, repository: &str) {
+        self.set_work_field(
+            work,
             "metadata",
             &json!({"repository": repository}).to_string(),
         );
         std::fs::write(
             self.beads_dir
                 .join("shim-state")
-                .join(format!("{bead}.repository")),
+                .join(format!("{work}.repository")),
             repository,
         )
         .expect("set bead repository");
     }
 
-    /// The status the work store reports for a bead right now — the
-    /// ledger-native replacement for reading `shim-state/<bead>.status`.
-    pub fn bead_status(&self, bead: &str) -> String {
+    /// The status the work store reports for a work right now — the
+    /// ledger-native replacement for reading `shim-state/<work>.status`.
+    pub fn work_status(&self, work: &str) -> String {
         self.work_db()
             .query_row(
                 "SELECT status FROM work_items WHERE work_id = ?1",
-                [bead],
+                [work],
                 |row| row.get(0),
             )
             .expect("work item status")
     }
 
-    /// One spec field at the bead's current revision (`title`,
+    /// One spec field at the work's current revision (`title`,
     /// `description`, `acceptance`, `design`, `notes`).
-    pub fn bead_field(&self, bead: &str, field: &str) -> String {
+    pub fn work_field(&self, work: &str, field: &str) -> String {
         let column = match field {
             "acceptance" => "acceptance_criteria",
             other => other,
@@ -1667,34 +1667,34 @@ impl TestEnv {
                         AND i.current_revision = r.revision \
                      WHERE r.work_id = ?1"
                 ),
-                [bead],
+                [work],
                 |row| row.get(0),
             )
             .expect("work item spec field")
     }
 
-    /// The revision the work store reports for a bead right now.
-    pub fn bead_revision(&self, bead: &str) -> String {
+    /// The revision the work store reports for a work right now.
+    pub fn work_revision(&self, work: &str) -> String {
         let conn = self.work_db();
-        self.current_work_revision(&conn, bead).to_string()
+        self.current_work_revision(&conn, work).to_string()
     }
 
     /// Return the current full row once, then make every later `bd show` for
-    /// this Bead carry a null revision. This models a row becoming malformed
+    /// this Work carry a null revision. This models a row becoming malformed
     /// after controller admission but before packet admission.
-    pub fn null_revision_after_next_show(&self, bead: &str) {
+    pub fn null_revision_after_next_show(&self, work: &str) {
         let state = self.beads_dir.join("shim-state");
         std::fs::create_dir_all(&state).expect("shim state");
-        std::fs::write(state.join(format!("{bead}.revision-null-after-show")), "1")
+        std::fs::write(state.join(format!("{work}.revision-null-after-show")), "1")
             .expect("arm revision removal");
     }
 
-    /// Seed a bead whose OWN fields are the spec — the supported route.
-    pub fn seed_bead_spec(&self, bead: &str, description: &str, acceptance: &str) {
-        self.set_bead_field(bead, "title", &format!("Bead {bead}"));
-        self.set_bead_field(bead, "description", description);
-        self.set_bead_field(bead, "acceptance", acceptance);
-        self.set_bead_field(bead, "status", "open");
+    /// Seed a work whose OWN fields are the spec — the supported route.
+    pub fn seed_work_spec(&self, work: &str, description: &str, acceptance: &str) {
+        self.set_work_field(work, "title", &format!("Bead {work}"));
+        self.set_work_field(work, "description", description);
+        self.set_work_field(work, "acceptance", acceptance);
+        self.set_work_field(work, "status", "open");
     }
 
     /// Make every `bd show` fail, the way an unreachable bd does.
@@ -1735,30 +1735,30 @@ impl TestEnv {
         }
     }
 
-    /// Set a bead's custody directly (no lease row: reclaimable residue,
+    /// Set a work's custody directly (no lease row: reclaimable residue,
     /// exactly what imported or crash-abandoned custody looks like).
-    pub fn set_assignee(&self, bead: &str, holder: &str) {
-        self.set_bead_field(bead, "assignee", holder);
+    pub fn set_assignee(&self, work: &str, holder: &str) {
+        self.set_work_field(work, "assignee", holder);
     }
 
     /// Arrange for the bd shim to install a successor immediately before its
     /// next `--if-assignee` check, simulating the close-CAS race precisely.
-    pub fn set_successor_on_guard(&self, bead: &str, holder: &str) {
+    pub fn set_successor_on_guard(&self, work: &str, holder: &str) {
         let state = self.beads_dir.join("shim-state");
         std::fs::create_dir_all(&state).expect("shim state");
-        std::fs::write(state.join(format!("{bead}.successor-on-guard")), holder)
+        std::fs::write(state.join(format!("{work}.successor-on-guard")), holder)
             .expect("set successor race");
     }
 
-    /// Give a bead's current assignee a far-future lease: every scoped
+    /// Give a work's current assignee a far-future lease: every scoped
     /// reclaim answers the refusal shape (nothing reclaimed, custody
     /// intact), whoever asks — the live-lease behavior, now literal.
-    pub fn set_lease_unexpired(&self, bead: &str) {
+    pub fn set_lease_unexpired(&self, work: &str) {
         let conn = self.work_db();
         let holder: Option<String> = conn
             .query_row(
                 "SELECT assignee FROM work_items WHERE work_id = ?1",
-                [bead],
+                [work],
                 |row| row.get(0),
             )
             .expect("lease holder read");
@@ -1768,17 +1768,17 @@ impl TestEnv {
              VALUES (?1, ?2, '2026-08-14T00:00:00.000000000Z', '2099-01-01T00:00:00.000000000Z') \
              ON CONFLICT(work_id) DO UPDATE SET holder = ?2, \
              expires_at = '2099-01-01T00:00:00.000000000Z'",
-            rusqlite::params![bead, holder],
+            rusqlite::params![work, holder],
         )
         .expect("set unexpired lease");
     }
 
-    /// A bead's current assignee in the bd shim state.
-    pub fn assignee(&self, bead: &str) -> Option<String> {
+    /// A work's current assignee in the bd shim state.
+    pub fn assignee(&self, work: &str) -> Option<String> {
         let conn = self.work_db();
         conn.query_row(
             "SELECT assignee FROM work_items WHERE work_id = ?1",
-            [bead],
+            [work],
             |row| row.get::<_, Option<String>>(0),
         )
         .ok()
@@ -1892,7 +1892,7 @@ pub fn fabricate_run(env: &TestEnv, run_id: &str) {
     ledger
         .create_run(forged_ledger::NewRun {
             run_id: forged_types::RunId::new(run_id).expect("run id"),
-            bead_id: format!("bead-{run_id}"),
+            work_id: format!("bead-{run_id}"),
             repo: env.repos.repo.to_string_lossy().into_owned(),
             base_ref: env.repos.base.clone(),
             branch: format!("forged/{run_id}"),
@@ -1902,7 +1902,7 @@ pub fn fabricate_run(env: &TestEnv, run_id: &str) {
 }
 
 /// Start an epic the way `epic_start` does: ONE `forged.epic.started` event
-/// under the epic bead id and NO run row — the combination production
+/// under the epic work id and NO run row — the combination production
 /// actually produces. A fixture that also created a run row would prove
 /// nothing about epic discovery.
 pub fn fabricate_epic(env: &TestEnv, epic_id: &str) {
@@ -1917,7 +1917,7 @@ pub fn fabricate_epic(env: &TestEnv, epic_id: &str) {
             kind: forged_types::WorkIdentitySubjectKind::Epic,
             id: epic_id.to_owned(),
         },
-        bead: forged_types::WorkIdentityBeadV1 {
+        work: forged_types::WorkIdentityWorkV1 {
             id: epic_id.to_owned(),
             title: Some(title.clone()),
             revision: None,

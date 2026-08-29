@@ -85,14 +85,14 @@ search of unanimity.
 ## Typed handoff
 
 Use the current installed CLI help if flags differ. The current ordered pair
-has no spec-file argument. Its run-start compatibility flag is still named
-`--bead`, but the value is the selected ledger work-item id:
+has no spec-file argument. Its run-start work-item flag is named `--work`;
+the persisted operation-envelope key remains the historical `bead` contract:
 
 ```bash
 PROFILE="${PROFILE:-standard}"
 ROSTER="${ROSTER:-default}"
 START_JSON="$(
-  forged run start --bead "$WORK_ID" --repo "$TARGET_REPO" \
+  forged run start --work "$WORK_ID" --repo "$TARGET_REPO" \
     --profile "$PROFILE" --roster "$ROSTER"
 )"
 RUN_ID="$(printf '%s' "$START_JSON" | jq -er '.result.run_id')"

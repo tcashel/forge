@@ -1164,7 +1164,7 @@ mod tests {
         ledger
             .create_run(NewRun {
                 run_id: RunId::new("run-terminal").expect("run id"),
-                bead_id: "bead-terminal".to_owned(),
+                work_id: "bead-terminal".to_owned(),
                 repo: "/repo".to_owned(),
                 base_ref: "main".to_owned(),
                 branch: "forged/run-terminal".to_owned(),

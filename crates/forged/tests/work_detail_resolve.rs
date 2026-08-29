@@ -1,5 +1,5 @@
 //! `work detail --id` — kind-blind resolution for the exact projection. A
-//! caller holding only a bead id asks with it and gets the same body the
+//! caller holding only a work id asks with it and gets the same body the
 //! exact pair returns; an id that resolves to no single subject gets the
 //! candidates it could have meant, under this tool's own schema, rather
 //! than a refusal. The exact pair stays an assertion: it never resolves.

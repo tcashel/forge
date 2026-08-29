@@ -21,7 +21,7 @@ fn seed_run(ledger: &Ledger, id: &str) {
     ledger
         .create_run(NewRun {
             run_id: RunId::new(id).expect("run id"),
-            bead_id: format!("bead-{id}"),
+            work_id: format!("bead-{id}"),
             repo: "/repo/forge".to_owned(),
             base_ref: "main".to_owned(),
             branch: format!("work/{id}"),

@@ -29,11 +29,11 @@ use crate::core::{on_ledger, session_claimant, Ctx, Failure};
 use crate::failpoint;
 
 /// One complete provider-authored planning artifact retained through critique
-/// and bounded revision. Only `spec` crosses the Beads write seam.
+/// and bounded revision. Only `spec` crosses the work write seam.
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlanCandidate {
-    pub spec: forged_types::NativeBeadSpecV1,
+    pub spec: forged_types::NativeWorkSpecV1,
     pub traceability: forged_types::PlanTraceabilityV1,
 }
 
@@ -356,7 +356,7 @@ pub(crate) fn packet_keys(packet: &WorkPacket) -> Result<(String, i64), Failure>
 
 /// Fill every `WorkPacket` field the intent does not carry.
 ///
-/// A bead-sourced packet reads its spec from the packet directory, where
+/// A work-sourced packet reads its spec from the packet directory, where
 /// `run_attempt` materializes the rendered body; a file-sourced one keeps
 /// pointing at the operator's file.
 #[allow(clippy::too_many_arguments)]
@@ -403,7 +403,7 @@ pub fn build_packet(
         .clone()
         .unwrap_or_else(|| format!("{}/{}/{}", run.run_id, stage_str(stage), intent.seq));
     let deliverable = if planning && matches!(stage, Stage::Implement | Stage::Fix) {
-        Deliverable::NativeBeadSpec
+        Deliverable::NativeWorkSpec
     } else if assurance {
         match prompt_stage {
             PromptStage::EpicAssuranceReview => Deliverable::ReviewBlock,
@@ -419,7 +419,7 @@ pub fn build_packet(
     };
     let instructions = if planning {
         match prompt_stage {
-            PromptStage::EpicPlan => "author one complete native Beads specification",
+            PromptStage::EpicPlan => "author one complete native work specification",
             PromptStage::EpicPlanReview => "critique the exact native specification candidate",
             PromptStage::EpicPlanRevision => "revise the exact candidate from bounded critique",
             _ => unreachable!("planning packet has a planning prompt"),
@@ -447,7 +447,7 @@ pub fn build_packet(
         schema: "forged.packet/1".to_owned(),
         packet_id,
         run_id: run.run_id.clone(),
-        bead_id: run.bead_id.clone(),
+        work_id: run.work_id.clone(),
         stage,
         execution: intent.execution.clone(),
         lane_seq: intent.execution.as_ref().map(|_| intent.seq),
@@ -471,15 +471,15 @@ pub fn build_packet(
         },
         result_schema: prompt_stage.result_schema().to_owned(),
         provider_hints: intent.hints.clone(),
-        field_notes: spec.bead_context.clone(),
+        field_notes: spec.work_context.clone(),
     };
     packet.spec.path = match source {
         SpecSource::File(path) => path.clone(),
-        SpecSource::Bead(_) => {
+        SpecSource::Work(_) => {
             let (stage_key, seq) = packet_keys(&packet)?;
             ctx.config
                 .packet_dir_key(&run.run_id, &stage_key, seq)
-                .join(crate::core::spec::BEAD_SPEC_FILE)
+                .join(crate::core::spec::WORK_SPEC_FILE)
                 .to_string_lossy()
                 .into_owned()
         }
@@ -494,9 +494,9 @@ pub fn build_packet(
 /// CREATION: it runs inside the advance that opens a whole stage's packets
 /// together, and replaying its stored response after a crash is exactly
 /// right, because the row it would create already exists. A re-pin is a pure
-/// row update whose result must CHANGE when the bead does — fence that on a
+/// row update whose result must CHANGE when the work does — fence that on a
 /// key and the key has to carry the world's state, and a content address is
-/// not injective over time (a bead edited A -> B -> A mints the key A
+/// not injective over time (a work edited A -> B -> A mints the key A
 /// already stored, and the replay writes nothing). The ledger's own
 /// `Immediate` transaction is the re-pin's fence instead: atomic, re-read
 /// every time, with no memory of an earlier call to replay.
@@ -741,7 +741,7 @@ fn assurance_review_context(
     let evidence = assurance_evidence(exec)?;
     let is_synthesis = assurance_is_synthesis(packet);
     Ok(json!({
-        "bead_id": packet.bead_id,
+        "bead_id": packet.work_id,
         "pr_number": exec.pr_number.unwrap_or(0),
         "evidence_path": evidence.path.to_string_lossy(),
         "head_sha": evidence.head_sha,
@@ -764,7 +764,7 @@ fn assurance_fix_context(
 ) -> Result<Value, Failure> {
     let evidence = assurance_evidence(exec)?;
     Ok(json!({
-        "bead_id": packet.bead_id,
+        "bead_id": packet.work_id,
         "pr_number": exec.pr_number.unwrap_or(0),
         "worktree": packet.worktree.to_string_lossy(),
         "branch": packet.branch,
@@ -790,7 +790,7 @@ fn render_context(
     let stage = prompt_stage_of(packet, exec.protocol.as_ref())?;
     let value = match stage {
         PromptStage::Implement => json!({
-            "bead_id": packet.bead_id,
+            "bead_id": packet.work_id,
             "worktree": worktree,
             "branch": packet.branch,
             "base_ref": format!("origin/{}", packet.base_ref),
@@ -801,7 +801,7 @@ fn render_context(
             "result_schema": packet.result_schema,
         }),
         PromptStage::Review => json!({
-            "bead_id": packet.bead_id,
+            "bead_id": packet.work_id,
             "pr_number": exec.pr_number.unwrap_or(0),
             "spec_path": packet.spec.path,
             "worktree": worktree,
@@ -821,7 +821,7 @@ fn render_context(
             "result_schema": packet.result_schema,
         }),
         PromptStage::Fix => json!({
-            "bead_id": packet.bead_id,
+            "bead_id": packet.work_id,
             "pr_number": exec.pr_number.unwrap_or(0),
             "worktree": worktree,
             "round": if packet.execution.is_some() { fix_round + 1 } else { fix_round },
@@ -838,14 +838,14 @@ fn render_context(
             "result_schema": packet.result_schema,
         }),
         PromptStage::EpicPlan => json!({
-            "bead_id": packet.bead_id,
+            "bead_id": packet.work_id,
             "spec_path": packet.spec.path,
             "field_notes": packet.field_notes,
             "packet_id": packet.packet_id,
             "result_schema": packet.result_schema,
         }),
         PromptStage::EpicPlanReview => json!({
-            "bead_id": packet.bead_id,
+            "bead_id": packet.work_id,
             "spec_path": packet.spec.path,
             "candidate_plan": serde_json::to_string(&exec.plan_candidate).unwrap_or_default(),
             "review_evidence": if packet.execution.as_ref().is_some_and(|value|
@@ -860,7 +860,7 @@ fn render_context(
             "result_schema": packet.result_schema,
         }),
         PromptStage::EpicPlanRevision => json!({
-            "bead_id": packet.bead_id,
+            "bead_id": packet.work_id,
             "spec_path": packet.spec.path,
             "candidate_plan": serde_json::to_string(&exec.plan_candidate).unwrap_or_default(),
             "findings": forged_provider::normalize_findings(&exec.findings),
@@ -1071,7 +1071,7 @@ pub async fn execute_packet(
     // token to fail one under, so a transport failure is charged to the
     // packet's bounded budget through its grant alone. Untracked, an
     // unreachable bd would refuse here for free, forever.
-    let spec = match crate::core::spec::resolve_for_packet(ctx, &packet.spec, &packet.bead_id).await
+    let spec = match crate::core::spec::resolve_for_packet(ctx, &packet.spec, &packet.work_id).await
     {
         Ok(spec) => spec,
         Err(failure) if failure.recoverable => {
@@ -1082,7 +1082,7 @@ pub async fn execute_packet(
     };
 
     // RE-PIN BEFORE THE CLAIM. The claim fences on the rendered body, so a
-    // bead edited under an already-open packet refuses `SpecDrift` — and
+    // work edited under an already-open packet refuses `SpecDrift` — and
     // nothing else on this path re-opens the packet, so the run would retry
     // the identical refusal until a human intervened.
     let packet = &repin_packet(ctx, packet, &spec).await?;
@@ -1117,7 +1117,7 @@ pub async fn execute_packet(
 /// Re-pin an open packet to the spec just resolved, returning the packet the
 /// claim should fence on.
 ///
-/// BEAD-SOURCED PACKETS ONLY. A file-sourced spec is fenced by the hash of a
+/// WORK-SOURCED PACKETS ONLY. A file-sourced spec is fenced by the hash of a
 /// file the operator owns, and nothing moves that file but an operator edit:
 /// `claim_packet` refusing `SpecDrift` on it IS the fence doing its job.
 /// Re-pinning here would adopt the edit silently, and nothing downstream
@@ -1130,9 +1130,9 @@ pub async fn execute_packet(
 /// NOT AN OPERATION. A re-pin writes three spec columns and nothing else —
 /// no bd call, no GitHub call, no spawn — so there is no external effect to
 /// deduplicate, and the operation layer exists for external effects. Its
-/// result must also change whenever the bead does, which is precisely what
+/// result must also change whenever the work does, which is precisely what
 /// a fence keyed on an idempotency key refuses to do: encode the spec in the
-/// key and a bead edited A -> B -> A reproduces the key its first open at A
+/// key and a work edited A -> B -> A reproduces the key its first open at A
 /// already stored, replaying that response over a row still pinned at B.
 /// `Ledger::repin_packet_spec`'s own `Immediate` transaction is the right
 /// fence and the only one needed — atomic, re-reading current state on every
@@ -1157,7 +1157,7 @@ async fn repin_packet(
 /// The re-pin, over the spec ref alone.
 ///
 /// `claim_next` resumes an open packet without ever building a `WorkPacket`,
-/// and it needs this same transition: a bead edited under an open packet
+/// and it needs this same transition: a work edited under an open packet
 /// leaves the row pinned to bytes nobody can reach, and a claim against the
 /// current body is refused as drift until something re-pins. Two claim paths
 /// that disagree about that is how the ledger-first resume ended up unable to
@@ -1239,7 +1239,7 @@ async fn charge_retry(
 ///
 /// The spec is re-resolved here because adoption claims nothing, so no
 /// ledger comparison stands behind it; the attempt refuses outright if the
-/// bead has moved off the body the packet pins.
+/// work has moved off the body the packet pins.
 ///
 /// A spec failure SETTLES the attempt before it propagates. The attempt is
 /// already `running` with no process behind it: left that way, the row keeps
@@ -1259,7 +1259,7 @@ pub async fn execute_adopted(
     if let Some(outcome) = settle_pre_spawn_deadline(ctx, exec, packet, attempt_id).await? {
         return Ok(outcome);
     }
-    let spec = match crate::core::spec::resolve_for_packet(ctx, &packet.spec, &packet.bead_id).await
+    let spec = match crate::core::spec::resolve_for_packet(ctx, &packet.spec, &packet.work_id).await
     {
         Ok(spec) => spec,
         Err(failure) => {
@@ -1491,7 +1491,7 @@ async fn run_attempt(
         // be refused and let the run's own lease lapse under it. Internal
         // runs (epic-plan / epic-assurance) claim NO work lease by design
         // and never renew; an ORDINARY run must actually hold its lease at
-        // spawn — a foreign or absent row means the bead was reclaimed or
+        // spawn — a foreign or absent row means the work was reclaimed or
         // released between Resolve and this attempt, and spawning a
         // provider beside the new holder is exactly the double-writer the
         // lease exists to prevent.
@@ -1499,33 +1499,33 @@ async fn run_attempt(
             exec.protocol.as_ref().map(|p| p.name.as_str()),
             Some("epic-plan") | Some("epic-assurance")
         );
-        let holder = crate::core::lease_identity(&ctx.ledger, &packet.bead_id, &run_id).await?;
+        let holder = crate::core::lease_identity(&ctx.ledger, &packet.work_id, &run_id).await?;
         let lease_is_ours = if internal_run {
             false
         } else {
             let row = {
-                let bead = packet.bead_id.clone();
-                on_ledger(&ctx.ledger, move |l| l.work_lease(&bead)).await?
+                let work = packet.work_id.clone();
+                on_ledger(&ctx.ledger, move |l| l.work_lease(&work)).await?
             };
             match row {
                 Some(row) if row.holder == holder => true,
                 Some(row) => {
                     return Err(Failure {
-                        code: ErrorCode::BeadLeaseHeld,
+                        code: ErrorCode::WorkLeaseHeld,
                         message: format!(
                             "work lease for {} is held by {:?}; refusing to spawn beside it",
-                            packet.bead_id, row.holder
+                            packet.work_id, row.holder
                         ),
                         recoverable: true,
                     })
                 }
                 None => {
                     return Err(Failure {
-                        code: ErrorCode::BeadLeaseHeld,
+                        code: ErrorCode::WorkLeaseHeld,
                         message: format!(
                             "no work lease held for {}; the run's claim was released or \
                              reclaimed — refusing to spawn unfenced",
-                            packet.bead_id
+                            packet.work_id
                         ),
                         recoverable: true,
                     })
@@ -2446,11 +2446,11 @@ async fn run_attempt(
                     let renewed =
                         on_ledger(&ctx.ledger, move |l| l.heartbeat_attempt(&token)).await;
                     let lease_renewed = if lease_is_ours {
-                        let bead = packet.bead_id.clone();
+                        let work = packet.work_id.clone();
                         let lease_holder = holder.clone();
                         on_ledger(&ctx.ledger, move |l| {
                             l.heartbeat_work_lease(
-                                &bead,
+                                &work,
                                 &lease_holder,
                                 forged_ledger::WORK_LEASE_TTL_S,
                             )
@@ -2465,7 +2465,7 @@ async fn run_attempt(
                     );
                     let lease_refused = matches!(
                         &lease_renewed,
-                        Err(failure) if failure.code == ErrorCode::BeadLeaseHeld
+                        Err(failure) if failure.code == ErrorCode::WorkLeaseHeld
                     );
                     if claim_refused || lease_refused {
                         // Our claim or our lease was taken out from under us:
@@ -2904,7 +2904,7 @@ mod tests {
             schema: "forged.packet/1".to_owned(),
             packet_id: format!("run-1/assurance-{purpose:?}/0"),
             run_id: "run-1".to_owned(),
-            bead_id: "epic-1".to_owned(),
+            work_id: "epic-1".to_owned(),
             stage,
             execution: Some(SeatExecutionV1 {
                 stage_id: "assurance-review".to_owned(),
@@ -3505,7 +3505,7 @@ mod settle_tests {
         ledger
             .create_run(forged_ledger::NewRun {
                 run_id: forged_types::RunId::new(RUN_ID).expect("run id"),
-                bead_id: RUN_ID.to_owned(),
+                work_id: RUN_ID.to_owned(),
                 repo: root.to_string_lossy().into_owned(),
                 base_ref: "main".to_owned(),
                 branch: format!("forged/{RUN_ID}"),
@@ -3518,7 +3518,7 @@ mod settle_tests {
                 kind: forged_ledger::WorkKind::Task,
                 status: forged_ledger::WorkStatus::Open,
                 priority: Some(2),
-                // Admission refuses a bead whose repository metadata does
+                // Admission refuses a work whose repository metadata does
                 // not match the run's `repo` column — the bd stub this
                 // replaced always carried it.
                 metadata: std::collections::BTreeMap::from([(
@@ -3586,7 +3586,7 @@ mod settle_tests {
             body: None,
             sha256: spec_sha.clone(),
             fence: forged_ledger::SpecFence::Sha256(spec_sha.clone()),
-            bead_context: Vec::new(),
+            work_context: Vec::new(),
         };
         let packet = build_packet(&ctx, &run, &intent, &source, &resolved, &[], budget_s, None)
             .expect("packet");

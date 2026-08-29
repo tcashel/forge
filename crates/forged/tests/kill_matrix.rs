@@ -28,17 +28,17 @@ fn wait_until(what: &str, mut pred: impl FnMut() -> bool) {
     }
 }
 
-fn start_run(env: &TestEnv, bead: &str) {
+fn start_run(env: &TestEnv, work: &str) {
     let (code, init) = env.forged(&["init"]);
     assert_eq!(code, 0, "init: {init}");
-    env.seed_frontier(bead);
+    env.seed_frontier(work);
     let repo = env.repos.repo.to_string_lossy().into_owned();
     let spec = env.spec.to_string_lossy().into_owned();
     let (code, started) = env.forged(&[
         "run",
         "start",
-        "--bead",
-        bead,
+        "--work",
+        work,
         "--repo",
         &repo,
         "--spec",
@@ -699,14 +699,14 @@ fn settlement_kills_draft_pr_generation_before_gh_can_fire() {
 
 // ------------------------------------------- settlement adjudication saga
 
-/// A run whose bead is claimable plus a legacy `forged.controller.started`
+/// A run whose work is claimable plus a legacy `forged.controller.started`
 /// record with a generation but no durable driver identity, and the exact
 /// re-assertable adjudication arguments for it.
 fn seed_legacy_adjudication(env: &TestEnv, run: &str) -> [&'static str; 12] {
     support::fabricate_run(env, run);
-    let bead = format!("bead-{run}");
-    env.set_bead_field(&bead, "status", "in_progress");
-    env.set_assignee(&bead, &format!("forged:{bead}:0"));
+    let work = format!("bead-{run}");
+    env.set_work_field(&work, "status", "in_progress");
+    env.set_assignee(&work, &format!("forged:{work}:0"));
     let ledger = env.ledger();
     ledger
         .append_event(
@@ -1236,10 +1236,10 @@ fn epic_terminal_and_input_stops_serialize_with_supervisor_spawn() {
         env.enable_dynamic_gh();
         if case == "input" {
             env.seed_epic(&epic, &[("direct-decision", &env.spec, true)]);
-            env.set_bead_field("direct-decision", "type", "decision");
+            env.set_work_field("direct-decision", "type", "decision");
         } else {
             env.seed_epic(&epic, &[("already-landed", &env.spec, true)]);
-            env.set_bead_field("already-landed", "status", "closed");
+            env.set_work_field("already-landed", "status", "closed");
         }
         assert_eq!(env.forged(&["init"]).0, 0);
         let repo = env.repos.repo.to_string_lossy().into_owned();
@@ -1390,7 +1390,7 @@ fn resolved_event_committed_then_crashed_replays_by_resolution_identity() {
         "epic-resolve-crash",
         &[("resolve-decision", &env.spec, true)],
     );
-    env.set_bead_field("resolve-decision", "type", "decision");
+    env.set_work_field("resolve-decision", "type", "decision");
     assert_eq!(env.forged(&["init"]).0, 0);
     let repo = env.repos.repo.to_string_lossy().into_owned();
     let spec = env.spec.to_string_lossy().into_owned();
@@ -1428,7 +1428,7 @@ fn resolved_event_committed_then_crashed_replays_by_resolution_identity() {
     assert_eq!(code, 0, "input stop: {held}");
     assert_eq!(held["result"]["stopped"]["code"], json!("non-code-child"));
 
-    env.set_bead_field("resolve-decision", "type", "task");
+    env.set_work_field("resolve-decision", "type", "task");
     let fp = env.root.join("fp-resolve-identity");
     std::fs::create_dir_all(&fp).expect("failpoint dir");
     let mut crashed = env
@@ -2150,27 +2150,27 @@ fn a_materialization_failure_leaves_no_running_attempt_behind() {
 
 // ------------------------------------------- schedule 9, the other doors
 
-/// Start a BEAD-SOURCED run: `materialize` is a no-op for a file spec (there
-/// is no rendered body to write), so only the bead route reaches the
+/// Start a WORK-SOURCED run: `materialize` is a no-op for a file spec (there
+/// is no rendered body to write), so only the work route reaches the
 /// post-claim, pre-spawn write these cases fail.
-fn start_bead_run(env: &TestEnv, bead: &str) {
+fn start_work_run(env: &TestEnv, work: &str) {
     let (code, init) = env.forged(&["init"]);
     assert_eq!(code, 0, "init: {init}");
     env.write_config(None);
-    env.seed_bead_spec(bead, "## Context\\n\\nthe bead is the spec.", "- ship it");
+    env.seed_work_spec(work, "## Context\\n\\nthe bead is the spec.", "- ship it");
     let repo = env.repos.repo.to_string_lossy().into_owned();
     let (code, started) = env.forged(&[
         "run",
         "start",
-        "--bead",
-        bead,
+        "--work",
+        work,
         "--repo",
         &repo,
         "--base-ref",
         "main",
     ]);
     assert_eq!(code, 0, "run start: {started}");
-    env.authorize_run(bead);
+    env.authorize_run(work);
 }
 
 /// Advance until the run's first packet row exists and no further.
@@ -2265,7 +2265,7 @@ fn assert_pre_spawn_evidence(env: &TestEnv, run: &str, attempt_id: i64, phase: &
     assert_eq!(session["metadata"]["phase"], phase);
 }
 
-fn start_bead_run_with_implementation_hint(env: &TestEnv, bead: &str, provider: &str, model: &str) {
+fn start_work_run_with_implementation_hint(env: &TestEnv, work: &str, provider: &str, model: &str) {
     let (code, init) = env.forged(&["init"]);
     assert_eq!(code, 0, "init: {init}");
     env.write_config(None);
@@ -2275,20 +2275,20 @@ fn start_bead_run_with_implementation_hint(env: &TestEnv, bead: &str, provider: 
     config["roster"]["implement"]["provider"] = json!(provider);
     config["roster"]["implement"]["model"] = json!(model);
     std::fs::write(&path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
-    env.seed_bead_spec(bead, r"## Context\n\nthe bead is the spec.", "- ship it");
+    env.seed_work_spec(work, r"## Context\n\nthe bead is the spec.", "- ship it");
     let repo = env.repos.repo.to_string_lossy().into_owned();
     let (code, started) = env.forged(&[
         "run",
         "start",
-        "--bead",
-        bead,
+        "--work",
+        work,
         "--repo",
         &repo,
         "--base-ref",
         "main",
     ]);
     assert_eq!(code, 0, "run start: {started}");
-    env.authorize_run(bead);
+    env.authorize_run(work);
 }
 
 #[test]
@@ -2298,7 +2298,7 @@ fn an_external_packet_claim_retires_its_own_unspawned_attempt() {
     // the seat's spec itself, and a failure there is post-claim and
     // pre-spawn just the same.
     let env = TestEnv::new("km9a");
-    start_bead_run(&env, "bead-k9a");
+    start_work_run(&env, "bead-k9a");
     let packet = advance_to_open_packet(&env, "bead-k9a");
     block_the_packet_dir(&env, "bead-k9a", "implementation", 0);
 
@@ -2319,7 +2319,7 @@ fn claim_next_retires_its_own_unspawned_attempt() {
     // has to be there too, or a resumed run wedges on a `running` row with no
     // process behind it.
     let env = TestEnv::new("km9b");
-    start_bead_run(&env, "bead-k9b");
+    start_work_run(&env, "bead-k9b");
     let packet = advance_to_open_packet(&env, "bead-k9b");
 
     // Leave the run resumable: one transport-failed attempt, nothing live.
@@ -2401,7 +2401,7 @@ fn a_required_herdr_host_settles_before_the_spawn_rather_than_propagating() {
     let (code, started) = env.forged(&[
         "run",
         "start",
-        "--bead",
+        "--work",
         "bead-k9c",
         "--repo",
         &repo,
@@ -2470,7 +2470,7 @@ fn a_refused_host_fallback_record_settles_before_the_spawn_rather_than_propagati
     // never got and both the re-claim and the re-pin that would clear the
     // cause are blocked behind it.
     let env = TestEnv::new("km9d");
-    start_bead_run(&env, "bead-k9d");
+    start_work_run(&env, "bead-k9d");
     let packet = advance_to_open_packet(&env, "bead-k9d");
 
     // Preferred is the configured default and the socket path is derived, so
@@ -2554,7 +2554,7 @@ fn a_refused_host_fallback_record_settles_before_the_spawn_rather_than_propagati
 #[test]
 fn a_missing_adapter_settles_with_complete_zero_byte_evidence() {
     let env = TestEnv::new("km9e");
-    start_bead_run_with_implementation_hint(&env, "bead-k9e", "missing-provider", "model-1");
+    start_work_run_with_implementation_hint(&env, "bead-k9e", "missing-provider", "model-1");
     advance_to_open_packet(&env, "bead-k9e");
     let (code, refused) = env.forged(&["run", "advance", "--run", "bead-k9e"]);
     assert_eq!(
@@ -2584,7 +2584,7 @@ fn an_invalid_invocation_settles_with_complete_zero_byte_evidence() {
     // runtime from the operator root, which authoring never sees. The space
     // in this environment's root makes every capture path unembeddable.
     let env = TestEnv::new("km9f bad");
-    start_bead_run_with_implementation_hint(&env, "bead-k9f", "claude", "opus");
+    start_work_run_with_implementation_hint(&env, "bead-k9f", "claude", "opus");
     advance_to_open_packet(&env, "bead-k9f");
     let (code, refused) = env.forged(&["run", "advance", "--run", "bead-k9f"]);
     assert_ne!(

@@ -2,7 +2,7 @@
 //!
 //! The only read crosses [`forged_ledger::Ledger::history_snapshot`]. All
 //! filtering, bucketing, rates, pagination, and high-cardinality folding are
-//! computed from that immutable value: no Beads, filesystem, process,
+//! computed from that immutable value: no current work, filesystem, process,
 //! provider, service, or GitHub fallback exists in this module.
 
 use std::cmp::Ordering;

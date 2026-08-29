@@ -69,7 +69,7 @@ const descendants = (root) => {
 const cards = [];
 for (const root of viewWaves(data)) {
   const walk = (node) => {
-    if (node.className.split(/\s+/).includes("bead")) {
+    if (node.className.split(/\s+/).includes("work-card")) {
       cards.push({ class: node.className, text: descendants(node) });
     }
     for (const kid of node.kids) walk(kid);

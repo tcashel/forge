@@ -93,7 +93,7 @@ fn seed_run(ledger: &Ledger) {
     ledger
         .create_run(NewRun {
             run_id: RunId::new(RUN).expect("run id"),
-            bead_id: "bead-1".to_owned(),
+            work_id: "bead-1".to_owned(),
             repo: "octo/demo".to_owned(),
             base_ref: "main".to_owned(),
             branch: "feat/x".to_owned(),

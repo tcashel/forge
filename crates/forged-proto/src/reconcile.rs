@@ -10,14 +10,14 @@
 //!
 //! [`stop_attempt`] is the attempt-local sibling of that order, and a
 //! SEPARATE function on purpose: it ends at `stopped` after the same
-//! confirmed death and reclaims nothing, because the work lease is bead-scoped
+//! confirmed death and reclaims nothing, because the work lease is work-scoped
 //! and shared with every sibling generation. One function serving both
-//! scopes is what let an attempt-local stop reach for a bead-scoped lease.
+//! scopes is what let an attempt-local stop reach for a work-scoped lease.
 //!
 //! Which of the two resumes a durable `revoking` marker is read from the
 //! marker itself: [`AttemptRow::revoke_scope`] committed with it. A stop
 //! whose `kill_confirmed` failed leaves an attempt-scoped marker, and this
-//! pass finishes it AS A STOP — resuming it through the bead-scoped order
+//! pass finishes it AS A STOP — resuming it through the work-scoped order
 //! would re-arm the exact defect the split removes.
 //!
 //! The ledger is synchronous by design; every ledger call here goes through
@@ -302,7 +302,7 @@ async fn reconcile_inner(
                     .await?;
                 }
                 // An operator's stop that could not confirm death. Finishing
-                // it through the bead-scoped order instead would reclaim the
+                // it through the work-scoped order instead would reclaim the
                 // shared lease on an attempt-local operation's behalf: the
                 // exact defect the split removes.
                 Some(RevokeScope::Attempt) => {
@@ -310,10 +310,10 @@ async fn reconcile_inner(
                         stop_order(ledger, ports, &attempt, config.termination_grace_s).await?;
                     note_terminal(settled, attempt.attempt_id, &mut report);
                 }
-                // `bead`, and `None` for every row written before the scope
+                // `work`, and `None` for every row written before the scope
                 // was durable — all of those are saga revocations, because
                 // the attempt-local stop did not exist when they were made.
-                Some(RevokeScope::Bead) | None => {
+                Some(RevokeScope::Work) | None => {
                     revoke_order(
                         ledger,
                         ports,
@@ -343,14 +343,14 @@ async fn reconcile_inner(
                         .await
                         .map_err(|source| port_failure(attempt.attempt_id, "liveness", source))?;
                     match liveness {
-                        SessionLiveness::Running => (false, String::new(), RevokeScope::Bead),
+                        SessionLiveness::Running => (false, String::new(), RevokeScope::Work),
                         SessionLiveness::Exited(code) => (
                             true,
                             format!("session exited ({code}) without landing a result"),
-                            RevokeScope::Bead,
+                            RevokeScope::Work,
                         ),
                         SessionLiveness::Vanished => {
-                            (true, "session vanished".to_owned(), RevokeScope::Bead)
+                            (true, "session vanished".to_owned(), RevokeScope::Work)
                         }
                     }
                 };
@@ -389,7 +389,7 @@ async fn reconcile_inner(
                                         .await?;
                                 note_terminal(settled, current.attempt_id, &mut report);
                             }
-                            Some(RevokeScope::Bead) | None => {
+                            Some(RevokeScope::Work) | None => {
                                 revoke_order(
                                     ledger,
                                     ports,
@@ -547,7 +547,7 @@ async fn revoke_order(
         .map_err(|source| port_failure(attempt_id, "kill_confirmed", source))?;
 
     // Between the marker and here an operator's stop may have settled this
-    // row. Re-read before the external reclaim: this fires a BEAD-scoped
+    // row. Re-read before the external reclaim: this fires a WORK-scoped
     // effect, and firing it for an attempt no longer under this order's
     // marker is the scope mismatch the split exists to remove. No step is
     // added or reordered — the order simply declines to continue one it no
@@ -561,7 +561,7 @@ async fn revoke_order(
     // Step 3: scoped external reclaim, holder = claimant verbatim.
     let older_than_s = reclaim_older_than(stage_budget_s);
     let outcome = ports
-        .reclaim_lease(&run.bead_id, &attempt.claimant, older_than_s)
+        .reclaim_lease(&run.work_id, &attempt.claimant, older_than_s)
         .await
         .map_err(|source| port_failure(attempt_id, "reclaim_lease", source))?;
     // A scoped reclaim that reports NO previous owner is the goal state, not
@@ -615,7 +615,7 @@ async fn revoke_order(
 /// terminal transition. Entered only after the durable `revoking` marker is
 /// committed, exactly as [`revoke_order`] is.
 ///
-/// **This deliberately reclaims no lease.** `run_holder` is bead-scoped —
+/// **This deliberately reclaims no lease.** `run_holder` is work-scoped —
 /// every generation of the run derives the identical string — so an
 /// attempt-local operation has no standing to take it, and a "no live
 /// sibling right now" check cannot be made safe against a sibling claimed

@@ -1,13 +1,13 @@
 //! One construction and read path for operator-facing durable identity.
 //!
 //! Canonical ids remain selectors. Titles and repository labels are display
-//! data captured at creation; no projection re-reads Beads to reconstruct
+//! data captured at creation; no projection re-reads work to reconstruct
 //! them after the fact.
 
 use forged_types::{
-    normalize_repository_path, repository_label, work_display_title, WorkIdentityBeadV1,
-    WorkIdentityContextV1, WorkIdentityRepositoryV1, WorkIdentitySource, WorkIdentitySubjectKind,
-    WorkIdentitySubjectV1, WorkIdentityV1, WORK_IDENTITY_SCHEMA_V1,
+    normalize_repository_path, repository_label, work_display_title, WorkIdentityContextV1,
+    WorkIdentityRepositoryV1, WorkIdentitySource, WorkIdentitySubjectKind, WorkIdentitySubjectV1,
+    WorkIdentityV1, WorkIdentityWorkV1, WORK_IDENTITY_SCHEMA_V1,
 };
 use serde_json::{Map, Value};
 
@@ -53,9 +53,9 @@ pub(crate) fn context_from_params(
 pub(crate) fn durable_identity(
     kind: WorkIdentitySubjectKind,
     subject_id: &str,
-    bead_id: &str,
-    bead_title: Option<&str>,
-    bead_revision: Option<&str>,
+    work_id: &str,
+    work_title: Option<&str>,
+    work_revision: Option<&str>,
     repository_path: Option<&str>,
     project: Option<WorkIdentityContextV1>,
     epic: Option<WorkIdentityContextV1>,
@@ -64,9 +64,9 @@ pub(crate) fn durable_identity(
         WorkIdentitySource::Durable,
         kind,
         subject_id,
-        bead_id,
-        bead_title,
-        bead_revision,
+        work_id,
+        work_title,
+        work_revision,
         repository_path,
         project,
         epic,
@@ -78,9 +78,9 @@ pub(crate) fn durable_identity(
 pub(crate) fn live_plan_identity(
     kind: WorkIdentitySubjectKind,
     subject_id: &str,
-    bead_id: &str,
-    bead_title: Option<&str>,
-    bead_revision: Option<&str>,
+    work_id: &str,
+    work_title: Option<&str>,
+    work_revision: Option<&str>,
     repository_path: Option<&str>,
     project: Option<WorkIdentityContextV1>,
     epic: Option<WorkIdentityContextV1>,
@@ -90,9 +90,9 @@ pub(crate) fn live_plan_identity(
         WorkIdentitySource::LivePlan,
         kind,
         subject_id,
-        bead_id,
-        bead_title,
-        bead_revision,
+        work_id,
+        work_title,
+        work_revision,
         repository_path,
         project,
         epic,
@@ -105,9 +105,9 @@ fn identity(
     source: WorkIdentitySource,
     kind: WorkIdentitySubjectKind,
     subject_id: &str,
-    bead_id: &str,
-    bead_title: Option<&str>,
-    bead_revision: Option<&str>,
+    work_id: &str,
+    work_title: Option<&str>,
+    work_revision: Option<&str>,
     repository_path: Option<&str>,
     project: Option<WorkIdentityContextV1>,
     epic: Option<WorkIdentityContextV1>,
@@ -124,11 +124,11 @@ fn identity(
             Ok(WorkIdentityRepositoryV1 { path, label })
         })
         .transpose()?;
-    let title = bead_title
+    let title = work_title
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_owned);
-    let revision = bead_revision
+    let revision = work_revision
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_owned);
@@ -145,8 +145,8 @@ fn identity(
             kind,
             id: subject_id.to_owned(),
         },
-        bead: WorkIdentityBeadV1 {
-            id: bead_id.to_owned(),
+        work: WorkIdentityWorkV1 {
+            id: work_id.to_owned(),
             title,
             revision,
         },
@@ -167,7 +167,7 @@ fn identity(
 }
 
 /// Load the one durable identity a projection must share. Missing identity
-/// is corruption after migration 015, not permission to consult Beads.
+/// is corruption after migration 015, not permission to consult current work.
 pub(crate) async fn load(
     ctx: &Ctx,
     kind: WorkIdentitySubjectKind,

@@ -1,19 +1,19 @@
 {
   "name": "forged",
   "version": "0.6.1",
-  "description": "Forge-owned conversational planning and portfolio control over native Beads and typed Forged operations.",
+  "description": "Forge-owned conversational planning and portfolio control over native work and typed Forged operations.",
   "author": {
     "name": "Tripp Cashel"
   },
   "homepage": "https://github.com/tcashel/forge",
   "repository": "https://github.com/tcashel/forge",
   "license": "LicenseRef-MIT-OpenAI-Anthropic-Rider",
-  "keywords": ["forged", "planning", "code-review", "beads", "orchestration"],
+  "keywords": ["forged", "planning", "code-review", "work", "orchestration"],
   "skills": "./skills/",
   "interface": {
     "displayName": "forged",
-    "shortDescription": "Plan, inspect, and safely control Beads and Forged work",
-    "longDescription": "Use ordinary language to plan native Bead work, inspect the bounded Forged portfolio, resolve human references, and invoke exact authorized submission or lifecycle controls.",
+    "shortDescription": "Plan, inspect, and safely control native and durable work",
+    "longDescription": "Use ordinary language to plan native work, inspect the bounded Forged portfolio, resolve human references, and invoke exact authorized submission or lifecycle controls.",
     "developerName": "Tripp Cashel",
     "category": "Development",
     "capabilities": ["Interactive", "Write"],

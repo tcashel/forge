@@ -1132,7 +1132,7 @@ mod tests {
         ctx.ledger
             .create_run(NewRun {
                 run_id: RunId::new("direct-run").expect("run id"),
-                bead_id: "bead-direct".to_owned(),
+                work_id: "bead-direct".to_owned(),
                 repo: repository.to_owned(),
                 base_ref: "main".to_owned(),
                 branch: "work/direct-run".to_owned(),

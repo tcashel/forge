@@ -22,7 +22,7 @@ fn projection_reconstructs_history_and_threads_inputs() {
     ledger
         .create_run(NewRun {
             run_id: RunId::new(RUN).expect("run id"),
-            bead_id: "bead-1".to_owned(),
+            work_id: "bead-1".to_owned(),
             repo: "octo/demo".to_owned(),
             base_ref: "main".to_owned(),
             branch: "feat/x".to_owned(),
@@ -132,7 +132,7 @@ fn every_proto_event_kind_round_trips_through_the_ledger() {
     ledger
         .create_run(NewRun {
             run_id: RunId::new(RUN).expect("run id"),
-            bead_id: "bead-1".to_owned(),
+            work_id: "bead-1".to_owned(),
             repo: "octo/demo".to_owned(),
             base_ref: "main".to_owned(),
             branch: "feat/x".to_owned(),
@@ -205,7 +205,7 @@ fn record_refuses_a_review_the_parser_would_reject() {
     ledger
         .create_run(NewRun {
             run_id: RunId::new(RUN).expect("run id"),
-            bead_id: "bead-1".to_owned(),
+            work_id: "bead-1".to_owned(),
             repo: "octo/demo".to_owned(),
             base_ref: "main".to_owned(),
             branch: "feat/x".to_owned(),
@@ -240,7 +240,7 @@ fn stale_acceptance_event_cannot_override_superseded_outcome() {
     ledger
         .create_run(NewRun {
             run_id: RunId::new(RUN).expect("run id"),
-            bead_id: "bead-1".to_owned(),
+            work_id: "bead-1".to_owned(),
             repo: "octo/demo".to_owned(),
             base_ref: "main".to_owned(),
             branch: "feat/x".to_owned(),

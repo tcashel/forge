@@ -10,21 +10,21 @@ use serde_json::json;
 use support::TestEnv;
 
 #[test]
-fn atomic_run_creation_replays_after_crash_without_beads() {
+fn atomic_run_creation_replays_after_crash_without_work() {
     let env = TestEnv::new("km-work-identity-run-bundle");
-    env.seed_bead_spec(
+    env.seed_work_spec(
         "identity-run-crash",
         "Capture the native Bead as durable identity.",
         "Creation is atomic and replayable.",
     );
-    env.set_bead_field("identity-run-crash", "title", "Frozen run identity");
+    env.set_work_field("identity-run-crash", "title", "Frozen run identity");
     env.seed_frontier("identity-run-crash");
     assert_eq!(env.forged(&["init"]).0, 0);
     let repo = env.repos.repo.to_string_lossy().into_owned();
     let args = [
         "run",
         "start",
-        "--bead",
+        "--work",
         "identity-run-crash",
         "--repo",
         &repo,
@@ -56,7 +56,7 @@ fn atomic_run_creation_replays_after_crash_without_beads() {
         )
         .expect("identity lookup")
         .expect("identity exists");
-    assert_eq!(identity.bead.title.as_deref(), Some("Frozen run identity"));
+    assert_eq!(identity.work.title.as_deref(), Some("Frozen run identity"));
     assert_eq!(
         ledger
             .list_events(Some("identity-run-crash"), 0, 65_536)
@@ -70,13 +70,13 @@ fn atomic_run_creation_replays_after_crash_without_beads() {
 }
 
 #[test]
-fn atomic_epic_creation_replays_after_crash_without_beads() {
+fn atomic_epic_creation_replays_after_crash_without_work() {
     let env = TestEnv::new("km-work-identity-epic-bundle");
     env.seed_epic(
         "identity-epic-crash",
         &[("identity-child-crash", &env.spec, true)],
     );
-    env.set_bead_field("identity-epic-crash", "title", "Frozen epic identity");
+    env.set_work_field("identity-epic-crash", "title", "Frozen epic identity");
     assert_eq!(env.forged(&["init"]).0, 0);
     let repo = env.repos.repo.to_string_lossy().into_owned();
     let args = [
@@ -115,7 +115,7 @@ fn atomic_epic_creation_replays_after_crash_without_beads() {
         )
         .expect("identity lookup")
         .expect("identity exists");
-    assert_eq!(identity.bead.title.as_deref(), Some("Frozen epic identity"));
+    assert_eq!(identity.work.title.as_deref(), Some("Frozen epic identity"));
     assert_eq!(
         ledger
             .list_events(Some("identity-epic-crash"), 0, 65_536)

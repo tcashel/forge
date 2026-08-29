@@ -17,7 +17,7 @@ pub enum Stage {
 
 /// The spec a packet implements, pinned against edits under it.
 ///
-/// A bead-sourced spec pins the bead's opaque `revision`; a file-sourced one
+/// A work-sourced spec pins the work's opaque `revision`; a file-sourced one
 /// — the deprecated `--spec <path>` route — pins the file's content hash.
 /// `path` is where the seat reads the bytes either way.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -25,7 +25,7 @@ pub enum Stage {
 pub struct SpecRef {
     pub path: String,
     pub sha256: String,
-    /// The bead revision this packet is pinned to; absent on a file-sourced
+    /// The work revision this packet is pinned to; absent on a file-sourced
     /// spec. OPAQUE: compared for equality only, never ordered or parsed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revision: Option<String>,
@@ -38,8 +38,9 @@ pub enum Deliverable {
     CommitsInWorktree,
     ReviewBlock,
     FixCommitsPushed,
-    /// One complete native Beads specification; no repository write.
-    NativeBeadSpec,
+    /// One complete native work specification; no repository write.
+    #[serde(rename = "nativeBeadSpec")]
+    NativeWorkSpec,
 }
 
 /// The obligations a packet places on its stage.
@@ -77,7 +78,8 @@ pub struct WorkPacket {
     pub schema: String,
     pub packet_id: String,
     pub run_id: String,
-    pub bead_id: String,
+    #[serde(rename = "beadId")]
+    pub work_id: String,
     pub stage: Stage,
     /// Semantic topology identity. Absent only on legacy v0 packets.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -206,10 +208,10 @@ pub struct SpecAmendment {
     pub proposed_change: String,
 }
 
-/// The four provider-authored native fields of one Beads specification.
+/// The four provider-authored native fields of one work specification.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct NativeBeadSpecV1 {
+pub struct NativeWorkSpecV1 {
     pub description: String,
     pub acceptance_criteria: String,
     pub design: String,
@@ -217,7 +219,7 @@ pub struct NativeBeadSpecV1 {
 }
 
 /// Provider-authored traceability that stays with a rolling-plan artifact
-/// but is never written into Beads' four native specification fields.
+/// but is never written into the work item's four native specification fields.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PlanTraceabilityV1 {
@@ -271,13 +273,13 @@ pub enum Outcome {
     /// A complete rolling-plan candidate. Non-empty `cruxes` require human
     /// adjudication and can never be persisted automatically.
     Plan {
-        spec: NativeBeadSpecV1,
+        spec: NativeWorkSpecV1,
         traceability: PlanTraceabilityV1,
         #[serde(default)]
         cruxes: Vec<SpecAmendment>,
     },
     /// Stop the current loop for operator adjudication without inventing a
-    /// fix, successor run, or successor Bead.
+    /// fix, successor run, or successor work item.
     SpecAmendment {
         amendment: SpecAmendment,
     },
@@ -325,7 +327,7 @@ mod tests {
             schema: "forged.packet/1".to_owned(),
             packet_id: "pkt-1".to_owned(),
             run_id: "run-1".to_owned(),
-            bead_id: "bead-1".to_owned(),
+            work_id: "bead-1".to_owned(),
             stage: Stage::Implement,
             execution: None,
             lane_seq: None,

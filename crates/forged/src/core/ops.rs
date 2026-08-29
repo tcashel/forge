@@ -307,7 +307,7 @@ pub async fn init(ctx: &Ctx, req: &mut OperationRequest) -> OperationResponse {
 
 // ------------------------------------------------------------- run start
 
-/// Resolve the Bead as work, not merely as a bag of spec fields.
+/// Resolve the Work as work, not merely as a bag of spec fields.
 ///
 /// `bd ready` is the authority for dependency readiness. Reading the issue
 /// first makes the refusal useful (status and type), while the frontier read
@@ -320,37 +320,37 @@ pub async fn init(ctx: &Ctx, req: &mut OperationRequest) -> OperationResponse {
 /// issue's own hydrated dependencies must still prove no active blocker,
 /// so a blocker added between claim-next and run start (or standing behind
 /// a stale frontier claim) refuses exactly as the frontier read would.
-/// A non-code Bead has an explicit route instead of being forced through a
+/// A non-code Work has an explicit route instead of being forced through a
 /// commit-and-PR protocol that cannot represent its correct result.
-async fn ready_slice_bead(
+async fn ready_slice_work(
     ctx: &Ctx,
-    bead: &str,
+    work: &str,
 ) -> Result<crate::core::work_types::IssueSummary, Failure> {
-    let issue = super::spec::read_bead(ctx, bead).await?;
+    let issue = super::spec::read_work(ctx, work).await?;
     let frontier_claimed = issue.status == "in_progress"
         && issue.assignee.as_deref() == Some(crate::core::FRONTIER_HOLDER);
     if issue.status != "open" && !frontier_claimed {
         return Err(Failure::invalid(format!(
-            "bead {bead} is {:?} under assignee {:?}, not open and ready or held by the forged frontier",
+            "work {work} is {:?} under assignee {:?}, not open and ready or held by the forged frontier",
             issue.status, issue.assignee
         )));
     }
     match issue.issue_type.as_str() {
         "epic" => {
             return Err(Failure::invalid(format!(
-                "bead {bead} is an epic; use `forged epic start`"
+                "work {work} is an epic; use `forged epic start`"
             )))
         }
         "chore" | "decision" | "milestone" => {
             return Err(Failure::invalid(format!(
-                "bead {bead} is a no-diff {}; complete it directly through Beads, not slice/v1",
+                "work {work} is a no-diff {}; complete it directly through the work store, not slice/v1",
                 issue.issue_type
             )))
         }
         "bug" | "feature" | "task" | "story" | "spike" => {}
         other => {
             return Err(Failure::invalid(format!(
-                "bead {bead} has unsupported issue type {other:?}"
+                "work {work} has unsupported issue type {other:?}"
             )))
         }
     }
@@ -363,25 +363,25 @@ async fn ready_slice_bead(
             .map(crate::core::work_types::PlanIssue::readiness);
         if readiness != Some(crate::core::work_types::PlanReadiness::Claimed) {
             return Err(Failure::invalid(format!(
-                "bead {bead} is frontier-claimed but its dependencies do not prove it ready \
+                "work {work} is frontier-claimed but its dependencies do not prove it ready \
                  ({readiness:?}); resolve its blockers before starting a run"
             )));
         }
     }
     if !frontier_claimed {
         let ready = super::workstore::ready_issues(&ctx.ledger).await?;
-        if !ready.iter().any(|candidate| candidate.id == bead) {
+        if !ready.iter().any(|candidate| candidate.id == work) {
             return Err(Failure::invalid(format!(
-                "bead {bead} is absent from `bd ready`; resolve its blockers before starting a run"
+                "work {work} is absent from the ready frontier; resolve its blockers before starting a run"
             )));
         }
     }
     Ok(issue)
 }
 
-/// `run start` — mint the RunId from the bead id (or the epic scheduler's
+/// `run start` — mint the RunId from the work id (or the epic scheduler's
 /// explicit child generation id) and fill `NewRun` from the config plus the
-/// `--repo` and `--base-ref` arguments. The spec comes from the bead;
+/// `--repo` and `--base-ref` arguments. The spec comes from the work;
 /// `--spec <path>` is the deprecated file route, honored for one release.
 pub async fn run_start(ctx: &Ctx, req: &mut OperationRequest) -> OperationResponse {
     let compiled = match ctx.config.compile_definition(
@@ -411,17 +411,17 @@ pub(crate) async fn run_start_with_definition(
     req: &mut OperationRequest,
     compiled: crate::config::CompiledDefinition,
 ) -> OperationResponse {
-    let bead = match param_str(&req.params, "bead") {
+    let work = match param_str(&req.params, "bead") {
         Ok(v) => v.to_owned(),
         Err(f) => return err_response(&derive_key("run_start", None, None, None), &f),
     };
-    let run_name = param_opt_str(&req.params, "run").unwrap_or(&bead);
+    let run_name = param_opt_str(&req.params, "run").unwrap_or(&work);
     let run_id = match RunId::new(run_name.to_owned()) {
         Ok(id) => id,
         Err(e) => {
             return err_response(
                 &derive_key("run_start", None, None, None),
-                &Failure::invalid(format!("bead id does not mint a valid run id: {e}")),
+                &Failure::invalid(format!("work id does not mint a valid run id: {e}")),
             )
         }
     };
@@ -541,20 +541,20 @@ pub(crate) async fn run_start_with_definition(
                 param_opt_str(&params, "spec").map(str::to_owned)
             };
             let issue = if let Some(protocol) = internal_protocol {
-                let issue = super::spec::read_bead(ctx, &bead).await?;
-                if param_opt_str(&params, "epicId") != Some(bead.as_str())
+                let issue = super::spec::read_work(ctx, &work).await?;
+                if param_opt_str(&params, "epicId") != Some(work.as_str())
                     || issue.issue_type != "epic"
                     || !matches!(issue.status.as_str(), "open" | "in_progress")
                 {
                     return Err(Failure::invalid(format!(
-                        "{protocol}/v1 run must bind to its open parent epic {bead}"
+                        "{protocol}/v1 run must bind to its open parent epic {work}"
                     )));
                 }
                 issue
             } else {
-                ready_slice_bead(ctx, &bead).await?
+                ready_slice_work(ctx, &work).await?
             };
-            // The spec source is settled BEFORE the run row exists: a bead
+            // The spec source is settled BEFORE the run row exists: a work
             // with no spec, or a spec path that is not there, must never
             // reach a seat as an empty spec.
             let source = match &spec {
@@ -564,18 +564,18 @@ pub(crate) async fn run_start_with_definition(
                     }
                     if internal_protocol.is_none() {
                         tracing::warn!(
-                            bead = %bead,
+                            work = %work,
                             spec = %path,
-                            "--spec is deprecated: the bead's own fields are the spec"
+                            "--spec is deprecated: the work item's own fields are the spec"
                         );
                     }
                     super::spec::SpecSource::File(path.clone())
                 }
                 None => {
-                    // Resolving proves the bead carries a spec, and names
+                    // Resolving proves the work carries a spec, and names
                     // every empty field when it does not.
                     super::spec::resolve_issue(&issue)?;
-                    super::spec::SpecSource::Bead(bead.clone())
+                    super::spec::SpecSource::Work(work.clone())
                 }
             };
             let base_ref = match param_opt_str(&params, "baseRef") {
@@ -599,7 +599,7 @@ pub(crate) async fn run_start_with_definition(
             };
             let new_run = NewRun {
                 run_id: run_id.clone(),
-                bead_id: bead.clone(),
+                work_id: work.clone(),
                 repo: repo.clone(),
                 base_ref: base_ref.clone(),
                 branch: branch.clone(),
@@ -620,7 +620,7 @@ pub(crate) async fn run_start_with_definition(
             let identity = super::work_identity::durable_identity(
                 WorkIdentitySubjectKind::Run,
                 run_id.as_str(),
-                &bead,
+                &work,
                 Some(&issue.title),
                 issue.revision.as_deref(),
                 Some(&repo),
@@ -633,8 +633,8 @@ pub(crate) async fn run_start_with_definition(
                     "source": "file",
                     "specPath": path,
                     "deprecated": true,
-                    "beadId": bead,
-                    "beadTitle": identity.bead.title.clone(),
+                    "beadId": work,
+                    "beadTitle": identity.work.title.clone(),
                     "beadRevision": issue.revision,
                     "repo": repo,
                     "operationId": operation_id,
@@ -643,11 +643,11 @@ pub(crate) async fn run_start_with_definition(
                     "project": identity.project.clone(),
                     "epic": identity.epic.clone(),
                 }),
-                super::spec::SpecSource::Bead(bead_id) => json!({
+                super::spec::SpecSource::Work(work_id) => json!({
                     "runId": run_id.as_str(),
                     "source": "bead",
-                    "beadId": bead_id,
-                    "beadTitle": identity.bead.title.clone(),
+                    "beadId": work_id,
+                    "beadTitle": identity.work.title.clone(),
                     "beadRevision": issue.revision,
                     "repo": repo,
                     "operationId": operation_id,
@@ -664,7 +664,7 @@ pub(crate) async fn run_start_with_definition(
             crate::failpoint::hit("run.start.bundle.after");
             Ok(json!({
                 "run_id": row.run_id,
-                "bead_id": row.bead_id,
+                "bead_id": row.work_id,
                 "branch": branch,
                 "base_ref": base_ref,
                 "protocol_ref": package.protocol_ref,
@@ -717,7 +717,7 @@ async fn recover_applied_run_start(
 }
 
 /// Recover the applied side of an interrupted atomic run creation without
-/// consulting Beads. The operation id is written into `forged.run.spec` in
+/// consulting current work. The operation id is written into `forged.run.spec` in
 /// the same transaction as the run and identity, so a matching event proves
 /// this exact safe-retry operation committed its effect.
 async fn replay_atomic_run_start(
@@ -769,7 +769,7 @@ async fn replay_atomic_run_start(
         .map_err(|error| Failure::internal(format!("stored execution package: {error}")))?;
     Ok(Some(json!({
         "run_id": run.run_id,
-        "bead_id": run.bead_id,
+        "bead_id": run.work_id,
         "branch": run.branch,
         "base_ref": run.base_ref,
         "protocol_ref": package.protocol_ref,
@@ -918,8 +918,8 @@ pub async fn run_status(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
             },
         )
         .await;
-        let expected_assignee = crate::core::run_holder(&view.run.bead_id);
-        let claim_health = match super::workstore::show_issue(&ctx.ledger, &view.run.bead_id).await
+        let expected_assignee = crate::core::run_holder(&view.run.work_id);
+        let claim_health = match super::workstore::show_issue(&ctx.ledger, &view.run.work_id).await
         {
             Ok(issue) => {
                 let holder_mismatch = issue
@@ -950,15 +950,15 @@ pub async fn run_status(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
                                 || controller_dead)));
                 let detail = if holder_mismatch {
                     format!(
-                        "Bead is assigned to {}, expected {expected_assignee}",
+                        "Work is assigned to {}, expected {expected_assignee}",
                         issue.assignee.as_deref().unwrap_or("nobody")
                     )
                 } else if awaiting_delivery {
-                    "Reviewed delivery retains its Beads claim until the PR lands".to_owned()
+                    "Reviewed delivery retains its work claim until the PR lands".to_owned()
                 } else if stale {
-                    "Bead remains in_progress although durable execution is no longer live".to_owned()
+                    "Work remains in_progress although durable execution is no longer live".to_owned()
                 } else {
-                    "Live Beads claim agrees with execution evidence".to_owned()
+                    "Live work claim agrees with execution evidence".to_owned()
                 };
                 json!({
                     "known": true,
@@ -975,7 +975,7 @@ pub async fn run_status(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
                 "assignee": Value::Null,
                 "expectedAssignee": expected_assignee,
                 "staleInProgress": false,
-                "detail": format!("Beads unavailable: {error}"),
+                "detail": format!("Work unavailable: {error}"),
             }),
         };
         let definition = match definition {
@@ -1062,7 +1062,7 @@ pub async fn run_status(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
                 "runId": view.run.run_id,
                 "identity": identity,
                 "herdrLayout": herdr_layout,
-                "beadId": view.run.bead_id,
+                "beadId": view.run.work_id,
                 "repo": view.run.repo,
                 "baseRef": view.run.base_ref,
                 "branch": view.run.branch,
@@ -1619,7 +1619,7 @@ pub async fn packet_claim(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
             let packet_admission = super::admission::PacketAdmission {
                 packet_id: packet_id.clone(),
                 run_id: row.run_id.clone(),
-                bead_id: view.run.bead_id.clone(),
+                work_id: view.run.work_id.clone(),
             };
             let admission_guard = super::handoff::acquire_packet_submit(
                 ctx,
@@ -1646,7 +1646,7 @@ pub async fn packet_claim(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
             // ledger compares and the bytes the seat will read.
             let spec_ref = forged_proto::packet_spec(&row);
             let resolved =
-                super::spec::resolve_for_packet(ctx, &spec_ref, &view.run.bead_id).await?;
+                super::spec::resolve_for_packet(ctx, &spec_ref, &view.run.work_id).await?;
             let fence = resolved.fence.clone();
             let provider = admission
                 .packet_provider_hints
@@ -2387,7 +2387,7 @@ pub enum Spend {
 ///
 /// Two sources, deliberately: a slice owns a `runs` row, but an epic never
 /// does — `epic_start` only appends `forged.epic.started` under the epic
-/// bead id, and the sole production writer of `runs` is `run_start`, called
+/// work id, and the sole production writer of `runs` is `run_start`, called
 /// per child. An inventory built from `list_runs()` alone therefore lists no
 /// epic at all, so every started epic id with no `runs` row is synthesized
 /// from its start event. `kind` stays derived from that event — the only
@@ -2485,12 +2485,12 @@ pub(super) fn project_entries(
                     run.run_id
                 ))
             })?;
-        let bead_id = identity.bead.id.clone();
+        let work_id = identity.work.id.clone();
         let mut entry = json!({
             "id": run.run_id.clone(),
             "kind": if epic { "epic" } else { "slice" },
             "identity": identity,
-            "beadId": bead_id,
+            "beadId": work_id,
             "repo": run.repo.clone(),
             "baseRef": run.base_ref.clone(),
             "branch": run.branch.clone(),
@@ -2531,7 +2531,7 @@ pub(super) fn project_entries(
             Some(value @ Value::String(_)) => value.clone(),
             _ => Value::Null,
         };
-        let bead_id = identity.bead.id.clone();
+        let work_id = identity.work.id.clone();
         let lifecycle = lifecycles.get(&epic_id);
         let updated_at = snapshot
             .latest_event
@@ -2542,7 +2542,7 @@ pub(super) fn project_entries(
             "id": epic_id,
             "kind": "epic",
             "identity": identity,
-            "beadId": bead_id,
+            "beadId": work_id,
             "repo": field("repo"),
             "baseRef": field("baseRef"),
             "branch": field("integrationBranch"),
@@ -2715,17 +2715,17 @@ const QUEUE_GROUPS: [&str; 5] = [
 
 /// Enrich the inventory and group it once for every operator surface.
 ///
-/// Beads is queried once for exactly the ids in the ledger. Controller
+/// Work is queried once for exactly the ids in the ledger. Controller
 /// records and progress events come from the already-open inventory
 /// snapshot, avoiding a ledger projection per row.
 pub(super) fn operator_queue(
     snapshot: &InventorySnapshot,
     entries: &mut [Value],
     attention: &[Value],
-    bead_read: Result<Vec<crate::core::work_types::IssueSummary>, String>,
+    work_read: Result<Vec<crate::core::work_types::IssueSummary>, String>,
 ) -> Value {
-    let bead_error = bead_read.as_ref().err().cloned();
-    let beads: BTreeMap<String, crate::core::work_types::IssueSummary> = bead_read
+    let work_error = work_read.as_ref().err().cloned();
+    let work: BTreeMap<String, crate::core::work_types::IssueSummary> = work_read
         .unwrap_or_default()
         .into_iter()
         .map(|issue| (issue.id.clone(), issue))
@@ -2778,12 +2778,12 @@ pub(super) fn operator_queue(
 
     for entry in entries.iter_mut() {
         let id = entry["id"].as_str().unwrap_or_default().to_owned();
-        let bead_id = entry["beadId"].as_str().unwrap_or_default().to_owned();
+        let work_id = entry["beadId"].as_str().unwrap_or_default().to_owned();
         let record = controller_records.remove(&id).map(|(_, record)| record);
         let controller = durable_controller_status(snapshot, &id, record);
-        let issue = beads.get(&bead_id);
+        let issue = work.get(&work_id);
         // Human-readable identity is frozen with the work. The bounded
-        // Beads read below remains authoritative for claim health and
+        // The work read below remains authoritative for claim health and
         // repository membership, but a later rename or outage must not
         // rewrite historical display state.
         let title = entry
@@ -2791,7 +2791,7 @@ pub(super) fn operator_queue(
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_owned();
-        let expected = crate::core::run_holder(&bead_id);
+        let expected = crate::core::run_holder(&work_id);
         let controller_state = controller.get("state").and_then(Value::as_str);
         let controller_live = controller_state == Some("running");
         let execution_live = controller_live || entry["liveSeats"].as_u64().unwrap_or(0) > 0;
@@ -2817,25 +2817,25 @@ pub(super) fn operator_queue(
                 || (!awaiting_delivery
                     && (!execution_live || visibly_terminal || dead_controller)));
         let claim_detail = if !claim_known {
-            bead_error
+            work_error
                 .as_deref()
-                .map(|error| format!("Beads unavailable: {error}"))
-                .unwrap_or_else(|| "Bead was not returned by the bounded live read".to_owned())
+                .map(|error| format!("Work unavailable: {error}"))
+                .unwrap_or_else(|| "Work was not returned by the bounded live read".to_owned())
         } else if holder_mismatch {
             format!(
-                "Bead is assigned to {}, expected {expected}",
+                "Work is assigned to {}, expected {expected}",
                 assignee.unwrap_or("nobody")
             )
         } else if awaiting_delivery {
-            "Reviewed delivery retains its Beads claim until the PR lands".to_owned()
+            "Reviewed delivery retains its work claim until the PR lands".to_owned()
         } else if stale {
-            "Bead remains in_progress although durable execution is no longer live".to_owned()
+            "Work remains in_progress although durable execution is no longer live".to_owned()
         } else if claim_status == Some("blocked") {
-            "Bead is blocked in the authoritative live store".to_owned()
+            "Work is blocked in the authoritative live store".to_owned()
         } else if claim_status == Some("closed") && !visibly_terminal {
-            "Bead is closed while durable execution is not settled".to_owned()
+            "Work is closed while durable execution is not settled".to_owned()
         } else {
-            "Live Beads claim agrees with execution evidence".to_owned()
+            "Live work claim agrees with execution evidence".to_owned()
         };
         let claim_health = json!({
             "known": claim_known,
@@ -3227,25 +3227,25 @@ fn attention_rail(snapshot: &InventorySnapshot, entries: &[Value]) -> Vec<Value>
         }
     }
 
-    // A failed Beads reconciliation is a durable promise still owed. Keep
+    // A failed work reconciliation is a durable promise still owed. Keep
     // the latest failed write visible; the exact error and intended outcome
     // are the recovery evidence.
-    let mut bead_pending: BTreeMap<String, Value> = BTreeMap::new();
+    let mut work_pending: BTreeMap<String, Value> = BTreeMap::new();
     for event in snapshot.events("run.bead-settlement.pending") {
         let Some(id) = event.run_id.clone() else {
             continue;
         };
         let payload = serde_json::from_str(&event.payload_json).unwrap_or(Value::Null);
-        bead_pending.insert(id, payload);
+        work_pending.insert(id, payload);
     }
-    for (id, payload) in bead_pending {
-        let error = payload["error"].as_str().unwrap_or("unknown Beads error");
+    for (id, payload) in work_pending {
+        let error = payload["error"].as_str().unwrap_or("unknown work error");
         push(
             "beads-settlement-pending",
             item(
                 &id,
                 "beads-settlement-pending",
-                format!("run outcome is stored but Beads reconciliation is pending: {error}"),
+                format!("run outcome is stored but work reconciliation is pending: {error}"),
                 payload,
             ),
         );
@@ -3459,7 +3459,7 @@ pub async fn work_list(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
                 != Some("available")
         {
             return Err(Failure {
-                code: ErrorCode::BeadsError,
+                code: ErrorCode::WorkError,
                 message: "work_list filtered membership is unavailable".to_owned(),
                 recoverable: false,
             });
@@ -3495,7 +3495,7 @@ pub async fn work_list(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
     .await
 }
 
-/// Legacy discovery never included plan-only Beads. Preserve that boundary
+/// Legacy discovery never included plan-only work. Preserve that boundary
 /// while sourcing its ordering and grouping from Operations.
 ///
 /// `count` and `entries` keep their legacy durable-only meaning. `code`,
@@ -3875,7 +3875,7 @@ pub(super) fn desired_only_entries(
                 "id": desired.subject_id,
                 "kind": if kind == WorkIdentitySubjectKind::Epic { "epic" } else { "slice" },
                 "identity": identity,
-                "beadId": identity.bead.id,
+                "beadId": identity.work.id,
                 "repo": repository,
                 "baseRef": Value::Null,
                 "branch": Value::Null,
@@ -3899,13 +3899,13 @@ pub(super) fn desired_only_entries(
         .collect()
 }
 
-/// The exact, unique Bead ids one bounded live read covers.
+/// The exact, unique Work ids one bounded live read covers.
 ///
-/// Several runs legitimately share one Bead — a resubmission, a superseded
+/// Several runs legitimately share one Work — a resubmission, a superseded
 /// attempt, an epic child re-driven — so the per-row ledger projection is not
 /// a set. The exact-hydrate contract requires one row per requested id;
 /// handing it a repeat fails the whole read closed.
-pub(super) fn entry_bead_ids(entries: &[Value]) -> Vec<String> {
+pub(super) fn entry_work_ids(entries: &[Value]) -> Vec<String> {
     entries
         .iter()
         .filter_map(|entry| {
@@ -3923,13 +3923,13 @@ pub(super) fn entry_bead_ids(entries: &[Value]) -> Vec<String> {
 ///
 /// `titleSource` is a SIBLING of the frozen `identity`: it never rewrites
 /// `identity.displayTitle` or `title`, which remain launch evidence. It
-/// carries a current Beads title only for a row whose identity froze without
+/// carries a current work title only for a row whose identity froze without
 /// one, and always names the authority that answered.
 pub(super) fn decorate_titles(
     entries: &mut [Value],
-    beads: &[crate::core::work_types::IssueSummary],
+    work: &[crate::core::work_types::IssueSummary],
 ) -> Result<(), Failure> {
-    let titles: BTreeMap<&str, &str> = beads
+    let titles: BTreeMap<&str, &str> = work
         .iter()
         .map(|issue| (issue.id.as_str(), issue.title.as_str()))
         .collect();
@@ -3940,7 +3940,7 @@ pub(super) fn decorate_titles(
             )?;
         let resolved = forged_types::resolve_work_title(
             &identity,
-            titles.get(identity.bead.id.as_str()).copied(),
+            titles.get(identity.work.id.as_str()).copied(),
         );
         let resolved = serde_json::to_value(resolved).map_err(|error| {
             Failure::internal(format!("serializing operator row title: {error}"))
@@ -3988,9 +3988,9 @@ pub(super) fn decorate_durable_entries(entries: &mut [Value]) -> Result<(), Fail
 struct OperationsUniverse {
     snapshot: InventorySnapshot,
     ledger_captured_at: String,
-    beads_captured_at: String,
+    work_captured_at: String,
     entries: Vec<Value>,
-    bead_summaries: Vec<crate::core::work_types::IssueSummary>,
+    work_summaries: Vec<crate::core::work_types::IssueSummary>,
     claim_error: Option<String>,
     plan_error: Option<String>,
     plan_discovered: usize,
@@ -3998,7 +3998,7 @@ struct OperationsUniverse {
 }
 
 impl OperationsUniverse {
-    /// The shared degradation posture: a Beads outage keeps ledger-backed
+    /// The shared degradation posture: a work-store outage keeps ledger-backed
     /// rows and is reported per source instead of failing the read closed.
     fn source_health(&self) -> Value {
         json!({
@@ -4036,16 +4036,16 @@ async fn collect_operations_universe(
     entries.extend(desired_only_entries(&snapshot, &entries)?);
     decorate_durable_entries(&mut entries)?;
 
-    let bead_ids = entry_bead_ids(&entries);
+    let work_ids = entry_work_ids(&entries);
     let filter_active =
         filters.repository.is_some() || filters.status.is_some() || filters.assignee.is_some();
     let plan_filters = filters.clone();
     let claim_filters = filters;
     let (plan_read, claim_read) = tokio::join!(
         super::workstore::plan_inventory(&ctx.ledger, plan_filters, LIVE_PLAN_LIMIT),
-        super::workstore::list_issues_filtered(&ctx.ledger, &bead_ids, claim_filters)
+        super::workstore::list_issues_filtered(&ctx.ledger, &work_ids, claim_filters)
     );
-    let beads_captured_at = now_iso();
+    let work_captured_at = now_iso();
     let (mut plans, plan_truncated, plan_discovered, mut plan_error) = match plan_read {
         Ok(inventory) => (
             inventory.issues,
@@ -4055,12 +4055,12 @@ async fn collect_operations_universe(
         ),
         Err(error) => (Vec::new(), false, 0, Some(error.to_string())),
     };
-    let (claim_beads, claim_error) = match claim_read {
+    let (claim_work, claim_error) = match claim_read {
         Ok(issues) => (issues, None),
         Err(error) => (Vec::new(), Some(error.to_string())),
     };
     if filter_active {
-        let matching_beads = claim_beads
+        let matching_work = claim_work
             .iter()
             .map(|issue| issue.id.as_str())
             .collect::<BTreeSet<_>>();
@@ -4068,7 +4068,7 @@ async fn collect_operations_universe(
             entry
                 .get("beadId")
                 .and_then(Value::as_str)
-                .is_some_and(|id| matching_beads.contains(id))
+                .is_some_and(|id| matching_work.contains(id))
         });
     }
     let represented: BTreeSet<String> = entries
@@ -4087,7 +4087,7 @@ async fn collect_operations_universe(
             .iter()
             .filter(|plan| !represented.contains(&plan.issue.id))
         {
-            match live_plan_entry(plan, &beads_captured_at) {
+            match live_plan_entry(plan, &work_captured_at) {
                 Ok(entry) => plan_entries.push(entry),
                 Err(error) => {
                     conversion_error = Some(format!(
@@ -4111,11 +4111,11 @@ async fn collect_operations_universe(
             .map(|plan| (plan.issue.id.as_str(), plan))
             .collect();
         for entry in &mut entries {
-            let bead_id = entry
+            let work_id = entry
                 .get("beadId")
                 .and_then(Value::as_str)
                 .map(str::to_owned);
-            if let Some(plan) = bead_id.as_deref().and_then(|id| plans_by_id.get(id)) {
+            if let Some(plan) = work_id.as_deref().and_then(|id| plans_by_id.get(id)) {
                 if let Some(object) = entry.as_object_mut() {
                     object.insert("priority".to_owned(), json!(plan.issue.priority));
                     object.insert(
@@ -4138,24 +4138,24 @@ async fn collect_operations_universe(
         entries.extend(plan_entries);
     }
 
-    let mut bead_summaries = claim_beads;
-    let mut known_beads = bead_summaries
+    let mut work_summaries = claim_work;
+    let mut known_work = work_summaries
         .iter()
         .map(|issue| issue.id.clone())
         .collect::<BTreeSet<_>>();
-    bead_summaries.extend(
+    work_summaries.extend(
         plans
             .iter()
             .map(|plan| plan.issue.clone())
-            .filter(|issue| known_beads.insert(issue.id.clone())),
+            .filter(|issue| known_work.insert(issue.id.clone())),
     );
-    decorate_titles(&mut entries, &bead_summaries)?;
+    decorate_titles(&mut entries, &work_summaries)?;
     Ok(OperationsUniverse {
         snapshot,
         ledger_captured_at,
-        beads_captured_at,
+        work_captured_at,
         entries,
-        bead_summaries,
+        work_summaries,
         claim_error,
         plan_error,
         plan_discovered,
@@ -4165,7 +4165,7 @@ async fn collect_operations_universe(
 
 /// `operations overview` — the bounded, read-only operator surface.
 ///
-/// One ledger snapshot supplies every durable fact. Beads contributes one
+/// One ledger snapshot supplies every durable fact. The work store contributes one
 /// exact claim/membership batch alongside one bounded N+1 plan discovery and
 /// one exact-id dependency hydrate. An outage retains unscoped durable rows
 /// and is reported as degraded instead of widening scope or inventing plan
@@ -4227,14 +4227,14 @@ pub async fn operations_overview(ctx: &Ctx, req: &OperationRequest) -> Operation
         let OperationsUniverse {
             snapshot,
             ledger_captured_at,
-            beads_captured_at,
+            work_captured_at,
             mut entries,
-            bead_summaries,
+            work_summaries,
             claim_error,
             plan_truncated,
             ..
         } = universe;
-        let attention = super::attention::project_active(&snapshot, &entries, &bead_summaries)?
+        let attention = super::attention::project_active(&snapshot, &entries, &work_summaries)?
             .into_iter()
             .map(|item| {
                 serde_json::to_value(item).map_err(|error| {
@@ -4244,11 +4244,11 @@ pub async fn operations_overview(ctx: &Ctx, req: &OperationRequest) -> Operation
             .collect::<Result<Vec<_>, _>>()?;
         enrich_operations_facts(&snapshot, &attention, &mut entries)?;
 
-        let bead_read = match claim_error.as_ref() {
+        let work_read = match claim_error.as_ref() {
             Some(error) => Err(error.clone()),
-            None => Ok(bead_summaries),
+            None => Ok(work_summaries),
         };
-        let mut queue = operator_queue(&snapshot, &mut entries, &attention, bead_read);
+        let mut queue = operator_queue(&snapshot, &mut entries, &attention, work_read);
         let mut remaining = limit as usize;
         let mut shown_total = 0usize;
         let mut matching_total = 0usize;
@@ -4352,7 +4352,7 @@ pub async fn operations_overview(ctx: &Ctx, req: &OperationRequest) -> Operation
             "scope": {"repository": repository},
             "capturedAt": {
                 "ledger": ledger_captured_at,
-                "beads": beads_captured_at,
+                "beads": work_captured_at,
             },
             "sourceHealth": source_health,
             "coverage": {
@@ -4395,7 +4395,7 @@ pub async fn operations_overview(ctx: &Ctx, req: &OperationRequest) -> Operation
 }
 
 /// Return the new Operations projection to compatibility facades without
-/// reimplementing its ledger/Beads joins or queue policy.
+/// reimplementing its ledger/work joins or queue policy.
 pub(super) async fn operations_projection(
     ctx: &Ctx,
     req: &OperationRequest,
@@ -4461,7 +4461,7 @@ fn attention_list_filter<'p>(
 /// `attention list` — the authoritative read-only attention projection.
 ///
 /// The collection universe is the Operations universe — ledger entries plus
-/// live plan entries plus claim/plan bead summaries — projected through
+/// live plan entries plus claim/plan work summaries — projected through
 /// `project_all` and state-filtered afterwards, so `state=all` can serve the
 /// resolved occurrences `project_active` strips. Items are complete
 /// unmodified `forged.attention-item/1` objects, grouped by condition with
@@ -4524,7 +4524,7 @@ pub async fn attention_list(ctx: &Ctx, req: &OperationRequest) -> OperationRespo
         let items = super::attention::project_all(
             &universe.snapshot,
             &universe.entries,
-            &universe.bead_summaries,
+            &universe.work_summaries,
         )?;
         let items: Vec<AttentionItemV1> = items
             .into_iter()
@@ -4623,7 +4623,7 @@ pub async fn attention_list(ctx: &Ctx, req: &OperationRequest) -> OperationRespo
             "schema": "forged.attention-list/1",
             "capturedAt": {
                 "ledger": &universe.ledger_captured_at,
-                "beads": &universe.beads_captured_at,
+                "beads": &universe.work_captured_at,
             },
             "filters": {
                 "repo": repo,
@@ -4659,14 +4659,14 @@ async fn all_attention(ctx: &Ctx) -> Result<Vec<AttentionItemV1>, Failure> {
     })
     .await?;
     let mut entries = project_entries(&snapshot, Spend::Include)?;
-    let bead_ids = entry_bead_ids(&entries);
-    // A Beads outage cannot authorize a control over a condition that only
-    // Beads can prove. Other ledger-backed items remain addressable.
-    let beads = super::workstore::list_issues(&ctx.ledger, &bead_ids)
+    let work_ids = entry_work_ids(&entries);
+    // A work-store outage cannot authorize a control over a condition that only
+    // the work store can prove. Other ledger-backed items remain addressable.
+    let work = super::workstore::list_issues(&ctx.ledger, &work_ids)
         .await
         .unwrap_or_default();
-    decorate_titles(&mut entries, &beads)?;
-    super::attention::project_all(&snapshot, &entries, &beads)
+    decorate_titles(&mut entries, &work)?;
+    super::attention::project_all(&snapshot, &entries, &work)
 }
 
 #[derive(Clone, Copy)]

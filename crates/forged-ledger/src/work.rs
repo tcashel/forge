@@ -768,7 +768,7 @@ impl Ledger {
 
     /// Guarded spec write: inserts revision `expected_revision + 1` iff the
     /// current revision is exactly `expected_revision`, in one transaction.
-    /// A moved revision refuses with `BeadsContention` (recoverable: re-read
+    /// A moved revision refuses with `WorkContention` (recoverable: re-read
     /// and re-decide).
     pub fn update_work_spec(
         &self,
@@ -783,7 +783,7 @@ impl Ledger {
             let current = require_snapshot_tx(&tx, &work_id)?;
             if current.revision != expected_revision {
                 return Err(refused(
-                    ErrorCode::BeadsContention,
+                    ErrorCode::WorkContention,
                     format!(
                         "work item {work_id:?} revision moved: expected {expected_revision}, \
                          current {}",
@@ -922,13 +922,13 @@ impl Ledger {
                 Some(current) if current == holder => {}
                 Some(current) => {
                     return Err(refused(
-                        ErrorCode::BeadLeaseHeld,
+                        ErrorCode::WorkLeaseHeld,
                         format!("work item {work_id:?} is held by {current:?}, not {holder:?}"),
                     ));
                 }
                 None => {
                     return Err(refused(
-                        ErrorCode::BeadLeaseHeld,
+                        ErrorCode::WorkLeaseHeld,
                         format!("work item {work_id:?} is unheld; expected holder {holder:?}"),
                     ));
                 }
@@ -953,7 +953,7 @@ impl Ledger {
     /// Idempotently clear custody (and the lease) under the actor CAS,
     /// status untouched — the bd-era guarded release, closed items included
     /// (recovery of older already-closed state). Unheld is an idempotent
-    /// no-op; a different holder refuses with `BeadLeaseHeld`.
+    /// no-op; a different holder refuses with `WorkLeaseHeld`.
     pub fn release_work_item(
         &self,
         work_id: &str,
@@ -971,7 +971,7 @@ impl Ledger {
                 }
                 Some(holder) if holder != actor => {
                     return Err(refused(
-                        ErrorCode::BeadLeaseHeld,
+                        ErrorCode::WorkLeaseHeld,
                         format!("work item {work_id:?} is held by {holder:?}, not {actor:?}"),
                     ));
                 }
@@ -999,7 +999,7 @@ impl Ledger {
     /// (cancelled/superseded). REFUSES on a closed item — the preserved
     /// adjudicated guard: terminal run settlement must never reopen a
     /// hand-closed item. Unheld and already at the target status is an
-    /// idempotent no-op; a different holder refuses with `BeadLeaseHeld`.
+    /// idempotent no-op; a different holder refuses with `WorkLeaseHeld`.
     pub fn release_unresolved_work_item(
         &self,
         work_id: &str,
@@ -1033,7 +1033,7 @@ impl Ledger {
                 None => {}
                 Some(holder) if holder != actor => {
                     return Err(refused(
-                        ErrorCode::BeadLeaseHeld,
+                        ErrorCode::WorkLeaseHeld,
                         format!("work item {work_id:?} is held by {holder:?}, not {actor:?}"),
                     ));
                 }
@@ -1106,7 +1106,7 @@ impl Ledger {
             let current = require_snapshot_tx(&tx, &work_id)?;
             if current.revision != expected_revision {
                 return Err(refused(
-                    ErrorCode::BeadsContention,
+                    ErrorCode::WorkContention,
                     format!(
                         "work item {work_id:?} revision moved: expected {expected_revision}, \
                          current {}",
@@ -1179,13 +1179,13 @@ impl Ledger {
             let before = require_snapshot_tx(&tx, &work_id)?;
             if let Some(current) = &before.assignee {
                 return Err(refused(
-                    ErrorCode::BeadsContention,
+                    ErrorCode::WorkContention,
                     format!("work item {work_id:?} is already held by {current:?}"),
                 ));
             }
             if before.status != expected_status {
                 return Err(refused(
-                    ErrorCode::BeadsContention,
+                    ErrorCode::WorkContention,
                     format!(
                         "work item {work_id:?} is {}, not the pinned {}",
                         before.status.as_str(),
@@ -1600,7 +1600,7 @@ mod tests {
         let err = l
             .update_work_spec("beads-cas", 1, spec("v2-race"), WorkRevisionCause::Authored)
             .unwrap_err();
-        assert_eq!(err.code(), ErrorCode::BeadsContention);
+        assert_eq!(err.code(), ErrorCode::WorkContention);
         assert_eq!(l.work_item("beads-cas").unwrap().unwrap().revision, 2);
 
         // The pinned revision dereferences to its exact bytes.
@@ -1687,7 +1687,7 @@ mod tests {
         l.assign_unassigned_work_item("beads-held", "mine", WorkStatus::Open)
             .unwrap();
         let err = l.close_held_work_item("beads-held", "thief").unwrap_err();
-        assert_eq!(err.code(), ErrorCode::BeadLeaseHeld);
+        assert_eq!(err.code(), ErrorCode::WorkLeaseHeld);
         let closed = l.close_held_work_item("beads-held", "mine").unwrap();
         assert_eq!(closed.status, WorkStatus::Closed);
         assert_eq!(closed.assignee, None);
@@ -1699,7 +1699,7 @@ mod tests {
         l.create_work_item(item("beads-unheld", WorkStatus::Open))
             .unwrap();
         let err = l.close_held_work_item("beads-unheld", "mine").unwrap_err();
-        assert_eq!(err.code(), ErrorCode::BeadLeaseHeld);
+        assert_eq!(err.code(), ErrorCode::WorkLeaseHeld);
     }
 
     #[test]
@@ -1715,7 +1715,7 @@ mod tests {
         let err = l
             .assign_unassigned_work_item("beads-res", "other", WorkStatus::Blocked)
             .unwrap_err();
-        assert_eq!(err.code(), ErrorCode::BeadsContention);
+        assert_eq!(err.code(), ErrorCode::WorkContention);
     }
 
     #[test]

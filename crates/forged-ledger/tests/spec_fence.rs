@@ -1,8 +1,8 @@
 //! The spec fence: a packet is pinned to the bytes its seats read — the
-//! rendered bead body, or a file's content hash on the deprecated route —
+//! rendered work body, or a file's content hash on the deprecated route —
 //! and the three halves of the contract that fence has to keep at once. An
 //! open packet refuses a seat once the BODY moves; a re-open re-pins it so
-//! the run recovers; and a bead revision that moved with no change to the
+//! the run recovers; and a work revision that moved with no change to the
 //! body claims anyway, because bd's revision is a write token that forged's
 //! own lease claim moves before every resume.
 
@@ -22,7 +22,7 @@ fn run(ledger: &Ledger, id: &str) -> String {
     ledger
         .create_run(NewRun {
             run_id: RunId::new(id).expect("valid run id"),
-            bead_id: "bead-1".to_owned(),
+            work_id: "bead-1".to_owned(),
             repo: "/repo".to_owned(),
             base_ref: "main".to_owned(),
             branch: format!("forged/{id}"),
@@ -56,7 +56,7 @@ fn observed(revision: &str, body_sha256: &str) -> SpecFence {
 }
 
 #[test]
-fn a_packet_open_against_one_body_refuses_a_seat_once_the_bead_is_edited() {
+fn a_packet_open_against_one_body_refuses_a_seat_once_the_work_is_edited() {
     let dir = tempfile::tempdir().expect("tempdir");
     let ledger = ledger(&dir);
     let run_id = run(&ledger, "run-pinned");
@@ -64,7 +64,7 @@ fn a_packet_open_against_one_body_refuses_a_seat_once_the_bead_is_edited() {
         .open_packet(packet_at(&run_id, REVISION_N, BODY))
         .expect("open packet");
 
-    // The bead still renders the pinned body: the seat claims.
+    // The work still renders the pinned body: the seat claims.
     let claimed = ledger
         .claim_packet(&packet, "claude:seat:1", &observed(REVISION_N, BODY))
         .expect("claim at the pinned body");
@@ -72,7 +72,7 @@ fn a_packet_open_against_one_body_refuses_a_seat_once_the_bead_is_edited() {
         .fail_packet(&packet, &claimed.claim_token, "transport: reopened")
         .expect("release the packet for a re-claim");
 
-    // The bead is EDITED under the still-open packet: refused, exactly as
+    // The work is EDITED under the still-open packet: refused, exactly as
     // the hash check refuses a file edited under a running packet.
     let err = ledger
         .claim_packet(
@@ -95,7 +95,7 @@ fn a_revision_that_moved_without_the_body_claims_and_re_pins_the_row() {
         .expect("open packet");
 
     // Crash resume: the reclaim and the re-claim of the run's bd lease both
-    // WRITE the bead, so the revision has moved by the time the resuming
+    // WRITE the work, so the revision has moved by the time the resuming
     // worker re-reads it — with not one byte of the spec changed. Fencing on
     // the token here would refuse the run its own resume, forever, because
     // the old revision never comes back.
@@ -206,13 +206,13 @@ fn the_fence_arms_are_not_interchangeable() {
     let dir = tempfile::tempdir().expect("tempdir");
     let ledger = ledger(&dir);
     let run_id = run(&ledger, "run-arms");
-    let bead = ledger
+    let work = ledger
         .open_packet(packet_at(&run_id, REVISION_N, BODY))
         .expect("open bead-sourced packet");
-    // A bead-sourced packet is never claimable by presenting a hash, even
+    // A work-sourced packet is never claimable by presenting a hash, even
     // one equal to the row's own spec_sha256.
     let err = ledger
-        .claim_packet(&bead, "claude:seat:1", &SpecFence::Sha256(BODY.to_owned()))
+        .claim_packet(&work, "claude:seat:1", &SpecFence::Sha256(BODY.to_owned()))
         .expect_err("a hash must not satisfy a bead fence");
     assert_eq!(err.code(), ErrorCode::SpecDrift);
 

@@ -7,7 +7,7 @@ active alternate execution path.
 ## 0. Keep the lead-agent UX; colocate it with Forged
 
 One user-facing lead agent is the right front door. It plans, critiques, and
-adjudicates. Beads is the durable specification and work graph. Forged owns
+adjudicates. The work store is the durable specification and work graph. Forged owns
 execution packages, providers, attempts, gates, review, recovery, and results.
 Herdr is process transport; GitHub is delivery truth.
 
@@ -16,9 +16,9 @@ same thin dual-host adapter beside the binary for its next containing release,
 so normal installation no longer depends on another repository. Smithy history
 remains evidence, not runtime authority.
 
-## 1. The Bead specification is the sole instruction
+## 1. The work item specification is the sole instruction
 
-The implementing seat receives the Bead title plus its native `description`,
+The implementing seat receives the work item title plus its native `description`,
 `design`, `acceptance_criteria`, and `notes`. It does not receive the planning
 conversation. Anything needed to implement safely must be in those fields.
 `metadata.repository` identifies the repository whose cited paths were
@@ -49,8 +49,8 @@ plugin initiates the typed handoff and does not duplicate GitHub state.
 ## 5. Structured critique output is a planning contract
 
 Critics emit one `forged-spec-critique` block. Synthesis emits one
-`forged-spec-recommendations` block and persists it as a tagged Bead comment.
-Adjudication reads that durable comment, applies accepted edits to native Bead
+`forged-spec-recommendations` block and persists it as a tagged work item comment.
+Adjudication reads that durable comment, applies accepted edits to native work item
 fields, and records a concise decision log in notes. Legacy
 `anvil-spec-recommendations` comments may be read during migration.
 
@@ -63,22 +63,22 @@ inventing its own identity or retry policy.
 
 ## 7. Operator state stays out of target repositories
 
-All Beads and Forged state lives under explicit `$BEADS_DIR` and
-`$ANVIL_HOME`. Planning never routes issue creation to a repository, never
+All work and Forged state lives under explicit operator state roots. Planning
+never routes issue creation to a repository, never
 initializes from the target checkout, and never commits `.beads`, agent
 settings, or spec files.
 Worktrees are disposable; the operator store is not.
 
 ## 8. Headless gates cannot depend on interactive authentication
 
-Every quality gate in a Bead must be runnable without a signing prompt, login
+Every quality gate in a work item must be runnable without a signing prompt, login
 dialog, or unlocked desktop session. A command that can block indefinitely is
 not an unattended gate. Provider and GitHub authentication are verified before
 submission, not smuggled into repository tests.
 
 ## 9. Open questions are a readiness gate
 
-Unresolved product decisions remain explicit and the Bead stays blocked.
+Unresolved product decisions remain explicit and the work item stays blocked.
 Adjudication may move it to `open` only after the native fields contain every
 resolution and scheduling dependencies are satisfied. `bd ready` derives the
 frontier; neither the plugin nor Forged guesses around it.
@@ -101,7 +101,7 @@ roster, not to the planning plugin.
 
 An epic plans the goal, cut lines, seam contracts, waves, and checkable
 assumptions up front. Only the current frontier receives a complete executable
-spec. Downstream children remain native Beads in `blocked` state with explicit
+spec. Downstream children remain native work items in `blocked` state with explicit
 assumptions. After upstream integration, the lead verifies reality, expands
 the native fields, critiques, adjudicates, and opens the next frontier.
 

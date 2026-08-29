@@ -60,12 +60,12 @@ impl ControlPlaneFixture {
         self.repository_b.repo.to_string_lossy().into_owned()
     }
 
-    fn create_run(&self, run_id: &str, bead_id: &str, repository: &str) {
+    fn create_run(&self, run_id: &str, work_id: &str, repository: &str) {
         let ledger = self.env.ledger();
         ledger
             .create_run(forged_ledger::NewRun {
                 run_id: forged_types::RunId::new(run_id).expect("run id"),
-                bead_id: bead_id.to_owned(),
+                work_id: work_id.to_owned(),
                 repo: repository.to_owned(),
                 base_ref: "main".to_owned(),
                 branch: format!("work/{run_id}"),
@@ -86,7 +86,7 @@ impl ControlPlaneFixture {
             schema: "forged.packet/1".to_owned(),
             packet_id: packet_id.clone(),
             run_id: run_id.to_owned(),
-            bead_id: format!("bead-{run_id}"),
+            work_id: format!("bead-{run_id}"),
             stage: forged_types::Stage::Implement,
             execution: None,
             lane_seq: None,
@@ -139,7 +139,7 @@ impl ControlPlaneFixture {
     fn seed(&self) {
         let repository_a = self.repository_a();
         let repository_b = self.repository_b();
-        for (bead, repository, status) in [
+        for (work, repository, status) in [
             ("bead-run-a", repository_a.as_str(), "in_progress"),
             ("bead-run-b", repository_b.as_str(), "closed"),
             ("bead-review-ready", repository_a.as_str(), "in_progress"),
@@ -147,12 +147,12 @@ impl ControlPlaneFixture {
             ("plan-b", repository_b.as_str(), "open"),
         ] {
             self.env
-                .set_bead_field(bead, "title", "Duplicate operator title");
-            self.env.set_bead_field(bead, "status", status);
-            self.env.set_bead_repository(bead, repository);
+                .set_work_field(work, "title", "Duplicate operator title");
+            self.env.set_work_field(work, "status", status);
+            self.env.set_work_repository(work, repository);
         }
-        self.env.set_bead_field("plan-a", "priority", "1");
-        self.env.set_bead_field("plan-b", "priority", "1");
+        self.env.set_work_field("plan-a", "priority", "1");
+        self.env.set_work_field("plan-b", "priority", "1");
 
         self.create_run("run-a", "bead-run-a", &repository_a);
         self.create_run("run-b", "bead-run-b", &repository_b);

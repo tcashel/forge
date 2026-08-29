@@ -28,7 +28,7 @@ pub(crate) fn run_row(row: &rusqlite::Row<'_>) -> Result<RunRow, rusqlite::Error
     let state = row.get::<_, String>(6)?;
     Ok(RunRow {
         run_id: row.get(0)?,
-        bead_id: row.get(1)?,
+        work_id: row.get(1)?,
         repo: row.get(2)?,
         base_ref: row.get(3)?,
         branch: row.get(4)?,
@@ -276,7 +276,7 @@ fn insert_run(
          created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?6)",
         rusqlite::params![
             run_id,
-            new_run.bead_id,
+            new_run.work_id,
             new_run.repo,
             new_run.base_ref,
             new_run.branch,
@@ -556,7 +556,7 @@ impl Ledger {
             if identity.source != WorkIdentitySource::Durable
                 || identity.subject.kind != WorkIdentitySubjectKind::Run
                 || identity.subject.id != new_run.run_id.as_str()
-                || identity.bead.id != new_run.bead_id
+                || identity.work.id != new_run.work_id
             {
                 return Err(refused(
                     ErrorCode::InvalidRequest,
@@ -585,12 +585,12 @@ impl Ledger {
                 || spec_event
                     .get("beadTitle")
                     .and_then(serde_json::Value::as_str)
-                    != identity.bead.title.as_deref()
+                    != identity.work.title.as_deref()
                 || spec_event
                     .get("beadId")
                     .and_then(serde_json::Value::as_str)
-                    .is_some_and(|value| value != identity.bead.id)
-                || event_revision(spec_event.get("beadRevision")) != identity.bead.revision
+                    .is_some_and(|value| value != identity.work.id)
+                || event_revision(spec_event.get("beadRevision")) != identity.work.revision
                 || spec_event
                     .get("repo")
                     .and_then(serde_json::Value::as_str)
@@ -653,7 +653,7 @@ impl Ledger {
                 tx.query_row(&sql, [run_id], run_row).optional()?
             };
             if let Some(row) = existing {
-                let immutable_run_matches = row.bead_id == new_run.bead_id
+                let immutable_run_matches = row.work_id == new_run.work_id
                     && row.repo == new_run.repo
                     && row.base_ref == new_run.base_ref
                     && row.branch == new_run.branch;

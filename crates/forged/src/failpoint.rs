@@ -31,7 +31,7 @@
 //! boundary: GitHub accepted the integration merge, but the operation and
 //! epic journal have not yet been completed.
 //! `epic.plan.apply.after-beads` is the rolling planner's corresponding
-//! boundary: the guarded four-field Beads write and exact readback succeeded,
+//! boundary: the guarded four-field work write and exact readback succeeded,
 //! but the SafeRetry operation and epic plan-applied event are not yet sealed.
 //! `controller.record.after` is the handoff equivalent: the detached
 //! controller identity is on disk, but its event and operation response are
@@ -52,7 +52,7 @@
 //! `run.start.bundle.after` and `epic.start.bundle.after` sit after the
 //! creation record, compatibility event, and WorkIdentityV1 commit in one
 //! transaction but before the operation response is settled; replay must use
-//! the durable bundle without consulting Beads again.
+//! the durable bundle without consulting current work again.
 //! `review.publish.probe.before` and `review.publish.probe.after` bracket the
 //! exact-marker observation. `review.publish.post.before` is after uncertain
 //! intent is durable but before GitHub is called; `review.publish.post.after`
@@ -61,7 +61,7 @@
 //! read and any append or charge; `bead-settlement.charge.after` is after the
 //! durable budget charge and before the bd mutation;
 //! `bead-settlement.landed-custody.after` is between the landed retry's
-//! guarded claim of an unassigned bead and its held close; and
+//! guarded claim of an unassigned work and its held close; and
 //! `bead-settlement.mutate.after` is the response-lost seam after the bd
 //! write and before `run.bead-settlement.succeeded` lands.
 //! `mcp.ledger.open.before` sits between the MCP gate's existence precheck
@@ -78,8 +78,8 @@
 //! is the contract and which no external condition can provoke:
 //! `host.fallback.record` is the ledger write that makes a preferred-Herdr
 //! fallback visible, sitting post-claim and pre-spawn where nothing may
-//! propagate over a `running` attempt row. The bead settlement pass fences
-//! every exit after a successful per-run claim — `bead-settlement
+//! propagate over a `running` attempt row. The work settlement pass fences
+//! every exit after a successful per-run claim — `work-settlement
 //! .wake-deadline`, `.mutation-lease-deadline`, `.charge`, `.get-run`,
 //! `.mutation`, `.append-succeeded`, and `.append-pending` — because each
 //! must release the claim token on failure rather than leave the run

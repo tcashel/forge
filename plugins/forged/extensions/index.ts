@@ -63,7 +63,7 @@ export default function forgedPiExtension(pi: ExtensionAPI): void {
     name: "forged_overview",
     label: "Forge Overview",
     description:
-      "Read the bounded authoritative Forge queue: Beads plans plus durable Forged work, attention, health, and spend. This tool is read-only.",
+      "Read the bounded authoritative Forge queue: work plans plus durable Forged execution, attention, health, and spend. This tool is read-only.",
     promptSnippet: "Inspect the Forge portfolio, queue, source health, attention, and spend",
     promptGuidelines: [
       "Use forged_overview before selecting Forge work; never infer a mutation target from a title alone.",
@@ -167,13 +167,13 @@ export default function forgedPiExtension(pi: ExtensionAPI): void {
     name: "forged_submit",
     label: "Submit to Forge",
     description:
-      "After explicit operator approval, freeze and submit one ready native Bead slice or epic to the detached Forged controller. Performs exactly start then submit and never merges.",
+      "After explicit operator approval, freeze and submit one ready native work slice or epic to the detached Forged controller. Performs exactly start then submit and never merges.",
     promptGuidelines: [
       "Call forged_submit only after the shared Forge skill has presented and received explicit approval for the exact subject, repository, base, profile, and roster.",
     ],
     parameters: Type.Object({
       kind: SubmitKind,
-      id: Type.String({ minLength: 1, description: "Bead id for a slice or epic id" }),
+      id: Type.String({ minLength: 1, description: "Work id for a slice or epic id" }),
       repository: Type.String({ minLength: 1, description: "Canonical absolute repository path" }),
       profile: Type.Optional(Type.String({ default: "standard" })),
       roster: Type.Optional(Type.String({ default: "default" })),
@@ -182,7 +182,7 @@ export default function forgedPiExtension(pi: ExtensionAPI): void {
     }),
     async execute(_id, params, signal) {
       const startArgs = params.kind === "slice"
-        ? ["run", "start", "--bead", params.id, "--repo", params.repository]
+        ? ["run", "start", "--work", params.id, "--repo", params.repository]
         : ["epic", "start", "--epic", params.id, "--repo", params.repository];
       addOptional(startArgs, "--profile", params.profile ?? "standard");
       addOptional(startArgs, "--roster", params.roster ?? "default");
@@ -328,17 +328,17 @@ export default function forgedPiExtension(pi: ExtensionAPI): void {
     name: "forged_critic",
     label: "Forge Spec Critic",
     description:
-      "Run the shared Forge critic as an isolated read-only Pi process against a rendered native Bead specification and repository.",
+      "Run the shared Forge critic as an isolated read-only Pi process against a rendered native work specification and repository.",
     parameters: Type.Object({
-      bead: Type.String({ minLength: 1, description: "Complete rendered native Bead JSON or text" }),
+      work: Type.String({ minLength: 1, description: "Complete rendered native work JSON or text" }),
       repository: Type.String({ minLength: 1, description: "Canonical repository path" }),
       model: Type.Optional(Type.String({ description: "Optional Pi provider/model coordinate" })),
     }),
     async execute(_id, params, signal, onUpdate) {
       const scratch = await mkdtemp(join(tmpdir(), "forged-pi-critic-"));
-      const taskPath = join(scratch, "bead.md");
+      const taskPath = join(scratch, "work.md");
       try {
-        await writeFile(taskPath, params.bead, { encoding: "utf8", mode: 0o600 });
+        await writeFile(taskPath, params.work, { encoding: "utf8", mode: 0o600 });
         const criticPath = join(pluginRoot, "agents", "critic.md");
         const critic = await readFile(criticPath, "utf8");
         const body = critic.replace(/^---\n[\s\S]*?\n---\n/, "");
@@ -357,7 +357,7 @@ export default function forgedPiExtension(pi: ExtensionAPI): void {
           systemPath,
         ];
         if (params.model) args.push("--model", params.model);
-        args.push(`@${taskPath}`, "Critique this complete native Bead against the repository. Return only the required fenced critique block.");
+        args.push(`@${taskPath}`, "Critique this complete native work item against the repository. Return only the required fenced critique block.");
         onUpdate?.({ content: [{ type: "text", text: "Running shared read-only Forge critic…" }] });
         const execution = await pi.exec(process.env.PI_BIN?.trim() || "pi", args, {
           cwd: params.repository,

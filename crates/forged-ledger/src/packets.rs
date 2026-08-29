@@ -65,10 +65,10 @@ impl Ledger {
 
     /// Re-pin an already-open packet's spec, in ONE guarded transaction.
     ///
-    /// The re-pin exists because a bead's spec can be revised under a packet
+    /// The re-pin exists because a work's spec can be revised under a packet
     /// that is already open, and the row must follow. It is deliberately NOT
     /// an operation: an operation fence stores one response per idempotency
-    /// key and replays it, so a bead edited A -> B -> A reproduces the key
+    /// key and replays it, so a work edited A -> B -> A reproduces the key
     /// its first open at A already stored and replays that response over a
     /// row still pinned at B. This `Immediate` transaction is the right
     /// fence — atomic, and re-reading current state on every call rather

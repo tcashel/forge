@@ -1352,7 +1352,7 @@ mod tests {
             schema: "forged.packet/1".to_owned(),
             packet_id: format!("{run_id}/implement/{seq}"),
             run_id: run_id.to_owned(),
-            bead_id: "bead-a".to_owned(),
+            work_id: "bead-a".to_owned(),
             stage: Stage::Implement,
             execution: None,
             lane_seq: None,
@@ -1802,7 +1802,7 @@ mod tests {
         ledger
             .create_run(NewRun {
                 run_id: forged_types::RunId::new(run_id).unwrap(),
-                bead_id: format!("bead-{run_id}"),
+                work_id: format!("bead-{run_id}"),
                 repo: "/repo".to_owned(),
                 base_ref: "main".to_owned(),
                 branch: format!("forged/{run_id}"),

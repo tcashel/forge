@@ -1,6 +1,6 @@
 //! Provider-session inventory integration: bounded historical projection,
 //! canonical filtering, pagination, durable intervention folding, and no
-//! Beads dependency on the read path.
+//! work-store dependency on the read path.
 
 mod support;
 
@@ -18,7 +18,7 @@ fn rows(value: &Value) -> &[Value] {
 fn process_history_is_bounded_filterable_and_independent_of_live_plan() {
     let env = TestEnv::new("forged-provider-session-inventory");
     assert_eq!(env.forged(&["init"]).0, 0);
-    env.seed_bead_spec(
+    env.seed_work_spec(
         "inventory-run",
         "Exercise the durable provider-session inventory.",
         "Every attempt remains diagnosable without a live probe.",
@@ -28,7 +28,7 @@ fn process_history_is_bounded_filterable_and_independent_of_live_plan() {
     let (code, started) = env.forged(&[
         "run",
         "start",
-        "--bead",
+        "--work",
         "inventory-run",
         "--repo",
         &repo,

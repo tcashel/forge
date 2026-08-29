@@ -1,6 +1,6 @@
 # forged lead-agent plugin
 
-**Talk to one agent. Keep the specification in Beads. Manage durable work.**
+**Talk to one agent. Keep the specification in the work store. Manage durable work.**
 
 This Forge-owned plugin is the conversational adapter for the `forged` binary.
 It gives Claude, Codex, and Pi the same eight capabilities through one shared
@@ -15,7 +15,7 @@ target-scoped controls.
 
 - **Lead agent/plugin:** conversation, planning, critique, adjudication,
   portfolio presentation, control authorization, and explicit submission.
-- **Beads:** native specification fields, parent/dependency graph, readiness,
+- **Work store:** native specification fields, parent/dependency graph, readiness,
   statuses, and leases.
 - **Forged:** immutable execution packages, provider dispatch, attempts, gates,
   review/remediation, artifacts, controller recovery, and outcomes.
@@ -25,18 +25,19 @@ target-scoped controls.
 No layer duplicates another's durable state. The plugin never turns host
 conversation or subagent sessions into an execution ledger.
 
-## Beads is the specification
+## Work is the specification
 
-The editable specification is the Bead's `description`, `design`,
-`acceptance_criteria`, and `notes`. Every Bead created by the plugin also has
+The editable specification is the work item's `description`, `design`,
+`acceptance_criteria`, and `notes`. Every work item created by the plugin also has
 `metadata.repository` set to the canonical absolute target-repository root.
 Epic membership uses native parent links. Old operator-owned spec files may be
 read as archival migration input, but the plugin never creates a new parallel
 spec file or treats one as authoritative.
 
-Every `bd` command uses the explicitly resolved `$BEADS_DIR`. The plugin never
-passes repository-routing options to Bead creation, initializes Beads in a
-target repository, or creates a repository-local `.beads` directory.
+The optional legacy importer resolves every `bd` command through the explicit
+`$BEADS_DIR`. Normal planning writes the operator-scoped work store directly;
+the plugin never initializes state in a target repository or creates a
+repository-local `.beads` directory.
 
 ## Install and register
 
@@ -88,12 +89,11 @@ Pi:
 pi install /absolute/prefix/share/forge
 ```
 
-Before setup, provide Beads through `PATH` or `BD_BIN`. Forge `v0.5.0` is
-release-qualified with exact `bd 1.2.1`; upstream `bd 1.2.2` lacks required
-commands and is unsupported. Setup requires the epic and lease command surface,
-then Forge's doctor verifies behavior; version order alone is not compatibility
-evidence. Forge does not install, upgrade, or downgrade Beads, Git, GitHub CLI,
-provider CLIs, credentials, profiles, configuration, or services.
+Beads is needed only for the optional one-shot legacy import. Supply it through
+`PATH` or `BD_BIN`; Forge `v0.5.0` qualifies exact `bd 1.2.1`, while upstream
+`bd 1.2.2` lacks required import commands. Forge does not install, upgrade, or
+downgrade Beads, Git, GitHub CLI, provider CLIs, credentials, profiles,
+configuration, or services.
 
 Use `/forge` for the native terminal cockpit. It presents work queues,
 attention, 30-day usage trends, and provider attempts directly from Forged's
@@ -165,8 +165,8 @@ uses the new immutable binary generation. Managed service lifecycle commands
 are unsupported on Linux.
 
 Then talk normally. Ask the lead agent to explore an idea, plan or revise work,
-critique or adjudicate a Bead, identify what needs attention, explain one run's
-blocker or spend, reprioritize a Bead, or safely pause, resume, or cancel exact
+critique or adjudicate a work item, identify what needs attention, explain one run's
+blocker or spend, reprioritize a work item, or safely pause, resume, or cancel exact
 existing work. It can also prepare one ready subject for explicit execution
 approval. The shared `manage-work` skill routes that intent without requiring a
 command name or machine id.

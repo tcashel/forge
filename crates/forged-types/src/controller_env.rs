@@ -22,7 +22,7 @@ pub const CONTROLLER_ENV: [&str; 5] = [
 /// Operator-state variables that repository gate commands must not observe.
 ///
 /// Gates execute repository-owned code, so inheriting these would run that
-/// code against the operator's forged config and Beads store. Provider
+/// code against the operator's forged config and legacy import store. Provider
 /// children are forged-owned agents and deliberately retain this state.
 pub const OPERATOR_STATE_ENV: [&str; 3] = ["ANVIL_HOME", "FORGED_CONFIG", "BEADS_DIR"];
 

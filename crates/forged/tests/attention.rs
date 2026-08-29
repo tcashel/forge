@@ -352,7 +352,7 @@ fn open_implement_packet(env: &TestEnv, run: &str, seq: i64) -> (String, String)
         schema: "forged.packet/1".to_owned(),
         packet_id: format!("{run}/implement/{seq}"),
         run_id: run.to_owned(),
-        bead_id: format!("bead-{run}"),
+        work_id: format!("bead-{run}"),
         stage: forged_types::Stage::Implement,
         execution: None,
         lane_seq: None,
@@ -1064,13 +1064,13 @@ fn attention_list_groups_decisions_first_and_serves_complete_rail_items() {
 }
 
 #[test]
-fn attention_list_serves_the_plan_only_blocked_bead_exactly_as_the_rail() {
+fn attention_list_serves_the_plan_only_blocked_work_exactly_as_the_rail() {
     let env = TestEnv::new("forged-attention-list-plan-blocked");
     env.forged(&["init"]);
     let repository = env.repos.repo.to_string_lossy().into_owned();
-    env.set_bead_field("plan-blk", "status", "blocked");
-    env.set_bead_field("plan-blk", "title", "Blocked plan-only bead");
-    env.set_bead_repository("plan-blk", &repository);
+    env.set_work_field("plan-blk", "status", "blocked");
+    env.set_work_field("plan-blk", "title", "Blocked plan-only bead");
+    env.set_work_repository("plan-blk", &repository);
 
     let (code, ops) = env.forged(&["operations", "overview"]);
     assert_eq!(code, 0, "{ops}");
@@ -1275,15 +1275,15 @@ fn attention_list_filters_and_bounds_fail_closed() {
 /// fixture's own repository keeps its item, a foreign repository keeps
 /// none, and both answers state their totals. (Run-backed fixture items
 /// carry the fabricated run's repo, so the positively scoped item here is
-/// a plan-only blocked bead whose repository is set explicitly.)
+/// a plan-only blocked work whose repository is set explicitly.)
 #[test]
 fn attention_list_repo_scope_matches_the_durable_item_repository() {
     let env = TestEnv::new("forged-attention-list-repo-scope");
     env.forged(&["init"]);
     let repository = env.repos.repo.to_string_lossy().into_owned();
-    env.set_bead_field("plan-scope", "status", "blocked");
-    env.set_bead_field("plan-scope", "title", "Scoped blocked bead");
-    env.set_bead_repository("plan-scope", &repository);
+    env.set_work_field("plan-scope", "status", "blocked");
+    env.set_work_field("plan-scope", "title", "Scoped blocked bead");
+    env.set_work_repository("plan-scope", &repository);
     let listed = attention_list(&env, &["--repo", &repository]);
     assert_eq!(listed["totals"]["total"], json!(1), "{listed}");
     assert_eq!(

@@ -8,11 +8,11 @@ use serde_json::json;
 use support::{fabricate_run, git, TestEnv};
 
 fn seed(env: &TestEnv, run: &str) -> String {
-    let bead = format!("bead-{run}");
+    let work = format!("bead-{run}");
     fabricate_run(env, run);
-    env.set_bead_field(&bead, "status", "in_progress");
-    env.set_assignee(&bead, &format!("forged:{bead}:0"));
-    bead
+    env.set_work_field(&work, "status", "in_progress");
+    env.set_assignee(&work, &format!("forged:{work}:0"));
+    work
 }
 
 #[test]
@@ -20,7 +20,7 @@ fn landed_closes_releases_and_retires_with_exact_evidence() {
     let env = TestEnv::new("forged-run-landed");
     env.forged(&["init"]);
     let run = "landed-run";
-    let bead = seed(&env, run);
+    let work = seed(&env, run);
     let sha = "a".repeat(40);
     let worktree = env.worktree(run);
     std::fs::create_dir_all(worktree.parent().expect("run dir")).expect("run dir");
@@ -64,7 +64,7 @@ fn landed_closes_releases_and_retires_with_exact_evidence() {
         !worktree.exists(),
         "a clean squash-merged branch retires without requiring ancestry"
     );
-    assert_eq!(env.assignee(&bead), None);
+    assert_eq!(env.assignee(&work), None);
     let ledger = env.ledger();
     let closes: Vec<serde_json::Value> = ledger
         .list_events(None, 0, 65_536)
@@ -73,7 +73,7 @@ fn landed_closes_releases_and_retires_with_exact_evidence() {
         .filter(|event| event.kind == "work.updated")
         .map(|event| serde_json::from_str::<serde_json::Value>(&event.payload_json).unwrap())
         .filter(|payload| {
-            payload["workId"] == json!(bead) && payload["status"]["to"] == json!("closed")
+            payload["workId"] == json!(work) && payload["status"]["to"] == json!("closed")
         })
         .collect();
     assert_eq!(closes.len(), 1, "one guarded close: {closes:?}");
@@ -82,9 +82,9 @@ fn landed_closes_releases_and_retires_with_exact_evidence() {
         json!("close-held"),
         "landed close must use the holder-guarded CAS, never an unguarded close: {closes:?}"
     );
-    assert_eq!(closes[0]["actor"], json!(format!("forged:{bead}:0")));
+    assert_eq!(closes[0]["actor"], json!(format!("forged:{work}:0")));
     let item = ledger
-        .work_item(&bead)
+        .work_item(&work)
         .expect("work item read")
         .expect("the bead exists");
     assert_eq!(item.status, forged_ledger::WorkStatus::Closed);
@@ -144,13 +144,13 @@ fn landed_predecessor_leaves_successor_ownership_unchanged_and_visible() {
     let env = TestEnv::new("forged-run-landed-successor");
     env.forged(&["init"]);
     let run = "landed-predecessor";
-    let bead = seed(&env, run);
+    let work = seed(&env, run);
     let successor = "forged:successor:0";
-    let revision_before = env.bead_revision(&bead);
+    let revision_before = env.work_revision(&work);
     // The competing claim is constructed BEFORE the stop — the transactional
     // store has no mid-CAS window. The close refuses under the holder CAS
     // and the settlement pends.
-    env.set_assignee(&bead, successor);
+    env.set_assignee(&work, successor);
     let sha = "b".repeat(40);
 
     let (code, response) = env.forged(&[
@@ -171,10 +171,10 @@ fn landed_predecessor_leaves_successor_ownership_unchanged_and_visible() {
     assert_eq!(response["ok"], json!(true), "{response}");
     assert_eq!(response["result"]["bead"]["pending"], json!(true));
     assert_eq!(response["result"]["bead"]["settled"], json!(false));
-    assert_eq!(env.assignee(&bead).as_deref(), Some(successor));
+    assert_eq!(env.assignee(&work).as_deref(), Some(successor));
     let ledger = env.ledger();
     let item = ledger
-        .work_item(&bead)
+        .work_item(&work)
         .expect("work item read")
         .expect("the bead exists");
     assert_eq!(
@@ -188,7 +188,7 @@ fn landed_predecessor_leaves_successor_ownership_unchanged_and_visible() {
         .into_iter()
         .filter(|event| event.kind == "work.updated")
         .map(|event| serde_json::from_str::<serde_json::Value>(&event.payload_json).unwrap())
-        .filter(|payload| payload["workId"] == json!(bead))
+        .filter(|payload| payload["workId"] == json!(work))
         .collect();
     ledger.close().expect("close");
     assert!(
@@ -197,7 +197,7 @@ fn landed_predecessor_leaves_successor_ownership_unchanged_and_visible() {
          unguarded close, no settlement note mutation: {work_writes:?}"
     );
     assert_eq!(
-        env.bead_revision(&bead),
+        env.work_revision(&work),
         revision_before,
         "coordination refusals never move the revision"
     );
@@ -210,15 +210,15 @@ fn landed_predecessor_leaves_successor_ownership_unchanged_and_visible() {
         .expect("visible pending settlement event");
     let payload: serde_json::Value =
         serde_json::from_str(&pending.payload_json).expect("pending payload");
-    assert_eq!(payload["beadId"], json!(bead));
+    assert_eq!(payload["beadId"], json!(work));
     assert_eq!(payload["outcome"], json!("landed"));
     assert_eq!(
         payload["expectedAssignee"],
-        json!(format!("forged:{bead}:0"))
+        json!(format!("forged:{work}:0"))
     );
     assert_eq!(
         payload["observedHolder"],
-        json!(format!("forged:{bead}:0")),
+        json!(format!("forged:{work}:0")),
         "run stop records the lease holder in force at pend time"
     );
     assert!(
@@ -271,7 +271,7 @@ fn landed_predecessor_leaves_successor_ownership_unchanged_and_visible() {
         writes_before_replay,
         "replay fires no work write"
     );
-    assert_eq!(env.assignee(&bead).as_deref(), Some(successor));
+    assert_eq!(env.assignee(&work).as_deref(), Some(successor));
 }
 
 #[test]
@@ -279,7 +279,7 @@ fn unresolved_outcomes_release_without_false_completion() {
     let env = TestEnv::new("forged-run-blocked");
     env.forged(&["init"]);
     let run = "blocked-run";
-    let bead = seed(&env, run);
+    let work = seed(&env, run);
 
     let (code, response) = env.forged(&[
         "run",
@@ -295,7 +295,7 @@ fn unresolved_outcomes_release_without_false_completion() {
     assert_eq!(response["result"]["bead"]["status"], json!("blocked"));
     assert_eq!(response["result"]["bead"]["released"], json!(true));
     assert_eq!(response["result"]["worktreeRetired"], json!(false));
-    assert_eq!(env.assignee(&bead), None);
+    assert_eq!(env.assignee(&work), None);
 
     let ledger = env.ledger();
     let row = ledger.get_run(run).expect("run");
@@ -311,7 +311,7 @@ fn unresolved_outcomes_release_without_false_completion() {
 }
 
 #[test]
-fn status_flags_an_orphaned_in_progress_bead() {
+fn status_flags_an_orphaned_in_progress_work() {
     let env = TestEnv::new("forged-run-stale-claim");
     env.forged(&["init"]);
     let run = "stale-run";
@@ -356,7 +356,7 @@ fn clean_candidate_claim_is_awaiting_delivery_not_stale() {
     assert!(
         health["detail"]
             .as_str()
-            .is_some_and(|detail| detail.contains("retains its Beads claim")),
+            .is_some_and(|detail| detail.contains("retains its work claim")),
         "{response}"
     );
 }
@@ -377,7 +377,7 @@ fn settlement_refreshes_siblings_after_whole_run_deadline_reconciliation() {
             schema: "forged.packet/1".to_owned(),
             packet_id: packet_id.clone(),
             run_id: run.to_owned(),
-            bead_id: format!("bead-{run}"),
+            work_id: format!("bead-{run}"),
             stage: forged_types::Stage::Implement,
             execution: None,
             lane_seq: None,
