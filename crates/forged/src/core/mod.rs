@@ -137,7 +137,7 @@ impl From<ProtoError> for Failure {
             ProtoError::Port {
                 source: PortError::Gh(message),
                 ..
-            } => Failure::refused(ErrorCode::GhError, message),
+            } => gh_failure(message),
             other => Failure::internal(other.to_string()),
         }
     }
@@ -146,7 +146,7 @@ impl From<ProtoError> for Failure {
 impl From<PortError> for Failure {
     fn from(err: PortError) -> Self {
         match err {
-            PortError::Gh(message) => Failure::refused(ErrorCode::GhError, message),
+            PortError::Gh(message) => gh_failure(message),
             other => Failure::internal(other.to_string()),
         }
     }
@@ -163,27 +163,262 @@ impl From<forged_beads::BdError> for Failure {
     }
 }
 
+fn contains_any(message: &str, patterns: &[&str]) -> bool {
+    patterns.iter().any(|pattern| message.contains(pattern))
+}
+
+fn contains_status_in(message: &str, statuses: std::ops::RangeInclusive<u16>) -> bool {
+    let mut previous = ["", ""];
+    for token in message.split(|character: char| !character.is_ascii_alphanumeric()) {
+        if !token.is_empty()
+            && previous.iter().any(|context| {
+                matches!(
+                    *context,
+                    "http" | "status" | "code" | "response" | "returned"
+                )
+            })
+            && token
+                .parse::<u16>()
+                .is_ok_and(|status| statuses.contains(&status))
+        {
+            return true;
+        }
+        if !token.is_empty() {
+            previous = [previous[1], token];
+        }
+    }
+    false
+}
+
+fn transient_io(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::HostUnreachable
+            | std::io::ErrorKind::Interrupted
+            | std::io::ErrorKind::NetworkUnreachable
+            | std::io::ErrorKind::NotConnected
+            | std::io::ErrorKind::ResourceBusy
+            | std::io::ErrorKind::TimedOut
+            | std::io::ErrorKind::UnexpectedEof
+            | std::io::ErrorKind::WouldBlock
+    )
+}
+
+fn transport_message_recoverable(message: &str) -> bool {
+    contains_status_in(message, 500..=599)
+        || contains_any(
+            message,
+            &[
+                "bad gateway",
+                "connection aborted",
+                "connection closed",
+                "connection refused",
+                "connection reset",
+                "context deadline exceeded",
+                "could not resolve host",
+                "dns lookup",
+                "dns resolution",
+                "error connecting",
+                "failed to connect",
+                "gateway timeout",
+                "http/2 stream",
+                "i/o timeout",
+                "internal server error",
+                "internet connection",
+                "name or service not known",
+                "network is unreachable",
+                "network unreachable",
+                "no route to host",
+                "no such host",
+                "operation timed out",
+                "request timed out",
+                "service unavailable",
+                "ssl_error_syscall",
+                "ssl handshake",
+                "temporary failure in name resolution",
+                "timed out",
+                "timeout",
+                "tls connection",
+                "tls handshake",
+                "unexpected eof",
+            ],
+        )
+}
+
+fn gh_message_recoverable(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    if contains_status_in(&message, 429..=429)
+        || contains_any(&message, &["rate limit", "too many requests"])
+    {
+        return true;
+    }
+    if contains_status_in(&message, 401..=401)
+        || contains_status_in(&message, 403..=404)
+        || contains_status_in(&message, 422..=422)
+        || contains_any(
+            &message,
+            &[
+                "authentication",
+                "authorization",
+                "forbidden",
+                "invalid request",
+                "invalid value",
+                "permission denied",
+                "repository not found",
+                "resource not found",
+                "unauthorized",
+                "unprocessable entity",
+                "validation error",
+                "validation failed",
+            ],
+        )
+    {
+        return false;
+    }
+    transport_message_recoverable(&message)
+}
+
+fn gh_error_recoverable(error: &forged_git::GhError) -> bool {
+    match error {
+        forged_git::GhError::Exec {
+            status: Some(4), ..
+        }
+        | forged_git::GhError::Json { .. }
+        | forged_git::GhError::NotFound
+        | forged_git::GhError::Auth => false,
+        forged_git::GhError::Exec { stderr, .. } => gh_message_recoverable(stderr),
+    }
+}
+
+fn git_error_recoverable(error: &forged_git::GitError) -> bool {
+    match error {
+        forged_git::GitError::Gh(error) => gh_error_recoverable(error),
+        forged_git::GitError::Exec { stderr, .. } => {
+            let message = stderr.to_ascii_lowercase();
+            if contains_status_in(&message, 401..=404)
+                || contains_status_in(&message, 422..=422)
+                || contains_any(
+                    &message,
+                    &[
+                        "[rejected]",
+                        "access denied",
+                        "authentication failed",
+                        "base branch not found",
+                        "base sha mismatch",
+                        "conflict",
+                        "could not read username",
+                        "fetch first",
+                        "non-fast-forward",
+                        "permission denied",
+                        "pr base mismatch",
+                        "remote rejected",
+                        "repository not found",
+                        "src refspec",
+                        "stale info",
+                    ],
+                )
+            {
+                return false;
+            }
+            transport_message_recoverable(&message)
+                || contains_any(
+                    &message,
+                    &[
+                        "could not read from remote repository",
+                        "early eof",
+                        "remote end hung up unexpectedly",
+                        "rpc failed",
+                    ],
+                )
+        }
+        forged_git::GitError::Io(error) => transient_io(error),
+        forged_git::GitError::WorktreeExists { .. }
+        | forged_git::GitError::WorktreeDirty { .. }
+        | forged_git::GitError::WorktreeUnresolved { .. }
+        | forged_git::GitError::BaseNotFound { .. }
+        | forged_git::GitError::BaseShaMismatch { .. }
+        | forged_git::GitError::PrBaseMismatch { .. }
+        | forged_git::GitError::DefaultBranchForbidden { .. }
+        | forged_git::GitError::PrNotMergeable { .. }
+        | forged_git::GitError::InvalidRunId(_)
+        | forged_git::GitError::InvalidPath { .. } => false,
+    }
+}
+
+fn gate_error_recoverable(error: &forged_gate::GateError) -> bool {
+    match error {
+        forged_gate::GateError::Spawn { source, .. } => transient_io(source),
+        forged_gate::GateError::Io(_) => true,
+        forged_gate::GateError::InvalidRequest { .. }
+        | forged_gate::GateError::ArtifactsDir { .. } => false,
+    }
+}
+
+fn provider_error_recoverable(error: &forged_provider::ProviderError) -> bool {
+    match error {
+        forged_provider::ProviderError::Io(error) => transient_io(error),
+        forged_provider::ProviderError::UnsafePath { .. }
+        | forged_provider::ProviderError::UnsafeShellLine { .. }
+        | forged_provider::ProviderError::UnsupportedEffort { .. }
+        | forged_provider::ProviderError::Malformed { .. }
+        | forged_provider::ProviderError::RolloutNotFound { .. } => false,
+    }
+}
+
+fn gh_failure(message: String) -> Failure {
+    let recoverable = gh_message_recoverable(&message);
+    Failure {
+        code: ErrorCode::GhError,
+        message,
+        recoverable,
+    }
+}
+
 impl From<forged_git::GitError> for Failure {
     fn from(err: forged_git::GitError) -> Self {
-        Failure::refused(err.code(), err.to_string())
+        let recoverable = git_error_recoverable(&err);
+        Failure {
+            code: err.code(),
+            message: err.to_string(),
+            recoverable,
+        }
     }
 }
 
 impl From<forged_git::GhError> for Failure {
     fn from(err: forged_git::GhError) -> Self {
-        Failure::refused(ErrorCode::GhError, err.to_string())
+        let recoverable = gh_error_recoverable(&err);
+        Failure {
+            code: ErrorCode::GhError,
+            message: err.to_string(),
+            recoverable,
+        }
     }
 }
 
 impl From<forged_gate::GateError> for Failure {
     fn from(err: forged_gate::GateError) -> Self {
-        Failure::refused(err.code(), err.to_string())
+        let recoverable = gate_error_recoverable(&err);
+        Failure {
+            code: err.code(),
+            message: err.to_string(),
+            recoverable,
+        }
     }
 }
 
 impl From<forged_provider::ProviderError> for Failure {
     fn from(err: forged_provider::ProviderError) -> Self {
-        Failure::refused(err.wire_code(), err.to_string())
+        let recoverable = provider_error_recoverable(&err);
+        Failure {
+            code: err.wire_code(),
+            message: err.to_string(),
+            recoverable,
+        }
     }
 }
 
@@ -207,8 +442,206 @@ impl From<forged_host::HostError> for Failure {
 #[cfg(test)]
 mod failure_tests {
     use super::Failure;
+    use forged_gate::GateError;
+    use forged_git::{GhError, GitError};
     use forged_host::HostError;
+    use forged_proto::{PortError, ProtoError};
+    use forged_provider::ProviderError;
     use forged_types::ErrorCode;
+
+    fn gh_exec(stderr: &str) -> GhError {
+        GhError::Exec {
+            status: Some(1),
+            stderr: stderr.to_owned(),
+        }
+    }
+
+    fn git_exec(stderr: &str) -> GitError {
+        GitError::Exec {
+            command: "git push origin topic".to_owned(),
+            stderr: stderr.to_owned(),
+        }
+    }
+
+    #[test]
+    fn gh_502_timeout_and_connection_evidence_are_recoverable() {
+        let cases = [
+            ("http 502", "HTTP 502: Bad Gateway"),
+            ("returned 502", "The requested URL returned error: 502"),
+            ("timeout", "request timeout awaiting response headers"),
+            ("connection", "connection reset by peer"),
+        ];
+
+        for (evidence, stderr) in cases {
+            let failure = Failure::from(gh_exec(stderr));
+            assert_eq!(failure.code, ErrorCode::GhError, "{evidence}");
+            assert!(failure.recoverable, "{evidence}: {failure}");
+        }
+    }
+
+    #[test]
+    fn gh_dns_tls_and_rate_limit_evidence_are_recoverable() {
+        let cases = [
+            ("dns", "temporary failure in name resolution"),
+            ("tls", "TLS handshake timed out"),
+            (
+                "rate limit",
+                "HTTP 403: API rate limit exceeded; retry later",
+            ),
+        ];
+
+        for (evidence, stderr) in cases {
+            let failure = Failure::from(gh_exec(stderr));
+            assert!(failure.recoverable, "{evidence}: {failure}");
+        }
+    }
+
+    #[test]
+    fn gh_auth_not_found_and_validation_evidence_are_not_recoverable() {
+        let cases = [
+            ("auth variant", GhError::Auth),
+            ("named resource 404", GhError::NotFound),
+            (
+                "validation",
+                gh_exec("HTTP 422: validation failed: timeout is invalid"),
+            ),
+            ("403 auth class", gh_exec("HTTP 403: Forbidden")),
+        ];
+
+        for (evidence, error) in cases {
+            let failure = Failure::from(error);
+            assert!(!failure.recoverable, "{evidence}: {failure}");
+        }
+    }
+
+    #[test]
+    fn gh_unrecognized_message_defaults_to_not_recoverable() {
+        let failure = Failure::from(gh_exec("quantum relay desynchronized"));
+
+        assert_eq!(failure.code, ErrorCode::GhError);
+        assert!(!failure.recoverable);
+    }
+
+    #[test]
+    fn proto_port_gh_transport_evidence_is_recoverable() {
+        let failure = Failure::from(ProtoError::Port {
+            attempt_id: 17,
+            step: "pr_for_head".to_owned(),
+            source: PortError::Gh("gh failed: HTTP 503 Service Unavailable".to_owned()),
+        });
+
+        assert_eq!(failure.code, ErrorCode::GhError);
+        assert_eq!(failure.message, "gh failed: HTTP 503 Service Unavailable");
+        assert!(failure.recoverable);
+    }
+
+    #[test]
+    fn git_transport_signatures_are_recoverable() {
+        let cases = [
+            ("connection", "fatal: connection refused"),
+            (
+                "remote read",
+                "fatal: Could not read from remote repository.",
+            ),
+            ("early eof", "fatal: early EOF"),
+        ];
+
+        for (evidence, stderr) in cases {
+            let failure = Failure::from(git_exec(stderr));
+            assert!(failure.recoverable, "{evidence}: {failure}");
+        }
+    }
+
+    #[test]
+    fn git_auth_ref_and_conflict_evidence_are_not_recoverable() {
+        let cases = [
+            (
+                "auth",
+                "Permission denied (publickey). Could not read from remote repository.",
+            ),
+            (
+                "non-fast-forward",
+                "[rejected] topic -> topic (non-fast-forward)",
+            ),
+            (
+                "conflict",
+                "CONFLICT (content): Merge conflict in src/lib.rs",
+            ),
+        ];
+
+        for (evidence, stderr) in cases {
+            let failure = Failure::from(git_exec(stderr));
+            assert!(!failure.recoverable, "{evidence}: {failure}");
+        }
+
+        let base_mismatch = Failure::from(GitError::BaseShaMismatch {
+            expected: "aaa".to_owned(),
+            actual: "bbb".to_owned(),
+        });
+        assert!(!base_mismatch.recoverable, "structured base mismatch");
+    }
+
+    #[test]
+    fn git_transient_io_and_nested_gh_transport_are_recoverable() {
+        let io = Failure::from(GitError::Io(std::io::Error::from(
+            std::io::ErrorKind::ConnectionReset,
+        )));
+        assert!(io.recoverable, "connection-reset io");
+
+        let gh = Failure::from(GitError::Gh(gh_exec("HTTP 504 Gateway Timeout")));
+        assert!(gh.recoverable, "nested gh transport");
+
+        let permission = Failure::from(GitError::Io(std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied,
+        )));
+        assert!(!permission.recoverable, "permission-denied io");
+    }
+
+    #[test]
+    fn gate_transient_spawn_and_io_evidence_are_recoverable() {
+        let spawn = Failure::from(GateError::Spawn {
+            command: "cargo test".to_owned(),
+            source: std::io::Error::from(std::io::ErrorKind::WouldBlock),
+        });
+        assert!(spawn.recoverable, "spawn would-block");
+
+        let io = Failure::from(GateError::Io(std::io::Error::other(
+            "child wait unresolved after spawn",
+        )));
+        assert!(io.recoverable, "structured post-spawn io");
+    }
+
+    #[test]
+    fn gate_missing_binary_and_invalid_request_are_not_recoverable() {
+        let missing = Failure::from(GateError::Spawn {
+            command: "missing-gate".to_owned(),
+            source: std::io::Error::from(std::io::ErrorKind::NotFound),
+        });
+        assert!(!missing.recoverable, "missing binary");
+
+        let invalid = Failure::from(GateError::InvalidRequest {
+            message: "commands must not be empty".to_owned(),
+        });
+        assert!(!invalid.recoverable, "invalid gate request");
+    }
+
+    #[test]
+    fn provider_transient_io_is_recoverable_but_config_refusal_is_not() {
+        let io = Failure::from(ProviderError::Io(std::io::Error::from(
+            std::io::ErrorKind::Interrupted,
+        )));
+        assert!(io.recoverable, "interrupted provider io");
+
+        let missing = Failure::from(ProviderError::Io(std::io::Error::from(
+            std::io::ErrorKind::NotFound,
+        )));
+        assert!(!missing.recoverable, "missing provider path or binary");
+
+        let bad_flag = Failure::from(ProviderError::UnsupportedEffort {
+            effort: "not valid".to_owned(),
+        });
+        assert!(!bad_flag.recoverable, "bad provider flag");
+    }
 
     #[test]
     fn host_session_loss_is_recoverable_despite_invalid_request_wire_code() {
