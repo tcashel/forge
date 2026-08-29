@@ -929,23 +929,22 @@ fn an_epic_child_prefers_its_work_fields_over_its_spec_pointer() {
     // A tick that hits a transiently slow git/gh call parks the epic in a
     // legitimate retry-backoff window, so progress is bounded by wall
     // clock, not by a fixed advance count.
-    let mut packet = None;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    loop {
+    let packet = loop {
         let (code, advanced) = env.forged(&["epic", "advance", "--epic", "epic-bead"]);
         assert_eq!(code, 0, "epic advance: {advanced}");
         let ledger = env.ledger();
-        packet = ledger
+        let packet = ledger
             .list_packets("child-fields")
             .unwrap_or_default()
             .into_iter()
             .next();
         ledger.close().expect("close");
         if packet.is_some() || std::time::Instant::now() > deadline {
-            break;
+            break packet;
         }
         std::thread::sleep(std::time::Duration::from_millis(250));
-    }
+    };
     let packet = packet.expect("the epic started the work-sourced child");
     assert!(
         packet.spec_revision.is_some(),
