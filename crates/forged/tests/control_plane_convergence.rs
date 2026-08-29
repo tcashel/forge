@@ -351,6 +351,7 @@ impl ControlPlaneFixture {
             "review_finding_deliveries",
             "work_items",
             "work_revisions",
+            "work_notes",
             "work_deps",
             "work_leases",
         ] {
@@ -537,7 +538,7 @@ fn modern_projections_and_all_five_apps_converge_on_real_envelopes() {
     tools.sort();
     assert_eq!(
         tools.len(),
-        57,
+        59,
         "the integrated public tool inventory moved"
     );
     assert!(tools.contains(&"review_publish".to_owned()));

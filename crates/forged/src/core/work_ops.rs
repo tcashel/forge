@@ -9,10 +9,14 @@
 use std::collections::BTreeMap;
 
 use forged_ledger::{
-    EffectClass, NewWorkItem, WorkDepKind, WorkItemFilters, WorkItemSnapshot, WorkKind,
-    WorkRevisionCause, WorkSpecFields, WorkStatus,
+    EffectClass, NewWorkItem, NewWorkNote, WorkDepKind, WorkItemFilters, WorkItemSnapshot,
+    WorkKind, WorkNoteKind, WorkRevisionCause, WorkSpecFields, WorkStatus, WORK_NOTE_DEFAULT_LIMIT,
+    WORK_NOTE_MAX_LIMIT,
 };
-use forged_types::{ErrorCode, OperationRequest, OperationResponse};
+use forged_types::{
+    canonical_json_bytes, parse_canonical, request_sha256, ErrorCode, OperationRequest,
+    OperationResponse,
+};
 use serde_json::{json, Value};
 
 use crate::core::{
@@ -88,6 +92,46 @@ fn actor_of(params: &serde_json::Map<String, Value>) -> Result<String, Failure> 
         .filter(|value| !value.trim().is_empty())
         .unwrap_or("operator")
         .to_owned())
+}
+
+fn work_note_kind(value: &str) -> Result<WorkNoteKind, Failure> {
+    WorkNoteKind::parse(value).ok_or_else(|| {
+        Failure::invalid(format!(
+            "work note kind {value:?} is not one of comment, critique, recommendation, approval"
+        ))
+    })
+}
+
+fn work_note_wire_string(
+    params: &serde_json::Map<String, Value>,
+    name: &str,
+) -> Result<Option<String>, Failure> {
+    match params.get(name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.clone())),
+        Some(_) => Err(Failure::invalid(format!(
+            "work note {name} must be a string when present"
+        ))),
+    }
+}
+
+fn canonical_work_note_body(params: &serde_json::Map<String, Value>) -> Result<String, Failure> {
+    let raw = work_note_wire_string(params, "bodyJson")?
+        .ok_or_else(|| Failure::invalid("bodyJson is required: pass JSON from --body-file"))?;
+    let value = parse_canonical(&raw).map_err(|error| {
+        Failure::invalid(format!(
+            "work note bodyJson must be JSON without duplicate keys or non-integer numbers: \
+             {error}"
+        ))
+    })?;
+    let bytes = canonical_json_bytes(&value).map_err(|error| {
+        Failure::invalid(format!(
+            "work note bodyJson must be JSON without duplicate keys or non-integer numbers: \
+             {error}"
+        ))
+    })?;
+    String::from_utf8(bytes)
+        .map_err(|error| Failure::internal(format!("canonical bodyJson is not UTF-8: {error}")))
 }
 
 /// `work_create` — author a new work item with its revision-1 spec.
@@ -241,6 +285,94 @@ pub async fn work_update(ctx: &Ctx, req: &mut OperationRequest) -> OperationResp
         },
     )
     .await
+}
+
+/// `work_note_add` — append evidence about a spec without minting a spec
+/// revision. The note row and terminal idempotency receipt land atomically.
+pub async fn work_note_add(ctx: &Ctx, req: &mut OperationRequest) -> OperationResponse {
+    let id = match param_str(&req.params, "id") {
+        Ok(value) if !value.trim().is_empty() => value.to_owned(),
+        _ => {
+            return err_response(
+                &derive_key("work_note_add", None, None, None),
+                &Failure::invalid("id is required: pass the existing work item id"),
+            )
+        }
+    };
+    let kind = match work_note_wire_string(&req.params, "kind")
+        .and_then(|value| value.ok_or_else(|| Failure::invalid("kind is required")))
+        .and_then(|value| work_note_kind(&value))
+    {
+        Ok(kind) => kind,
+        Err(error) => {
+            return err_response(&derive_key("work_note_add", Some(&id), None, None), &error)
+        }
+    };
+    let body_json = match canonical_work_note_body(&req.params) {
+        Ok(body) => body,
+        Err(error) => {
+            return err_response(
+                &derive_key("work_note_add", Some(&id), Some(kind.as_str()), None),
+                &error,
+            )
+        }
+    };
+    let schema = match work_note_wire_string(&req.params, "schema") {
+        Ok(schema) => schema.unwrap_or_else(|| format!("{}/0", kind.as_str())),
+        Err(error) => {
+            return err_response(
+                &derive_key("work_note_add", Some(&id), Some(kind.as_str()), None),
+                &error,
+            )
+        }
+    };
+    let actor = match work_note_wire_string(&req.params, "actor") {
+        Ok(actor) => actor.unwrap_or_else(|| "operator".to_owned()),
+        Err(error) => {
+            return err_response(
+                &derive_key("work_note_add", Some(&id), Some(kind.as_str()), None),
+                &error,
+            )
+        }
+    };
+
+    // Normalize semantic defaults and canonical body bytes before hashing:
+    // omitted defaults and their explicit spellings are one idempotent
+    // request, as are differently formatted renderings of the same JSON.
+    req.params.insert("id".to_owned(), json!(id));
+    req.params.insert("kind".to_owned(), json!(kind.as_str()));
+    req.params.insert("schema".to_owned(), json!(schema));
+    req.params.insert("actor".to_owned(), json!(actor));
+    req.params.insert("bodyJson".to_owned(), json!(body_json));
+    if crate::core::key_absent(req) {
+        let hash = match request_sha256(req) {
+            Ok(hash) => hash,
+            Err(error) => {
+                return err_response(
+                    &derive_key("work_note_add", Some(&id), Some(kind.as_str()), None),
+                    &Failure::invalid(format!("params cannot be canonicalized: {error}")),
+                )
+            }
+        };
+        default_key(req, format!("op:work_note_add:{id}:{hash}"));
+    }
+    let new = NewWorkNote {
+        work_id: id,
+        kind,
+        schema,
+        actor,
+        body_json,
+    };
+    let key = req.idempotency_key.clone();
+    match on_ledger(&ctx.ledger, {
+        let request = req.clone();
+        move |ledger| ledger.apply_work_note_operation("work_note_add", &request, new)
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => err_response(&key, &error),
+    }
 }
 
 /// `work_link` — add one typed dependency edge.
@@ -553,7 +685,65 @@ pub async fn work_show(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
             let id = id.clone();
             on_ledger(&ctx.ledger, move |l| l.work_dependencies(&id)).await?
         };
-        Ok(json!({"work": snapshot, "dependencies": deps}))
+        let notes_count = {
+            let id = id.clone();
+            on_ledger(&ctx.ledger, move |l| l.work_note_count(&id)).await?
+        };
+        Ok(json!({
+            "work": snapshot,
+            "dependencies": deps,
+            "notesCount": notes_count,
+        }))
+    })
+    .await
+}
+
+/// `work_note_list` — bounded annotation bodies, oldest first.
+pub async fn work_note_list(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
+    let id = match param_str(&req.params, "id") {
+        Ok(value) if !value.trim().is_empty() => value.to_owned(),
+        _ => {
+            return err_response(
+                &derive_key("work_note_list", None, None, None),
+                &Failure::invalid("id is required: pass the existing work item id"),
+            )
+        }
+    };
+    crate::core::read_only("work_note_list", req, || async {
+        let kind = work_note_wire_string(&req.params, "kind")?
+            .map(|value| work_note_kind(&value))
+            .transpose()?;
+        let limit = req
+            .params
+            .get("limit")
+            .map(|value| {
+                value.as_u64().ok_or_else(|| {
+                    Failure::invalid("work note list limit must be an unsigned integer")
+                })
+            })
+            .transpose()?
+            .unwrap_or(WORK_NOTE_DEFAULT_LIMIT);
+        if !(1..=WORK_NOTE_MAX_LIMIT).contains(&limit) {
+            return Err(Failure::invalid(format!(
+                "work note list limit must be between 1 and {WORK_NOTE_MAX_LIMIT}"
+            )));
+        }
+        let page = {
+            let id = id.clone();
+            on_ledger(&ctx.ledger, move |ledger| {
+                ledger.list_work_notes(&id, kind, limit)
+            })
+            .await?
+        };
+        let mut filters = json!({"id": id, "limit": limit});
+        if let Some(kind) = kind {
+            filters["kind"] = json!(kind.as_str());
+        }
+        Ok(json!({
+            "filters": filters,
+            "totals": {"shown": page.notes.len(), "total": page.total},
+            "notes": page.notes,
+        }))
     })
     .await
 }

@@ -4,6 +4,8 @@
 mod support;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write as _;
+use std::process::Stdio;
 
 use forged_ledger::{NewWorkItem, WorkKind, WorkRevisionCause, WorkSpecFields, WorkStatus};
 use serde_json::{json, Value};
@@ -299,6 +301,239 @@ fn work_spec_file_inputs_round_trip_verbatim_and_conflict_with_inline_forms() {
         stderr.contains("--notes") && stderr.contains("--notes-file"),
         "clear conflict error: {stderr}"
     );
+}
+
+#[test]
+fn work_notes_round_trip_canonically_without_minting_revisions() {
+    let env = TestEnv::new("forged-work-notes");
+    assert_eq!(env.forged(&["init"]).0, 0);
+    result(
+        &env,
+        &[
+            "work",
+            "create",
+            "--id",
+            "noted-work",
+            "--title",
+            "Noted work",
+        ],
+    );
+    let body_path = env.root.join("critique.json");
+    std::fs::write(&body_path, r#"{"z":1,"a":{"d":4,"b":2}}"#).expect("write body");
+    let body_path = body_path.to_str().expect("UTF-8 body path");
+
+    let added = result(
+        &env,
+        &[
+            "work",
+            "note",
+            "add",
+            "--id",
+            "noted-work",
+            "--kind",
+            "critique",
+            "--body-file",
+            body_path,
+        ],
+    );
+    assert_eq!(added["note"]["schema"], json!("critique/0"));
+    assert_eq!(added["note"]["actor"], json!("operator"));
+    assert_eq!(
+        added["note"]["bodyJson"],
+        json!(r#"{"a":{"b":2,"d":4},"z":1}"#),
+        "the stored and returned bytes are the parser's canonical rendering"
+    );
+    let note_id = added["note"]["noteId"].as_str().expect("note id");
+    assert_eq!(
+        uuid::Uuid::parse_str(note_id)
+            .expect("house UUID")
+            .get_version_num(),
+        7
+    );
+
+    let replayed = env
+        .forged(&[
+            "work",
+            "note",
+            "add",
+            "--id",
+            "noted-work",
+            "--kind",
+            "critique",
+            "--body-file",
+            body_path,
+        ])
+        .1;
+    assert_eq!(replayed["reused"], json!(true));
+    assert_eq!(replayed["result"]["note"]["noteId"], json!(note_id));
+
+    result(
+        &env,
+        &[
+            "work",
+            "close",
+            "--id",
+            "noted-work",
+            "--reason",
+            "approval evidence follows",
+        ],
+    );
+    std::fs::write(body_path, r#"{"approved":true}"#).expect("replace body");
+    let supplied = result(
+        &env,
+        &[
+            "work",
+            "note",
+            "add",
+            "--id",
+            "noted-work",
+            "--kind",
+            "approval",
+            "--schema",
+            "example.execution-approval/7",
+            "--actor",
+            "lead-agent",
+            "--body-file",
+            body_path,
+        ],
+    );
+    assert_eq!(
+        supplied["note"]["schema"],
+        json!("example.execution-approval/7"),
+        "a supplied wire schema is stored verbatim"
+    );
+    assert_eq!(supplied["note"]["actor"], json!("lead-agent"));
+
+    let mut child = env
+        .forged_cmd(&[
+            "work",
+            "note",
+            "add",
+            "--id",
+            "noted-work",
+            "--kind",
+            "comment",
+            "--body-file",
+            "-",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn stdin note add");
+    child
+        .stdin
+        .take()
+        .expect("child stdin")
+        .write_all(br#"{"stdin":true}"#)
+        .expect("write stdin body");
+    let output = child.wait_with_output().expect("stdin note completes");
+    assert!(
+        output.status.success(),
+        "stdin note add: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let listed = result(&env, &["work", "note", "list", "--id", "noted-work"]);
+    assert_eq!(listed["filters"], json!({"id": "noted-work", "limit": 100}));
+    assert_eq!(listed["totals"], json!({"shown": 3, "total": 3}));
+    assert_eq!(listed["notes"][0]["bodyJson"], added["note"]["bodyJson"]);
+    let filtered = result(
+        &env,
+        &[
+            "work",
+            "note",
+            "list",
+            "--id",
+            "noted-work",
+            "--kind",
+            "critique",
+            "--limit",
+            "1",
+        ],
+    );
+    assert_eq!(
+        filtered["filters"],
+        json!({"id": "noted-work", "kind": "critique", "limit": 1})
+    );
+    assert_eq!(filtered["totals"], json!({"shown": 1, "total": 1}));
+    assert_eq!(filtered["notes"][0]["noteId"], json!(note_id));
+
+    let shown = result(&env, &["work", "show", "--id", "noted-work"]);
+    assert_eq!(shown["notesCount"], json!(3));
+    assert_eq!(
+        shown["work"]["revision"],
+        json!(1),
+        "annotations and close-time evidence never mint revisions"
+    );
+}
+
+#[test]
+fn work_note_add_refuses_ambiguous_json_and_missing_work() {
+    let env = TestEnv::new("forged-work-note-refusals");
+    assert_eq!(env.forged(&["init"]).0, 0);
+    result(
+        &env,
+        &["work", "create", "--id", "note-json", "--title", "JSON"],
+    );
+    let body = env.root.join("invalid-note.json");
+    let body_path = body.to_str().expect("UTF-8 body path");
+    for (raw, rule) in [
+        (r#"{"same":1,"same":2}"#, "duplicate object key"),
+        (r#"{"float":1.5}"#, "non-integer number"),
+    ] {
+        std::fs::write(&body, raw).expect("write invalid body");
+        let (code, refused) = env.forged(&[
+            "work",
+            "note",
+            "add",
+            "--id",
+            "note-json",
+            "--kind",
+            "comment",
+            "--body-file",
+            body_path,
+        ]);
+        assert_ne!(code, 0, "invalid body was accepted: {refused}");
+        assert!(
+            refused["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains(rule)),
+            "the refusal names the canonical JSON rule: {refused}"
+        );
+    }
+
+    std::fs::write(&body, "{}").expect("write valid body");
+    let (code, missing) = env.forged(&[
+        "work",
+        "note",
+        "add",
+        "--id",
+        "missing-note-target",
+        "--kind",
+        "comment",
+        "--body-file",
+        body_path,
+    ]);
+    assert_ne!(code, 0, "missing work accepted a note: {missing}");
+    let message = missing["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("missing-note-target"), "{message}");
+    assert!(message.contains("work_create"), "{message}");
+
+    for limit in ["0", "501"] {
+        let (code, refused) = env.forged(&[
+            "work",
+            "note",
+            "list",
+            "--id",
+            "note-json",
+            "--limit",
+            limit,
+        ]);
+        assert_ne!(code, 0, "out-of-range limit accepted: {refused}");
+        assert!(refused["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("between 1 and 500")));
+    }
 }
 
 #[test]

@@ -5,6 +5,7 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use forged_types::OperationRequest;
 use serde_json::{json, Map, Value};
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
 /// forged: the CLI and MCP binary over the forged core.
@@ -986,6 +987,11 @@ pub enum WorkCmd {
     Show(WorkIdArgs),
     /// The ready frontier (read-only).
     Ready(WorkReadyArgs),
+    /// Append-only evidence about a work specification.
+    Note {
+        #[command(subcommand)]
+        command: WorkNoteCmd,
+    },
     /// Create a work item with its revision-1 spec.
     Create(WorkCreateArgs),
     /// Guarded spec update (revision CAS).
@@ -1002,6 +1008,55 @@ pub enum WorkCmd {
     Supersede(WorkSupersedeArgs),
     /// Revert spec content to an earlier revision's bytes.
     Revert(WorkRevertArgs),
+}
+
+/// `work note` subcommands.
+#[derive(Debug, Subcommand)]
+pub enum WorkNoteCmd {
+    /// Append one immutable annotation.
+    Add(WorkNoteAddArgs),
+    /// List bounded annotations in append order.
+    List(WorkNoteListArgs),
+}
+
+/// `work note add` arguments.
+#[derive(Debug, Args)]
+pub struct WorkNoteAddArgs {
+    /// The existing work item id.
+    #[arg(long)]
+    pub id: String,
+    /// comment | critique | recommendation | approval.
+    #[arg(long)]
+    pub kind: String,
+    /// Payload schema wire name (default <kind>/0).
+    #[arg(long)]
+    pub schema: Option<String>,
+    /// Acting identity (default operator).
+    #[arg(long)]
+    pub actor: Option<String>,
+    /// Read the JSON body from a UTF-8 file; `-` reads stdin.
+    #[arg(long)]
+    pub body_file: PathBuf,
+    /// Override the derived idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+/// `work note list` arguments.
+#[derive(Debug, Args)]
+pub struct WorkNoteListArgs {
+    /// The existing work item id.
+    #[arg(long)]
+    pub id: String,
+    /// Optional exact kind filter.
+    #[arg(long)]
+    pub kind: Option<String>,
+    /// Maximum notes, 1..=500 (default 100).
+    #[arg(long)]
+    pub limit: Option<u64>,
+    /// Override the read-only idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
 }
 
 /// One work item id.
@@ -1654,6 +1709,19 @@ fn spec_field_input(
     }
 }
 
+fn read_utf8_file_or_stdin(path: &Path, flag: &str) -> Result<String, String> {
+    if path == Path::new("-") {
+        let mut body = String::new();
+        std::io::stdin()
+            .read_to_string(&mut body)
+            .map_err(|error| format!("reading {flag} - as UTF-8: {error}"))?;
+        Ok(body)
+    } else {
+        std::fs::read_to_string(path)
+            .map_err(|error| format!("reading {flag} {} as UTF-8: {error}", path.display()))
+    }
+}
+
 /// The core name a parsed command routes to, WITHOUT consuming it — what a
 /// failure before request mapping (an unloadable config, an unopenable
 /// ledger, an unreadable CLI input file) needs in order to name the
@@ -1734,6 +1802,10 @@ pub fn command_name(command: &Command) -> &'static str {
             WorkCmd::ImportBeads(_) => "work_import_beads",
             WorkCmd::Show(_) => "work_show",
             WorkCmd::Ready(_) => "work_ready",
+            WorkCmd::Note { command } => match command {
+                WorkNoteCmd::Add(_) => "work_note_add",
+                WorkNoteCmd::List(_) => "work_note_list",
+            },
             WorkCmd::Create(_) => "work_create",
             WorkCmd::Update(_) => "work_update",
             WorkCmd::Link(_) => "work_link",
@@ -2379,6 +2451,41 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
                     request(a.idempotency_key, None, Value::Object(params)),
                 )
             }
+            WorkCmd::Note { command } => match command {
+                WorkNoteCmd::Add(a) => {
+                    let mut params = Map::new();
+                    params.insert("id".to_owned(), json!(a.id));
+                    params.insert("kind".to_owned(), json!(a.kind));
+                    params.insert(
+                        "bodyJson".to_owned(),
+                        json!(read_utf8_file_or_stdin(&a.body_file, "--body-file")?),
+                    );
+                    if let Some(schema) = a.schema {
+                        params.insert("schema".to_owned(), json!(schema));
+                    }
+                    if let Some(actor) = a.actor {
+                        params.insert("actor".to_owned(), json!(actor));
+                    }
+                    (
+                        "work_note_add",
+                        request(a.idempotency_key, None, Value::Object(params)),
+                    )
+                }
+                WorkNoteCmd::List(a) => {
+                    let mut params = Map::new();
+                    params.insert("id".to_owned(), json!(a.id));
+                    if let Some(kind) = a.kind {
+                        params.insert("kind".to_owned(), json!(kind));
+                    }
+                    if let Some(limit) = a.limit {
+                        params.insert("limit".to_owned(), json!(limit));
+                    }
+                    (
+                        "work_note_list",
+                        request(a.idempotency_key, None, Value::Object(params)),
+                    )
+                }
+            },
             WorkCmd::Create(a) => {
                 let description = spec_field_input(
                     a.description,

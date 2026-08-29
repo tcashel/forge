@@ -1,5 +1,5 @@
 //! CLI/MCP parity (the two-adapters-over-one-core criterion): for each of
-//! the fifty-seven public core functions, the CLI path and the MCP tool path produce
+//! the fifty-nine public core functions, the CLI path and the MCP tool path produce
 //! identical `OperationResponse` values — modulo the minted `operationId` —
 //! from the same core call.
 
@@ -33,6 +33,12 @@ fn normalized(mut envelope: Value) -> Value {
     }
     if envelope["result"]["capturedAt"]["history"].is_string() {
         envelope["result"]["capturedAt"]["history"] = json!("<sampled>");
+    }
+    if envelope["result"]["note"]["noteId"].is_string() {
+        envelope["result"]["note"]["noteId"] = json!("<minted>");
+    }
+    if envelope["result"]["note"]["writtenAt"].is_string() {
+        envelope["result"]["note"]["writtenAt"] = json!("<sampled>");
     }
     if let Some(entries) = envelope["result"]["runs"].as_array_mut() {
         for entry in entries {
@@ -68,7 +74,7 @@ fn doctor_shape(envelope: &Value) -> Value {
 }
 
 #[test]
-fn all_fifty_seven_tools_match_their_cli_counterparts() {
+fn all_fifty_nine_tools_match_their_cli_counterparts() {
     let env = TestEnv::new("forged-parity");
     env.forged(&["init"]);
     fabricate_run(&env, "par-repository");
@@ -133,6 +139,8 @@ fn all_fifty_seven_tools_match_their_cli_counterparts() {
         "epic_abandon",
         "work_create",
         "work_update",
+        "work_note_add",
+        "work_note_list",
         "work_link",
         "work_close",
         "work_reopen",
@@ -143,7 +151,7 @@ fn all_fifty_seven_tools_match_their_cli_counterparts() {
         "work_ready",
     ];
     expected.sort_unstable();
-    assert_eq!(tools, expected, "the fifty-seven tools, exactly");
+    assert_eq!(tools, expected, "the fifty-nine tools, exactly");
 
     let overview_tool = mcp.tool("overview");
     assert_eq!(
@@ -230,6 +238,35 @@ fn all_fifty_seven_tools_match_their_cli_counterparts() {
         assert!(
             description.contains(statement),
             "work_ready description states {statement:?}: {description}"
+        );
+    }
+    let work_note_add = mcp.tool("work_note_add");
+    let add_schema = work_note_add
+        .pointer("/inputSchema/properties/params/properties")
+        .cloned()
+        .unwrap_or(Value::Null);
+    for param in ["id", "kind", "bodyJson", "schema", "actor"] {
+        assert!(
+            add_schema.get(param).is_some(),
+            "work_note_add advertises params.{param}: {add_schema}"
+        );
+    }
+    for kind in ["comment", "critique", "recommendation", "approval"] {
+        assert!(
+            work_note_add["inputSchema"].to_string().contains(kind),
+            "work_note_add advertises kind {kind}: {}",
+            work_note_add["inputSchema"]
+        );
+    }
+    let work_note_list = mcp.tool("work_note_list");
+    let list_schema = work_note_list
+        .pointer("/inputSchema/properties/params/properties")
+        .cloned()
+        .unwrap_or(Value::Null);
+    for param in ["id", "kind", "limit"] {
+        assert!(
+            list_schema.get(param).is_some(),
+            "work_note_list advertises params.{param}: {list_schema}"
         );
     }
     let work_history = mcp.tool("work_history");
@@ -1252,6 +1289,61 @@ fn all_fifty_seven_tools_match_their_cli_counterparts() {
         normalized(tool),
         "composed-filter work_list parity"
     );
+
+    let note_body = env.root.join("parity-note.json");
+    std::fs::write(&note_body, r#"{"z":1,"a":2}"#).expect("write parity note");
+    let note_body = note_body.to_str().expect("UTF-8 note path");
+    let cli = env
+        .forged(&[
+            "work",
+            "note",
+            "add",
+            "--id",
+            "bead-par-repository",
+            "--kind",
+            "critique",
+            "--body-file",
+            note_body,
+            "--idempotency-key",
+            "op:work_note_add:par-cli",
+        ])
+        .1;
+    let tool = mcp.call_tool(
+        "work_note_add",
+        json!({
+            "schemaVersion": 1,
+            "idempotencyKey": "op:work_note_add:par-mcp",
+            "params": {
+                "id": "bead-par-repository",
+                "kind": "critique",
+                "bodyJson": r#"{"z":1,"a":2}"#,
+            },
+        }),
+    );
+    assert_eq!(normalized(cli), normalized(tool), "work_note_add parity");
+    let cli = env
+        .forged(&[
+            "work",
+            "note",
+            "list",
+            "--id",
+            "bead-par-repository",
+            "--kind",
+            "critique",
+            "--limit",
+            "25",
+        ])
+        .1;
+    let tool = mcp.call_tool(
+        "work_note_list",
+        envelope(json!({
+            "id": "bead-par-repository",
+            "kind": "critique",
+            "limit": 25,
+        })),
+    );
+    assert_eq!(tool["operationId"], json!("op:work_note_list:read"));
+    assert_eq!(normalized(cli), normalized(tool), "work_note_list parity");
 
     let cli = env
         .forged(&[
