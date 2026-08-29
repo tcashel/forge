@@ -969,10 +969,7 @@ pub(crate) fn check_schema_version(req: &OperationRequest) -> Result<(), Failure
     Ok(())
 }
 
-/// Run a read-only command: the same envelope in, an envelope out, the
-/// operation store never touched. An absent key defaults to
-/// `op:<name>:read`, echoed as `operationId` with `reused: false`.
-pub async fn read_only<F, Fut>(name: &str, req: &OperationRequest, effect: F) -> OperationResponse
+async fn unfenced<F, Fut>(name: &str, req: &OperationRequest, effect: F) -> OperationResponse
 where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = CoreResult>,
@@ -988,6 +985,78 @@ where
     match effect().await {
         Ok(result) => ok_response(&key, false, result),
         Err(f) => err_response(&key, &f),
+    }
+}
+
+/// Run a genuine read: the same envelope in, an envelope out, with neither
+/// the operation store nor domain state touched. An absent key defaults to
+/// `op:<name>:read`, echoed as `operationId` with `reused: false`.
+pub async fn read_only<F, Fut>(name: &str, req: &OperationRequest, effect: F) -> OperationResponse
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = CoreResult>,
+{
+    unfenced(name, req, effect).await
+}
+
+/// Run a deliberately unfenced domain write. These writes rely on their own
+/// storage-level identity rather than the operation store, while retaining
+/// the same request validation and response shape as unfenced reads.
+pub async fn unfenced_write<F, Fut>(
+    name: &str,
+    req: &OperationRequest,
+    effect: F,
+) -> OperationResponse
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = CoreResult>,
+{
+    unfenced(name, req, effect).await
+}
+
+#[cfg(test)]
+mod unfenced_audit_tests {
+    use std::path::Path;
+
+    fn operation_names(root: &Path, needle: &str, names: &mut Vec<String>) {
+        for entry in std::fs::read_dir(root).expect("read core source directory") {
+            let path = entry.expect("core source entry").path();
+            if path.is_dir() {
+                operation_names(&path, needle, names);
+            } else if path.extension().and_then(|value| value.to_str()) == Some("rs") {
+                let source = std::fs::read_to_string(&path).expect("read core source");
+                for line in source.lines() {
+                    if let Some(rest) = line.split_once(needle).map(|(_, rest)| rest) {
+                        if let Some(name) = rest.split('"').next().filter(|name| !name.is_empty()) {
+                            names.push(name.to_owned());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unfenced_write_tenants_are_explicit_and_read_only_names_only_reads() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/core");
+        let unfenced_needle = ["unfenced", "_write(\""].concat();
+        let read_needle = ["read", "_only(\""].concat();
+        let mut writes = Vec::new();
+        let mut reads = Vec::new();
+        operation_names(&root, &unfenced_needle, &mut writes);
+        operation_names(&root, &read_needle, &mut reads);
+        writes.sort();
+
+        assert_eq!(
+            writes,
+            ["packet_heartbeat", "usage_ingest", "work_import_beads"]
+        );
+        for tenant in &writes {
+            assert!(
+                !reads.contains(tenant),
+                "unfenced writer {tenant} is mislabeled read_only"
+            );
+        }
     }
 }
 
@@ -1324,7 +1393,7 @@ pub(crate) async fn released_retry_seq_staged(
 /// Dispatch one named command to its core function. Both surfaces call
 /// exactly this, so their envelopes are identical by construction.
 pub async fn dispatch(ctx: &Ctx, name: &str, mut req: OperationRequest) -> OperationResponse {
-    // The two explicit-key commands are refused before any defaulting.
+    // The three explicit-key commands are refused before any defaulting.
     match name {
         "artifact_compact" | "claim_next" | "worktree_retire" if key_absent(&req) => {
             return err_response(

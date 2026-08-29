@@ -692,7 +692,7 @@ pub enum ArtifactCmd {
     /// Verify one manifest and every named digest without changing them.
     Verify(AttemptScoped),
     /// Explicitly compact an eligible successful intermediate attempt.
-    Compact(AttemptScoped),
+    Compact(AttemptCompactArgs),
 }
 
 /// An attempt-scoped read-only command.
@@ -704,6 +704,17 @@ pub struct AttemptScoped {
     /// Override the read-only idempotency key.
     #[arg(long)]
     pub idempotency_key: Option<String>,
+}
+
+/// An attempt-scoped compaction, whose operation identity cannot be derived.
+#[derive(Debug, Args)]
+pub struct AttemptCompactArgs {
+    /// Positive ledger attempt identity.
+    #[arg(long)]
+    pub attempt: i64,
+    /// Required because artifact compact cannot derive a meaningful key.
+    #[arg(long)]
+    pub idempotency_key: String,
 }
 
 /// `session` subcommands.
@@ -841,7 +852,7 @@ pub struct ClaimNextArgs {
     pub holder: String,
     /// REQUIRED: claim-next cannot derive a meaningful key.
     #[arg(long)]
-    pub idempotency_key: Option<String>,
+    pub idempotency_key: String,
 }
 
 /// `gate` subcommands.
@@ -1677,7 +1688,7 @@ pub struct WorktreeRetireArgs {
     pub run_state_terminal: bool,
     /// REQUIRED: worktree retire cannot derive a meaningful key.
     #[arg(long)]
-    pub idempotency_key: Option<String>,
+    pub idempotency_key: String,
 }
 
 fn request(key: Option<String>, run_id: Option<String>, params: Value) -> OperationRequest {
@@ -2130,7 +2141,7 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
             ),
             ArtifactCmd::Compact(a) => (
                 "artifact_compact",
-                request(a.idempotency_key, None, json!({"attempt": a.attempt})),
+                request(Some(a.idempotency_key), None, json!({"attempt": a.attempt})),
             ),
         },
         Command::Session { command } => match command {
@@ -2202,7 +2213,7 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
         },
         Command::ClaimNext(a) => (
             "claim_next",
-            request(a.idempotency_key, None, json!({"holder": a.holder})),
+            request(Some(a.idempotency_key), None, json!({"holder": a.holder})),
         ),
         Command::Gate { command } => match command {
             GateCmd::Run(a) => (
@@ -2710,7 +2721,7 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
             WorktreeCmd::Retire(a) => (
                 "worktree_retire",
                 request(
-                    a.idempotency_key,
+                    Some(a.idempotency_key),
                     Some(a.run.clone()),
                     json!({
                         "run": a.run,

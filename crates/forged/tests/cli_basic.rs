@@ -1,5 +1,5 @@
 //! Envelope-level CLI behavior: help coverage, key derivation and
-//! overrides, replay semantics, the two explicit-key refusals, and
+//! overrides, replay semantics, the three explicit-key refusals, and
 //! read-only defaults.
 
 mod support;
@@ -230,16 +230,38 @@ fn replay_uses_the_ledger_operation_outcome() {
 }
 
 #[test]
-fn claim_next_and_worktree_retire_require_an_explicit_key() {
+fn explicit_key_operations_require_the_flag_at_clap() {
     let env = TestEnv::new("forged-explicit-keys");
-    let (code, resp) = env.forged(&["claim-next", "--holder", "w1"]);
-    assert_eq!(code, 1);
-    assert_eq!(resp["ok"], json!(false));
-    assert_eq!(resp["error"]["code"], json!("INVALID_REQUEST"));
+    for (args, help_args) in [
+        (
+            &["artifact", "compact", "--attempt", "1"][..],
+            &["artifact", "compact", "--help"][..],
+        ),
+        (
+            &["claim-next", "--holder", "w1"][..],
+            &["claim-next", "--help"][..],
+        ),
+        (
+            &["worktree", "retire", "--run", "r1"][..],
+            &["worktree", "retire", "--help"][..],
+        ),
+    ] {
+        let out = env.forged_cmd(args).output().expect("forged clap refusal");
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        assert!(out.stdout.is_empty(), "clap refusal wrote stdout: {args:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("--idempotency-key <IDEMPOTENCY_KEY>"),
+            "clap refusal names the recovery flag for {args:?}: {stderr}"
+        );
 
-    let (code, resp) = env.forged(&["worktree", "retire", "--run", "r1"]);
-    assert_eq!(code, 1);
-    assert_eq!(resp["error"]["code"], json!("INVALID_REQUEST"));
+        let help = help_text(&env, help_args);
+        let usage = help.lines().find(|line| line.starts_with("Usage:"));
+        assert!(
+            usage.is_some_and(|line| line.contains("--idempotency-key <IDEMPOTENCY_KEY>")),
+            "required key is present in Usage for {help_args:?}: {help}"
+        );
+    }
 
     // With a key, claim-next against an empty frontier is a SUCCESS with
     // claimed: null — never an error.

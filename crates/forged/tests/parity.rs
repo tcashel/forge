@@ -1,5 +1,5 @@
 //! CLI/MCP parity (the two-adapters-over-one-core criterion): for each of
-//! the fifty-nine public core functions, the CLI path and the MCP tool path produce
+//! the sixty-two public core functions, the CLI path and the MCP tool path produce
 //! identical `OperationResponse` values — modulo the minted `operationId` —
 //! from the same core call.
 
@@ -73,8 +73,56 @@ fn doctor_shape(envelope: &Value) -> Value {
     json!({"ok": envelope["ok"], "probes": probes})
 }
 
+fn cli_envelope_text(env: &TestEnv, args: &[&str]) -> (i32, String) {
+    let output = env.forged_cmd(args).output().expect("forged CLI runs");
+    let text = String::from_utf8(output.stdout).expect("CLI envelope is UTF-8");
+    (
+        output.status.code().unwrap_or(-1),
+        text.trim_end_matches(['\r', '\n']).to_owned(),
+    )
+}
+
+fn envelope(params: Value) -> Value {
+    json!({"schemaVersion": 1, "params": params})
+}
+
+fn start_run(env: &TestEnv, run: &str) {
+    env.seed_work_spec(
+        run,
+        "Exercise one MCP run-identity regression.",
+        "Conflicting run aliases are rejected without effects.",
+    );
+    let repository = env.repos.repo.to_string_lossy().into_owned();
+    let (code, response) = env.forged(&[
+        "run",
+        "start",
+        "--work",
+        run,
+        "--repo",
+        &repository,
+        "--base-ref",
+        "main",
+    ]);
+    assert_eq!(code, 0, "start {run}: {response}");
+}
+
+fn prepare_run_worktree(env: &TestEnv, run: &str) {
+    let spec = forged_git::WorktreeSpec {
+        repo: env.repos.repo.clone(),
+        runs_root: env.anvil.join("runs"),
+        run_id: run.to_owned(),
+        branch: format!("forged/{run}"),
+        base: env.repos.base.clone(),
+        expected_base_sha: None,
+    };
+    tokio::runtime::Runtime::new()
+        .expect("test runtime")
+        .block_on(forged_git::prepare_worktree(&spec))
+        .expect("prepare run worktree");
+}
+
 #[test]
-fn all_fifty_nine_tools_match_their_cli_counterparts() {
+fn all_sixty_two_tools_match_their_cli_counterparts() {
     let env = TestEnv::new("forged-parity");
     env.forged(&["init"]);
     fabricate_run(&env, "par-repository");
@@ -112,9 +160,11 @@ fn all_fifty_nine_tools_match_their_cli_counterparts() {
         "epic_start",
         "epic_status",
         "epic_submit",
+        "packet_show",
         "packet_claim",
         "packet_complete",
         "packet_fail",
+        "gate_run",
         "reconcile",
         "review_publish",
         "run_advance",
@@ -149,9 +199,35 @@ fn all_fifty_nine_tools_match_their_cli_counterparts() {
         "work_revert",
         "work_show",
         "work_ready",
+        "worktree_retire",
     ];
     expected.sort_unstable();
-    assert_eq!(tools, expected, "the fifty-nine tools, exactly");
+    assert_eq!(tools, expected, "the sixty-two tools, exactly");
+
+    // Both MCP result paths turn a failed operation envelope into a tool
+    // error without changing one byte of the CLI-compatible JSON text.
+    let (code, cli_text) = cli_envelope_text(&env, &["run", "status", "--run", "absent"]);
+    assert_eq!(code, 1);
+    let raw = mcp.call_tool_result(
+        "run_status",
+        json!({
+            "schemaVersion": 1,
+            "runId": "absent",
+            "params": {"run": "absent"},
+        }),
+    );
+    assert_eq!(raw["isError"], json!(true));
+    assert_eq!(raw["content"][0]["text"], json!(cli_text));
+
+    let (code, cli_text) = cli_envelope_text(&env, &["overview", "--run", "absent"]);
+    assert_eq!(code, 1);
+    let raw = mcp.call_tool_result("overview", envelope(json!({"run": "absent"})));
+    assert_eq!(raw["isError"], json!(true));
+    assert_eq!(raw["content"][0]["text"], json!(cli_text));
+    assert_eq!(
+        raw["structuredContent"],
+        serde_json::from_str::<Value>(&cli_text).expect("structured failure envelope")
+    );
 
     let overview_tool = mcp.tool("overview");
     assert_eq!(
@@ -576,8 +652,6 @@ fn all_fifty_nine_tools_match_their_cli_counterparts() {
         app.pointer("/contents/0/_meta/ui/permissions"),
         Some(&json!({}))
     );
-
-    let envelope = |params: Value| json!({"schemaVersion": 1, "params": params});
 
     let cli = env.forged(&["definition", "validate"]).1;
     let tool = mcp.call_tool("definition_validate", envelope(json!({})));
@@ -1110,14 +1184,53 @@ fn all_fifty_nine_tools_match_their_cli_counterparts() {
     );
     assert_eq!(normalized(cli), normalized(tool), "packet_fail parity");
 
+    // packet_show: an absent packet is the same read-only refusal.
+    let cli = env
+        .forged(&["packet", "show", "--packet", "absent/implement/1"])
+        .1;
+    let tool = mcp.call_tool(
+        "packet_show",
+        envelope(json!({"packet": "absent/implement/1"})),
+    );
+    assert_eq!(normalized(cli), normalized(tool), "packet_show parity");
+
     // artifact_verify: a missing attempt is the same read-only refusal.
     let cli = env.forged(&["artifact", "verify", "--attempt", "1"]).1;
     let tool = mcp.call_tool("artifact_verify", envelope(json!({"attempt": 1})));
     assert_eq!(normalized(cli), normalized(tool), "artifact_verify parity");
 
-    // artifact_compact requires an explicit key on both adapters.
-    let cli = env.forged(&["artifact", "compact", "--attempt", "1"]).1;
-    let tool = mcp.call_tool("artifact_compact", envelope(json!({"attempt": 1})));
+    // artifact_compact requires an explicit key at Clap; the shared handler
+    // retains the same backstop for MCP and direct core callers.
+    let missing_key = mcp.call_tool_result("artifact_compact", envelope(json!({"attempt": 1})));
+    assert_eq!(missing_key["isError"], json!(true));
+    let missing_key_envelope: Value = serde_json::from_str(
+        missing_key["content"][0]["text"]
+            .as_str()
+            .expect("artifact_compact refusal text"),
+    )
+    .expect("artifact_compact refusal envelope");
+    assert_eq!(
+        missing_key_envelope["error"]["code"],
+        json!("INVALID_REQUEST")
+    );
+    let cli = env
+        .forged(&[
+            "artifact",
+            "compact",
+            "--attempt",
+            "1",
+            "--idempotency-key",
+            "artifact-parity",
+        ])
+        .1;
+    let tool = mcp.call_tool(
+        "artifact_compact",
+        json!({
+            "schemaVersion": 1,
+            "idempotencyKey": "artifact-parity",
+            "params": {"attempt": 1},
+        }),
+    );
     assert_eq!(normalized(cli), normalized(tool), "artifact_compact parity");
 
     // Session controls: missing durable state refuses identically.
@@ -1225,14 +1338,18 @@ fn all_fifty_nine_tools_match_their_cli_counterparts() {
     );
     assert_eq!(normalized(cli), normalized(tool), "session_stop parity");
 
-    // claim_next: the missing-key refusal is identical; the real call (an
-    // empty frontier) is identical too, under distinct explicit keys.
-    let cli = env.forged(&["claim-next", "--holder", "w"]).1;
-    let tool = mcp.call_tool("claim_next", envelope(json!({"holder": "w"})));
+    // claim_next is required at Clap; MCP keeps the core refusal backstop.
+    let missing_key = mcp.call_tool_result("claim_next", envelope(json!({"holder": "w"})));
+    assert_eq!(missing_key["isError"], json!(true));
+    let missing_key_envelope: Value = serde_json::from_str(
+        missing_key["content"][0]["text"]
+            .as_str()
+            .expect("claim_next refusal text"),
+    )
+    .expect("claim_next refusal envelope");
     assert_eq!(
-        normalized(cli),
-        normalized(tool),
-        "claim_next refusal parity"
+        missing_key_envelope["error"]["code"],
+        json!("INVALID_REQUEST")
     );
 
     let cli = env
@@ -1253,6 +1370,19 @@ fn all_fifty_nine_tools_match_their_cli_counterparts() {
         }),
     );
     assert_eq!(normalized(cli), normalized(tool), "claim_next parity");
+
+    // gate_run: a nonexistent run refuses before the operation fence on both
+    // surfaces, leaving byte-equivalent envelopes.
+    let cli = env.forged(&["gate", "run", "--run", "absent"]).1;
+    let tool = mcp.call_tool(
+        "gate_run",
+        json!({
+            "schemaVersion": 1,
+            "runId": "absent",
+            "params": {"run": "absent", "stage": null},
+        }),
+    );
+    assert_eq!(normalized(cli), normalized(tool), "gate_run parity");
 
     // reconcile: a nonexistent run refuses identically.
     let cli = env.forged(&["reconcile", "--run", "absent"]).1;
@@ -1396,6 +1526,159 @@ fn all_fifty_nine_tools_match_their_cli_counterparts() {
     assert_eq!(doctor_shape(&cli), doctor_shape(&tool), "doctor parity");
     assert_eq!(cli["operationId"], json!("op:doctor:read"));
     assert_eq!(tool["operationId"], json!("op:doctor:read"));
+}
+
+#[test]
+fn worktree_retire_matches_over_cli_and_mcp() {
+    const RUN: &str = "par-worktree-retire";
+    const KEY: &str = "op:worktree_retire:parity";
+
+    // Retire is stateful, so exercise each adapter against an identical,
+    // isolated fixture rather than turning the second call into a replay.
+    let cli_env = TestEnv::new("forged-worktree-retire-cli-parity");
+    cli_env.forged(&["init"]);
+    fabricate_run(&cli_env, RUN);
+    let (code, cli_text) = cli_envelope_text(
+        &cli_env,
+        &["worktree", "retire", "--run", RUN, "--idempotency-key", KEY],
+    );
+    assert_eq!(code, 0, "CLI retire: {cli_text}");
+
+    let mcp_env = TestEnv::new("forged-worktree-retire-mcp-parity");
+    mcp_env.forged(&["init"]);
+    fabricate_run(&mcp_env, RUN);
+    let mut mcp = McpClient::new(&mcp_env);
+    let missing_key = mcp.call_tool_result(
+        "worktree_retire",
+        envelope(json!({"run": RUN, "force": false, "runStateTerminal": false})),
+    );
+    assert_eq!(missing_key["isError"], json!(true));
+
+    let raw = mcp.call_tool_result(
+        "worktree_retire",
+        json!({
+            "schemaVersion": 1,
+            "idempotencyKey": KEY,
+            "runId": RUN,
+            "params": {"run": RUN, "force": false, "runStateTerminal": false},
+        }),
+    );
+    assert_eq!(raw["isError"], json!(false));
+    let cli: Value = serde_json::from_str(&cli_text).expect("CLI retire envelope");
+    let tool: Value = serde_json::from_str(
+        raw["content"][0]["text"]
+            .as_str()
+            .expect("MCP retire envelope text"),
+    )
+    .expect("MCP retire envelope");
+    assert_eq!(normalized(cli), normalized(tool));
+}
+
+/// Only MCP can independently supply envelope runId and params.run. A
+/// disagreement must be rejected before gate projection, operation fencing,
+/// or artifact creation, otherwise the recorded run and executed worktree
+/// diverge.
+#[test]
+fn gate_run_rejects_conflicting_mcp_run_aliases_without_effects() {
+    const TARGET: &str = "par-gate-target";
+    const ENVELOPE: &str = "par-gate-envelope";
+    const KEY: &str = "op:gate_run:conflicting-mcp-aliases";
+
+    let env = TestEnv::new("forged-gate-run-conflicting-mcp-aliases");
+    env.forged(&["init"]);
+    start_run(&env, TARGET);
+    prepare_run_worktree(&env, TARGET);
+    fabricate_run(&env, ENVELOPE);
+    let artifacts = env.anvil.join("runs").join(TARGET).join("artifacts");
+    assert!(!artifacts.exists(), "fixture starts without gate artifacts");
+
+    let mut mcp = McpClient::new(&env);
+    let response = mcp.call_tool(
+        "gate_run",
+        json!({
+            "schemaVersion": 1,
+            "idempotencyKey": KEY,
+            "runId": ENVELOPE,
+            "params": {"run": TARGET, "stage": "gate"},
+        }),
+    );
+    assert_eq!(response["ok"], json!(false), "{response}");
+    assert_eq!(
+        response["error"]["code"],
+        json!("INVALID_REQUEST"),
+        "{response}"
+    );
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("conflicts with params.run")),
+        "the refusal names the conflicting aliases: {response}"
+    );
+    drop(mcp);
+
+    let ledger = env.ledger();
+    assert!(
+        ledger
+            .find_operation("gate_run", KEY)
+            .expect("gate operation lookup")
+            .is_none(),
+        "the refusal creates no operation"
+    );
+    ledger.close().expect("close ledger");
+    assert!(!artifacts.exists(), "the refusal creates no gate artifacts");
+}
+
+/// A forced retirement must never fence one run while deleting another run's
+/// dirty worktree. Rejecting the two MCP aliases before the fence preserves
+/// both the worktree and its uncommitted file without minting an operation.
+#[test]
+fn worktree_retire_rejects_conflicting_mcp_run_aliases_without_effects() {
+    const TARGET: &str = "par-retire-target";
+    const ENVELOPE: &str = "par-retire-envelope";
+    const KEY: &str = "op:worktree_retire:conflicting-mcp-aliases";
+
+    let env = TestEnv::new("forged-retire-conflicting-mcp-aliases");
+    env.forged(&["init"]);
+    start_run(&env, TARGET);
+    prepare_run_worktree(&env, TARGET);
+    fabricate_run(&env, ENVELOPE);
+    let dirty = env.worktree(TARGET).join("uncommitted.txt");
+    std::fs::write(&dirty, "must survive\n").expect("write dirty fixture");
+
+    let mut mcp = McpClient::new(&env);
+    let response = mcp.call_tool(
+        "worktree_retire",
+        json!({
+            "schemaVersion": 1,
+            "idempotencyKey": KEY,
+            "runId": ENVELOPE,
+            "params": {"run": TARGET, "force": true, "runStateTerminal": true},
+        }),
+    );
+    assert_eq!(response["ok"], json!(false), "{response}");
+    assert_eq!(
+        response["error"]["code"],
+        json!("INVALID_REQUEST"),
+        "{response}"
+    );
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("conflicts with params.run")),
+        "the refusal names the conflicting aliases: {response}"
+    );
+    drop(mcp);
+
+    let ledger = env.ledger();
+    assert!(
+        ledger
+            .find_operation("worktree_retire", KEY)
+            .expect("retire operation lookup")
+            .is_none(),
+        "the refusal creates no operation"
+    );
+    ledger.close().expect("close ledger");
+    assert!(dirty.exists(), "the dirty target worktree survives refusal");
 }
 
 /// The typed `overview` params moved one boundary and this pins it: a

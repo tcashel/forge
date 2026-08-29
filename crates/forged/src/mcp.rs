@@ -1,7 +1,11 @@
-//! `forged mcp` — the rmcp stdio server. Forty-six tools, each taking the same
-//! operation envelope in and returning the same envelope out; every
-//! tool routes through the identical core dispatch the CLI uses, so the two
-//! surfaces are two adapters over one core.
+//! `forged mcp` — the rmcp stdio server. Sixty-two tools, each taking the same
+//! operation envelope in and returning the same envelope out; every tool
+//! routes through the identical core dispatch the CLI uses, so the two
+//! surfaces are two adapters over one core. Five dispatcher operations remain
+//! deliberately CLI-only: `init` owns local setup, `supervise` is the daemon
+//! entry point, `work_import_beads` is a legacy import, `packet_heartbeat` is
+//! controller-internal, and foreground `run_drive` is omitted because this
+//! detached-first surface exposes `run_submit` instead.
 //!
 //! rmcp 3.x idioms (operator-adjudicated): `ContentBlock` for tool results,
 //! `ServerInfo::default()` then mutate for the server declaration, and the
@@ -98,7 +102,7 @@ pub struct EnvelopeArgs {
     #[serde(default = "default_schema_version")]
     pub schema_version: u32,
     /// The idempotency key; derived (mutating) or defaulted (read-only)
-    /// when absent, exactly two tools require it explicitly.
+    /// when absent, exactly three operations require it explicitly.
     #[serde(default)]
     pub idempotency_key: Option<String>,
     /// The run the operation addresses, when any.
@@ -1164,18 +1168,29 @@ impl ForgedServer {
 
     async fn call(&self, name: &str, args: EnvelopeArgs) -> CallToolResult {
         let resp = self.respond(name, args).await;
-        let text = serde_json::to_string(&resp)
-            .unwrap_or_else(|e| format!("{{\"ok\":false,\"error\":\"unserializable: {e}\"}}"));
-        CallToolResult::success(vec![ContentBlock::text(text)])
+        Self::tool_result(resp, false)
     }
 
     async fn call_structured(&self, name: &str, args: EnvelopeArgs) -> CallToolResult {
         let resp = self.respond(name, args).await;
-        let structured = serde_json::to_value(&resp).unwrap_or(Value::Null);
+        Self::tool_result(resp, true)
+    }
+
+    fn tool_result(
+        resp: forged_types::OperationResponse,
+        include_structured: bool,
+    ) -> CallToolResult {
+        let is_error = !resp.ok;
+        let structured =
+            include_structured.then(|| serde_json::to_value(&resp).unwrap_or(Value::Null));
         let text = serde_json::to_string(&resp)
             .unwrap_or_else(|e| format!("{{\"ok\":false,\"error\":\"unserializable: {e}\"}}"));
-        let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
-        result.structured_content = Some(structured);
+        let mut result = if is_error {
+            CallToolResult::error(vec![ContentBlock::text(text)])
+        } else {
+            CallToolResult::success(vec![ContentBlock::text(text)])
+        };
+        result.structured_content = structured;
         result
     }
 }
@@ -1367,6 +1382,15 @@ impl ForgedServer {
             .await
     }
 
+    /// Read one stored packet and its attempts.
+    #[tool(
+        name = "packet_show",
+        description = "Show one stored packet and its attempts read-only."
+    )]
+    pub async fn packet_show(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
+        self.call("packet_show", args.0).await
+    }
+
     /// Claim one packet.
     #[tool(name = "packet_claim", description = "Claim a packet for execution.")]
     pub async fn packet_claim(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
@@ -1468,6 +1492,15 @@ impl ForgedServer {
     )]
     pub async fn claim_next(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
         self.call("claim_next", args.0).await
+    }
+
+    /// Run the configured gates in a run's worktree.
+    #[tool(
+        name = "gate_run",
+        description = "Run the configured gates in a run's worktree."
+    )]
+    pub async fn gate_run(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
+        self.call("gate_run", args.0).await
     }
 
     /// One reconcile pass over a run.
@@ -1728,6 +1761,15 @@ impl ForgedServer {
     )]
     pub async fn attention_reopen(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
         self.call("attention_reopen", args.0).await
+    }
+
+    /// Retire a run's worktree through the explicit repair verb.
+    #[tool(
+        name = "worktree_retire",
+        description = "Retire a run's worktree. Requires an explicit idempotencyKey."
+    )]
+    pub async fn worktree_retire(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
+        self.call("worktree_retire", args.0).await
     }
 }
 
