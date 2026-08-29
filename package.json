@@ -1,6 +1,6 @@
 {
   "name": "forged-pi",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "description": "Native Pi tools and shared Forge lead-agent skills for the Forged execution control plane.",
   "license": "SEE LICENSE IN LICENSE",
   "keywords": [
