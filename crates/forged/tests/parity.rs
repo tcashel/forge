@@ -86,6 +86,41 @@ fn envelope(params: Value) -> Value {
     json!({"schemaVersion": 1, "params": params})
 }
 
+fn start_run(env: &TestEnv, run: &str) {
+    env.seed_work_spec(
+        run,
+        "Exercise one MCP run-identity regression.",
+        "Conflicting run aliases are rejected without effects.",
+    );
+    let repository = env.repos.repo.to_string_lossy().into_owned();
+    let (code, response) = env.forged(&[
+        "run",
+        "start",
+        "--work",
+        run,
+        "--repo",
+        &repository,
+        "--base-ref",
+        "main",
+    ]);
+    assert_eq!(code, 0, "start {run}: {response}");
+}
+
+fn prepare_run_worktree(env: &TestEnv, run: &str) {
+    let spec = forged_git::WorktreeSpec {
+        repo: env.repos.repo.clone(),
+        runs_root: env.anvil.join("runs"),
+        run_id: run.to_owned(),
+        branch: format!("forged/{run}"),
+        base: env.repos.base.clone(),
+        expected_base_sha: None,
+    };
+    tokio::runtime::Runtime::new()
+        .expect("test runtime")
+        .block_on(forged_git::prepare_worktree(&spec))
+        .expect("prepare run worktree");
+}
+
 #[test]
 fn all_sixty_two_tools_match_their_cli_counterparts() {
     let env = TestEnv::new("forged-parity");
@@ -1537,6 +1572,113 @@ fn worktree_retire_matches_over_cli_and_mcp() {
     )
     .expect("MCP retire envelope");
     assert_eq!(normalized(cli), normalized(tool));
+}
+
+/// Only MCP can independently supply envelope runId and params.run. A
+/// disagreement must be rejected before gate projection, operation fencing,
+/// or artifact creation, otherwise the recorded run and executed worktree
+/// diverge.
+#[test]
+fn gate_run_rejects_conflicting_mcp_run_aliases_without_effects() {
+    const TARGET: &str = "par-gate-target";
+    const ENVELOPE: &str = "par-gate-envelope";
+    const KEY: &str = "op:gate_run:conflicting-mcp-aliases";
+
+    let env = TestEnv::new("forged-gate-run-conflicting-mcp-aliases");
+    env.forged(&["init"]);
+    start_run(&env, TARGET);
+    prepare_run_worktree(&env, TARGET);
+    fabricate_run(&env, ENVELOPE);
+    let artifacts = env.anvil.join("runs").join(TARGET).join("artifacts");
+    assert!(!artifacts.exists(), "fixture starts without gate artifacts");
+
+    let mut mcp = McpClient::new(&env);
+    let response = mcp.call_tool(
+        "gate_run",
+        json!({
+            "schemaVersion": 1,
+            "idempotencyKey": KEY,
+            "runId": ENVELOPE,
+            "params": {"run": TARGET, "stage": "gate"},
+        }),
+    );
+    assert_eq!(response["ok"], json!(false), "{response}");
+    assert_eq!(
+        response["error"]["code"],
+        json!("INVALID_REQUEST"),
+        "{response}"
+    );
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("conflicts with params.run")),
+        "the refusal names the conflicting aliases: {response}"
+    );
+    drop(mcp);
+
+    let ledger = env.ledger();
+    assert!(
+        ledger
+            .find_operation("gate_run", KEY)
+            .expect("gate operation lookup")
+            .is_none(),
+        "the refusal creates no operation"
+    );
+    ledger.close().expect("close ledger");
+    assert!(!artifacts.exists(), "the refusal creates no gate artifacts");
+}
+
+/// A forced retirement must never fence one run while deleting another run's
+/// dirty worktree. Rejecting the two MCP aliases before the fence preserves
+/// both the worktree and its uncommitted file without minting an operation.
+#[test]
+fn worktree_retire_rejects_conflicting_mcp_run_aliases_without_effects() {
+    const TARGET: &str = "par-retire-target";
+    const ENVELOPE: &str = "par-retire-envelope";
+    const KEY: &str = "op:worktree_retire:conflicting-mcp-aliases";
+
+    let env = TestEnv::new("forged-retire-conflicting-mcp-aliases");
+    env.forged(&["init"]);
+    start_run(&env, TARGET);
+    prepare_run_worktree(&env, TARGET);
+    fabricate_run(&env, ENVELOPE);
+    let dirty = env.worktree(TARGET).join("uncommitted.txt");
+    std::fs::write(&dirty, "must survive\n").expect("write dirty fixture");
+
+    let mut mcp = McpClient::new(&env);
+    let response = mcp.call_tool(
+        "worktree_retire",
+        json!({
+            "schemaVersion": 1,
+            "idempotencyKey": KEY,
+            "runId": ENVELOPE,
+            "params": {"run": TARGET, "force": true, "runStateTerminal": true},
+        }),
+    );
+    assert_eq!(response["ok"], json!(false), "{response}");
+    assert_eq!(
+        response["error"]["code"],
+        json!("INVALID_REQUEST"),
+        "{response}"
+    );
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("conflicts with params.run")),
+        "the refusal names the conflicting aliases: {response}"
+    );
+    drop(mcp);
+
+    let ledger = env.ledger();
+    assert!(
+        ledger
+            .find_operation("worktree_retire", KEY)
+            .expect("retire operation lookup")
+            .is_none(),
+        "the refusal creates no operation"
+    );
+    ledger.close().expect("close ledger");
+    assert!(dirty.exists(), "the dirty target worktree survives refusal");
 }
 
 /// The typed `overview` params moved one boundary and this pins it: a

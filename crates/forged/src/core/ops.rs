@@ -1896,6 +1896,26 @@ pub async fn packet_heartbeat(ctx: &Ctx, req: &OperationRequest) -> OperationRes
 
 // -------------------------------------------------------------- gate run
 
+/// Bind the envelope identity to the run selected by operation params.
+/// MCP callers can supply both aliases independently; refusing disagreement
+/// before projection or fencing keeps the durable operation and its effect on
+/// the same run. The CLI always supplies matching values.
+fn bind_envelope_run(
+    req: &mut OperationRequest,
+    operation: &str,
+    run_id: &str,
+) -> Result<(), Failure> {
+    if let Some(envelope) = req.run_id.as_deref() {
+        if envelope != run_id {
+            return Err(Failure::invalid(format!(
+                "{operation} envelope runId {envelope:?} conflicts with params.run {run_id:?}"
+            )));
+        }
+    }
+    req.run_id = Some(run_id.to_owned());
+    Ok(())
+}
+
 /// `gate run` — fenced SafeRetry gate pass; a failing gate is data in its
 /// rows, never an error.
 pub async fn gate_run(ctx: &Ctx, req: &mut OperationRequest) -> OperationResponse {
@@ -1910,8 +1930,8 @@ pub async fn gate_run(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespons
         req,
         derive_key("gate_run", Some(&run_id), Some(&stage), None),
     );
-    if req.run_id.is_none() {
-        req.run_id = Some(run_id.clone());
+    if let Err(error) = bind_envelope_run(req, "gate_run", &run_id) {
+        return err_response(&req.idempotency_key, &error);
     }
     let view = match crate::core::drive::project(ctx, &run_id).await {
         Ok(view) => view,
@@ -5124,8 +5144,8 @@ pub async fn worktree_retire(ctx: &Ctx, req: &OperationRequest) -> OperationResp
         Ok(r) => r.to_owned(),
         Err(f) => return err_response(&req.idempotency_key, &f),
     };
-    if req.run_id.is_none() {
-        req.run_id = Some(run_id.clone());
+    if let Err(error) = bind_envelope_run(&mut req, "worktree_retire", &run_id) {
+        return err_response(&req.idempotency_key, &error);
     }
     let params = req.params.clone();
     fenced(
