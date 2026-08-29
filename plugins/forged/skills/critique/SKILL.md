@@ -10,7 +10,7 @@ Position: complete work item -> one bounded critique record. Next:
 
 Boundary: critique runs in the lead session. The lead reads the ledger,
 delegates only read-only critic perspectives, verifies their evidence, and
-stores the synthesized record in `notes`. Forged does not execute a run here.
+stores one typed recommendation note. Forged does not execute a run here.
 
 ## Load the authoritative record
 
@@ -52,9 +52,35 @@ duplicates, and separate:
 - **open questions:** facts that still need a decision or evidence;
 - **rejected findings:** concise reasons critic claims are inapplicable.
 
-Do not silently modify the specification. Produce one exact fenced block. The
-block deliberately avoids unchecked Markdown checkboxes: the plan gate reserves
-those for questions that make an item ledger-blocked.
+Do not silently modify the specification. Produce one exact JSON payload using
+the closed `forged.spec-recommendations/1` contract:
+
+```json
+{
+  "schema": "forged.spec-recommendations/1",
+  "workItem": "<ore-id>",
+  "repository": "<canonical absolute path>",
+  "reviewedAt": "<ISO-8601 UTC>",
+  "topology": "<low|normal|high and seats used>",
+  "recommendations": [
+    {"target": "<field or edge>", "correction": "<specific correction and evidence>"}
+  ],
+  "cruxes": [
+    {
+      "id": "CRUX-1",
+      "evidence": ["<verified fact>"],
+      "options": ["<bounded choice and consequence>"],
+      "recommendation": "<lead critic's call>"
+    }
+  ],
+  "openQuestions": ["<question>"],
+  "rejectedFindings": [{"finding": "<finding>", "reason": "<reason>"}],
+  "verification": ["<what was inspected and what was not>"]
+}
+```
+
+Render the same synthesis for the operator using this fenced Markdown
+guidance. This projection is not the stored contract:
 
 ````markdown
 ```forged-spec-recommendations
@@ -84,44 +110,42 @@ topology: <low|normal|high and seats used>
 ```
 ````
 
-Current main has no separate ledger commentary operation. Construct one
-combined notes file from the exact existing `notes` bytes plus the complete
-block, preserving everything already there. Fail closed before the update if
-the combined file cannot be read, is empty, or cannot be loaded:
+The required `recommendations` and `cruxes` arrays may be empty. Optional
+fields may be omitted. Never store the rendering as the contract. Only the
+critique seat writes kind `recommendation`, so newest-wins remains truthful.
+
+Write the raw JSON object, without a Markdown fence, through the typed note
+verb. Fail closed before the add if the body file is unreadable or empty:
 
 ```bash
 : "${DRAFT_DIR:?set DRAFT_DIR to the critique scratch directory}"
-UPDATED_NOTES_PATH="$DRAFT_DIR/notes-with-critique.md"
-if [[ ! -r "$UPDATED_NOTES_PATH" || ! -s "$UPDATED_NOTES_PATH" ]]; then
-  printf 'missing or empty combined critique notes: %s\n' \
-    "$UPDATED_NOTES_PATH" >&2
+RECOMMENDATIONS_PATH="$DRAFT_DIR/spec-recommendations.json"
+if [[ ! -r "$RECOMMENDATIONS_PATH" || ! -s "$RECOMMENDATIONS_PATH" ]]; then
+  printf 'missing or empty recommendation payload: %s\n' \
+    "$RECOMMENDATIONS_PATH" >&2
   exit 1
 fi
-UPDATED_NOTES="$(<"$UPDATED_NOTES_PATH")" || exit 1
-if [[ -z "$UPDATED_NOTES" ]]; then
-  printf 'combined critique notes must be nonempty\n' >&2
-  exit 1
-fi
-forged work update \
+forged work note add \
   --id "$WORK_ID" \
-  --expected-revision "$OBSERVED_REVISION" \
-  --notes="$UPDATED_NOTES"
+  --kind recommendation \
+  --schema forged.spec-recommendations/1 \
+  --actor critique \
+  --body-file "$RECOMMENDATIONS_PATH"
 forged work show --id "$WORK_ID"
 ```
 
-The update mints a spec revision. This is a known temporary gap, so only one
-lead session may write the record during critique. A moved revision fails
-closed: re-read and reconcile; never overwrite another planner's notes.
+The append does not mint a spec revision or change coordination state. A schema
+or field refusal must be fixed in the body file and added again; never fall
+back to a spec-notes append.
 
-If there are no findings, persist a block that says `None` and has no unresolved
-CRUX. That completes critique but does not bypass adjudication's readiness
-checks.
+If there are no findings, persist empty `recommendations` and `cruxes` arrays.
+That completes critique but does not bypass adjudication's readiness checks.
 
 ## Never
 
 - Do not change `description`, `design`, `acceptanceCriteria`, title, edges, or
   work-item status here.
-- Do not resolve CRUXes during critique or invent a nonexistent comment verb.
+- Do not resolve CRUXes during critique or write a second recommendation kind.
 - Do not run implementation, CI, installation, GitHub writes, or Forged
   execution.
 - Do not repeat critique merely because another critic could imagine more.

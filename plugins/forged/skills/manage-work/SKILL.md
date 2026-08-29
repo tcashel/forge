@@ -173,12 +173,13 @@ A short “yes” is valid only when it immediately and unambiguously answers th
 tuple. A later reply, general approval, different subject, or changed normative
 field requires a new tuple.
 
-After approval and before start, append exactly one fenced JSON record to the
-existing `notes` bytes:
+After approval and before start, construct exactly one approval object. A
+fenced rendering may be shown to the operator, but the raw JSON object is the
+typed note contract:
 
 ```forged-execution-approval
 {
-  "schema": "forged-execution-approval/1",
+  "schema": "forged.execution-approval/1",
   "subjectKind": "<slice|epic>",
   "workItemId": "<exact ore id>",
   "observedRevision": "<revision shown in the tuple>",
@@ -193,34 +194,30 @@ existing `notes` bytes:
 }
 ```
 
-Current main has no separate ledger commentary verb, so preserve all existing
-notes and perform one guarded update. Fail closed before the update unless the
-combined approval notes file is readable, nonempty, and loaded successfully:
+Write the raw object, without the Markdown fence, through the approval note
+verb. Fail closed before the add unless the body file is readable and nonempty:
 
 ```bash
 : "${DRAFT_DIR:?set DRAFT_DIR to the approval scratch directory}"
-APPROVED_NOTES_PATH="$DRAFT_DIR/notes-with-approval.md"
-if [[ ! -r "$APPROVED_NOTES_PATH" || ! -s "$APPROVED_NOTES_PATH" ]]; then
-  printf 'missing or empty combined approval notes: %s\n' \
-    "$APPROVED_NOTES_PATH" >&2
+APPROVAL_PATH="$DRAFT_DIR/execution-approval.json"
+if [[ ! -r "$APPROVAL_PATH" || ! -s "$APPROVAL_PATH" ]]; then
+  printf 'missing or empty execution approval payload: %s\n' \
+    "$APPROVAL_PATH" >&2
   exit 1
 fi
-APPROVED_NOTES="$(<"$APPROVED_NOTES_PATH")" || exit 1
-if [[ -z "$APPROVED_NOTES" ]]; then
-  printf 'combined approval notes must be nonempty\n' >&2
-  exit 1
-fi
-forged work update \
+forged work note add \
   --id "$WORK_ID" \
-  --expected-revision "$OBSERVED_REVISION" \
-  --notes="$APPROVED_NOTES"
+  --kind approval \
+  --schema forged.execution-approval/1 \
+  --actor "$OPERATOR_ACTOR" \
+  --body-file "$APPROVAL_PATH"
 forged work show --id "$WORK_ID"
 ```
 
-Verify only the intended notes append and revision changed; title, description,
-design, acceptance criteria, repository, edges, kind, and readiness must not.
-The post-update revision is the handoff snapshot. Any conflict or later
-normative drift requires fresh approval.
+Verify the returned note uses `forged.execution-approval/1`, its body matches
+the approved tuple, and the work-item revision is still the observed revision.
+The append changes no spec field or coordination state. Any later normative
+drift requires fresh approval.
 
 Before promising unattended continuation, run only `forged doctor` and
 `forged service status`. Do not install, start, restart, or repair service here.
