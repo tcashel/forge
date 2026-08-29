@@ -21,7 +21,7 @@ fn make_run(ledger: &Ledger, id: &str) -> String {
     ledger
         .create_run(NewRun {
             run_id: RunId::new(id).expect("valid run id"),
-            bead_id: "bead-1".to_owned(),
+            work_id: "bead-1".to_owned(),
             repo: "example/repo".to_owned(),
             base_ref: "main".to_owned(),
             branch: format!("feat/{id}"),
@@ -662,7 +662,7 @@ fn events_are_append_only_and_run_attributed() {
 
 /// The marker's SCOPE is durable and first-writer-wins. Without it a
 /// `revoking` row cannot say whose revocation it is, and the recovery path
-/// finishes an operator's stop through the bead-scoped reclaim it exists to
+/// finishes an operator's stop through the work-scoped reclaim it exists to
 /// avoid.
 #[test]
 fn a_revoking_marker_records_the_scope_that_placed_it() {
@@ -671,7 +671,7 @@ fn a_revoking_marker_records_the_scope_that_placed_it() {
     let run = make_run(&ledger, "run-scope");
     let fence = SpecFence::Sha256("cafe".to_owned());
 
-    // The saga's own entry point is bead-scoped.
+    // The saga's own entry point is work-scoped.
     let saga_packet = make_packet(&ledger, &run);
     // One live attempt per packet, so the two revocations need two packets.
     let stop_packet = ledger
@@ -696,7 +696,7 @@ fn a_revoking_marker_records_the_scope_that_placed_it() {
             .get_attempt(saga.attempt_id)
             .expect("get")
             .revoke_scope,
-        Some(forged_ledger::RevokeScope::Bead)
+        Some(forged_ledger::RevokeScope::Work)
     );
 
     // An operator's stop is attempt-scoped, and a second revocation of an

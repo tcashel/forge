@@ -32,7 +32,7 @@ const EVENT_PAGE: u32 = 256;
 
 /// The spec ref a packet row pins, rebuilt from its columns.
 ///
-/// `spec_revision` is present exactly when the packet is bead-sourced, and
+/// `spec_revision` is present exactly when the packet is work-sourced, and
 /// is then the fence; a file-sourced packet keeps the content hash.
 pub fn packet_spec(row: &forged_ledger::PacketRow) -> forged_types::SpecRef {
     forged_types::SpecRef {

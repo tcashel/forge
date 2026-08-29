@@ -52,7 +52,7 @@ fn help_lists_every_command_and_subcommand_flags() {
     }
     let start = help_text(&env, &["run", "start", "--help"]);
     for flag in [
-        "--bead",
+        "--work",
         "--repo",
         "--spec",
         "--base-ref",
@@ -65,6 +65,10 @@ fn help_lists_every_command_and_subcommand_flags() {
             "run start --help must document {flag}"
         );
     }
+    assert!(
+        !start.contains("--bead"),
+        "run start --help must not expose the retired --bead flag"
+    );
     let definition = help_text(&env, &["definition", "validate", "--help"]);
     for flag in ["--profile", "--roster", "--idempotency-key"] {
         assert!(

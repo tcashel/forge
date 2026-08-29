@@ -24,7 +24,8 @@ pub enum AttentionSubjectKind {
 pub enum AttentionCondition {
     InputRequired,
     Blocked,
-    BeadsSettlementPending,
+    #[serde(rename = "beads-settlement-pending")]
+    WorkSettlementPending,
     Revoking,
     Quarantined,
     MergeApproval,
@@ -75,7 +76,8 @@ pub enum AttentionEvidenceKind {
     Reservation,
     ArtifactManifest,
     PullRequest,
-    Bead,
+    #[serde(rename = "bead")]
+    Work,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -83,7 +85,8 @@ pub enum AttentionEvidenceKind {
 pub enum AttentionActionCode {
     ProvideInput,
     ResolveBlocker,
-    ReconcileBeads,
+    #[serde(rename = "reconcile-beads")]
+    ReconcileWork,
     ReclaimAttempt,
     AdjudicateQuarantine,
     MergePullRequest,

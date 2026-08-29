@@ -1,6 +1,6 @@
 //! Bounded history/spend behavior over production-shaped durable rows.
 //!
-//! Fixtures write only the scratch SQLite database. No Beads, provider,
+//! Fixtures write only the scratch SQLite database. No live work, provider,
 //! filesystem evidence, service, GitHub, or network path participates in a
 //! history call.
 
@@ -24,7 +24,7 @@ fn packet_body(run_id: &str, packet_id: &str, provider: &str) -> String {
         schema: "forged.packet/1".to_owned(),
         packet_id: packet_id.to_owned(),
         run_id: run_id.to_owned(),
-        bead_id: format!("bead-{run_id}"),
+        work_id: format!("bead-{run_id}"),
         stage: Stage::Implement,
         execution: Some(SeatExecutionV1 {
             stage_id: "implementation".to_owned(),
@@ -75,7 +75,7 @@ fn insert_identity(
         title: Some(title.to_owned()),
     });
     let display = work_display_title(id, Some(title), Some(&label), None, epic_context.as_ref());
-    let bead_id = if kind == "epic" {
+    let work_id = if kind == "epic" {
         id.to_owned()
     } else {
         format!("bead-{id}")
@@ -90,7 +90,7 @@ fn insert_identity(
         params![
             kind,
             id,
-            bead_id,
+            work_id,
             title,
             repository,
             label,

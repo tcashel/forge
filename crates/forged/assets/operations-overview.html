@@ -213,7 +213,7 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
   }
   function titleFor(entry) { return entry?.titleSource?.value || entry?.identity?.displayTitle || entry?.beadId || "Untitled work"; }
   // A resolved title states its authority: an id form is rendered AS an id,
-  // and a current Beads read is marked live rather than read as launch
+  // and a current work read is marked live rather than read as launch
   // evidence. A payload without `titleSource` marks nothing.
   function titleMark(entry) { const t = entry?.titleSource; return !t ? "" : t.known === false ? "untitled id" : t.source === "beads.title" ? "live title" : ""; }
   function stateFor(detail) { return detail?.status?.state || detail?.status?.status || detail?.state || "unknown"; }
@@ -304,7 +304,7 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
     row.addEventListener("click", () => selectAttention(item));
     return row;
   }
-  function itemBeadId(item) { return arr(item?.evidenceRefs).find(reference => reference?.kind === "bead")?.id || null; }
+  function itemWorkId(item) { return arr(item?.evidenceRefs).find(reference => reference?.kind === "bead")?.id || null; }
   function blockedRoots(group, map) {
     const nodes = new Map(arr(map?.nodes).map(node => [`${node?.workRef?.kind}:${node?.workRef?.id}`, node]));
     const direct = new Map();
@@ -317,8 +317,8 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
     const roots = new Map();
     let unresolved = 0;
     for (const item of arr(group?.items)) {
-      const bead = itemBeadId(item);
-      const targets = bead ? arr(direct.get(`plan:${bead}`)) : [];
+      const workId = itemWorkId(item);
+      const targets = workId ? arr(direct.get(`plan:${workId}`)) : [];
       if (!targets.length) { unresolved += 1; continue; }
       // ONE root per blocked item — the first resolvable blocker — so the
       // per-root counts sum to the blocked total instead of counting edges.
@@ -437,8 +437,8 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
     }
     if (state.plan) {
       const entry = state.plan;
-      add("plan facts", "from the live Beads read; no execution record exists yet");
-      add("bead", entry.beadId || entry.id);
+      add("plan facts", "from the live work read; no execution record exists yet");
+      add("work", entry.beadId || entry.id);
       add("status", entry.plan?.status);
       add("readiness", entry.plan?.readiness);
       add("issue type", entry.plan?.issueType);
@@ -460,7 +460,7 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
     box.append(dl);
   }
   /**
-   * A live-plan row is not a dead row: its whole Beads record already
+   * A live-plan row is not a dead row: its whole work record already
    * travelled inside the projection, so opening it needs no tool call.
    */
   function openPlan(entry) { state.detail = null; state.detailError = null; state.attentionSelection = null; state.plan = entry; renderDetail(); reportSize(); }
@@ -486,7 +486,7 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
     if (!data) { byId("groups").append(el("div", "empty", "Waiting for work.")); renderDetail(); reportSize(); return; }
     byId("scope").textContent = data.scope?.repository || "All repositories";
     const headline=fullHeadline(data);byId("headline").textContent=headline;byId("headline").title=headline;state.lastHeadline=headline;
-    const health = byId("health"); health.append(healthPill("ledger", data.sourceHealth?.ledger)); health.append(healthPill("beads", data.sourceHealth?.beads)); health.append(healthPill("plan", data.sourceHealth?.plan));
+    const health = byId("health"); health.append(healthPill("ledger", data.sourceHealth?.ledger)); health.append(healthPill("work", data.sourceHealth?.beads)); health.append(healthPill("plan", data.sourceHealth?.plan));
     const stats = byId("stats");
     for (const [value, label] of [[data.coverage?.total,"work"],[data.counts?.live,"live"],[data.counts?.attention,"attention"],[data.counts?.planOnly,"plan only"],[spendText(data.spend)??"—","known spend"]]) {
       const cell = el("div", "stat"); cell.append(el("b", "", typeof value === "string" ? value : fmt(value))); cell.append(el("span", "", label)); stats.append(cell);
@@ -501,7 +501,7 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
         const target = entry.detailTarget;
         const selector = target ? `${target.subjectKind}:${target.subjectId}` : null;
         // A row with no durable detail target is not therefore dead: a
-        // live-plan row already carries its whole Beads record, and opening
+        // live-plan row already carries its whole work record, and opening
         // that needs no server tool.
         const planFacts = !target && !!entry.plan;
         const canDetail = !!target && host.capabilities.serverTools;
@@ -553,7 +553,7 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
       const state = source?.state || "unknown";
       if (state === "available") continue;
       const error = typeof source?.error === "string" && source.error ? `: ${source.error.slice(0, 400)}` : "";
-      degraded.push(`${name} ${state}${error}`);
+      degraded.push(`${name === "beads" ? "work" : name} ${state}${error}`);
     }
     return degraded;
   }
@@ -585,7 +585,7 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
     return value;
   }
   function mergeTriage(active, settlements) {
-    // Spec amendment (adjudicated on the bead): the settlements query is a
+    // Spec amendment (adjudicated on the work item): the settlements query is a
     // separate, PRESENTATION-ONLY surface. totals/decisions/symptoms,
     // group membership, and oldest ages come from the ACTIVE payload
     // verbatim — resolved history never counts as outstanding work. A

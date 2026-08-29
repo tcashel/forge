@@ -1,7 +1,7 @@
 //! Versioned scheduler inputs and durable admission decisions.
 //!
 //! The scheduler contract deliberately contains only durable ledger facts and
-//! the bounded Beads projection. Process identity and filesystem state are
+//! the bounded work projection. Process identity and filesystem state are
 //! reconciler concerns and must never leak into these values.
 
 use serde::{Deserialize, Serialize};
@@ -45,9 +45,12 @@ pub enum AdmissionReason {
     MissingCost,
     RateLimitCeiling,
     StaleRateLimit,
-    BeadUnavailable,
-    BeadMalformed,
-    BeadNotRunnable,
+    #[serde(rename = "bead-unavailable")]
+    WorkUnavailable,
+    #[serde(rename = "bead-malformed")]
+    WorkMalformed,
+    #[serde(rename = "bead-not-runnable")]
+    WorkNotRunnable,
     RepositoryMismatch,
     Unauthorized,
     DesiredNotRunning,
@@ -64,13 +67,17 @@ pub struct AdmissionCandidateV1 {
     pub subject_kind: AdmissionSubjectKind,
     pub subject_id: String,
     pub control_revision: u64,
-    pub bead_id: String,
-    pub bead_revision: Option<String>,
-    pub bead_status: Option<String>,
+    #[serde(rename = "beadId")]
+    pub work_id: String,
+    #[serde(rename = "beadRevision")]
+    pub work_revision: Option<String>,
+    #[serde(rename = "beadStatus")]
+    pub work_status: Option<String>,
     pub priority: Option<i64>,
     pub repository: String,
-    pub bead_repository: Option<String>,
-    /// Bounded/sanitized collection failure, when the one Beads batch was
+    #[serde(rename = "beadRepository")]
+    pub work_repository: Option<String>,
+    /// Bounded/sanitized collection failure, when the one work batch was
     /// unavailable. It is evidence, never permission to guess.
     pub input_error: Option<String>,
     pub desired_wake_at: Option<String>,

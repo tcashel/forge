@@ -8,7 +8,7 @@
     {
       "name": "forged",
       "source": "./plugins/forged",
-      "description": "Plan native Bead work, inspect the Forged portfolio, and safely invoke exact authorized submissions or lifecycle controls."
+      "description": "Plan native work, inspect the Forged portfolio, and safely invoke exact authorized submissions or lifecycle controls."
     }
   ]
 }

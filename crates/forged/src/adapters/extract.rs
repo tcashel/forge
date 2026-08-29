@@ -442,7 +442,7 @@ fn finish(text: &str, expected_schema: &str, packet_id: &str) -> Harvest {
 mod tests {
     use super::*;
     use forged_types::{
-        Finding, NativeBeadSpecV1, Outcome, PlanTraceabilityV1, ProtocolRef, Severity,
+        Finding, NativeWorkSpecV1, Outcome, PlanTraceabilityV1, ProtocolRef, Severity,
         SpecAmendment, Verdict,
     };
     use serde_json::json;
@@ -506,7 +506,7 @@ mod tests {
 
     fn plan_outcome() -> Outcome {
         Outcome::Plan {
-            spec: NativeBeadSpecV1 {
+            spec: NativeWorkSpecV1 {
                 description: "complete description".to_owned(),
                 acceptance_criteria: "observable acceptance".to_owned(),
                 design: "bounded design".to_owned(),

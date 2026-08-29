@@ -39,7 +39,7 @@ fn seed_run(ledger: &Ledger) -> String {
     ledger
         .create_run(NewRun {
             run_id: RunId::new(RUN).expect("run id"),
-            bead_id: "bead-1".to_owned(),
+            work_id: "bead-1".to_owned(),
             repo: "octo/demo".to_owned(),
             base_ref: "main".to_owned(),
             branch: "feat/x".to_owned(),
@@ -90,8 +90,8 @@ async fn kill_mid_implement_revokes_and_the_same_packet_is_reclaimable() {
         .any(|c| matches!(c, PortCall::Liveness(s) if s == "claude:sess-a:1")));
     assert!(calls.iter().any(|c| matches!(
         c,
-        PortCall::ReclaimLease { bead, holder, older_than_s }
-            if bead == "bead-1" && holder == "claude:sess-a:1" && *older_than_s == 1500
+        PortCall::ReclaimLease { work, holder, older_than_s }
+            if work == "bead-1" && holder == "claude:sess-a:1" && *older_than_s == 1500
     )));
 
     // The SAME packet is re-claimable by a successor; the packet id is

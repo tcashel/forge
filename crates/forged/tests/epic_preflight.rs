@@ -126,7 +126,7 @@ fn preflight_names_a_missing_repository_and_unknown_profile() {
         json!(false),
         "{preflight}"
     );
-    // The report keeps going past failures: the bead checks still ran.
+    // The report keeps going past failures: the work checks still ran.
     assert_eq!(check(result, "epic-bead")["ok"], json!(true), "{preflight}");
     assert_nothing_durable(&env, "epic-pfr");
 }
@@ -139,7 +139,7 @@ fn preflight_names_a_child_assigned_to_another_repository() {
     let env = TestEnv::new("forged-epic-preflight-repo-mismatch");
     env.seed_epic("epic-pfr", &[("child-pfr", &env.spec, true)]);
     assert_eq!(env.forged(&["init"]).0, 0);
-    env.set_bead_repository("child-pfr", "/somewhere/else");
+    env.set_work_repository("child-pfr", "/somewhere/else");
     let repo = env.repos.repo.to_string_lossy().into_owned();
 
     let (code, preflight) =
@@ -168,7 +168,7 @@ fn preflight_reports_no_run_identity_for_a_no_diff_child() {
             ("child-chore", &env.spec, true),
         ],
     );
-    env.set_bead_field("child-chore", "type", "chore");
+    env.set_work_field("child-chore", "type", "chore");
     assert_eq!(env.forged(&["init"]).0, 0);
     let repo = env.repos.repo.to_string_lossy().into_owned();
 

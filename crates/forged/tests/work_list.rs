@@ -96,7 +96,7 @@ fn fabricate_run_in_repository(env: &TestEnv, run_id: &str, repository: &str) {
     ledger
         .create_run(forged_ledger::NewRun {
             run_id: forged_types::RunId::new(run_id).expect("run id"),
-            bead_id: format!("bead-{run_id}"),
+            work_id: format!("bead-{run_id}"),
             repo: repository.to_owned(),
             base_ref: "main".to_owned(),
             branch: format!("forged/{run_id}"),
@@ -116,7 +116,7 @@ fn fabricate_epic_in_repository(env: &TestEnv, epic_id: &str, repository: &str) 
             kind: forged_types::WorkIdentitySubjectKind::Epic,
             id: epic_id.to_owned(),
         },
-        bead: forged_types::WorkIdentityBeadV1 {
+        work: forged_types::WorkIdentityWorkV1 {
             id: epic_id.to_owned(),
             title: Some(title.clone()),
             revision: None,
@@ -198,10 +198,10 @@ fn the_operator_queue_is_human_named_grouped_and_honest_about_unknowns() {
     fabricate_run(&env, "q-stalled");
     fabricate_run(&env, "q-ready");
     fabricate_live_seats(&env, "q-running", 1);
-    env.set_bead_field("bead-q-planned", "title", "Prepare the operator queue");
-    env.set_bead_field("bead-q-stalled", "status", "in_progress");
+    env.set_work_field("bead-q-planned", "title", "Prepare the operator queue");
+    env.set_work_field("bead-q-stalled", "status", "in_progress");
     env.set_assignee("bead-q-stalled", "someone-else");
-    env.set_bead_field("bead-q-ready", "status", "in_progress");
+    env.set_work_field("bead-q-ready", "status", "in_progress");
     env.set_assignee("bead-q-ready", "forged:bead-q-ready:0");
     let ledger = env.ledger();
     ledger
@@ -339,7 +339,7 @@ fn the_operator_queue_is_human_named_grouped_and_honest_about_unknowns() {
 }
 
 #[test]
-fn repository_scope_uses_exact_bead_metadata_for_slices_epics_and_renamed_checkouts() {
+fn repository_scope_uses_exact_work_metadata_for_slices_epics_and_renamed_checkouts() {
     let env = TestEnv::new("forged-work-list-repository-scope");
     env.forged(&["init"]);
     let forge = "/Users/operator/repositories/forge";
@@ -353,15 +353,15 @@ fn repository_scope_uses_exact_bead_metadata_for_slices_epics_and_renamed_checko
     fabricate_run_in_repository(&env, "repo-smithy", smithy);
     fabricate_run_in_repository(&env, "repo-unknown", "/legacy/guessed/repository");
     fabricate_run_in_repository(&env, "repo-renamed", old_checkout);
-    env.set_bead_repository("bead-repo-forge", forge);
-    env.set_bead_repository("repo-drover", drover);
-    env.set_bead_repository("bead-repo-smithy", smithy);
+    env.set_work_repository("bead-repo-forge", forge);
+    env.set_work_repository("repo-drover", drover);
+    env.set_work_repository("bead-repo-smithy", smithy);
     // Override the shim's convenience default so this fixture really models
-    // a Bead with no authoritative repository metadata.
-    env.set_bead_field("bead-repo-unknown", "metadata", "{}");
+    // a Work with no authoritative repository metadata.
+    env.set_work_field("bead-repo-unknown", "metadata", "{}");
     // The renamed checkout proves membership comes from current canonical
-    // Bead metadata, not the launch-time repository column in the ledger.
-    env.set_bead_repository("bead-repo-renamed", renamed_checkout);
+    // Work metadata, not the launch-time repository column in the ledger.
+    env.set_work_repository("bead-repo-renamed", renamed_checkout);
 
     let scoped = |repository: &str| {
         let (code, response) = env.forged(&["work", "list", "--repo", repository]);
@@ -453,16 +453,16 @@ fn repository_status_and_assignee_filters_compose_over_a_mixed_store() {
     ];
     for (run, repository, status, assignee) in fixtures {
         fabricate_run_in_repository(&env, run, repository);
-        let bead = format!("bead-{run}");
-        env.set_bead_repository(&bead, repository);
-        env.set_bead_field(&bead, "status", status);
-        env.set_assignee(&bead, assignee);
+        let work = format!("bead-{run}");
+        env.set_work_repository(&work, repository);
+        env.set_work_field(&work, "status", status);
+        env.set_assignee(&work, assignee);
     }
     let revisions = fixtures
         .iter()
         .map(|(run, _, _, _)| {
-            let bead = format!("bead-{run}");
-            (bead.clone(), env.bead_revision(&bead))
+            let work = format!("bead-{run}");
+            (work.clone(), env.work_revision(&work))
         })
         .collect::<Vec<_>>();
 
@@ -509,9 +509,9 @@ fn repository_status_and_assignee_filters_compose_over_a_mixed_store() {
         ]),
         BTreeSet::from(["a-blocked-alice".to_owned()])
     );
-    for (bead, revision) in revisions {
+    for (work, revision) in revisions {
         assert_eq!(
-            env.bead_revision(&bead),
+            env.work_revision(&work),
             revision,
             "read filters must not mint work revisions"
         );
@@ -844,7 +844,7 @@ fn an_unreadable_pause_payload_still_lists_a_paused_epic() {
 /// The `runs` row is the durable state wherever one exists. A legacy/corrupt
 /// id that carries BOTH an epic start event and a fabricated run row is ONE
 /// entry: labelled `epic` by the event, with the row's columns. Production
-/// now refuses routing an epic Bead through `run start`.
+/// now refuses routing an epic Work through `run start`.
 #[test]
 fn an_id_with_a_run_row_and_a_start_event_is_one_epic_entry() {
     let (env, _, _) = started_epic("forged-work-list-both", "epic-both", "child-both");
@@ -878,7 +878,7 @@ fn a_stopped_run_reports_its_reason() {
     let (code, started) = env.forged(&[
         "run",
         "start",
-        "--bead",
+        "--work",
         "wl-stopped",
         "--repo",
         &repo,

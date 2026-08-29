@@ -2,7 +2,7 @@
 //! of work.
 //!
 //! This is the storage seam behind exact Work Detail projections. It never
-//! reads Beads, controller files, processes, Herdr, or providers. An epic's
+//! reads current work, controller files, processes, Herdr, or providers. An epic's
 //! child and internal planning/assurance runs are discovered from their
 //! durable epic start-link events and every run table is then read in a bounded
 //! number of bulk queries inside the same SQLite read transaction.
@@ -657,8 +657,8 @@ impl Ledger {
 mod tests {
     use forged_types::{
         work_display_title, AdmissionCapacityV1, AdmissionOutcome, AdmissionReason,
-        AdmissionResourceClass, AdmissionSubjectKind, WorkIdentityBeadV1, WorkIdentityContextV1,
-        WorkIdentitySource, WorkIdentitySubjectKind, WorkIdentitySubjectV1, WorkIdentityV1,
+        AdmissionResourceClass, AdmissionSubjectKind, WorkIdentityContextV1, WorkIdentitySource,
+        WorkIdentitySubjectKind, WorkIdentitySubjectV1, WorkIdentityV1, WorkIdentityWorkV1,
         ADMISSION_DECISION_SCHEMA_V1, WORK_IDENTITY_SCHEMA_V1,
     };
     use serde_json::json;
@@ -686,7 +686,7 @@ mod tests {
                 kind,
                 id: id.to_owned(),
             },
-            bead: WorkIdentityBeadV1 {
+            work: WorkIdentityWorkV1 {
                 id: id.to_owned(),
                 title: Some(title.to_owned()),
                 revision: None,

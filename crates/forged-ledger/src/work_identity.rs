@@ -1,14 +1,14 @@
 //! Durable `WorkIdentityV1` storage and migration backfill.
 //!
 //! All construction is from caller input or ledger facts. This module has no
-//! Beads, filesystem, or process boundary.
+//! current work, filesystem, or process boundary.
 
 use std::collections::BTreeMap;
 
 use forged_types::{
-    normalize_repository_path, repository_label, work_display_title, ErrorCode, WorkIdentityBeadV1,
+    normalize_repository_path, repository_label, work_display_title, ErrorCode,
     WorkIdentityContextV1, WorkIdentityRepositoryV1, WorkIdentitySource, WorkIdentitySubjectKind,
-    WorkIdentitySubjectV1, WorkIdentityV1, WORK_IDENTITY_SCHEMA_V1,
+    WorkIdentitySubjectV1, WorkIdentityV1, WorkIdentityWorkV1, WORK_IDENTITY_SCHEMA_V1,
 };
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use serde_json::Value;
@@ -83,7 +83,7 @@ pub(crate) fn identity_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkIden
             kind: subject_kind(1, &row.get::<_, String>(1)?)?,
             id: row.get(2)?,
         },
-        bead: WorkIdentityBeadV1 {
+        work: WorkIdentityWorkV1 {
             id: row.get(3)?,
             title: row.get(4)?,
             revision: row.get(5)?,
@@ -154,9 +154,9 @@ pub(crate) fn insert_work_identity_tx(
             identity.schema,
             identity.subject.kind.as_str(),
             identity.subject.id,
-            identity.bead.id,
-            identity.bead.title,
-            identity.bead.revision,
+            identity.work.id,
+            identity.work.title,
+            identity.work.revision,
             identity
                 .repository
                 .as_ref()
@@ -234,8 +234,8 @@ pub(crate) fn legacy_run_identity(new_run: &NewRun, captured_at: &str) -> WorkId
             kind: WorkIdentitySubjectKind::Run,
             id: new_run.run_id.as_str().to_owned(),
         },
-        bead: WorkIdentityBeadV1 {
-            id: new_run.bead_id.clone(),
+        work: WorkIdentityWorkV1 {
+            id: new_run.work_id.clone(),
             title: None,
             revision: None,
         },
@@ -298,7 +298,7 @@ struct BackfillEvent {
 
 /// Populate migration 015 only from existing ledger rows/events. This runs
 /// inside the migration transaction and therefore cannot observe or invoke
-/// Beads even indirectly.
+/// current work even indirectly.
 pub(crate) fn backfill_work_identities_tx(conn: &Connection) -> Result<(), LedgerError> {
     let mut epic_starts: BTreeMap<String, BackfillEvent> = BTreeMap::new();
     let mut child_epics: BTreeMap<String, String> = BTreeMap::new();
@@ -344,15 +344,15 @@ pub(crate) fn backfill_work_identities_tx(conn: &Connection) -> Result<(), Ledge
                 .is_none_or(|recorded| recorded == epic_id)
         });
         let payload = valid.then_some(event.payload.as_ref()).flatten();
-        let bead_title = payload.and_then(|value| text(value.get("title")));
-        let bead_revision = payload.and_then(|value| revision(value.get("specRevision")));
+        let work_title = payload.and_then(|value| text(value.get("title")));
+        let work_revision = payload.and_then(|value| revision(value.get("specRevision")));
         let repository = payload
             .and_then(|value| text(value.get("repo")))
             .and_then(|path| repository(&path));
         let project = payload.and_then(|value| payload_context(value, "project"));
         let display_title = work_display_title(
             epic_id,
-            bead_title.as_deref(),
+            work_title.as_deref(),
             repository.as_ref().map(|value| value.label.as_str()),
             project.as_ref(),
             None,
@@ -363,10 +363,10 @@ pub(crate) fn backfill_work_identities_tx(conn: &Connection) -> Result<(), Ledge
                 kind: WorkIdentitySubjectKind::Epic,
                 id: epic_id.clone(),
             },
-            bead: WorkIdentityBeadV1 {
+            work: WorkIdentityWorkV1 {
                 id: epic_id.clone(),
-                title: bead_title.clone(),
-                revision: bead_revision,
+                title: work_title.clone(),
+                revision: work_revision,
             },
             repository,
             project,
@@ -387,7 +387,7 @@ pub(crate) fn backfill_work_identities_tx(conn: &Connection) -> Result<(), Ledge
             epic_id.clone(),
             WorkIdentityContextV1 {
                 id: epic_id.clone(),
-                title: bead_title,
+                title: work_title,
             },
         );
     }
@@ -428,7 +428,7 @@ pub(crate) fn backfill_work_identities_tx(conn: &Connection) -> Result<(), Ledge
         })?;
         rows.collect::<Result<Vec<_>, _>>()?
     };
-    for (run_id, bead_id, repo, created_at) in runs {
+    for (run_id, work_id, repo, created_at) in runs {
         let spec = run_specs.get(&run_id);
         let valid_payload = spec.and_then(|event| {
             let payload = event.payload.as_ref()?;
@@ -436,14 +436,14 @@ pub(crate) fn backfill_work_identities_tx(conn: &Connection) -> Result<(), Ledge
                 .get("runId")
                 .and_then(Value::as_str)
                 .is_none_or(|recorded| recorded == run_id);
-            let bead_matches = payload
+            let work_matches = payload
                 .get("beadId")
                 .and_then(Value::as_str)
-                .is_none_or(|recorded| recorded == bead_id);
-            (run_matches && bead_matches).then_some(payload)
+                .is_none_or(|recorded| recorded == work_id);
+            (run_matches && work_matches).then_some(payload)
         });
-        let bead_title = valid_payload.and_then(|value| text(value.get("beadTitle")));
-        let bead_revision = valid_payload.and_then(|value| {
+        let work_title = valid_payload.and_then(|value| text(value.get("beadTitle")));
+        let work_revision = valid_payload.and_then(|value| {
             revision(value.get("beadRevision")).or_else(|| revision(value.get("specRevision")))
         });
         let project = valid_payload
@@ -470,7 +470,7 @@ pub(crate) fn backfill_work_identities_tx(conn: &Connection) -> Result<(), Ledge
         let repository = repository(&repo);
         let display_title = work_display_title(
             &run_id,
-            bead_title.as_deref(),
+            work_title.as_deref(),
             repository.as_ref().map(|value| value.label.as_str()),
             project.as_ref(),
             epic.as_ref(),
@@ -481,10 +481,10 @@ pub(crate) fn backfill_work_identities_tx(conn: &Connection) -> Result<(), Ledge
                 kind: WorkIdentitySubjectKind::Run,
                 id: run_id.clone(),
             },
-            bead: WorkIdentityBeadV1 {
-                id: bead_id,
-                title: bead_title,
-                revision: bead_revision,
+            work: WorkIdentityWorkV1 {
+                id: work_id,
+                title: work_title,
+                revision: work_revision,
             },
             repository,
             project,
@@ -578,7 +578,7 @@ impl Ledger {
             if identity.source != WorkIdentitySource::Durable
                 || identity.subject.kind != WorkIdentitySubjectKind::Epic
                 || identity.subject.id != epic_id
-                || identity.bead.id != epic_id
+                || identity.work.id != epic_id
             {
                 return Err(refused(
                     ErrorCode::InvalidRequest,
@@ -592,13 +592,13 @@ impl Ledger {
                     "epic start event epicId does not match its identity",
                 ));
             }
-            if text(event.get("title")) != identity.bead.title {
+            if text(event.get("title")) != identity.work.title {
                 return Err(refused(
                     ErrorCode::InvalidRequest,
                     "epic start event title does not match its identity",
                 ));
             }
-            if revision(event.get("specRevision")) != identity.bead.revision {
+            if revision(event.get("specRevision")) != identity.work.revision {
                 return Err(refused(
                     ErrorCode::InvalidRequest,
                     "epic start event revision does not match its identity",

@@ -703,7 +703,7 @@ mod tests {
         ledger
             .create_run(NewRun {
                 run_id: RunId::new(&run_id).expect("run id"),
-                bead_id: format!("bead-{ownership_id}"),
+                work_id: format!("bead-{ownership_id}"),
                 repo: "/repo".to_owned(),
                 base_ref: "main".to_owned(),
                 branch: format!("work/{ownership_id}"),
@@ -792,7 +792,7 @@ mod tests {
         ledger
             .create_run(NewRun {
                 run_id: RunId::new("cleanup-run").expect("run id"),
-                bead_id: "bead-cleanup".to_owned(),
+                work_id: "bead-cleanup".to_owned(),
                 repo: "/repo".to_owned(),
                 base_ref: "main".to_owned(),
                 branch: "work/cleanup".to_owned(),
@@ -854,7 +854,7 @@ mod tests {
             ledger: ledger.clone(),
         };
 
-        let mut settlement = super::super::supervise::BeadSettlementPass::new();
+        let mut settlement = super::super::supervise::WorkSettlementPass::new();
         let report = super::super::supervise::tick(&ctx, &mut settlement, true)
             .await
             .expect("tick");
@@ -1060,7 +1060,7 @@ mod tests {
             ledger
                 .create_run(NewRun {
                     run_id: RunId::new(&subject_id).expect("run id"),
-                    bead_id: format!("bead-fenced-{name}"),
+                    work_id: format!("bead-fenced-{name}"),
                     repo: "/repo".to_owned(),
                     base_ref: "main".to_owned(),
                     branch: format!("work/fenced-{name}"),

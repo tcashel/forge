@@ -1623,7 +1623,7 @@ fn operations_model_context_names_a_degraded_plan_source_before_its_counts() {
     );
     // The visual surface is unchanged: the pills still report every source.
     let rendered = degraded["text"].to_string();
-    for pill in ["ledger available", "beads available", "plan unavailable"] {
+    for pill in ["ledger available", "work available", "plan unavailable"] {
         assert!(
             rendered.contains(pill),
             "health pill {pill} is missing: {rendered}"
@@ -1915,7 +1915,7 @@ fn every_app_row_leads_with_its_display_title_and_keeps_the_selector() {
             .unwrap_or_else(|| panic!("the portfolio card draws {class}: {}", dispatched.text))
     };
     assert!(
-        position("bead__title") < position("chip chip--id"),
+        position("work-card__title") < position("chip chip--id"),
         "the portfolio card leads with its title and chips the selector: {}",
         dispatched.text
     );
@@ -2058,7 +2058,7 @@ fn work_detail_states_a_finding_bound_rather_than_slicing_silently() {
 
 fn triage_item(
     id: &str,
-    bead: &str,
+    work: &str,
     condition: &str,
     title: &str,
     state: &str,
@@ -2074,7 +2074,7 @@ fn triage_item(
         "occurrenceId": format!("occurrence-{id}-{condition}"),
         "subjectKind": "run",
         "subjectId": id,
-        "subjectTitle": {"known": true, "value": title, "source": "beads.title", "beadId": bead},
+        "subjectTitle": {"known": true, "value": title, "source": "beads.title", "beadId": work},
         "repository": "/repo",
         "condition": condition,
         "severity": "high",
@@ -2084,7 +2084,7 @@ fn triage_item(
         "updatedAt": updated_at,
         "detail": format!("{title} needs attention"),
         "evidence": {},
-        "evidenceRefs": [{"kind": "bead", "id": bead}],
+        "evidenceRefs": [{"kind": "bead", "id": work}],
         "recommendedAction": {"code": "provide-input", "text": action},
         "acknowledgement": if state == "acknowledged" { json!({"actor": "operator", "at": updated_at}) } else { Value::Null },
         "resolution": if state == "resolved" { json!({"actor": "operator", "disposition": "fixed", "note": "settled", "at": updated_at}) } else { Value::Null },
@@ -2480,10 +2480,10 @@ fn operations_triage_groups_blocked_items_by_their_direct_named_blocker() {
         ("blocked-c", "plan-c", "Blocked C"),
     ]
     .into_iter()
-    .map(|(id, bead, title)| {
+    .map(|(id, work, title)| {
         triage_item(
             id,
-            bead,
+            work,
             "blocked",
             title,
             "open",
@@ -3143,7 +3143,7 @@ fn the_operations_rail_groups_sorts_titles_and_states_its_bound() {
 /// A plan row is not a dead row.
 ///
 /// Every live-plan row rendered disabled with "no durable detail yet", which
-/// is true and useless: the projection hands the App the whole Beads plan
+/// is true and useless: the projection hands the App the whole work plan
 /// record. The row opens what it already holds, and needs no server tool to
 /// do it.
 #[test]

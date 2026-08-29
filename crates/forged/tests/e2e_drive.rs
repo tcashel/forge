@@ -105,7 +105,7 @@ fn push_transport_retries_are_bounded_then_stop_as_input_required() {
     let (code, started) = env.forged(&[
         "run",
         "start",
-        "--bead",
+        "--work",
         "bead-push-retry",
         "--repo",
         &repo,
@@ -424,11 +424,11 @@ fn drive_internal_plan_to_stop(env: &TestEnv, run: &str) -> Value {
 fn incomplete_blocked_stub_does_not_opt_into_rolling_planning() {
     let env = TestEnv::new("forged-rolling-explicit-authorization");
     env.seed_epic("epic-explicit", &[("forgotten-stub", &env.spec, false)]);
-    env.set_bead_field("forgotten-stub", "description", "");
-    env.set_bead_field("forgotten-stub", "acceptance", "");
-    env.set_bead_field("forgotten-stub", "design", "");
-    env.set_bead_field("forgotten-stub", "notes", "");
-    env.set_bead_field("forgotten-stub", "status", "blocked");
+    env.set_work_field("forgotten-stub", "description", "");
+    env.set_work_field("forgotten-stub", "acceptance", "");
+    env.set_work_field("forgotten-stub", "design", "");
+    env.set_work_field("forgotten-stub", "notes", "");
+    env.set_work_field("forgotten-stub", "status", "blocked");
     assert_eq!(env.forged(&["init"]).0, 0);
     let repo = env.repos.repo.to_string_lossy().into_owned();
     let (code, refused) = env.forged(&[
@@ -463,18 +463,18 @@ fn reach_rolling_planning_boundary(env: &TestEnv) -> usize {
             ("child-stub", &env.spec, false),
         ],
     );
-    env.set_bead_field("child-stub", "description", "");
-    env.set_bead_field("child-stub", "acceptance", "");
-    env.set_bead_field("child-stub", "design", "frozen hint");
-    env.set_bead_field("child-stub", "notes", "frozen note");
-    env.set_bead_field("child-stub", "status", "blocked");
-    env.set_bead_field("child-stub", "dependencies", "[]");
-    env.set_bead_field("child-stub", "priority", "0");
-    env.set_bead_field("child-next", "priority", "4");
+    env.set_work_field("child-stub", "description", "");
+    env.set_work_field("child-stub", "acceptance", "");
+    env.set_work_field("child-stub", "design", "frozen hint");
+    env.set_work_field("child-stub", "notes", "frozen note");
+    env.set_work_field("child-stub", "status", "blocked");
+    env.set_work_field("child-stub", "dependencies", "[]");
+    env.set_work_field("child-stub", "priority", "0");
+    env.set_work_field("child-next", "priority", "4");
     // `ready: false` no longer withholds an open child: readiness is a store
     // query. Hold child-next off the frontier the way the graph does, so the
     // release in `start_rolling_plan` is a real state change.
-    env.set_bead_field(
+    env.set_work_field(
         "child-next",
         "dependencies",
         r#"[{"id":"child-next-blocker","dependency_type":"blocks","status":"open"}]"#,
@@ -541,7 +541,7 @@ fn planning_applies(env: &TestEnv, work_id: &str) -> usize {
 
 fn start_rolling_plan(env: &TestEnv) -> usize {
     let gh_before_plan = reach_rolling_planning_boundary(env);
-    env.set_bead_field("child-next-blocker", "status", "closed");
+    env.set_work_field("child-next-blocker", "status", "closed");
     let (code, planning) = env.forged(&["epic", "advance", "--epic", "epic-rolling"]);
     assert_eq!(code, 0, "planning dispatch: {planning}");
     assert_eq!(
@@ -591,7 +591,7 @@ fn rolling_epic_assures_the_exact_draft_pr_head_before_completion() {
     let env = TestEnv::new("forged-rolling-assurance");
     env.enable_dynamic_gh();
     env.seed_epic("epic-assurance", &[("child-done", &env.spec, false)]);
-    env.set_bead_field("child-done", "status", "closed");
+    env.set_work_field("child-done", "status", "closed");
     assert_eq!(env.forged(&["init"]).0, 0);
 
     let repo = env.repos.repo.to_string_lossy().into_owned();
@@ -713,7 +713,7 @@ fn rolling_epic_assures_the_exact_draft_pr_head_before_completion() {
         .iter()
         .all(|line| { !line.starts_with("epic-assurance-epic-assurance/implementation/") }));
     assert_eq!(
-        env.bead_status("epic-assurance"),
+        env.work_status("epic-assurance"),
         "open",
         "internal assurance must not mutate or resolve the root Bead"
     );
@@ -757,7 +757,7 @@ fn three_submitted_rolling_epics_converge_below_capacity_with_one_isolated_crux(
     ];
     for (epic, child) in epics {
         env.seed_epic(epic, &[(child, &env.spec, false)]);
-        env.set_bead_field(child, "status", "closed");
+        env.set_work_field(child, "status", "closed");
     }
     assert_eq!(env.forged(&["init"]).0, 0);
     let repo = env.repos.repo.to_string_lossy().into_owned();
@@ -982,7 +982,7 @@ fn assurance_start_crash_recovers_one_run_and_one_draft_pr() {
         "epic-assurance-crash",
         &[("child-assurance-crash", &env.spec, false)],
     );
-    env.set_bead_field("child-assurance-crash", "status", "closed");
+    env.set_work_field("child-assurance-crash", "status", "closed");
     assert_eq!(env.forged(&["init"]).0, 0);
     let repo = env.repos.repo.to_string_lossy().into_owned();
     let (code, started) = env.forged(&[
@@ -1086,7 +1086,7 @@ fn assert_assurance_finalization_cleanup_recovery(unresolved_cleanup: bool) {
         "epic-assurance-finalize-crash",
         &[("child-assurance-finalize-crash", &env.spec, false)],
     );
-    env.set_bead_field("child-assurance-finalize-crash", "status", "closed");
+    env.set_work_field("child-assurance-finalize-crash", "status", "closed");
     assert_eq!(env.forged(&["init"]).0, 0);
     let default_sha = rev_parse(&env.repos.origin, "main");
     let repo = env.repos.repo.to_string_lossy().into_owned();
@@ -1509,7 +1509,7 @@ fn assurance_body_crash_then_drift_clears_stale_approval_before_stop() {
         "epic-assurance-finalize-crash-drift",
         &[("child-assurance-finalize-crash-drift", &env.spec, false)],
     );
-    env.set_bead_field("child-assurance-finalize-crash-drift", "status", "closed");
+    env.set_work_field("child-assurance-finalize-crash-drift", "status", "closed");
     assert_eq!(env.forged(&["init"]).0, 0);
     let default_sha = rev_parse(&env.repos.origin, "main");
     let repo = env.repos.repo.to_string_lossy().into_owned();
@@ -1632,7 +1632,7 @@ fn assurance_final_binding_drift_leaves_explicit_non_assured_body() {
         "epic-assurance-final-drift",
         &[("child-assurance-final-drift", &env.spec, false)],
     );
-    env.set_bead_field("child-assurance-final-drift", "status", "closed");
+    env.set_work_field("child-assurance-final-drift", "status", "closed");
     assert_eq!(env.forged(&["init"]).0, 0);
     let repo = env.repos.repo.to_string_lossy().into_owned();
     let (code, started) = env.forged(&[
@@ -1693,7 +1693,7 @@ fn assurance_final_binding_drift_leaves_explicit_non_assured_body() {
 fn resolving_pre_cycle_planning_stop_never_opens_the_placeholder() {
     let env = TestEnv::new("forged-rolling-pre-cycle-resolve");
     reach_rolling_planning_boundary(&env);
-    env.set_bead_field(
+    env.set_work_field(
         "child-stub",
         "dependencies",
         r#"[{"id":"late-blocker","dependency_type":"blocks","status":"closed"}]"#,
@@ -1711,7 +1711,7 @@ fn resolving_pre_cycle_planning_stop_never_opens_the_placeholder() {
         .iter()
         .all(|event| event.kind != "forged.epic.plan.started"));
 
-    env.set_bead_field("child-stub", "dependencies", "[]");
+    env.set_work_field("child-stub", "dependencies", "[]");
     let updates_before = planning_applies(&env, "child-stub");
     let (code, resolved) = env.forged(&[
         "epic",
@@ -1725,7 +1725,7 @@ fn resolving_pre_cycle_planning_stop_never_opens_the_placeholder() {
     ]);
     assert_eq!(code, 0, "resolve pre-cycle drift: {resolved}");
     assert_eq!(
-        env.bead_status("child-stub"),
+        env.work_status("child-stub"),
         "blocked",
         "resolution must not materialize the placeholder"
     );
@@ -2006,7 +2006,7 @@ fn rolling_planning_package_remains_frozen_across_epic_roster_revisions() {
 }
 
 #[test]
-fn adjudicating_internal_plan_settlement_never_mutates_the_parent_epic_bead() {
+fn adjudicating_internal_plan_settlement_never_mutates_the_parent_epic_work() {
     let env = TestEnv::new("forged-rolling-plan-adjudication");
     start_rolling_plan(&env);
     let run = "child-stub-epic-plan";
@@ -2065,8 +2065,8 @@ fn adjudicating_internal_plan_settlement_never_mutates_the_parent_epic_bead() {
         before,
         "adjudication performs no parent or child work mutation"
     );
-    assert_eq!(env.bead_status("epic-rolling"), "open");
-    assert_eq!(env.bead_status("child-stub"), "blocked");
+    assert_eq!(env.work_status("epic-rolling"), "open");
+    assert_eq!(env.work_status("child-stub"), "blocked");
 
     let (code, held) = env.forged(&["epic", "advance", "--epic", "epic-rolling"]);
     assert_eq!(code, 0, "epic consumes internal stop: {held}");
@@ -2086,13 +2086,13 @@ fn rolling_epic_plans_applies_and_opens_the_next_wave_without_manual_handoff() {
     );
     assert!(!env.worktree("child-stub-epic-plan").exists());
     assert_eq!(env.gh_calls().len(), gh_before_plan);
-    assert_eq!(env.bead_status("child-stub"), "open");
+    assert_eq!(env.work_status("child-stub"), "open");
     assert_eq!(
-        env.bead_field("child-stub", "description"),
+        env.work_field("child-stub", "description"),
         "planned context and outcome"
     );
     assert_eq!(
-        env.bead_field("child-stub", "acceptance"),
+        env.work_field("child-stub", "acceptance"),
         "planned observable acceptance"
     );
     let (_, status) = env.forged(&["epic", "status", "--epic", "epic-rolling"]);
@@ -2168,7 +2168,7 @@ fn dirty_planning_worktree_blocks_apply_and_preserves_child_artifacts() {
     assert_eq!(held["result"]["stopped"]["childId"], json!("child-stub"));
     assert!(worktree.exists(), "dirty artifacts remain for adjudication");
     assert_eq!(
-        env.bead_status("child-stub"),
+        env.work_status("child-stub"),
         "blocked",
         "no Beads mutation crosses the dirty-worktree gate"
     );
@@ -2229,7 +2229,7 @@ fn dirty_planning_worktree_blocks_apply_and_preserves_child_artifacts() {
 fn assigned_blocked_stub_blocks_apply_and_preserves_child_artifacts() {
     let env = TestEnv::new("forged-rolling-assigned-plan");
     prepare_reviewed_rolling_plan(&env);
-    env.set_bead_field("child-stub", "assignee", "foreign-owner");
+    env.set_work_field("child-stub", "assignee", "foreign-owner");
     let worktree = env.worktree("child-stub-epic-plan");
 
     let (code, held) = env.forged(&["epic", "advance", "--epic", "epic-rolling"]);
@@ -2244,7 +2244,7 @@ fn assigned_blocked_stub_blocks_apply_and_preserves_child_artifacts() {
         "custody refusal preserves plan artifacts"
     );
     assert_eq!(
-        env.bead_status("child-stub"),
+        env.work_status("child-stub"),
         "blocked",
         "no work mutation crosses the custody gate"
     );
@@ -2259,7 +2259,7 @@ fn assigned_blocked_stub_blocks_apply_and_preserves_child_artifacts() {
 fn structural_stub_drift_blocks_apply_with_exact_checkpoint_evidence() {
     let env = TestEnv::new("forged-rolling-structural-drift");
     prepare_reviewed_rolling_plan(&env);
-    env.set_bead_field("child-stub", "title", "Retitled outside the rolling cycle");
+    env.set_work_field("child-stub", "title", "Retitled outside the rolling cycle");
     let worktree = env.worktree("child-stub-epic-plan");
 
     let (code, held) = env.forged(&["epic", "advance", "--epic", "epic-rolling"]);
@@ -2283,12 +2283,12 @@ fn structural_stub_drift_blocks_apply_with_exact_checkpoint_evidence() {
 fn root_drift_before_planning_checkpoint_stops_against_frozen_contract() {
     let env = TestEnv::new("forged-rolling-root-drift");
     reach_rolling_planning_boundary(&env);
-    env.set_bead_field(
+    env.set_work_field(
         "epic-rolling",
         "description",
         "Changed outside the frozen epic contract",
     );
-    env.set_bead_field("child-next-blocker", "status", "closed");
+    env.set_work_field("child-next-blocker", "status", "closed");
 
     let (code, held) = env.forged(&["epic", "advance", "--epic", "epic-rolling"]);
     assert_eq!(code, 0, "root drift becomes typed epic input: {held}");
@@ -2312,14 +2312,14 @@ fn root_drift_before_planning_checkpoint_stops_against_frozen_contract() {
 fn root_revision_only_churn_does_not_hold_planning_or_apply() {
     let env = TestEnv::new("forged-rolling-root-revision-churn");
     reach_rolling_planning_boundary(&env);
-    let frozen_revision = env.bead_revision("epic-rolling");
-    env.set_bead_field("epic-rolling", "title", "Test epic");
+    let frozen_revision = env.work_revision("epic-rolling");
+    env.set_work_field("epic-rolling", "title", "Test epic");
     assert_ne!(
-        env.bead_revision("epic-rolling"),
+        env.work_revision("epic-rolling"),
         frozen_revision,
         "the unchanged semantic root must still receive a new write token"
     );
-    env.set_bead_field("child-next-blocker", "status", "closed");
+    env.set_work_field("child-next-blocker", "status", "closed");
 
     let (code, planning) = env.forged(&["epic", "advance", "--epic", "epic-rolling"]);
     assert_eq!(
@@ -2333,10 +2333,10 @@ fn root_revision_only_churn_does_not_hold_planning_or_apply() {
 
     let planned = drive_internal_plan_to_stop(&env, "child-stub-epic-plan");
     assert_eq!(planned["result"]["run"]["outcome"], json!("clean"));
-    let planned_revision = env.bead_revision("epic-rolling");
-    env.set_bead_field("epic-rolling", "title", "Test epic");
+    let planned_revision = env.work_revision("epic-rolling");
+    env.set_work_field("epic-rolling", "title", "Test epic");
     assert_ne!(
-        env.bead_revision("epic-rolling"),
+        env.work_revision("epic-rolling"),
         planned_revision,
         "the unchanged semantic root must receive another write token before apply"
     );
@@ -2366,7 +2366,7 @@ fn resolving_post_apply_implementation_failure_uses_ordinary_child_reset() {
     assert_eq!(code, 0, "apply plan: {applied}");
     // Isolate the post-apply wave to the planned stub: hold the sibling off
     // the frontier again now that the apply has opened child-stub.
-    env.set_bead_field("child-next", "status", "blocked");
+    env.set_work_field("child-next", "status", "blocked");
     let (code, wave) = env.forged(&["epic", "advance", "--epic", "epic-rolling"]);
     assert_eq!(code, 0, "post-plan wave: {wave}");
     env.set_scenario("implement", "wait-release", 1);
@@ -2424,7 +2424,7 @@ fn resolving_post_apply_implementation_failure_uses_ordinary_child_reset() {
 
 #[cfg(feature = "failpoints")]
 #[test]
-fn rolling_plan_apply_recovers_exact_post_image_without_a_second_beads_write() {
+fn rolling_plan_apply_recovers_exact_post_image_without_a_second_work_write() {
     let env = TestEnv::new("forged-rolling-apply-crash");
     prepare_reviewed_rolling_plan(&env);
     let mut crashed = env
@@ -2440,9 +2440,9 @@ fn rolling_plan_apply_recovers_exact_post_image_without_a_second_beads_write() {
         "the process must abort after the Beads write"
     );
 
-    assert_eq!(env.bead_status("child-stub"), "open");
+    assert_eq!(env.work_status("child-stub"), "open");
     assert_eq!(
-        env.bead_field("child-stub", "description"),
+        env.work_field("child-stub", "description"),
         "planned context and outcome"
     );
     let update_count = || planning_applies(&env, "child-stub");
@@ -2523,9 +2523,9 @@ fn epic_fanout_freezes_two_slots_and_a_failed_child_does_not_block_its_sibling()
             ("child-c", &env.spec, true),
         ],
     );
-    env.set_bead_field("child-a", "priority", "0");
-    env.set_bead_field("child-b", "priority", "1");
-    env.set_bead_field("child-c", "priority", "9");
+    env.set_work_field("child-a", "priority", "0");
+    env.set_work_field("child-b", "priority", "1");
+    env.set_work_field("child-c", "priority", "9");
     assert_eq!(env.forged(&["init"]).0, 0);
     let repo = env.repos.repo.to_string_lossy().into_owned();
     let spec = env.spec.to_string_lossy().into_owned();
@@ -2553,10 +2553,10 @@ fn epic_fanout_freezes_two_slots_and_a_failed_child_does_not_block_its_sibling()
         wave["result"]["progress"]["children"],
         json!(["child-a", "child-b", "child-c"])
     );
-    // The whole launch order is part of the frozen wave. A later Beads edit
+    // The whole launch order is part of the frozen wave. A later work edit
     // can affect a future frontier, but cannot reshuffle already-recorded
     // membership around a crash/restart boundary.
-    env.set_bead_field("child-c", "priority", "-1");
+    env.set_work_field("child-c", "priority", "-1");
     let (code, launched) = env.forged(&["epic", "advance", "--epic", "epic-fanout"]);
     assert_eq!(code, 0, "launch tick: {launched}");
     assert_eq!(
@@ -2801,7 +2801,7 @@ fn interventions_cross_a_durable_boundary_and_sessions_stay_observable() {
     let (code, started) = env.forged(&[
         "run",
         "start",
-        "--bead",
+        "--work",
         "bead-session",
         "--repo",
         &repo,
@@ -2888,13 +2888,13 @@ fn a_rejected_cross_run_intervention_never_enters_the_target_queue() {
     assert_eq!(env.forged(&["init"]).0, 0);
     let repo = env.repos.repo.to_string_lossy().into_owned();
     let spec = env.spec.to_string_lossy().into_owned();
-    for bead in ["bead-message-target", "bead-message-owner"] {
-        env.seed_frontier(bead);
+    for work in ["bead-message-target", "bead-message-owner"] {
+        env.seed_frontier(work);
         let (code, started) = env.forged(&[
             "run",
             "start",
-            "--bead",
-            bead,
+            "--work",
+            work,
             "--repo",
             &repo,
             "--spec",
@@ -2904,8 +2904,8 @@ fn a_rejected_cross_run_intervention_never_enters_the_target_queue() {
             "--profile",
             "lean",
         ]);
-        assert_eq!(code, 0, "start {bead}: {started}");
-        env.authorize_run(bead);
+        assert_eq!(code, 0, "start {work}: {started}");
+        env.authorize_run(work);
     }
     let (code, driven) = env.forged(&["run", "drive", "--run", "bead-message-owner"]);
     assert_eq!(code, 0, "owner drive: {driven}");
@@ -2950,7 +2950,7 @@ fn concurrent_submit_keys_share_one_controller_generation() {
     let (code, started) = env.forged(&[
         "run",
         "start",
-        "--bead",
+        "--work",
         "bead-submit-singleton",
         "--repo",
         &repo,
@@ -3176,7 +3176,7 @@ fn roster_failover_cycles_get_distinct_revision_keys() {
     let (code, started) = env.forged(&[
         "run",
         "start",
-        "--bead",
+        "--work",
         "bead-roster-cycles",
         "--repo",
         &repo,
@@ -3219,7 +3219,7 @@ fn run_drive_reaches_done_with_one_draft_pr_and_real_commits() {
     let (code, started) = env.forged(&[
         "run",
         "start",
-        "--bead",
+        "--work",
         "bead-e2e",
         "--repo",
         &repo,
@@ -3510,7 +3510,7 @@ fn profiles_scale_topology_and_an_explicit_roster_revision_switches_provider_fam
     let (code, started) = lean.forged(&[
         "run",
         "start",
-        "--bead",
+        "--work",
         "bead-lean",
         "--repo",
         &repo,
@@ -3558,7 +3558,7 @@ fn profiles_scale_topology_and_an_explicit_roster_revision_switches_provider_fam
     let (code, started) = switched.forged(&[
         "run",
         "start",
-        "--bead",
+        "--work",
         "bead-switch",
         "--repo",
         &repo,
@@ -3629,7 +3629,7 @@ fn transport_failure_advances_to_the_next_candidate_and_lands_once() {
     let (code, started) = env.forged(&[
         "run",
         "start",
-        "--bead",
+        "--work",
         "bead-fallback",
         "--repo",
         &repo,
@@ -3719,7 +3719,7 @@ fn real_provider_timeout_falls_back_to_the_next_candidate() {
     let (code, started) = env.forged(&[
         "run",
         "start",
-        "--bead",
+        "--work",
         "bead-timeout-fallback",
         "--repo",
         &repo,
@@ -3791,7 +3791,7 @@ fn real_provider_timeouts_exhaust_the_frozen_retry_budget() {
     let (code, started) = env.forged(&[
         "run",
         "start",
-        "--bead",
+        "--work",
         "bead-timeout-exhaustion",
         "--repo",
         &repo,
@@ -3856,7 +3856,7 @@ fn roster_revision_resets_transport_fallback_to_its_first_candidate() {
     let (code, started) = env.forged(&[
         "run",
         "start",
-        "--bead",
+        "--work",
         "bead-revision-fallback",
         "--repo",
         &repo,
@@ -3934,7 +3934,7 @@ fn high_profile_runs_three_reviews_and_a_synthesis_seat() {
     let (code, started) = env.forged(&[
         "run",
         "start",
-        "--bead",
+        "--work",
         "bead-high",
         "--repo",
         &repo,
@@ -3999,7 +3999,7 @@ fn synthetic_review_failure_is_honest_and_both_new_terminals_accept_risk() {
     let (code, started) = env.forged(&[
         "run",
         "start",
-        "--bead",
+        "--work",
         "bead-review-provenance",
         "--repo",
         &repo,
@@ -4055,7 +4055,7 @@ fn synthetic_review_failure_is_honest_and_both_new_terminals_accept_risk() {
     let (code, started) = env.forged(&[
         "run",
         "start",
-        "--bead",
+        "--work",
         "bead-done-risk",
         "--repo",
         &repo,
@@ -4143,7 +4143,7 @@ fn review_budget_above_one_exhausts_exactly_and_accept_risk_is_durable() {
         env.forged(&[
             "run",
             "start",
-            "--bead",
+            "--work",
             "bead-round-budget",
             "--repo",
             &repo,
@@ -4277,7 +4277,7 @@ fn implementer_spec_amendment_stops_before_gate_or_review() {
         env.forged(&[
             "run",
             "start",
-            "--bead",
+            "--work",
             "bead-amendment",
             "--repo",
             &repo,
@@ -4333,7 +4333,7 @@ fn gate_failure_escalates_once_but_standard_review_never_escalates_topology() {
         gate.forged(&[
             "run",
             "start",
-            "--bead",
+            "--work",
             "bead-gate-edge",
             "--repo",
             &repo,
@@ -4380,7 +4380,7 @@ fn gate_failure_escalates_once_but_standard_review_never_escalates_topology() {
             .forged(&[
                 "run",
                 "start",
-                "--bead",
+                "--work",
                 "bead-conflict-edge",
                 "--repo",
                 &repo,
@@ -4429,7 +4429,7 @@ fn pre_policy_run_package_is_migrated_once_and_then_stays_frozen() {
     let (code, started) = env.forged(&[
         "run",
         "start",
-        "--bead",
+        "--work",
         "legacy-policy-run",
         "--repo",
         &repo,
@@ -4541,7 +4541,7 @@ fn stored_old_policy_with_an_excessive_budget_fails_before_execution() {
     let (code, started) = env.forged(&[
         "run",
         "start",
-        "--bead",
+        "--work",
         "old-package-budget-bound",
         "--repo",
         &repo,
@@ -4614,7 +4614,7 @@ fn pre_upgrade_run_start_operation_replays_with_its_legacy_request_hash() {
     let args = [
         "run",
         "start",
-        "--bead",
+        "--work",
         "legacy-start-replay",
         "--repo",
         &repo,
@@ -4803,7 +4803,7 @@ fn run_uses_its_frozen_roster_after_the_authoring_config_changes() {
     let (code, started) = env.forged(&[
         "run",
         "start",
-        "--bead",
+        "--work",
         "bead-frozen",
         "--repo",
         &repo,
@@ -4874,7 +4874,7 @@ fn epic_roster_revision_updates_current_and_future_children() {
             ("roster-child-two", &env.spec, false),
         ],
     );
-    env.set_bead_field(
+    env.set_work_field(
         "roster-child-two",
         "dependencies",
         r#"[{"id":"roster-child-two-blocker","dependency_type":"blocks","status":"open"}]"#,
@@ -4931,7 +4931,7 @@ fn epic_roster_revision_updates_current_and_future_children() {
     );
 
     env.set_scenario("reviewclaude", "approve", 2);
-    env.set_bead_field("roster-child-two-blocker", "status", "closed");
+    env.set_work_field("roster-child-two-blocker", "status", "closed");
     let (code, driven) = env.forged(&["epic", "drive", "--epic", "epic-roster"]);
     assert_eq!(code, 0, "drive revised epic: {driven}");
     let ledger = env.ledger();
@@ -5005,7 +5005,7 @@ fn semantic_failure_consumes_no_transport_budget_and_reclaims() {
     env.forged(&[
         "run",
         "start",
-        "--bead",
+        "--work",
         "bead-sem",
         "--repo",
         &repo,
@@ -5062,7 +5062,7 @@ fn claude_rate_limit_is_a_free_transport_retry() {
     env.forged(&[
         "run",
         "start",
-        "--bead",
+        "--work",
         "bead-tr",
         "--repo",
         &repo,
@@ -5115,7 +5115,7 @@ fn a_provider_that_never_reports_its_pid_is_killed_not_left_unguarded() {
     env.forged(&[
         "run",
         "start",
-        "--bead",
+        "--work",
         "bead-nopid",
         "--repo",
         &repo,
@@ -5204,7 +5204,7 @@ fn reconcile_runs_the_ports_end_to_end_on_a_live_run() {
     env.forged(&[
         "run",
         "start",
-        "--bead",
+        "--work",
         "bead-rec",
         "--repo",
         &repo,
@@ -5316,7 +5316,7 @@ fn execution_health_and_deferrals_read_from_every_surface() {
     let (code, blocker) = env.forged(&[
         "run",
         "start",
-        "--bead",
+        "--work",
         "blocker-writer",
         "--repo",
         &repo,
@@ -5575,7 +5575,7 @@ fn a_reclaimed_work_lease_self_terminates_the_attempt_with_frozen_evidence() {
     let (code, started) = env.forged(&[
         "run",
         "start",
-        "--bead",
+        "--work",
         "bead-lease-loss",
         "--repo",
         &repo,

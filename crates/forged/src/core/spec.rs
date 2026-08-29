@@ -1,18 +1,18 @@
 //! Where a run's spec comes from, and how it is pinned.
 //!
-//! The bead is the source of truth: its `description`,
+//! The work is the source of truth: its `description`,
 //! `acceptance_criteria`, `design`, and `notes` fields ARE the spec body,
 //! assembled here in one documented order so every seat of a packet reads
 //! identical bytes. The digest of THAT body is the packet's drift fence,
-//! replacing the file hash; the bead's opaque `revision` rides along as
-//! bookkeeping only, because bd mints a new one on every write to the bead
+//! replacing the file hash; the work's opaque `revision` rides along as
+//! bookkeeping only, because bd mints a new one on every write to the work
 //! — forged's own lease claim included — and a fence that moved for a
 //! lease write would refuse the run its own crash resume.
 //!
 //! `--spec <path>` is deprecated but still honored for one release, so a
 //! file-sourced run keeps working with the hash fence it was opened under.
 //!
-//! BD READ BUDGET: exactly one bead read per packet open and one per claim,
+//! BD READ BUDGET: exactly one work read per packet open and one per claim,
 //! never one per seat — the bd gate lock is shared with live runs, and a
 //! read storm during a wave would contend with an epic scheduler's own bd
 //! traffic.
@@ -26,14 +26,14 @@ use forged_types::{ErrorCode, SpecRef};
 use crate::adapters::execute::sha256_file;
 use crate::core::{Ctx, Failure};
 
-/// The file a bead-sourced packet's body is materialized into, inside the
+/// The file a work-sourced packet's body is materialized into, inside the
 /// packet directory the seat already works from.
-pub const BEAD_SPEC_FILE: &str = "spec.md";
+pub const WORK_SPEC_FILE: &str = "spec.md";
 
 /// One spec section: the bd field name it maps to, and how to read it.
 type Section = (&'static str, fn(&IssueSummary) -> String);
 
-/// The spec sections, in the order they are assembled, paired with the bead
+/// The spec sections, in the order they are assembled, paired with the work
 /// field each one comes from.
 const SECTIONS: [Section; 4] = [
     ("description", |issue| prose(&issue.description)),
@@ -47,7 +47,7 @@ const SECTIONS: [Section; 4] = [
 /// A description with forged's own LEADING pointer block removed.
 ///
 /// `spec:` and `repo:` are addressing, not prose, WHERE FORGED WROTE THEM —
-/// at the top. A bead whose description is nothing but that block carries no
+/// at the top. A work whose description is nothing but that block carries no
 /// spec of its own and still belongs to the file route, and one that carries
 /// both must not open its seat's spec with a stray addressing line.
 ///
@@ -84,8 +84,8 @@ const HEADINGS: [&str; 4] = [
 /// Where a run's spec body comes from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpecSource {
-    /// The bead's own fields — the supported route.
-    Bead(String),
+    /// The work's own fields — the supported route.
+    Work(String),
     /// A markdown file at this path — deprecated, honored for one release.
     File(String),
 }
@@ -93,21 +93,21 @@ pub enum SpecSource {
 /// A spec resolved once, for one packet open or one claim.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedSpec {
-    /// The rendered body, present only for a bead-sourced spec; a
+    /// The rendered body, present only for a work-sourced spec; a
     /// file-sourced one is already on disk where the seat expects it.
     pub body: Option<String>,
     /// SHA-256 over the bytes the seat reads.
     pub sha256: String,
     /// The fence this spec is pinned by.
     pub fence: SpecFence,
-    /// Human work context copied from the Bead for provider prompts. This is
+    /// Human work context copied from the Work for provider prompts. This is
     /// explanatory only: the rendered body above remains the requirements
     /// contract and the ledger fence remains the execution authority.
-    pub bead_context: Vec<String>,
+    pub work_context: Vec<String>,
 }
 
 impl ResolvedSpec {
-    /// The observed bead revision, or `None` for a file-sourced spec.
+    /// The observed work revision, or `None` for a file-sourced spec.
     pub fn revision(&self) -> Option<String> {
         match &self.fence {
             SpecFence::Revision { revision, .. } => Some(revision.clone()),
@@ -116,8 +116,8 @@ impl ResolvedSpec {
     }
 }
 
-/// Assemble the spec body from a bead's fields, in the documented section
-/// order. Deterministic by construction: the same bead revision always
+/// Assemble the spec body from a work's fields, in the documented section
+/// order. Deterministic by construction: the same work revision always
 /// renders the same bytes, which is what lets the revision fence stand in
 /// for a content hash.
 pub fn render_body(issue: &IssueSummary) -> String {
@@ -148,7 +148,7 @@ pub fn render_body(issue: &IssueSummary) -> String {
 /// is building and no test of when it is done.
 const REQUIRED_SECTIONS: [usize; 2] = [0, 1];
 
-/// The required spec fields this bead leaves empty, named as bd names them.
+/// The required spec fields this work leaves empty, named as bd names them.
 /// An empty return is exactly [`carries_spec`].
 pub fn missing_spec_fields(issue: &IssueSummary) -> Vec<&'static str> {
     REQUIRED_SECTIONS
@@ -159,13 +159,13 @@ pub fn missing_spec_fields(issue: &IssueSummary) -> Vec<&'static str> {
         .collect::<Vec<_>>()
 }
 
-/// Whether this bead carries a spec of its own: BOTH required sections
+/// Whether this work carries a spec of its own: BOTH required sections
 /// populated, not merely one of the four.
 ///
-/// The bar is deliberately the whole spec, not any fragment of one. A bead
+/// The bar is deliberately the whole spec, not any fragment of one. A work
 /// with a valid `spec:` pointer and a stray `design` note would otherwise
-/// freeze bead-sourced, never read the file it points at, and hand its seat
-/// a body with no Context and no Acceptance Criteria. `false` is the bead
+/// freeze work-sourced, never read the file it points at, and hand its seat
+/// a body with no Context and no Acceptance Criteria. `false` is the work
 /// that must still point at a spec file.
 pub fn carries_spec(issue: &IssueSummary) -> bool {
     missing_spec_fields(issue).is_empty()
@@ -182,14 +182,14 @@ fn sha256_bytes(bytes: &[u8]) -> String {
     hex
 }
 
-/// The refusal a bead carrying no spec earns.
+/// The refusal a work carrying no spec earns.
 ///
-/// It names the bead and EVERY required field that bead left empty, so one
+/// It names the work and EVERY required field that work left empty, so one
 /// reading tells the operator exactly what to write. `design` and `notes`
 /// are commentary and are never named: their absence is not a defect.
-fn no_spec_refusal(bead_id: &str, missing: &[&'static str]) -> Failure {
+fn no_spec_refusal(work_id: &str, missing: &[&'static str]) -> Failure {
     Failure::invalid(format!(
-        "bead {bead_id} carries no spec: {} {} empty",
+        "work {work_id} carries no spec: {} {} empty",
         missing.join(", "),
         if missing.len() == 1 { "is" } else { "are" }
     ))
@@ -197,18 +197,18 @@ fn no_spec_refusal(bead_id: &str, missing: &[&'static str]) -> Failure {
 
 /// Read one work item from the ledger-native store (formerly one budgeted
 /// bd call; an in-process read has no transport failure mode to budget).
-pub(crate) async fn read_bead(ctx: &Ctx, bead_id: &str) -> Result<IssueSummary, Failure> {
-    crate::core::workstore::show_issue(&ctx.ledger, bead_id).await
+pub(crate) async fn read_work(ctx: &Ctx, work_id: &str) -> Result<IssueSummary, Failure> {
+    crate::core::workstore::show_issue(&ctx.ledger, work_id).await
 }
 
-/// Resolve a bead into a spec: one read, rendered body, revision fence.
+/// Resolve a work into a spec: one read, rendered body, revision fence.
 ///
-/// Refused when the bead carries no spec — a seat handed a body with no
+/// Refused when the work carries no spec — a seat handed a body with no
 /// Context or no Acceptance Criteria is worse than a run that never
-/// started, so the refusal names the bead and every required field it left
+/// started, so the refusal names the work and every required field it left
 /// empty.
-pub async fn resolve_bead(ctx: &Ctx, bead_id: &str) -> Result<ResolvedSpec, Failure> {
-    let issue = read_bead(ctx, bead_id).await?;
+pub async fn resolve_work(ctx: &Ctx, work_id: &str) -> Result<ResolvedSpec, Failure> {
+    let issue = read_work(ctx, work_id).await?;
     resolve_issue(&issue)
 }
 
@@ -216,23 +216,23 @@ pub async fn resolve_bead(ctx: &Ctx, bead_id: &str) -> Result<ResolvedSpec, Fail
 /// this after its readiness check so validating the spec does not pay for a
 /// second `bd show`; packet open and claim still re-read independently.
 pub(crate) fn resolve_issue(issue: &IssueSummary) -> Result<ResolvedSpec, Failure> {
-    let bead_id = &issue.id;
+    let work_id = &issue.id;
     let missing = missing_spec_fields(issue);
     if !missing.is_empty() {
-        return Err(no_spec_refusal(bead_id, &missing));
+        return Err(no_spec_refusal(work_id, &missing));
     }
     let revision = issue.revision.clone().ok_or_else(|| {
         Failure::invalid(format!(
-            "bead {bead_id} reports no revision; a bead-sourced spec cannot be fenced without one"
+            "work {work_id} reports no revision; a work-sourced spec cannot be fenced without one"
         ))
     })?;
     let body = render_body(issue);
     let body_sha256 = sha256_bytes(body.as_bytes());
-    let mut bead_context = vec![
+    let mut work_context = vec![
         format!("Bead title: {}", issue.title),
         format!("Bead issue type: {}", issue.issue_type),
     ];
-    bead_context.extend(
+    work_context.extend(
         issue
             .metadata
             .iter()
@@ -245,7 +245,7 @@ pub(crate) fn resolve_issue(issue: &IssueSummary) -> Result<ResolvedSpec, Failur
             revision,
             body_sha256,
         },
-        bead_context,
+        work_context,
     })
 }
 
@@ -256,14 +256,14 @@ pub fn resolve_file(path: &str) -> Result<ResolvedSpec, Failure> {
         body: None,
         fence: SpecFence::Sha256(sha256.clone()),
         sha256,
-        bead_context: Vec::new(),
+        work_context: Vec::new(),
     })
 }
 
 /// Resolve whichever source a run was started from.
 pub async fn resolve(ctx: &Ctx, source: &SpecSource) -> Result<ResolvedSpec, Failure> {
     match source {
-        SpecSource::Bead(bead_id) => resolve_bead(ctx, bead_id).await,
+        SpecSource::Work(work_id) => resolve_work(ctx, work_id).await,
         SpecSource::File(path) => resolve_file(path),
     }
 }
@@ -273,15 +273,15 @@ pub async fn resolve(ctx: &Ctx, source: &SpecSource) -> Result<ResolvedSpec, Fai
 pub async fn resolve_for_packet(
     ctx: &Ctx,
     spec: &SpecRef,
-    bead_id: &str,
+    work_id: &str,
 ) -> Result<ResolvedSpec, Failure> {
     match spec.revision {
-        Some(_) => resolve_bead(ctx, bead_id).await,
+        Some(_) => resolve_work(ctx, work_id).await,
         None => resolve_file(&spec.path),
     }
 }
 
-/// Write a bead-sourced body where its seat will read it. A file-sourced
+/// Write a work-sourced body where its seat will read it. A file-sourced
 /// spec is already on disk and is never rewritten.
 pub fn materialize(spec: &ResolvedSpec, path: &Path) -> Result<(), Failure> {
     let Some(body) = &spec.body else {
@@ -297,12 +297,12 @@ pub fn materialize(spec: &ResolvedSpec, path: &Path) -> Result<(), Failure> {
 
 /// Refuse to hand a seat bytes the packet is not pinned to.
 ///
-/// Only bead-sourced packets are checked: their body is materialized from a
+/// Only work-sourced packets are checked: their body is materialized from a
 /// read that the ledger did not fence (the adoption path claims nothing), so
 /// this is the check that keeps every seat of one packet byte-identical.
 ///
 /// The comparison is over the RENDERED BODY, matching the ledger's own
-/// fence: bd's revision moves on every write to the bead, and `claim_packet`
+/// fence: bd's revision moves on every write to the work, and `claim_packet`
 /// re-pins the row's `spec_revision` when it does, so the revision a caller
 /// read before its claim is stale by construction. The bytes are not.
 pub fn assert_pinned(spec: &SpecRef, resolved: &ResolvedSpec) -> Result<(), Failure> {
@@ -313,7 +313,7 @@ pub fn assert_pinned(spec: &SpecRef, resolved: &ResolvedSpec) -> Result<(), Fail
         return Err(Failure::refused(
             ErrorCode::SpecDrift,
             format!(
-                "bead moved off the body this packet pins: rendered {}, pinned {}",
+                "work moved off the body this packet pins: rendered {}, pinned {}",
                 resolved.sha256, spec.sha256
             ),
         ));
@@ -358,7 +358,7 @@ mod tests {
     }
 
     #[test]
-    fn the_body_is_byte_identical_for_the_same_bead() {
+    fn the_body_is_byte_identical_for_the_same_work() {
         let issue = issue();
         assert_eq!(render_body(&issue), render_body(&issue.clone()));
     }
@@ -396,7 +396,7 @@ mod tests {
     }
 
     #[test]
-    fn the_refusal_names_the_bead_and_every_empty_required_field() {
+    fn the_refusal_names_the_work_and_every_empty_required_field() {
         let mut issue = issue();
         issue.description = String::new();
         let one = no_spec_refusal("bead-1", &missing_spec_fields(&issue));
@@ -428,9 +428,9 @@ mod tests {
     }
 
     #[test]
-    fn a_bead_with_only_commentary_does_not_carry_a_spec() {
+    fn a_work_with_only_commentary_does_not_carry_a_spec() {
         // The epic child this guards: a valid `spec:` pointer plus a stray
-        // `design` note. Preferring the bead here would hand the seat a body
+        // `design` note. Preferring the work here would hand the seat a body
         // with no Context and no Acceptance Criteria and never read the file.
         let mut issue = issue();
         issue.description = "spec: /specs/child.md".to_owned();
@@ -488,7 +488,7 @@ mod tests {
                 revision: "8".to_owned(),
                 body_sha256: "beef".to_owned(),
             },
-            bead_context: Vec::new(),
+            work_context: Vec::new(),
         };
         let failure = assert_pinned(&pinned, &moved).expect_err("must refuse");
         assert_eq!(failure.code, ErrorCode::SpecDrift);

@@ -20,7 +20,7 @@ fn review_packet(run_id: &str, seq: i64) -> WorkPacket {
         schema: "forged.packet/1".to_owned(),
         packet_id,
         run_id: run_id.to_owned(),
-        bead_id: format!("bead-{run_id}"),
+        work_id: format!("bead-{run_id}"),
         stage: Stage::ReviewClaude,
         execution: None,
         lane_seq: None,
@@ -428,7 +428,7 @@ fn malformed_or_contradictory_draft_pr_target_fails_closed() {
     ledger
         .create_run(NewRun {
             run_id: RunId::new("review-target").expect("run id"),
-            bead_id: "bead-review-target".to_owned(),
+            work_id: "bead-review-target".to_owned(),
             repo: env.repos.repo.to_string_lossy().into_owned(),
             base_ref: "main".to_owned(),
             branch: "forged/review-target".to_owned(),

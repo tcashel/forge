@@ -61,7 +61,7 @@ fn every_seam_member_is_consumable() {
     let run_row = ledger
         .create_run(NewRun {
             run_id: RunId::new("run-seam").expect("valid"),
-            bead_id: "bead".to_owned(),
+            work_id: "bead".to_owned(),
             repo: "repo".to_owned(),
             base_ref: "main".to_owned(),
             branch: "feat/seam".to_owned(),
@@ -69,7 +69,7 @@ fn every_seam_member_is_consumable() {
         .expect("create_run");
     let _: (&String, &String, &String, &String, &String, &String) = (
         &run_row.run_id,
-        &run_row.bead_id,
+        &run_row.work_id,
         &run_row.repo,
         &run_row.base_ref,
         &run_row.branch,
@@ -365,24 +365,24 @@ fn every_seam_member_is_consumable() {
     ledger.close().expect("close");
 }
 
-/// The bead-settlement seam: pending-list discovery, the probe-observation
+/// The work-settlement seam: pending-list discovery, the probe-observation
 /// upsert, claim/charge/finish, transactional watermark stamping, and the
 /// episode reset — every exported settlement row field read from outside.
 #[test]
-fn bead_settlement_seam_members_are_consumable() {
+fn work_settlement_seam_members_are_consumable() {
     let dir = tempfile::tempdir().expect("tempdir");
     let ledger = Ledger::open(&dir.path().join("state.db")).expect("open");
     ledger
         .create_run(NewRun {
             run_id: RunId::new("run-settle").expect("valid"),
-            bead_id: "bead-settle".to_owned(),
+            work_id: "bead-settle".to_owned(),
             repo: "repo".to_owned(),
             base_ref: "main".to_owned(),
             branch: "feat/settle".to_owned(),
         })
         .expect("create_run");
     assert!(ledger
-        .list_pending_bead_settlements()
+        .list_pending_work_settlements()
         .expect("empty discovery")
         .is_empty());
     ledger
@@ -394,9 +394,9 @@ fn bead_settlement_seam_members_are_consumable() {
         )
         .expect("pending event");
 
-    // Discovery: every PendingBeadSettlementRow field.
+    // Discovery: every PendingWorkSettlementRow field.
     let pending = ledger
-        .list_pending_bead_settlements()
+        .list_pending_work_settlements()
         .expect("discovery")
         .remove(0);
     let _: (&String, i64, &String, &Option<String>) = (
@@ -408,7 +408,7 @@ fn bead_settlement_seam_members_are_consumable() {
 
     // Probe-observation upsert creates the row without opening the budget.
     ledger
-        .record_bead_settlement_probe(
+        .record_work_settlement_probe(
             "run-settle",
             "2030-01-01T00:01:00.000000000Z",
             60,
@@ -420,7 +420,7 @@ fn bead_settlement_seam_members_are_consumable() {
 
     // Claim / charge (with the watermark stamp) / finish.
     let claimed = ledger
-        .claim_bead_settlement_retry(
+        .claim_work_settlement_retry(
             "run-settle",
             "seam-token",
             "2030-01-01T00:00:00.000000000Z",
@@ -428,9 +428,9 @@ fn bead_settlement_seam_members_are_consumable() {
         )
         .expect("claim_bead_settlement_retry")
         .expect("claimed");
-    assert_eq!(claimed.budget, forged_ledger::BEAD_SETTLEMENT_RETRY_BUDGET);
+    assert_eq!(claimed.budget, forged_ledger::WORK_SETTLEMENT_RETRY_BUDGET);
     let charged = ledger
-        .charge_bead_settlement_retry(
+        .charge_work_settlement_retry(
             "run-settle",
             "seam-token",
             "2030-01-01T00:00:30.000000000Z",
@@ -442,7 +442,7 @@ fn bead_settlement_seam_members_are_consumable() {
 
     // The pass-minted re-record stamps the watermark transactionally.
     assert!(ledger
-        .append_bead_settlement_pending_if_pending(
+        .append_work_settlement_pending_if_pending(
             "run-settle",
             pending.event_id,
             json!({"schemaVersion": 1, "beadId": "bead-settle", "outcome": "landed",
@@ -451,7 +451,7 @@ fn bead_settlement_seam_members_are_consumable() {
         .expect("append_bead_settlement_pending_if_pending"));
     // A charge for a superseded pending event refuses at the stream head.
     ledger
-        .charge_bead_settlement_retry(
+        .charge_work_settlement_retry(
             "run-settle",
             "seam-token",
             "2030-01-01T00:00:30.000000000Z",
@@ -460,7 +460,7 @@ fn bead_settlement_seam_members_are_consumable() {
         )
         .expect_err("charge refuses once its pending event is superseded");
     assert!(ledger
-        .finish_bead_settlement_retry(
+        .finish_work_settlement_retry(
             "run-settle",
             "seam-token",
             RetryErrorUpdate::Set("still held".to_owned())
@@ -468,19 +468,19 @@ fn bead_settlement_seam_members_are_consumable() {
         .expect("finish_bead_settlement_retry"));
     // A failed probe read defers the wake without touching observations.
     ledger
-        .defer_bead_settlement_probe("run-settle", "2030-01-01T00:02:00.000000000Z", 120)
+        .defer_work_settlement_probe("run-settle", "2030-01-01T00:02:00.000000000Z", 120)
         .expect("defer_bead_settlement_probe");
     // The other two RetryErrorUpdate arms are addressable at the seam.
     assert!(!ledger
-        .finish_bead_settlement_retry("run-settle", "seam-token", RetryErrorUpdate::Keep)
+        .finish_work_settlement_retry("run-settle", "seam-token", RetryErrorUpdate::Keep)
         .expect("finish keep (already released)"));
     assert!(!ledger
-        .finish_bead_settlement_retry("run-settle", "seam-token", RetryErrorUpdate::Clear)
+        .finish_work_settlement_retry("run-settle", "seam-token", RetryErrorUpdate::Clear)
         .expect("finish clear (already released)"));
 
-    // Every BeadSettlementRetryRow field.
+    // Every WorkSettlementRetryRow field.
     let row = ledger
-        .get_bead_settlement_retry("run-settle")
+        .get_work_settlement_retry("run-settle")
         .expect("get_bead_settlement_retry")
         .expect("row");
     let _: (&String, u32, u32, &Option<String>, &Option<String>) = (
@@ -504,14 +504,14 @@ fn bead_settlement_seam_members_are_consumable() {
         &row.updated_at,
     );
     let repended = ledger
-        .list_pending_bead_settlements()
+        .list_pending_work_settlements()
         .expect("re-discovery")
         .remove(0);
     assert_eq!(row.event_id, Some(repended.event_id));
 
     // Epoch reset: the pass's own re-record loses; a newer episode wins.
     assert!(!ledger
-        .reset_bead_settlement_retry_for_new_episode("run-settle", repended.event_id)
+        .reset_work_settlement_retry_for_new_episode("run-settle", repended.event_id)
         .expect("own re-record reset"));
     ledger
         .append_event(
@@ -522,16 +522,16 @@ fn bead_settlement_seam_members_are_consumable() {
         )
         .expect("new episode pending");
     let fresh = ledger
-        .list_pending_bead_settlements()
+        .list_pending_work_settlements()
         .expect("fresh discovery")
         .remove(0);
     assert!(ledger
-        .reset_bead_settlement_retry_for_new_episode("run-settle", fresh.event_id)
+        .reset_work_settlement_retry_for_new_episode("run-settle", fresh.event_id)
         .expect("reset_bead_settlement_retry_for_new_episode"));
 
     // Convergence retires the run at the stream itself.
     assert!(ledger
-        .append_bead_settlement_succeeded_if_pending(
+        .append_work_settlement_succeeded_if_pending(
             "run-settle",
             fresh.event_id,
             json!({"schema": "forged.bead-settlement/1", "beadId": "bead-settle",
@@ -539,7 +539,7 @@ fn bead_settlement_seam_members_are_consumable() {
         )
         .expect("append_bead_settlement_succeeded_if_pending"));
     assert!(ledger
-        .list_pending_bead_settlements()
+        .list_pending_work_settlements()
         .expect("retired discovery")
         .is_empty());
     ledger.close().expect("close");
@@ -563,7 +563,7 @@ fn enums_round_trip_their_ddl_strings() {
         assert_eq!(AttemptState::try_from(s).expect("parse"), state);
     }
     for (scope, s) in [
-        (forged_ledger::RevokeScope::Bead, "bead"),
+        (forged_ledger::RevokeScope::Work, "bead"),
         (forged_ledger::RevokeScope::Attempt, "attempt"),
         (forged_ledger::RevokeScope::Deadline, "deadline"),
     ] {

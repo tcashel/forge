@@ -11,7 +11,7 @@ fn seed_packet(ledger: &Ledger, run_id: &str) -> String {
     ledger
         .create_run(NewRun {
             run_id: RunId::new(run_id).expect("valid run id"),
-            bead_id: "bead-race".to_owned(),
+            work_id: "bead-race".to_owned(),
             repo: "example/repo".to_owned(),
             base_ref: "main".to_owned(),
             branch: format!("feat/{run_id}"),

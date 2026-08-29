@@ -116,7 +116,7 @@ fn metadata(
         Some(row.identity.subject.kind.as_str().into()),
     );
     tokens.insert("subject_id".into(), token(Some(&row.identity.subject.id)));
-    tokens.insert("bead".into(), token(Some(&identity.bead.id)));
+    tokens.insert("bead".into(), token(Some(&identity.work.id)));
     tokens.insert(
         "repository".into(),
         token(

@@ -1,5 +1,5 @@
 //! Whole-run settlement: stop every live attempt, project one terminal
-//! outcome, reconcile Beads ownership, and retire landed worktrees.
+//! outcome, reconcile work ownership, and retire landed worktrees.
 
 use std::path::Path;
 
@@ -41,7 +41,7 @@ fn outcome(value: &str) -> Result<RunOutcome, Failure> {
     RunOutcome::try_from(value).map_err(Failure::from)
 }
 
-/// The deterministic marker addressing a run's terminal Beads comment. The
+/// The deterministic marker addressing a run's terminal work comment. The
 /// settlement write and the supervisor's convergence probe must derive the
 /// identical string or the probe can never observe a delivered comment.
 pub(super) fn settlement_marker(run_id: &str, outcome: RunOutcome) -> String {
@@ -51,10 +51,10 @@ pub(super) fn settlement_marker(run_id: &str, outcome: RunOutcome) -> String {
 /// The exact `run.bead-settlement.succeeded` payload. Shared with the
 /// supervisor retry pass so convergence from either writer is one event
 /// shape, deduplicable by byte equality.
-pub(super) fn succeeded_payload(bead_id: &str, outcome: RunOutcome) -> Value {
+pub(super) fn succeeded_payload(work_id: &str, outcome: RunOutcome) -> Value {
     json!({
         "schema": "forged.bead-settlement/1",
-        "beadId": bead_id,
+        "beadId": work_id,
         "outcome": outcome.as_str(),
         "settled": true,
     })
@@ -148,14 +148,14 @@ async fn stop_live_attempts(ctx: &Ctx, run_id: &str, reason: &str) -> Result<Vec
 async fn settlement_note(
     ctx: &Ctx,
     run_id: &str,
-    bead_id: &str,
+    work_id: &str,
     actor: &str,
     marker: &str,
     detail: &str,
 ) -> Result<(), Failure> {
     let run_id_owned = run_id.to_owned();
     let payload = serde_json::json!({
-        "workId": bead_id,
+        "workId": work_id,
         "actor": actor,
         "marker": marker,
         "detail": detail,
@@ -167,12 +167,12 @@ async fn settlement_note(
     .await
 }
 
-/// Settle the bead under `actor` — the caller's resolved custody identity.
+/// Settle the work under `actor` — the caller's resolved custody identity.
 ///
 /// The primary `run stop` path passes the work lease identity actually in
 /// force — the derived run holder or an adopted frontier claim from
 /// `claim-next` — read at settlement time. A hardcoded derived holder would
-/// wedge settlement of a frontier-claimed bead against forged's own lease.
+/// wedge settlement of a frontier-claimed work against forged's own lease.
 /// The supervisor retry pass instead passes the custody epoch RECORDED in
 /// the pending payload, so a later claim-next's live frontier claim is
 /// never adopted by an old settlement's retry.
@@ -186,10 +186,10 @@ async fn settlement_note(
 /// event still heading the stream, and every bd write is CAS-guarded on
 /// the exact holder, so the window needs a byte-identical claim taken
 /// while a terminal run's settlement is still pending.
-pub(super) async fn settle_bead(
+pub(super) async fn settle_work(
     ctx: &Ctx,
     run_id: &str,
-    bead_id: &str,
+    work_id: &str,
     settlement: &Settlement,
     actor: &str,
 ) -> Result<Value, Failure> {
@@ -211,13 +211,13 @@ pub(super) async fn settle_bead(
     match settlement.outcome {
         RunOutcome::Landed => {
             // Ownership is the first mutation and is repeated inside bd's
-            // atomic update. A successor or an unowned Bead therefore gets
+            // atomic update. A successor or an unowned Work therefore gets
             // neither closed nor annotated by this predecessor. Close and
             // release are one CAS, removing the old partially-closed seam.
-            let closed = super::workstore::close_held_issue(&ctx.ledger, bead_id, actor).await?;
-            settlement_note(ctx, run_id, bead_id, actor, &marker, &detail).await?;
+            let closed = super::workstore::close_held_issue(&ctx.ledger, work_id, actor).await?;
+            settlement_note(ctx, run_id, work_id, actor, &marker, &detail).await?;
             Ok(json!({
-                "id": bead_id,
+                "id": work_id,
                 "settled": true,
                 "status": closed.status,
                 "assignee": closed.assignee,
@@ -226,12 +226,12 @@ pub(super) async fn settle_bead(
             }))
         }
         RunOutcome::Blocked | RunOutcome::InputRequired => {
-            settlement_note(ctx, run_id, bead_id, actor, &marker, &detail).await?;
+            settlement_note(ctx, run_id, work_id, actor, &marker, &detail).await?;
             let issue =
-                super::workstore::release_unresolved_issue(&ctx.ledger, bead_id, actor, true)
+                super::workstore::release_unresolved_issue(&ctx.ledger, work_id, actor, true)
                     .await?;
             Ok(json!({
-                "id": bead_id,
+                "id": work_id,
                 "settled": true,
                 "status": issue.status,
                 "assignee": issue.assignee,
@@ -239,12 +239,12 @@ pub(super) async fn settle_bead(
             }))
         }
         RunOutcome::Cancelled | RunOutcome::Superseded => {
-            settlement_note(ctx, run_id, bead_id, actor, &marker, &detail).await?;
+            settlement_note(ctx, run_id, work_id, actor, &marker, &detail).await?;
             let issue =
-                super::workstore::release_unresolved_issue(&ctx.ledger, bead_id, actor, false)
+                super::workstore::release_unresolved_issue(&ctx.ledger, work_id, actor, false)
                     .await?;
             Ok(json!({
-                "id": bead_id,
+                "id": work_id,
                 "settled": true,
                 "status": issue.status,
                 "assignee": issue.assignee,
@@ -255,9 +255,9 @@ pub(super) async fn settle_bead(
         // explicit landed settlement. AcceptedRisk is rejected by parse and
         // owned by the review acceptance operation.
         RunOutcome::Clean | RunOutcome::AcceptedRisk => {
-            settlement_note(ctx, run_id, bead_id, actor, &marker, &detail).await?;
+            settlement_note(ctx, run_id, work_id, actor, &marker, &detail).await?;
             Ok(json!({
-                "id": bead_id,
+                "id": work_id,
                 "settled": true,
                 "preserved": true,
             }))
@@ -266,13 +266,13 @@ pub(super) async fn settle_bead(
 }
 
 /// Post-terminal aftermath shared by fenced settlement and pid-less
-/// adjudication: stop every live attempt, reconcile the Bead, retire a
+/// adjudication: stop every live attempt, reconcile the Work, retire a
 /// landed worktree. Every step is replay-idempotent, so an interrupted
 /// settlement resumes here without duplicating any effect.
 ///
-/// `closed_bead_converges` is the adjudication path's contract: a legacy
-/// run's Bead was usually closed by hand long ago, and an adjudicated
-/// terminal outcome must read that closed Bead as already converged — for
+/// `closed_work_converges` is the adjudication path's contract: a legacy
+/// run's Work was usually closed by hand long ago, and an adjudicated
+/// terminal outcome must read that closed Work as already converged — for
 /// every outcome — rather than error into permanent settlement-pending
 /// noise. The live `run stop` path keeps the strict guarded mutations.
 async fn settle_aftermath(
@@ -280,26 +280,26 @@ async fn settle_aftermath(
     run_id: &str,
     settlement: &Settlement,
     run: &RunRow,
-    closed_bead_converges: bool,
+    closed_work_converges: bool,
 ) -> Result<(Vec<i64>, Value, bool, Option<String>), Failure> {
     // Every token is invalidated durably before confirmed death. This loop
     // also catches an attempt that raced the terminal state write.
     let stopped_attempts =
         stop_live_attempts(ctx, run_id, &run.stop_reason.clone().unwrap()).await?;
-    let converged = if closed_bead_converges {
-        match super::workstore::show_issue(&ctx.ledger, &run.bead_id).await {
+    let converged = if closed_work_converges {
+        match super::workstore::show_issue(&ctx.ledger, &run.work_id).await {
             Ok(issue) if issue.status == "closed" => {
-                // The closed Bead converges every adjudicated outcome, but
+                // The closed Work converges every adjudicated outcome, but
                 // stale forged custody is still released — leaving
-                // forged:<bead>:0 on a closed Bead forever is the exact
+                // forged:<work>:0 on a closed Work forever is the exact
                 // noise this operation retires. Foreign custody is a
                 // successor's and stays untouched; a failed release is
                 // reported honestly, never read as settled custody.
-                let expected = run_holder(&run.bead_id);
+                let expected = run_holder(&run.work_id);
                 let (assignee, released, release_error) = match issue.assignee.as_deref() {
                     None => (None, true, None),
                     Some(holder) if holder == expected => {
-                        match super::workstore::release_issue(&ctx.ledger, &run.bead_id, holder)
+                        match super::workstore::release_issue(&ctx.ledger, &run.work_id, holder)
                             .await
                         {
                             Ok(after) => (after.assignee, true, None),
@@ -309,7 +309,7 @@ async fn settle_aftermath(
                     Some(_) => (issue.assignee.clone(), false, None),
                 };
                 let mut converged = json!({
-                    "id": run.bead_id,
+                    "id": run.work_id,
                     "settled": true,
                     "status": issue.status,
                     "assignee": assignee,
@@ -322,7 +322,7 @@ async fn settle_aftermath(
                 }
                 Some(converged)
             }
-            // An open Bead — or one this read cannot reach — belongs to the
+            // An open Work — or one this read cannot reach — belongs to the
             // live settlement path below, whose pending fallback stays
             // retryable against the same evidence.
             _ => None,
@@ -330,7 +330,7 @@ async fn settle_aftermath(
     } else {
         None
     };
-    let bead = if let Some(converged) = converged {
+    let work = if let Some(converged) = converged {
         converged
     } else {
         // Resolve the custody identity once, before the mutation chain: the
@@ -343,9 +343,9 @@ async fn settle_aftermath(
         // later successful read rather than parking conservative-foreign
         // forever.
         let (settled, observed_holder) =
-            match lease_identity(&ctx.ledger, &run.bead_id, run_id).await {
+            match lease_identity(&ctx.ledger, &run.work_id, run_id).await {
                 Ok(actor) => (
-                    settle_bead(ctx, run_id, &run.bead_id, settlement, &actor).await,
+                    settle_work(ctx, run_id, &run.work_id, settlement, &actor).await,
                     Some(actor),
                 ),
                 Err(error) => (Err(error), None),
@@ -355,9 +355,9 @@ async fn settle_aftermath(
             Err(error) => {
                 let mut pending = json!({
                     "schemaVersion": 1,
-                    "beadId": run.bead_id,
+                    "beadId": run.work_id,
                     "outcome": settlement.outcome.as_str(),
-                    "expectedAssignee": run_holder(&run.bead_id),
+                    "expectedAssignee": run_holder(&run.work_id),
                     "settled": false,
                     "pending": true,
                     "error": error.to_string(),
@@ -377,13 +377,13 @@ async fn settle_aftermath(
             }
         }
     };
-    if bead.get("settled").and_then(Value::as_bool) == Some(true) {
+    if work.get("settled").and_then(Value::as_bool) == Some(true) {
         let event_run = run_id.to_owned();
-        let event = succeeded_payload(&run.bead_id, settlement.outcome);
+        let event = succeeded_payload(&run.work_id, settlement.outcome);
         on_ledger(&ctx.ledger, move |ledger| {
             ledger.append_event_once(
                 &event_run,
-                super::attention::BEAD_SETTLEMENT_SUCCEEDED,
+                super::attention::WORK_SETTLEMENT_SUCCEEDED,
                 event,
             )?;
             Ok(())
@@ -417,7 +417,7 @@ async fn settle_aftermath(
     } else {
         (false, None)
     };
-    Ok((stopped_attempts, bead, retired, cleanup_error))
+    Ok((stopped_attempts, work, retired, cleanup_error))
 }
 
 /// Execute a validated settlement. Kept reusable for the review acceptance
@@ -490,11 +490,11 @@ pub(crate) async fn settle(
     }
 
     let internal = is_internal_epic_run(ctx, run_id).await?;
-    let (stopped_attempts, bead, retired, cleanup_error) = if internal {
+    let (stopped_attempts, work, retired, cleanup_error) = if internal {
         let stopped = stop_live_attempts(ctx, run_id, &settlement.reason).await?;
         // Preserve planning artifacts through typed stops. The epic apply
         // seam performs the required clean retirement immediately before the
-        // guarded Beads write.
+        // guarded work write.
         (stopped, Value::Null, false, None)
     } else {
         settle_aftermath(ctx, run_id, &settlement, &run, false).await?
@@ -512,7 +512,7 @@ pub(crate) async fn settle(
         "stoppedAttempts": stopped_attempts,
         "controllerGeneration": controller.as_ref().map(|target| target.generation),
         "controllerStopped": controller_stopped,
-        "bead": bead,
+        "bead": work,
         "worktreeRetired": retired,
         "worktreeCleanupError": cleanup_error,
     }))
@@ -557,7 +557,7 @@ pub async fn run_stop(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespons
         ),
     );
     // Every effect is replay-safe: ledger settlement is immutable/idempotent,
-    // attempt stop is marker-fenced and kill-confirmed, Beads writes are
+    // attempt stop is marker-fenced and kill-confirmed, work writes are
     // guarded/idempotent, and worktree retirement is idempotent.
     fenced(ctx, "run_stop", EffectClass::SafeRetry, req, None, {
         move |_operation| async move { settle(ctx, &run_id, settlement).await }
@@ -871,7 +871,7 @@ async fn adjudicate_locked(
             failure
         })?
     };
-    let (stopped_attempts, bead, retired, cleanup_error) =
+    let (stopped_attempts, work, retired, cleanup_error) =
         if is_internal_epic_run(ctx, run_id).await? {
             (
                 stop_live_attempts(ctx, run_id, &settlement.reason).await?,
@@ -895,7 +895,7 @@ async fn adjudicate_locked(
         "stoppedAttempts": stopped_attempts,
         "controllerGeneration": generation,
         "controllerStopped": false,
-        "bead": bead,
+        "bead": work,
         "worktreeRetired": retired,
         "worktreeCleanupError": cleanup_error,
     }))

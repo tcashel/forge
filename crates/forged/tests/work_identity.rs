@@ -1,5 +1,5 @@
 //! Durable human-readable identity is captured once and shared by every
-//! operator projection. Live Beads remains claim-health input, never the
+//! operator projection. Live work remains claim-health input, never the
 //! source of historical display identity.
 
 mod support;
@@ -11,14 +11,14 @@ const DESCRIPTION: &str = "Implement durable work identity from native Bead fiel
 const ACCEPTANCE: &str = "Every projection carries the same frozen identity.";
 
 fn start_run(env: &TestEnv, id: &str, title: &str) -> Value {
-    env.seed_bead_spec(id, DESCRIPTION, ACCEPTANCE);
-    env.set_bead_field(id, "title", title);
+    env.seed_work_spec(id, DESCRIPTION, ACCEPTANCE);
+    env.set_work_field(id, "title", title);
     env.seed_frontier(id);
     let repo = env.repos.repo.to_string_lossy().into_owned();
     let (code, started) = env.forged(&[
         "run",
         "start",
-        "--bead",
+        "--work",
         id,
         "--repo",
         &repo,
@@ -43,15 +43,15 @@ fn listed_identity(env: &TestEnv, id: &str) -> (Value, Value) {
 }
 
 #[test]
-fn run_identity_survives_rename_and_outage_and_is_shared_without_extra_beads_reads() {
+fn run_identity_survives_rename_and_outage_and_is_shared_without_extra_work_reads() {
     let env = TestEnv::new("forged-work-identity-run");
     assert_eq!(env.forged(&["init"]).0, 0);
     start_run(&env, "identity-run", "  Original launch title  ");
-    let launch_revision = env.bead_revision("identity-run");
+    let launch_revision = env.work_revision("identity-run");
 
     // A later title is live claim-health data only; it cannot rewrite the
     // identity the atomic creation bundle captured.
-    env.set_bead_field("identity-run", "title", "Renamed live title");
+    env.set_work_field("identity-run", "title", "Renamed live title");
     let (identity, entry) = listed_identity(&env, "identity-run");
     assert_eq!(identity["schema"], json!("forged.work-identity/1"));
     assert_eq!(
@@ -61,7 +61,7 @@ fn run_identity_survives_rename_and_outage_and_is_shared_without_extra_beads_rea
     assert_eq!(identity["bead"]["title"], json!("Original launch title"));
     assert_eq!(identity["bead"]["revision"], json!(launch_revision));
     assert_ne!(
-        env.bead_revision("identity-run"),
+        env.work_revision("identity-run"),
         launch_revision,
         "the rename minted a live revision the captured identity ignores"
     );
@@ -84,7 +84,7 @@ fn run_identity_survives_rename_and_outage_and_is_shared_without_extra_beads_rea
     // The captured identity is immutable even as the live store keeps
     // changing under it (the outage mode this replaced cannot occur: the
     // store is in-process and always answers).
-    env.set_bead_field("identity-run", "title", "Renamed again");
+    env.set_work_field("identity-run", "title", "Renamed again");
     let (stable_identity, _entry) = listed_identity(&env, "identity-run");
     assert_eq!(stable_identity, identity);
     let (code, later_status) = env.forged(&["run", "status", "--run", "identity-run"]);
@@ -96,7 +96,7 @@ fn run_identity_survives_rename_and_outage_and_is_shared_without_extra_beads_rea
 fn epic_identity_is_atomic_and_shared_by_status_inventory_and_overview() {
     let env = TestEnv::new("forged-work-identity-epic");
     env.seed_epic("identity-epic", &[("identity-child", &env.spec, true)]);
-    env.set_bead_field("identity-epic", "title", "Identity convergence");
+    env.set_work_field("identity-epic", "title", "Identity convergence");
     assert_eq!(env.forged(&["init"]).0, 0);
     let repo = env.repos.repo.to_string_lossy().into_owned();
     let spec = env.spec.to_string_lossy().into_owned();
@@ -145,7 +145,7 @@ fn epic_identity_is_atomic_and_shared_by_status_inventory_and_overview() {
 
     // The store is in-process: the inventory is always available, and the
     // captured identity still never re-derives from it.
-    env.set_bead_field("identity-epic", "title", "Renamed epic title");
+    env.set_work_field("identity-epic", "title", "Renamed epic title");
     let (code, later) = env.forged(&["epic", "status", "--epic", "identity-epic"]);
     assert_eq!(code, 0, "durable epic status: {later}");
     assert_eq!(later["result"]["identity"], identity);

@@ -407,7 +407,7 @@ fn route_attention(entries: &mut [Value], attention: &[Value]) -> Result<(), Fai
             .get("id")
             .and_then(Value::as_str)
             .ok_or_else(|| Failure::internal("operator entry has no id"))?;
-        let bead_id = entry
+        let work_id = entry
             .get("beadId")
             .and_then(Value::as_str)
             .unwrap_or_default();
@@ -415,19 +415,19 @@ fn route_attention(entries: &mut [Value], attention: &[Value]) -> Result<(), Fai
         let items = attention
             .iter()
             .filter(|item| {
-                let bead_evidence = item
+                let work_evidence = item
                     .get("evidenceRefs")
                     .and_then(Value::as_array)
                     .into_iter()
                     .flatten()
                     .any(|reference| {
                         reference.get("kind").and_then(Value::as_str) == Some("bead")
-                            && reference.get("id").and_then(Value::as_str) == Some(bead_id)
+                            && reference.get("id").and_then(Value::as_str) == Some(work_id)
                     });
                 if is_plan {
-                    bead_evidence
+                    work_evidence
                 } else {
-                    !bead_evidence && item.get("subjectId").and_then(Value::as_str) == Some(id)
+                    !work_evidence && item.get("subjectId").and_then(Value::as_str) == Some(id)
                 }
             })
             .cloned()
@@ -609,7 +609,7 @@ async fn project(ctx: &Ctx, request: MapRequest) -> Result<Value, Failure> {
             request.max_nodes
         )));
     }
-    let exact_ids = super::ops::entry_bead_ids(&entries);
+    let exact_ids = super::ops::entry_work_ids(&entries);
     let plan_scope = match request.scope.kind {
         WorkMapScopeKind::Operator => crate::core::work_types::WorkMapPlanScope::Operator,
         WorkMapScopeKind::Repository => crate::core::work_types::WorkMapPlanScope::Repository(
@@ -627,7 +627,7 @@ async fn project(ctx: &Ctx, request: MapRequest) -> Result<Value, Failure> {
     let plan_read =
         super::workstore::work_map_plan_inventory(&ctx.ledger, &plan_scope, &exact_ids, plan_limit)
             .await;
-    let beads_captured_at = now_iso();
+    let work_captured_at = now_iso();
     let (plan_inventory, plan_error) = match plan_read {
         Ok(inventory) => (Some(inventory), None),
         Err(error) => (None, Some(error.to_string())),
@@ -645,7 +645,7 @@ async fn project(ctx: &Ctx, request: MapRequest) -> Result<Value, Failure> {
     }
 
     let mut plan_issues = Vec::new();
-    let bead_summaries = if let Some(inventory) = &plan_inventory {
+    let work_summaries = if let Some(inventory) = &plan_inventory {
         plan_issues = inventory.issues.clone();
         inventory.exact_issues.clone()
     } else {
@@ -653,11 +653,11 @@ async fn project(ctx: &Ctx, request: MapRequest) -> Result<Value, Failure> {
     };
     if request.source != Some(WorkMapSource::Durable) {
         for plan in &plan_issues {
-            entries.push(super::ops::live_plan_entry(plan, &beads_captured_at)?);
+            entries.push(super::ops::live_plan_entry(plan, &work_captured_at)?);
         }
     }
-    super::ops::decorate_titles(&mut entries, &bead_summaries)?;
-    let attention = super::attention::project_active(&snapshot, &entries, &bead_summaries)?
+    super::ops::decorate_titles(&mut entries, &work_summaries)?;
+    let attention = super::attention::project_active(&snapshot, &entries, &work_summaries)?
         .into_iter()
         .map(|item| {
             serde_json::to_value(item).map_err(|error| {
@@ -666,10 +666,10 @@ async fn project(ctx: &Ctx, request: MapRequest) -> Result<Value, Failure> {
         })
         .collect::<Result<Vec<_>, _>>()?;
     super::ops::enrich_operations_facts(&snapshot, &attention, &mut entries)?;
-    let bead_read = plan_error
+    let work_read = plan_error
         .as_ref()
-        .map_or_else(|| Ok(bead_summaries.clone()), |error| Err(error.clone()));
-    let _queue = super::ops::operator_queue(&snapshot, &mut entries, &attention, bead_read);
+        .map_or_else(|| Ok(work_summaries.clone()), |error| Err(error.clone()));
+    let _queue = super::ops::operator_queue(&snapshot, &mut entries, &attention, work_read);
     route_attention(&mut entries, &attention)?;
 
     entries.retain(|entry| {
@@ -721,7 +721,7 @@ async fn project(ctx: &Ctx, request: MapRequest) -> Result<Value, Failure> {
         .collect();
     let mut edges = Vec::new();
     let mut edge_indexes = BTreeMap::new();
-    let known_plan_status = bead_summaries
+    let known_plan_status = work_summaries
         .iter()
         .map(|issue| (issue.id.clone(), json!(issue.status)))
         .collect::<BTreeMap<_, _>>();
@@ -730,13 +730,13 @@ async fn project(ctx: &Ctx, request: MapRequest) -> Result<Value, Failure> {
         let Some(identity) = &node.identity else {
             continue;
         };
-        let target = work_ref(WorkRefKind::Plan, &identity.bead.id)?;
+        let target = work_ref(WorkRefKind::Plan, &identity.work.id)?;
         let context_only = !refs.contains_key(&ref_key(&target))
-            && known_plan_status.contains_key(&identity.bead.id);
+            && known_plan_status.contains_key(&identity.work.id);
         if context_only {
             boundary_status
-                .entry(identity.bead.id.clone())
-                .or_insert_with(|| known_plan_status[&identity.bead.id].clone());
+                .entry(identity.work.id.clone())
+                .or_insert_with(|| known_plan_status[&identity.work.id].clone());
         }
         add_edge(
             &mut edges,
@@ -912,7 +912,7 @@ async fn project(ctx: &Ctx, request: MapRequest) -> Result<Value, Failure> {
         focus: request.focus,
         captured_at: WorkMapCapturedAtV1 {
             ledger: ledger_captured_at,
-            beads: plan_inventory.as_ref().map(|_| beads_captured_at),
+            work: plan_inventory.as_ref().map(|_| work_captured_at),
             history: history_captured_at,
         },
         source_health,

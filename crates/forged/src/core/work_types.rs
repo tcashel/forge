@@ -4,27 +4,27 @@
 
 use std::collections::BTreeMap;
 
-/// The Beads fields forged consumes — the epic scheduler's inventory plus
+/// The work fields forged consumes — the epic scheduler's inventory plus
 /// the spec body a run is built from.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IssueSummary {
-    /// Stable Beads id.
+    /// Stable work id.
     pub id: String,
     /// Human-readable title.
     pub title: String,
     /// Markdown-ish issue description: the spec's Context and What We're
-    /// Building sections, and on older beads the `spec:` and `repo:`
+    /// Building sections, and on older imports the `spec:` and `repo:`
     /// pointers.
     pub description: String,
-    /// Current Beads status.
+    /// Current work status.
     pub status: String,
     /// Native numeric scheduling priority. Missing or non-integral values
     /// remain `None` so admission can defer fail-closed.
     pub priority: Option<i64>,
-    /// Current Beads assignee/lease holder, when any.
+    /// Current work assignee/lease holder, when any.
     pub assignee: Option<String>,
-    /// Beads issue type (`task`, `epic`, ...).
+    /// Work issue type (`task`, `epic`, ...).
     pub issue_type: String,
     /// `acceptance_criteria` — the spec's Acceptance Criteria section.
     pub acceptance_criteria: String,
@@ -32,7 +32,7 @@ pub struct IssueSummary {
     pub design: String,
     /// `notes` — the spec's Agent Instructions section.
     pub notes: String,
-    /// `spec_id` — the bead's link to an external specification document.
+    /// `spec_id` — the work's link to an external specification document.
     pub spec_id: Option<String>,
     /// `metadata` — the JSON extension point carrying the spec's Quality
     /// Gates. Non-string values are kept as their compact JSON text: this
@@ -46,7 +46,7 @@ pub struct IssueSummary {
     /// it is compared for equality and nothing else — never ordered, parsed,
     /// incremented, or assumed positive (bd 1.2.1 emits negative values).
     pub revision: Option<String>,
-    /// Authoritative Beads update time when the read shape carries it. Live
+    /// Authoritative work update time when the read shape carries it. Live
     /// plan identity uses this stable source timestamp instead of making an
     /// otherwise read-only projection vary with the wall clock.
     pub updated_at: Option<String>,
@@ -66,14 +66,14 @@ pub struct NativeSpecUpdate {
     pub notes: String,
 }
 
-/// One native Beads dependency coordinate carried by a hydrated plan row.
+/// One native work dependency coordinate carried by a hydrated plan row.
 ///
 /// This is deliberately only identity and current status. Forged does not
-/// reinterpret Beads' graph or manufacture readiness from display text.
+/// reinterpret the work graph or manufacture readiness from display text.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlanDependency {
-    /// Canonical dependency Bead id.
+    /// Canonical dependency Work id.
     pub id: String,
     /// Native dependency edge type from the pinned bd contract.
     pub dependency_type: PlanDependencyType,
@@ -226,11 +226,11 @@ pub enum PlanReadiness {
     Unknown,
 }
 
-/// One current, nonterminal Beads plan row.
+/// One current, nonterminal work-plan row.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlanIssue {
-    /// The same issue fields every Forged Beads consumer uses.
+    /// The same issue fields every Forged work consumer uses.
     #[serde(flatten)]
     pub issue: IssueSummary,
     /// Native parent id, when present.
@@ -288,7 +288,7 @@ pub struct PlanInventory {
     pub discovered: usize,
 }
 
-/// Scope for the Work Map's one bounded Beads graph read.
+/// Scope for the Work Map's one bounded work-graph read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkMapPlanScope {
     /// All live operator-scoped plans.
@@ -299,7 +299,7 @@ pub enum WorkMapPlanScope {
     Epic(String),
 }
 
-/// Current plan rows plus exact Bead summaries needed by the shared
+/// Current plan rows plus exact Work summaries needed by the shared
 /// Operations classifier. Both collections come from the same final hydrate;
 /// no separate claim/membership process is needed.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -307,7 +307,7 @@ pub enum WorkMapPlanScope {
 pub struct WorkMapPlanInventory {
     /// Hydrated live plan rows selected for display.
     pub issues: Vec<PlanIssue>,
-    /// Exact durable-linked Bead summaries available to classification.
+    /// Exact durable-linked Work summaries available to classification.
     pub exact_issues: Vec<IssueSummary>,
     /// More live plan rows matched than the caller's bound.
     pub truncated: bool,

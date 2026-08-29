@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use forged_ledger::{AttemptState, PacketRow};
 use forged_proto::{advance, MachineStage, NextAction, Terminal, TerminalAttempt};
 use forged_types::{
-    Capability, Deliverable, ExecutionPackageV1, HostPolicyV1, NativeBeadSpecV1, Outcome,
+    Capability, Deliverable, ExecutionPackageV1, HostPolicyV1, NativeWorkSpecV1, Outcome,
     ProfileDefinitionV1, ProfileRef, ProtocolRef, ProviderCandidateV1, ResolvedRosterV1, RoleId,
     RosterRef, Sandbox, SeatDefinitionV1, SeatId, SeatPurpose, SpecAmendment, Stage, StageContract,
     Verdict, WorkPacket,
@@ -111,7 +111,7 @@ fn complete(
         schema: "forged.packet/1".to_owned(),
         packet_id: packet_id.clone(),
         run_id: view.run.run_id.clone(),
-        bead_id: view.run.bead_id.clone(),
+        work_id: view.run.work_id.clone(),
         stage: intent.stage,
         execution: Some(execution),
         lane_seq: Some(intent.seq),
@@ -126,7 +126,7 @@ fn complete(
         contract: StageContract {
             instructions: "plan".to_owned(),
             gate_commands: Vec::new(),
-            deliverable: Deliverable::NativeBeadSpec,
+            deliverable: Deliverable::NativeWorkSpec,
             budget_s: 60,
         },
         result_schema: "forged.result.epic-plan/1".to_owned(),
@@ -158,7 +158,7 @@ fn complete(
 
 fn plan(label: &str) -> Outcome {
     Outcome::Plan {
-        spec: NativeBeadSpecV1 {
+        spec: NativeWorkSpecV1 {
             description: format!("description {label}"),
             acceptance_criteria: "observable acceptance".to_owned(),
             design: "minimal design".to_owned(),

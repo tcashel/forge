@@ -1,6 +1,6 @@
 #![cfg(feature = "failpoints")]
 
-//! Crash windows inside the bead settlement retry pass: between the
+//! Crash windows inside the work settlement retry pass: between the
 //! convergence read and the event append, and between a charged bd mutation
 //! and its event append. The run must keep projecting pending, the
 //! interrupted attempt must cost at most one budget charge, and the next
@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 use support::{fabricate_run, TestEnv};
 
 fn seed_pending(env: &TestEnv, run: &str, error: &str) -> String {
-    let bead = format!("bead-{run}");
+    let work = format!("bead-{run}");
     fabricate_run(env, run);
     let ledger = env.ledger();
     ledger
@@ -34,10 +34,10 @@ fn seed_pending(env: &TestEnv, run: &str, error: &str) -> String {
             "run.bead-settlement.pending",
             json!({
                 "schemaVersion": 1,
-                "beadId": bead,
+                "beadId": work,
                 "outcome": "landed",
-                "expectedAssignee": format!("forged:{bead}:0"),
-                "observedHolder": format!("forged:{bead}:0"),
+                "expectedAssignee": format!("forged:{work}:0"),
+                "observedHolder": format!("forged:{work}:0"),
                 "settled": false,
                 "pending": true,
                 "error": error,
@@ -45,7 +45,7 @@ fn seed_pending(env: &TestEnv, run: &str, error: &str) -> String {
         )
         .expect("pending event");
     ledger.close().expect("close");
-    bead
+    work
 }
 
 fn crash_supervise_at(env: &TestEnv, site: &str) {
@@ -83,7 +83,7 @@ fn event_count(env: &TestEnv, run: &str, kind: &str) -> usize {
 
 /// Every `work.updated` payload for one item, oldest first (coordination
 /// events carry no run id, so the scan is over the whole stream).
-fn work_updates(env: &TestEnv, bead: &str) -> Vec<Value> {
+fn work_updates(env: &TestEnv, work: &str) -> Vec<Value> {
     let ledger = env.ledger();
     let events = ledger.list_events(None, 0, 65_536).expect("events");
     ledger.close().expect("close");
@@ -91,13 +91,13 @@ fn work_updates(env: &TestEnv, bead: &str) -> Vec<Value> {
         .into_iter()
         .filter(|event| event.kind == "work.updated")
         .map(|event| serde_json::from_str::<Value>(&event.payload_json).expect("payload"))
-        .filter(|payload| payload["workId"] == json!(bead))
+        .filter(|payload| payload["workId"] == json!(work))
         .collect()
 }
 
 /// Closes recorded for one item (status moved to closed).
-fn close_writes(env: &TestEnv, bead: &str) -> usize {
-    work_updates(env, bead)
+fn close_writes(env: &TestEnv, work: &str) -> usize {
+    work_updates(env, work)
         .into_iter()
         .filter(|update| update["status"]["to"] == json!("closed"))
         .count()
@@ -105,14 +105,14 @@ fn close_writes(env: &TestEnv, bead: &str) -> usize {
 
 fn used(env: &TestEnv, run: &str) -> Option<u32> {
     let ledger = env.ledger();
-    let row = ledger.get_bead_settlement_retry(run).expect("retry row");
+    let row = ledger.get_work_settlement_retry(run).expect("retry row");
     ledger.close().expect("close");
     row.map(|row| row.used)
 }
 
 fn claim_token(env: &TestEnv, run: &str) -> Option<String> {
     let ledger = env.ledger();
-    let row = ledger.get_bead_settlement_retry(run).expect("retry row");
+    let row = ledger.get_work_settlement_retry(run).expect("retry row");
     ledger.close().expect("close");
     row.and_then(|row| row.claim_token)
 }
@@ -148,8 +148,8 @@ fn a_crash_between_the_convergence_read_and_the_append_charges_nothing() {
     let env = TestEnv::new("km-bead-settlement-read");
     assert_eq!(env.forged(&["init"]).0, 0);
     let run = "km-bsr-read";
-    let bead = seed_pending(&env, run, "bd lease held");
-    env.set_bead_field(&bead, "status", "closed");
+    let work = seed_pending(&env, run, "bd lease held");
+    env.set_work_field(&work, "status", "closed");
 
     crash_supervise_at(&env, "bead-settlement.read.after");
     assert_eq!(
@@ -157,7 +157,7 @@ fn a_crash_between_the_convergence_read_and_the_append_charges_nothing() {
         0,
         "the crash lost the append: the run still projects pending"
     );
-    assert!(work_updates(&env, &bead).is_empty());
+    assert!(work_updates(&env, &work).is_empty());
     assert_eq!(used(&env, run), None, "a read-only pass charges nothing");
 
     let report = supervise_once(&env);
@@ -167,7 +167,7 @@ fn a_crash_between_the_convergence_read_and_the_append_charges_nothing() {
     );
     assert_eq!(event_count(&env, run, "run.bead-settlement.succeeded"), 1);
     assert!(
-        work_updates(&env, &bead).is_empty(),
+        work_updates(&env, &work).is_empty(),
         "recovery converges with no work mutation or note"
     );
 }
@@ -196,17 +196,17 @@ fn latest_pending(env: &TestEnv, run: &str) -> Value {
 }
 
 /// The guarded release CAS fences the assignee alone: a reopen landing
-/// between the closed-bead probe and the release yields an open, unassigned
-/// bead. The attempt must fail with that evidence — never record settlement
-/// success over a bead that no longer matches the promise.
+/// between the closed-work probe and the release yields an open, unassigned
+/// work. The attempt must fail with that evidence — never record settlement
+/// success over a work that no longer matches the promise.
 #[test]
 fn a_reopen_between_the_charge_and_the_release_fails_the_attempt_not_the_promise() {
     let env = TestEnv::new("km-bead-settlement-reopen");
     assert_eq!(env.forged(&["init"]).0, 0);
     let run = "km-bsr-reopen";
-    let bead = seed_pending(&env, run, "bd timed out mid-close");
-    env.set_bead_field(&bead, "status", "closed");
-    env.set_assignee(&bead, &format!("forged:{bead}:0"));
+    let work = seed_pending(&env, run, "bd timed out mid-close");
+    env.set_work_field(&work, "status", "closed");
+    env.set_assignee(&work, &format!("forged:{work}:0"));
 
     let fp = env.anvil.join("failpoints");
     std::fs::create_dir_all(&fp).expect("failpoint dir");
@@ -222,16 +222,16 @@ fn a_reopen_between_the_charge_and_the_release_fails_the_attempt_not_the_promise
     wait_until("the charged executor pauses before its release", || {
         fp.join("bead-settlement.charge.after.reached").exists()
     });
-    // The concurrent reopen: the closed bead goes back to open while the
+    // The concurrent reopen: the closed work goes back to open while the
     // charged executor is parked between its charge and its guarded release.
-    env.set_bead_field(&bead, "status", "open");
+    env.set_work_field(&work, "status", "open");
     std::fs::write(fp.join("bead-settlement.charge.after.release"), b"").expect("release");
     assert!(
         paused.wait().expect("supervise completes").success(),
         "the tick itself survives the failed attempt"
     );
 
-    assert_eq!(env.assignee(&bead), None, "the release CAS itself fired");
+    assert_eq!(env.assignee(&work), None, "the release CAS itself fired");
     assert_eq!(
         used(&env, run),
         Some(1),
@@ -251,55 +251,55 @@ fn a_reopen_between_the_charge_and_the_release_fails_the_attempt_not_the_promise
     );
 
     // The promise stays owed until an attempt actually delivers it: the
-    // next pass takes guarded custody of the reopened, unassigned bead
+    // next pass takes guarded custody of the reopened, unassigned work
     // (the landed-over-unassigned path) and closes it for real — success
     // is recorded only behind that delivery, never over the raced state.
     rewind_wakes(&env);
     supervise_once(&env);
     assert_eq!(event_count(&env, run, "run.bead-settlement.succeeded"), 1);
     assert_eq!(
-        close_writes(&env, &bead),
+        close_writes(&env, &work),
         1,
         "the recovery attempt performs the one real close"
     );
-    assert_eq!(env.assignee(&bead), None);
+    assert_eq!(env.assignee(&work), None);
 }
 
 /// Settlement notes recorded for one item (the bd comment's replacement).
-fn comment_calls(env: &TestEnv, bead: &str) -> usize {
+fn comment_calls(env: &TestEnv, work: &str) -> usize {
     let ledger = env.ledger();
     let events = ledger.list_events(None, 0, 65_536).expect("events");
     ledger.close().expect("close");
     events
         .into_iter()
-        .filter(|event| event.kind == "work.settled.note" && event.payload_json.contains(bead))
+        .filter(|event| event.kind == "work.settled.note" && event.payload_json.contains(work))
         .count()
 }
 
 /// Guarded custody takes recorded for one item.
-fn custody_calls(env: &TestEnv, bead: &str) -> usize {
-    work_updates(env, bead)
+fn custody_calls(env: &TestEnv, work: &str) -> usize {
+    work_updates(env, work)
         .into_iter()
         .filter(|update| update["verb"] == json!("assign-unassigned"))
         .count()
 }
 
 /// The blocked→accept-risk→landed crash window: guarded custody of the
-/// blocked/open, unassigned bead landed, the process died before the close. The
-/// next attempt finds a held bead and closes it — one close, one comment,
+/// blocked/open, unassigned work landed, the process died before the close. The
+/// next attempt finds a held work and closes it — one close, one comment,
 /// no second custody write.
 #[test]
 fn a_crash_between_guarded_custody_and_close_converges_without_a_duplicate_comment() {
     let env = TestEnv::new("km-bead-settlement-custody");
     assert_eq!(env.forged(&["init"]).0, 0);
     let run = "km-bsr-claim";
-    let bead = seed_pending(&env, run, "bead is open and unassigned");
-    env.set_bead_field(&bead, "status", "open");
-    let expected = format!("forged:{bead}:0");
+    let work = seed_pending(&env, run, "bead is open and unassigned");
+    env.set_work_field(&work, "status", "open");
+    let expected = format!("forged:{work}:0");
 
     crash_supervise_at(&env, "bead-settlement.landed-custody.after");
     assert_eq!(
-        env.assignee(&bead).as_deref(),
+        env.assignee(&work).as_deref(),
         Some(expected.as_str()),
         "the crash leaves guarded custody held"
     );
@@ -310,7 +310,7 @@ fn a_crash_between_guarded_custody_and_close_converges_without_a_duplicate_comme
     );
     assert_eq!(event_count(&env, run, "run.bead-settlement.succeeded"), 0);
     assert_eq!(
-        comment_calls(&env, &bead),
+        comment_calls(&env, &work),
         0,
         "the crash fired before the close and its comment"
     );
@@ -320,11 +320,11 @@ fn a_crash_between_guarded_custody_and_close_converges_without_a_duplicate_comme
     rewind_wakes(&env);
     expire_claim_leases(&env);
     supervise_once(&env);
-    assert_eq!(env.assignee(&bead), None);
+    assert_eq!(env.assignee(&work), None);
     assert_eq!(event_count(&env, run, "run.bead-settlement.succeeded"), 1);
-    assert_eq!(comment_calls(&env, &bead), 1, "no duplicate comment");
+    assert_eq!(comment_calls(&env, &work), 1, "no duplicate comment");
     assert_eq!(
-        custody_calls(&env, &bead),
+        custody_calls(&env, &work),
         1,
         "the recovery attempt closes the held bead without retaking custody"
     );
@@ -367,13 +367,13 @@ fn every_failure_after_a_successful_claim_releases_the_claim_token() {
     // close. Run B: a foreign holder, so the real mutation always fails and
     // exercises the re-pend append.
     let run_a = "km-bsr-hyg-own";
-    let bead_a = seed_pending(&env, run_a, "bd timed out mid-close");
-    env.set_bead_field(&bead_a, "status", "in_progress");
-    env.set_assignee(&bead_a, &format!("forged:{bead_a}:0"));
+    let work_a = seed_pending(&env, run_a, "bd timed out mid-close");
+    env.set_work_field(&work_a, "status", "in_progress");
+    env.set_assignee(&work_a, &format!("forged:{work_a}:0"));
     let run_b = "km-bsr-hyg-thief";
-    let bead_b = seed_pending(&env, run_b, "bd refused the close");
-    env.set_bead_field(&bead_b, "status", "in_progress");
-    env.set_assignee(&bead_b, "forged:thief:0");
+    let work_b = seed_pending(&env, run_b, "bd refused the close");
+    env.set_work_field(&work_b, "status", "in_progress");
+    env.set_assignee(&work_b, "forged:thief:0");
 
     let sites = [
         "bead-settlement.wake-deadline",
@@ -417,7 +417,7 @@ fn every_failure_after_a_successful_claim_releases_the_claim_token() {
     assert_eq!(refused["action"], json!("retry-failed"), "{report}");
     assert_eq!(event_count(&env, run_a, "run.bead-settlement.succeeded"), 1);
     assert_eq!(
-        close_writes(&env, &bead_a),
+        close_writes(&env, &work_a),
         1,
         "recovery never repeats the delivered close"
     );
@@ -431,8 +431,8 @@ fn a_wedged_settlement_pass_never_delays_due_work_claiming_or_doubles() {
     let env = TestEnv::new("km-bead-settlement-wedge");
     assert_eq!(env.forged(&["init"]).0, 0);
     let run = "km-bsr-wedge";
-    let bead = seed_pending(&env, run, "bd lease held");
-    env.set_bead_field(&bead, "status", "closed");
+    let work = seed_pending(&env, run, "bd lease held");
+    env.set_work_field(&work, "status", "closed");
 
     // A due desired subject the ticks must keep claiming: an authorized,
     // already-stopped run that admission settles as ineligible-terminal.
@@ -488,13 +488,13 @@ fn a_wedged_settlement_pass_never_delays_due_work_claiming_or_doubles() {
         "no second settlement pass settles while one is wedged open"
     );
 
-    // Release the wedge: the pass completes and converges the closed bead.
+    // Release the wedge: the pass completes and converges the closed work.
     std::fs::write(fp.join("bead-settlement.read.after.release"), b"").expect("release");
     wait_until("the released pass converges the pending settlement", || {
         event_count(&env, run, "run.bead-settlement.succeeded") == 1
     });
     assert!(
-        work_updates(&env, &bead).is_empty(),
+        work_updates(&env, &work).is_empty(),
         "the wedged-then-released pass converged read-only"
     );
     supervisor.kill().expect("stop supervisor");
@@ -506,19 +506,19 @@ fn a_crash_after_the_charged_mutation_converges_without_repeating_it() {
     let env = TestEnv::new("km-bead-settlement-mutate");
     assert_eq!(env.forged(&["init"]).0, 0);
     let run = "km-bsr-mutate";
-    let bead = seed_pending(&env, run, "bd timed out mid-close");
+    let work = seed_pending(&env, run, "bd timed out mid-close");
     // Closed but still held by this run: the pass performs the one guarded
     // release, then crashes before its event lands.
-    env.set_bead_field(&bead, "status", "closed");
-    env.set_assignee(&bead, &format!("forged:{bead}:0"));
+    env.set_work_field(&work, "status", "closed");
+    env.set_assignee(&work, &format!("forged:{work}:0"));
 
     crash_supervise_at(&env, "bead-settlement.mutate.after");
     assert_eq!(
-        work_updates(&env, &bead).len(),
+        work_updates(&env, &work).len(),
         1,
         "the guarded release fired before the crash"
     );
-    assert_eq!(env.assignee(&bead), None);
+    assert_eq!(env.assignee(&work), None);
     assert_eq!(
         used(&env, run),
         Some(1),
@@ -538,7 +538,7 @@ fn a_crash_after_the_charged_mutation_converges_without_repeating_it() {
     );
     assert_eq!(event_count(&env, run, "run.bead-settlement.succeeded"), 1);
     assert_eq!(
-        work_updates(&env, &bead).len(),
+        work_updates(&env, &work).len(),
         1,
         "recovery never repeats the bd mutation"
     );

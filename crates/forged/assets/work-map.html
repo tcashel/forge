@@ -135,7 +135,7 @@ h1 { margin:0; font-size:20px; line-height:1.2; }
   function semanticState(value,group,conditions=conditionRows(value)){const queue=String(group||value?.queueGroup||value?.queue?.group||"").toLowerCase().replace(/\s+/g,"-");const outcome=value?.outcome||value?.execution?.outcome||value?.status?.outcome||value?.status?.terminalOutcome;const attempt=value?.attempt?.activity||value?.attempt?.state;const names=conditions.map(item=>typeof item==="string"?item:item?.condition).filter(Boolean);if(["needs-me","ready-to-merge"].includes(queue)||["clean","accepted-risk","input-required"].includes(outcome)||names.some(name=>DECISION_CONDITIONS.includes(name)))return "attend";if(queue==="running"||attempt==="running"||names.includes("revoking"))return "running";if(outcome==="landed"||value?.merged===true||value?.execution?.merged===true||value?.status?.merged===true)return "landed";if(["cancelled","superseded"].includes(outcome))return "dormant";if(queue==="stalled-or-recoverable"||outcome==="blocked"||names.some(name=>name!=="revoking"&&SYMPTOM_CONDITIONS.includes(name)))return "stalled";if(queue==="planned"||value?.source==="live-plan"||value?.workRef?.kind==="plan")return "dormant";return "dormant";}
   function semanticLabel(value,conditions,semantic=semanticState(value,null,conditions)){return semantic==="running"&&conditions.some(item=>(typeof item==="string"?item:item?.condition)==="revoking")?"recovering":semantic;}
   function spendText(spend){if(!spend||(!Object.hasOwn(spend,"costUsdKnown")&&!Object.hasOwn(spend,"rowsMissingCost")))return null;const known=typeof spend.costUsdKnown==="number"&&Number.isFinite(spend.costUsdKnown)?spend.costUsdKnown:0,missing=typeof spend.rowsMissingCost==="number"&&Number.isFinite(spend.rowsMissingCost)?spend.rowsMissingCost:0;if(missing>0&&known===0)return "?";return `$${known.toFixed(2)}${missing>0?` + ${Math.round(missing).toLocaleString()} unpriced`:""}`;}
-  function degradedSources(data){const degraded=[];for(const name of ["ledger","beads","plan","history"]){const source=data?.sourceHealth?.[name];if(!source)continue;const status=source.state||"unknown";if(status!=="available")degraded.push(`${name} ${status}`);}return degraded;}
+  function degradedSources(data){const degraded=[];for(const name of ["ledger","beads","plan","history"]){const source=data?.sourceHealth?.[name];if(!source)continue;const status=source.state||"unknown";if(status!=="available")degraded.push(`${name==="beads"?"work":name} ${status}`);}return degraded;}
   function reducedHeadline(data){const parts=[];const degraded=degradedSources(data);if(degraded.length)parts.push(`Degraded sources: ${degraded.join(", ")}`);for(const [key,label] of [["nodes","nodes"],["edges","edges"],["runs","runs"],["epics","epics"],["attention","attention"]])if(typeof data?.counts?.[key]==="number")parts.push(`${Math.round(data.counts[key]).toLocaleString()} ${label}`);return `${parts.join("; ")}.`;}
   function request(method, params={}) {
     if (tornDown) return Promise.reject(new Error("resource torn down"));
@@ -158,7 +158,7 @@ h1 { margin:0; font-size:20px; line-height:1.2; }
   function nodeState(node){return node.plan?.status||node.queue?.group||node.execution?.state||node.execution?.outcome||"unknown";}
   function nodeTitle(node){return node.titleSource?.value||node.identity?.displayTitle||node.plan?.title||node.workRef?.id||"Untitled";}
   // A resolved title states its authority: an id form is rendered AS an id,
-  // and a current Beads read is marked live rather than read as launch
+  // and a current work read is marked live rather than read as launch
   // evidence. A payload without `titleSource` marks nothing.
   function titleMark(node){const t=node?.titleSource;return !t?"":t.known===false?"untitled id":t.source==="beads.title"?"live title":"";}
   async function openDetail(node){
@@ -173,9 +173,9 @@ h1 { margin:0; font-size:20px; line-height:1.2; }
     const dl=el("dl","kv");const add=(label,value)=>{dl.append(el("dt","",label));dl.append(el("dd","",value==null||value===""?"—":value));};
     add("title",nodeTitle(node));add("source",node.source);add("repository",repositoryLabel(node.identity)||node.repository);add("epic",node.epicId);add("queue",node.queue?.group);add("execution",node.execution?.state||node.execution?.outcome);add("attention",arr(node.attention).length);add("history",node.history?"attached":"not attached");
     const progress=node.queue?.desired?.lastProgressAt||node.execution?.updatedAt;if(progress)add("last progress",age(progress));
-    // A plan node is not a dead node: the whole Beads record already
+    // A plan node is not a dead node: the whole work record already
     // travelled inside the projection, so it opens what it already carries.
-    if(node.workRef?.kind==="plan"){add("plan facts","from the live Beads read; no execution record exists yet");add("status",node.plan?.status);add("readiness",node.plan?.readiness);add("issue type",node.plan?.issueType);add("priority",node.plan?.priority);add("assignee",node.plan?.assignee);add("parent",node.plan?.parent);add("dependencies",arr(node.plan?.dependencies).length);add("next action",node.queue?.nextAction);}
+    if(node.workRef?.kind==="plan"){add("plan facts","from the live work read; no execution record exists yet");add("status",node.plan?.status);add("readiness",node.plan?.readiness);add("issue type",node.plan?.issueType);add("priority",node.plan?.priority);add("assignee",node.plan?.assignee);add("parent",node.plan?.parent);add("dependencies",arr(node.plan?.dependencies).length);add("next action",node.queue?.nextAction);}
     else add("detail",host.capabilities.serverTools?(state.detail?"Work Detail loaded":"Select to load Work Detail"):`${node.detailTarget?.subjectKind}:${node.detailTarget?.subjectId}`);
     box.append(dl);
   }
@@ -184,7 +184,7 @@ h1 { margin:0; font-size:20px; line-height:1.2; }
     if(state.error){byId("headline").textContent="";byId("scope").textContent="Projection unavailable";byId("nodes").append(el("div","error",state.error.message||String(state.error)));renderDrawer(null);reportSize();return;}
     const data=state.data;if(!data){byId("nodes").append(el("div","empty","Waiting for work."));renderDrawer(null);reportSize();return;}
     const scope=data.scope?.kind==="repository"?data.scope.repository:data.scope?.kind==="epic"?data.scope.epicId:"All operator work";byId("scope").textContent=scope;const headline=reducedHeadline(data);byId("headline").textContent=headline;byId("headline").title=headline;
-    for(const name of ["ledger","beads","plan","history"])byId("health").append(healthPill(name,data.sourceHealth?.[name]));
+    for(const name of ["ledger","beads","plan","history"])byId("health").append(healthPill(name==="beads"?"work":name,data.sourceHealth?.[name]));
     for(const [value,label] of [[data.counts?.nodes,"nodes"],[data.counts?.edges,"edges"],[data.counts?.runs,"runs"],[data.counts?.epics,"epics"],[data.counts?.attention,"attention"],[data.counts?.historyUnattached,"history unknown"]]){const cell=el("div","stat");cell.append(el("b","",value??0));cell.append(el("span","",label));byId("stats").append(cell);}
     const nodeRows=byId("nodes");const canTools=!!host.capabilities.serverTools;
     // The title leads the row; the kind and the canonical selector ride

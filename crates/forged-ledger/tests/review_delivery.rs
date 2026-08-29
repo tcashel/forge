@@ -17,7 +17,7 @@ fn fixture() -> (tempfile::TempDir, Ledger, NewReviewFindingDelivery) {
     ledger
         .create_run(NewRun {
             run_id: RunId::new("review-ledger").expect("run id"),
-            bead_id: "bead-review-ledger".to_owned(),
+            work_id: "bead-review-ledger".to_owned(),
             repo: "/tmp/repo".to_owned(),
             base_ref: "main".to_owned(),
             branch: "forged/review-ledger".to_owned(),

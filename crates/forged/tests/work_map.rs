@@ -1,4 +1,4 @@
-//! Work Map keeps Beads plan truth, durable execution truth, and their
+//! Work Map keeps current plan truth, durable execution truth, and their
 //! coordinates distinct while remaining bounded and observational.
 
 mod support;
@@ -8,12 +8,12 @@ use std::collections::BTreeMap;
 use serde_json::{json, Value};
 use support::{fabricate_run, TestEnv};
 
-fn fabricate_run_for_bead(env: &TestEnv, run_id: &str, bead_id: &str) {
+fn fabricate_run_for_work(env: &TestEnv, run_id: &str, work_id: &str) {
     let ledger = env.ledger();
     ledger
         .create_run(forged_ledger::NewRun {
             run_id: forged_types::RunId::new(run_id).expect("run id"),
-            bead_id: bead_id.to_owned(),
+            work_id: work_id.to_owned(),
             repo: env.repos.repo.to_string_lossy().into_owned(),
             base_ref: env.repos.base.clone(),
             branch: format!("forged/{run_id}"),
@@ -70,24 +70,24 @@ fn map_preserves_plan_twins_multiple_executions_and_native_edge_direction() {
     let env = TestEnv::new("forged-work-map-authorities");
     env.forged(&["init"]);
     let repository = env.repos.repo.to_string_lossy().into_owned();
-    fabricate_run_for_bead(&env, "exec-one", "shared-bead");
-    fabricate_run_for_bead(&env, "exec-two", "shared-bead");
+    fabricate_run_for_work(&env, "exec-one", "shared-bead");
+    fabricate_run_for_work(&env, "exec-two", "shared-bead");
 
-    env.set_bead_field("shared-bead", "title", "Current renamed plan title");
-    env.set_bead_field("shared-bead", "status", "in_progress");
-    env.set_bead_repository("shared-bead", &repository);
-    env.set_bead_field("plan-next", "title", "Next plan");
-    env.set_bead_field("plan-next", "status", "blocked");
-    env.set_bead_field("plan-next", "parent", "epic-boundary");
-    env.set_bead_repository("epic-boundary", "/tmp/a-different-repository");
-    env.set_bead_field(
+    env.set_work_field("shared-bead", "title", "Current renamed plan title");
+    env.set_work_field("shared-bead", "status", "in_progress");
+    env.set_work_repository("shared-bead", &repository);
+    env.set_work_field("plan-next", "title", "Next plan");
+    env.set_work_field("plan-next", "status", "blocked");
+    env.set_work_field("plan-next", "parent", "epic-boundary");
+    env.set_work_repository("epic-boundary", "/tmp/a-different-repository");
+    env.set_work_field(
         "plan-next",
         "dependencies",
         r#"[{"id":"foundation-boundary","dependency_type":"blocks","status":"closed"}]"#,
     );
-    env.set_bead_repository("plan-next", &repository);
-    env.set_bead_field("other-repo", "status", "open");
-    env.set_bead_repository("other-repo", "/tmp/a-different-repository");
+    env.set_work_repository("plan-next", &repository);
+    env.set_work_field("other-repo", "status", "open");
+    env.set_work_repository("other-repo", "/tmp/a-different-repository");
 
     let (code, response) = env.forged(&[
         "work",
@@ -189,17 +189,17 @@ fn a_supersedes_edge_keeps_its_native_kind_and_direction() {
     env.forged(&["init"]);
     let repository = env.repos.repo.to_string_lossy().into_owned();
 
-    env.set_bead_field("plan-replacement", "title", "Replacement slice");
-    env.set_bead_field("plan-replacement", "status", "open");
-    env.set_bead_field(
+    env.set_work_field("plan-replacement", "title", "Replacement slice");
+    env.set_work_field("plan-replacement", "status", "open");
+    env.set_work_field(
         "plan-replacement",
         "dependencies",
         r#"[{"id":"plan-superseded","dependency_type":"supersedes","status":"open"}]"#,
     );
-    env.set_bead_repository("plan-replacement", &repository);
-    // The superseded bead must be genuinely outside the hydrated scope for
+    env.set_work_repository("plan-replacement", &repository);
+    // The superseded work must be genuinely outside the hydrated scope for
     // the boundary-context claim to mean anything.
-    env.set_bead_repository("plan-superseded", "/tmp/a-different-repository");
+    env.set_work_repository("plan-superseded", "/tmp/a-different-repository");
 
     let (code, response) = env.forged(&[
         "work",
@@ -251,21 +251,21 @@ fn a_supersedes_edge_keeps_its_native_kind_and_direction() {
 fn epic_scope_unions_native_and_legacy_children() {
     let env = TestEnv::new("forged-work-map-epic");
     env.forged(&["init"]);
-    env.set_bead_field("epic-map", "type", "epic");
-    env.set_bead_field("epic-map", "status", "open");
-    env.set_bead_field(
+    env.set_work_field("epic-map", "type", "epic");
+    env.set_work_field("epic-map", "status", "open");
+    env.set_work_field(
         "epic-map",
         "dependencies",
         r#"[{"id":"legacy-child","title":"Legacy child","status":"open","issue_type":"task","dependency_type":"related"}]"#,
     );
-    env.set_bead_field("native-child", "status", "open");
-    env.set_bead_field("native-child", "parent", "epic-map");
-    env.set_bead_field(
+    env.set_work_field("native-child", "status", "open");
+    env.set_work_field("native-child", "parent", "epic-map");
+    env.set_work_field(
         "native-child",
         "dependencies",
         r#"[{"id":"epic-map","dependency_type":"parent-child","status":"open"}]"#,
     );
-    env.set_bead_field("legacy-child", "status", "open");
+    env.set_work_field("legacy-child", "status", "open");
     let (code, response) = env.forged(&["work", "map", "--scope", "epic", "--epic-id", "epic-map"]);
     assert_eq!(code, 0, "epic map: {response}");
     let rows = nodes(&response);
@@ -286,7 +286,7 @@ fn epic_scope_unions_native_and_legacy_children() {
 }
 
 #[test]
-fn a_run_whose_plan_bead_is_absent_marks_an_unresolved_coordinate() {
+fn a_run_whose_plan_work_is_absent_marks_an_unresolved_coordinate() {
     let env = TestEnv::new("forged-work-map-outage");
     env.forged(&["init"]);
     fabricate_run(&env, "outage-run");
@@ -322,7 +322,7 @@ fn known_closed_execution_target_is_bounded_context_not_false_dangling() {
     let env = TestEnv::new("forged-work-map-closed-target");
     env.forged(&["init"]);
     fabricate_run(&env, "closed-target");
-    env.set_bead_field("bead-closed-target", "status", "closed");
+    env.set_work_field("bead-closed-target", "status", "closed");
 
     let (code, response) = env.forged(&["work", "map", "--source", "durable"]);
     assert_eq!(code, 0, "closed target context: {response}");
@@ -350,7 +350,7 @@ fn graph_cap_refuses_without_returning_a_partial_map() {
     let env = TestEnv::new("forged-work-map-cap");
     env.forged(&["init"]);
     for id in ["plan-a", "plan-b", "plan-c"] {
-        env.set_bead_field(id, "status", "open");
+        env.set_work_field(id, "status", "open");
     }
     let (code, response) = env.forged(&["work", "map", "--max-nodes", "2"]);
     assert_ne!(code, 0, "cap overflow must refuse: {response}");
@@ -378,8 +378,8 @@ fn graph_health_names_cycle_members_without_marking_their_ancestor() {
         ("plan-b", "plan-c"),
         ("plan-c", "plan-b"),
     ] {
-        env.set_bead_field(id, "status", "open");
-        env.set_bead_field(
+        env.set_work_field(id, "status", "open");
+        env.set_work_field(
             id,
             "dependencies",
             &format!(r#"[{{"id":"{dependency}","dependency_type":"related","status":"open"}}]"#),
@@ -403,8 +403,8 @@ fn graph_health_names_cycle_members_without_marking_their_ancestor() {
 fn plan_twins_cannot_inherit_durable_only_attention() {
     let env = TestEnv::new("forged-work-map-attention-routing");
     env.forged(&["init"]);
-    fabricate_run_for_bead(&env, "same-id", "same-id");
-    env.set_bead_field("same-id", "status", "blocked");
+    fabricate_run_for_work(&env, "same-id", "same-id");
+    env.set_work_field("same-id", "status", "blocked");
     let ledger = env.ledger();
     ledger
         .append_event(
@@ -449,7 +449,7 @@ fn plan_twins_cannot_inherit_durable_only_attention() {
     assert_eq!(plan[0]["evidenceRefs"][0]["kind"], "bead");
 }
 
-/// An epic bead is minted as a `plan` reference so every `execution-of`,
+/// An epic work is minted as a `plan` reference so every `execution-of`,
 /// `parent-child` and dependency target keeps resolving. `counts.epics`
 /// therefore reads subject kind, and deliberately overlaps `counts.plan`.
 #[test]
@@ -458,12 +458,12 @@ fn a_live_plan_epic_counts_as_an_epic_while_its_reference_stays_a_plan() {
     env.forged(&["init"]);
     let repository = env.repos.repo.to_string_lossy().into_owned();
     fabricate_run(&env, "count-run");
-    env.set_bead_repository("bead-count-run", &repository);
-    env.set_bead_field("bead-count-run", "status", "in_progress");
-    env.set_bead_field("count-epic", "title", "Counted epic");
-    env.set_bead_field("count-epic", "type", "epic");
-    env.set_bead_field("count-epic", "status", "open");
-    env.set_bead_repository("count-epic", &repository);
+    env.set_work_repository("bead-count-run", &repository);
+    env.set_work_field("bead-count-run", "status", "in_progress");
+    env.set_work_field("count-epic", "title", "Counted epic");
+    env.set_work_field("count-epic", "type", "epic");
+    env.set_work_field("count-epic", "status", "open");
+    env.set_work_repository("count-epic", &repository);
 
     let (code, response) = env.forged(&[
         "work",
@@ -512,7 +512,7 @@ fn a_live_plan_epic_counts_as_an_epic_while_its_reference_stays_a_plan() {
     );
     assert_eq!(epic["identity"]["subject"]["kind"], json!("epic"));
     // `decorate_titles` runs after the live-plan entries are pushed, so a
-    // plan node carries the plan bead's real title rather than null.
+    // plan node carries the plan work's real title rather than null.
     assert_eq!(
         epic["titleSource"]["source"],
         json!("identity.displayTitle")

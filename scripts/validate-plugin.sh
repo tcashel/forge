@@ -499,7 +499,7 @@ function loadHost(host) {
 
   if (!isClaude) {
     invariant(
-      stableJson(manifest.keywords) === stableJson(['forged', 'planning', 'code-review', 'beads', 'orchestration']),
+      stableJson(manifest.keywords) === stableJson(['forged', 'planning', 'code-review', 'work', 'orchestration']),
       'Codex manifest discovery keywords moved',
     );
     exactKeys(

@@ -1,7 +1,7 @@
 //! Stable, human-readable identity for operator-facing work projections.
 //!
 //! Canonical ids remain selectors. This value is display context captured at
-//! launch, so a later Bead rename or outage cannot rewrite execution history.
+//! launch, so a later Work rename or outage cannot rewrite execution history.
 
 use std::path::{Component, Path};
 
@@ -30,7 +30,7 @@ impl WorkIdentitySubjectKind {
 /// Where the display facts came from.
 ///
 /// `LivePlan` is valid only in an in-memory projection. The ledger rejects it
-/// so a current Beads read can never masquerade as frozen execution history.
+/// so a current work read can never masquerade as frozen execution history.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum WorkIdentitySource {
@@ -58,10 +58,10 @@ pub struct WorkIdentitySubjectV1 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct WorkIdentityBeadV1 {
+pub struct WorkIdentityWorkV1 {
     pub id: String,
     pub title: Option<String>,
-    /// Opaque Beads revision token. Equality only; never ordered or parsed.
+    /// Opaque work revision token. Equality only; never ordered or parsed.
     pub revision: Option<String>,
 }
 
@@ -86,7 +86,8 @@ pub struct WorkIdentityContextV1 {
 pub struct WorkIdentityV1 {
     pub schema: String,
     pub subject: WorkIdentitySubjectV1,
-    pub bead: WorkIdentityBeadV1,
+    #[serde(rename = "bead")]
+    pub work: WorkIdentityWorkV1,
     pub repository: Option<WorkIdentityRepositoryV1>,
     pub project: Option<WorkIdentityContextV1>,
     pub epic: Option<WorkIdentityContextV1>,
@@ -125,9 +126,9 @@ impl WorkIdentityV1 {
             ));
         }
         require_nonempty("subject.id", &self.subject.id)?;
-        require_nonempty("bead.id", &self.bead.id)?;
-        require_optional_nonempty("bead.title", self.bead.title.as_deref())?;
-        require_optional_nonempty("bead.revision", self.bead.revision.as_deref())?;
+        require_nonempty("bead.id", &self.work.id)?;
+        require_optional_nonempty("bead.title", self.work.title.as_deref())?;
+        require_optional_nonempty("bead.revision", self.work.revision.as_deref())?;
         require_context("project", self.project.as_ref())?;
         require_context("epic", self.epic.as_ref())?;
         require_nonempty("displayTitle", &self.display_title)?;
@@ -148,7 +149,7 @@ impl WorkIdentityV1 {
 
         let expected = work_display_title(
             &self.subject.id,
-            self.bead.title.as_deref(),
+            self.work.title.as_deref(),
             self.repository.as_ref().map(|value| value.label.as_str()),
             self.project.as_ref(),
             self.epic.as_ref(),
@@ -257,12 +258,12 @@ pub fn repository_label(path: &str) -> Option<String> {
 
 /// Apply one display-title precedence across durable and live projections.
 ///
-/// Context titles precede a Bead title when it exists. Without a Bead title,
+/// Context titles precede a Work title when it exists. Without a Work title,
 /// context precedes the canonical subject id. Repository context is appended
 /// last and is never part of selection or identity joins.
 pub fn work_display_title(
     subject_id: &str,
-    bead_title: Option<&str>,
+    work_title: Option<&str>,
     repository_label: Option<&str>,
     project: Option<&WorkIdentityContextV1>,
     epic: Option<&WorkIdentityContextV1>,
@@ -275,7 +276,7 @@ pub fn work_display_title(
         .map(str::trim)
         .filter(|title| !title.is_empty());
     let mut parts: Vec<&str> = context_titles.collect();
-    match bead_title.map(str::trim).filter(|title| !title.is_empty()) {
+    match work_title.map(str::trim).filter(|title| !title.is_empty()) {
         Some(title) => parts.push(title),
         None => parts.push(subject_id.trim()),
     }
@@ -294,16 +295,16 @@ pub fn work_display_title(
 /// Which authority answered for one operator row's display title.
 ///
 /// The wire strings are part of the contract and are pinned explicitly; the
-/// derived form would emit `beadsLive` and falsify the seam consumers read.
+/// derived form would emit `workLive` and falsify the seam consumers read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WorkTitleSource {
-    /// The frozen `identity.displayTitle` already carried a Bead title.
+    /// The frozen `identity.displayTitle` already carried a work title.
     #[serde(rename = "identity.displayTitle")]
     Identity,
-    /// A current bounded Beads read answered for an identity that froze
+    /// A current bounded work read answered for an identity that froze
     /// without a title.
     #[serde(rename = "beads.title")]
-    BeadsLive,
+    WorkLive,
     /// No authority ever titled this work; `value` is the id form.
     #[serde(rename = "unknown")]
     Unknown,
@@ -320,18 +321,19 @@ pub struct WorkTitleV1 {
     pub known: bool,
     pub value: String,
     pub source: WorkTitleSource,
-    pub bead_id: String,
+    #[serde(rename = "beadId")]
+    pub work_id: String,
 }
 
 /// Resolve one display title for an operator row without rewriting identity.
 ///
-/// A frozen Bead title wins and yields `identity.display_title` verbatim, so
+/// A frozen work title wins and yields `identity.display_title` verbatim, so
 /// the sibling can never contradict launch evidence. Only an identity that
 /// froze titleless consults `live`, and it is formatted through
 /// [`work_display_title`] so both title strings format identically.
 pub fn resolve_work_title(identity: &WorkIdentityV1, live: Option<&str>) -> WorkTitleV1 {
     let frozen = identity
-        .bead
+        .work
         .title
         .as_deref()
         .map(str::trim)
@@ -341,7 +343,7 @@ pub fn resolve_work_title(identity: &WorkIdentityV1, live: Option<&str>) -> Work
             known: true,
             value: identity.display_title.clone(),
             source: WorkTitleSource::Identity,
-            bead_id: identity.bead.id.clone(),
+            work_id: identity.work.id.clone(),
         };
     }
     match live.map(str::trim).filter(|title| !title.is_empty()) {
@@ -357,14 +359,14 @@ pub fn resolve_work_title(identity: &WorkIdentityV1, live: Option<&str>) -> Work
                 identity.project.as_ref(),
                 identity.epic.as_ref(),
             ),
-            source: WorkTitleSource::BeadsLive,
-            bead_id: identity.bead.id.clone(),
+            source: WorkTitleSource::WorkLive,
+            work_id: identity.work.id.clone(),
         },
         None => WorkTitleV1 {
             known: false,
             value: identity.display_title.clone(),
             source: WorkTitleSource::Unknown,
-            bead_id: identity.bead.id.clone(),
+            work_id: identity.work.id.clone(),
         },
     }
 }
@@ -445,7 +447,7 @@ mod tests {
                 kind: WorkIdentitySubjectKind::Run,
                 id: "run-1".to_owned(),
             },
-            bead: WorkIdentityBeadV1 {
+            work: WorkIdentityWorkV1 {
                 id: "bead-1".to_owned(),
                 title: None,
                 revision: None,
@@ -465,7 +467,7 @@ mod tests {
     #[test]
     fn a_frozen_title_wins_and_never_contradicts_identity() {
         let mut identity = titleless_identity();
-        identity.bead.title = Some("Frozen".to_owned());
+        identity.work.title = Some("Frozen".to_owned());
         identity.display_title = work_display_title(
             "run-1",
             Some("Frozen"),
@@ -477,14 +479,14 @@ mod tests {
         assert_eq!(resolved.source, WorkTitleSource::Identity);
         assert_eq!(resolved.value, identity.display_title);
         assert!(resolved.known);
-        assert_eq!(resolved.bead_id, "bead-1");
+        assert_eq!(resolved.work_id, "bead-1");
     }
 
     #[test]
     fn a_live_title_is_formatted_exactly_as_identity_would_have_frozen_it() {
         let identity = titleless_identity();
         let resolved = resolve_work_title(&identity, Some("Repair the bead read"));
-        assert_eq!(resolved.source, WorkTitleSource::BeadsLive);
+        assert_eq!(resolved.source, WorkTitleSource::WorkLive);
         assert!(resolved.known);
         assert_eq!(
             resolved.value,
@@ -511,7 +513,7 @@ mod tests {
     fn the_three_title_sources_serialize_to_their_pinned_wire_strings() {
         for (source, wire) in [
             (WorkTitleSource::Identity, "\"identity.displayTitle\""),
-            (WorkTitleSource::BeadsLive, "\"beads.title\""),
+            (WorkTitleSource::WorkLive, "\"beads.title\""),
             (WorkTitleSource::Unknown, "\"unknown\""),
         ] {
             assert_eq!(serde_json::to_string(&source).expect("closed source"), wire);
@@ -530,7 +532,7 @@ mod tests {
                 kind: WorkIdentitySubjectKind::Run,
                 id: "run-1".to_owned(),
             },
-            bead: WorkIdentityBeadV1 {
+            work: WorkIdentityWorkV1 {
                 id: "bead-1".to_owned(),
                 title: Some("Identity".to_owned()),
                 revision: Some("opaque".to_owned()),

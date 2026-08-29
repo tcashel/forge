@@ -382,7 +382,7 @@ mod tests {
     ///
     /// Controller identity would give repository code an ownership claim it
     /// never made; operator-state variables would redirect its tests into the
-    /// operator's live config and Beads store. Ordinary host and toolchain
+    /// operator's live config and work store. Ordinary host and toolchain
     /// environment remains available.
     #[tokio::test]
     async fn a_gate_child_strips_forged_state_and_keeps_host_environment() {

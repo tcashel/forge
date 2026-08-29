@@ -52,7 +52,7 @@ pub struct LeaseReclaim {
 pub struct ResolveState {
     /// Whether the run's worktree exists.
     pub worktree_present: bool,
-    /// The current work lease holder for the run's bead, when any.
+    /// The current work lease holder for the run's work, when any.
     pub lease_holder: Option<String>,
 }
 
@@ -95,7 +95,7 @@ pub trait ReconcilePorts: Send + Sync {
     /// `claimant`, verbatim.
     async fn reclaim_lease(
         &self,
-        bead: &str,
+        work: &str,
         holder: &str,
         older_than_s: u64,
     ) -> Result<LeaseReclaim, PortError>;

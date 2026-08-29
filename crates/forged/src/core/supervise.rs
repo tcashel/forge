@@ -78,7 +78,7 @@ impl Drop for ProjectionPassTask {
     }
 }
 
-/// The bead settlement pass slot, owned by the supervise session ACROSS
+/// The work settlement pass slot, owned by the supervise session ACROSS
 /// ticks. Its per-run probes and guarded writes are bounded only by bd's
 /// own timeouts, so it must never sit in front of due-work claiming and
 /// admission: a wedged bd — the exact condition that creates pending
@@ -92,12 +92,12 @@ impl Drop for ProjectionPassTask {
 /// wedge.
 /// An abort on drop is equivalent to a crash: the persisted charge and
 /// claim lease are the recovery evidence.
-pub(super) struct BeadSettlementPass {
+pub(super) struct WorkSettlementPass {
     handle: Option<tokio::task::JoinHandle<Result<Value, Failure>>>,
     last_report: Value,
 }
 
-impl BeadSettlementPass {
+impl WorkSettlementPass {
     pub(super) fn new() -> Self {
         Self {
             handle: None,
@@ -122,7 +122,7 @@ impl BeadSettlementPass {
                 ledger: ctx.ledger.clone(),
             };
             self.handle = Some(tokio::spawn(async move {
-                super::bead_settlement::reconcile(&pass_ctx).await
+                super::work_settlement::reconcile(&pass_ctx).await
             }));
         }
     }
@@ -149,7 +149,7 @@ impl BeadSettlementPass {
             }),
             Err(error) => json!({
                 "schema": "forged.bead-settlement.report/1",
-                "error": format!("bead settlement task failed: {error}"),
+                "error": format!("work settlement task failed: {error}"),
             }),
         };
     }
@@ -159,7 +159,7 @@ impl BeadSettlementPass {
     }
 }
 
-impl Drop for BeadSettlementPass {
+impl Drop for WorkSettlementPass {
     fn drop(&mut self) {
         if let Some(handle) = self.handle.take() {
             handle.abort();
@@ -822,7 +822,7 @@ async fn reconcile_claimed(
     if recovery_generation.is_some() {
         // The exact owned effect is confirmed absent. Its old decision is no
         // longer launch authority: release capacity and make the subject due
-        // so the next tick re-reads current Beads and policy before spawning.
+        // so the next tick re-reads current work and policy before spawning.
         on_ledger(&ctx.ledger, move |ledger| {
             ledger.release_admission_reservation(
                 &admission_reservation,
@@ -1114,7 +1114,7 @@ async fn finish_spawn_failure(
 
 pub(super) async fn tick(
     ctx: &Ctx,
-    settlement: &mut BeadSettlementPass,
+    settlement: &mut WorkSettlementPass,
     join_settlement: bool,
 ) -> Result<Value, Failure> {
     let started_at = now_iso();
@@ -1123,11 +1123,11 @@ pub(super) async fn tick(
     // runnable work. The durable projection lease makes cancellation safe:
     // an ambiguous request is retried later at a strictly newer sequence.
     let projection_task = ProjectionPassTask::start(ctx);
-    // Pending bead settlements are a third independent durable queue: the
+    // Pending work settlements are a third independent durable queue: the
     // read-only convergence probe and the budgeted, per-run-fenced mutating
     // retries live inside the pass. It runs beside the tick, decoupled from
     // the tick join, never in front of due-work claiming — see
-    // [`BeadSettlementPass`].
+    // [`WorkSettlementPass`].
     settlement.poll(ctx).await;
     // Pane cleanup is an independent durable work queue. Run it even when no
     // desired subject is due; attempt settlement never waits on this effect.
@@ -1318,7 +1318,7 @@ pub(super) async fn tick(
     if join_settlement {
         settlement.join().await;
     }
-    let bead_settlement = settlement.report();
+    let work_settlement = settlement.report();
     let wake_now = now_iso();
     let desired_now = wake_now.clone();
     let desired_wake_at = on_ledger(&ctx.ledger, move |ledger| {
@@ -1348,7 +1348,7 @@ pub(super) async fn tick(
         "subjects": subjects,
         "cleanup": cleanup,
         "layoutCleanup": layout_cleanup,
-        "beadSettlement": bead_settlement,
+        "beadSettlement": work_settlement,
         "herdrProjection": projection,
         "nextWakeAt": next_wake_at,
     }))
@@ -1508,7 +1508,7 @@ pub async fn supervise(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
     bootstrap_pass(ctx).await;
     if once {
         // One deterministic tick: the settlement pass is joined fully.
-        let mut settlement = BeadSettlementPass::new();
+        let mut settlement = WorkSettlementPass::new();
         return match tick(ctx, &mut settlement, true).await {
             Ok(report) => ok_response(&key, false, report),
             Err(error) => err_response(&key, &error),
@@ -1531,7 +1531,7 @@ pub async fn supervise(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
     let started_at = now_iso();
     let mut ticks = 0u64;
     let mut last_report = Value::Null;
-    let mut settlement = BeadSettlementPass::new();
+    let mut settlement = WorkSettlementPass::new();
     // The daemon's config is decided fresh per tick, so a live edit to
     // rosters, admission, or pricing is served without a service restart. A
     // malformed mid-edit file keeps the last-good snapshot rather than

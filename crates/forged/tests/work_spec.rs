@@ -1,4 +1,4 @@
-//! Bead-sourced specs end to end: a run started from a bead alone, the
+//! Work-sourced specs end to end: a run started from a work alone, the
 //! rendered body every seat reads, the body fence under a spec edit (and
 //! under the write token bd moves on every write), and the refusals that
 //! keep an empty spec away from a seat.
@@ -45,11 +45,11 @@ fn wait_for(env: &TestEnv, args: &[&str], ready: impl Fn(&Value) -> bool) -> Val
 }
 
 #[test]
-fn a_run_starts_from_a_bead_alone_and_every_seat_reads_the_rendered_body() {
+fn a_run_starts_from_a_work_alone_and_every_seat_reads_the_rendered_body() {
     let env = TestEnv::new("forged-bead-spec");
     assert_eq!(env.forged(&["init"]).0, 0);
-    env.seed_bead_spec("bead-sourced", DESCRIPTION, ACCEPTANCE);
-    env.set_bead_field(
+    env.seed_work_spec("bead-sourced", DESCRIPTION, ACCEPTANCE);
+    env.set_work_field(
         "bead-sourced",
         "metadata",
         &format!(
@@ -59,11 +59,11 @@ fn a_run_starts_from_a_bead_alone_and_every_seat_reads_the_rendered_body() {
     );
     let repo = env.repos.repo.to_string_lossy().into_owned();
 
-    // No --spec: the bead's own fields are the spec.
+    // No --spec: the work's own fields are the spec.
     let (code, started) = env.forged(&[
         "run",
         "start",
-        "--bead",
+        "--work",
         "bead-sourced",
         "--repo",
         &repo,
@@ -74,7 +74,7 @@ fn a_run_starts_from_a_bead_alone_and_every_seat_reads_the_rendered_body() {
     assert_eq!(started["result"]["run_id"], json!("bead-sourced"));
     env.authorize_run("bead-sourced");
 
-    // The packet is bead-sourced — it carries a revision where a file-sourced
+    // The packet is work-sourced — it carries a revision where a file-sourced
     // one carries none — and its spec path is the body materialized inside
     // the packet directory.
     let packet = advance_to_open_packet(&env, "bead-sourced");
@@ -129,7 +129,7 @@ fn a_run_starts_from_a_bead_alone_and_every_seat_reads_the_rendered_body() {
 
     // Byte-identical for every seat of the run: each packet materialized the
     // body it was fenced on, and all of them pinned the same BODY. Not the
-    // same revision — bd mints a fresh one on every write to the bead, and
+    // same revision — bd mints a fresh one on every write to the work, and
     // the run writes its own lease between packets.
     let ledger = env.ledger();
     let packets = ledger.list_packets("bead-sourced").expect("packets");
@@ -148,17 +148,17 @@ fn a_run_starts_from_a_bead_alone_and_every_seat_reads_the_rendered_body() {
 }
 
 #[test]
-fn run_start_obeys_the_ready_frontier_and_routes_non_slice_beads_explicitly() {
+fn run_start_obeys_the_ready_frontier_and_routes_non_slice_work_explicitly() {
     let env = TestEnv::new("forged-bead-ready-types");
     assert_eq!(env.forged(&["init"]).0, 0);
     let repo = env.repos.repo.to_string_lossy().into_owned();
 
-    env.seed_bead_spec("blocked-target", DESCRIPTION, ACCEPTANCE);
-    env.seed_bead_spec("ready-competitor", DESCRIPTION, ACCEPTANCE);
+    env.seed_work_spec("blocked-target", DESCRIPTION, ACCEPTANCE);
+    env.seed_work_spec("ready-competitor", DESCRIPTION, ACCEPTANCE);
     env.seed_frontier("ready-competitor");
     // Readiness is a query now: open + unassigned + no open `blocks` edge.
-    // The withheld bead must be withheld structurally.
-    env.set_bead_field(
+    // The withheld work must be withheld structurally.
+    env.set_work_field(
         "blocked-target",
         "dependencies",
         r#"[{"id":"blocker-open","dependency_type":"blocks","status":"open"}]"#,
@@ -166,7 +166,7 @@ fn run_start_obeys_the_ready_frontier_and_routes_non_slice_beads_explicitly() {
     let (code, blocked) = env.forged(&[
         "run",
         "start",
-        "--bead",
+        "--work",
         "blocked-target",
         "--repo",
         &repo,
@@ -175,27 +175,27 @@ fn run_start_obeys_the_ready_frontier_and_routes_non_slice_beads_explicitly() {
     ]);
     assert_ne!(
         code, 0,
-        "a bead outside bd ready must not dispatch: {blocked}"
+        "work outside the ready frontier must not dispatch: {blocked}"
     );
     assert!(
         blocked["error"]["message"]
             .as_str()
             .unwrap_or_default()
-            .contains("absent from `bd ready`"),
+            .contains("absent from the ready frontier"),
         "readiness refusal is actionable: {blocked}"
     );
 
-    for (bead, issue_type, route) in [
+    for (work, issue_type, route) in [
         ("wrong-epic", "epic", "epic start"),
-        ("no-diff", "decision", "directly through Beads"),
+        ("no-diff", "decision", "directly through the work store"),
     ] {
-        env.seed_bead_spec(bead, DESCRIPTION, ACCEPTANCE);
-        env.set_bead_field(bead, "type", issue_type);
+        env.seed_work_spec(work, DESCRIPTION, ACCEPTANCE);
+        env.set_work_field(work, "type", issue_type);
         let (code, refused) = env.forged(&[
             "run",
             "start",
-            "--bead",
-            bead,
+            "--work",
+            work,
             "--repo",
             &repo,
             "--base-ref",
@@ -213,18 +213,18 @@ fn run_start_obeys_the_ready_frontier_and_routes_non_slice_beads_explicitly() {
 }
 
 #[test]
-fn a_bead_with_no_spec_fields_is_refused_by_name_at_run_start() {
+fn a_work_with_no_spec_fields_is_refused_by_name_at_run_start() {
     let env = TestEnv::new("forged-bead-spec-empty");
     assert_eq!(env.forged(&["init"]).0, 0);
     // Title and status only: nothing a seat could implement.
-    env.set_bead_field("bead-empty", "title", "an empty bead");
-    env.set_bead_field("bead-empty", "status", "open");
+    env.set_work_field("bead-empty", "title", "an empty bead");
+    env.set_work_field("bead-empty", "status", "open");
     let repo = env.repos.repo.to_string_lossy().into_owned();
 
     let (code, refused) = env.forged(&[
         "run",
         "start",
-        "--bead",
+        "--work",
         "bead-empty",
         "--repo",
         &repo,
@@ -254,13 +254,13 @@ fn a_bead_with_no_spec_fields_is_refused_by_name_at_run_start() {
     }
 
     // Half a spec is refused too, and names only the half that is missing.
-    env.set_bead_field("bead-half", "title", "half a bead");
-    env.set_bead_field("bead-half", "status", "open");
-    env.set_bead_field("bead-half", "description", DESCRIPTION);
+    env.set_work_field("bead-half", "title", "half a bead");
+    env.set_work_field("bead-half", "status", "open");
+    env.set_work_field("bead-half", "description", DESCRIPTION);
     let (code, half) = env.forged(&[
         "run",
         "start",
-        "--bead",
+        "--work",
         "bead-half",
         "--repo",
         &repo,
@@ -288,15 +288,15 @@ fn a_bead_with_no_spec_fields_is_refused_by_name_at_run_start() {
 }
 
 #[test]
-fn a_seat_claim_refuses_an_edited_bead_but_survives_a_moved_write_token() {
+fn a_seat_claim_refuses_an_edited_work_but_survives_a_moved_write_token() {
     let env = TestEnv::new("forged-bead-spec-edit");
     assert_eq!(env.forged(&["init"]).0, 0);
-    env.seed_bead_spec("bead-edited", DESCRIPTION, ACCEPTANCE);
+    env.seed_work_spec("bead-edited", DESCRIPTION, ACCEPTANCE);
     let repo = env.repos.repo.to_string_lossy().into_owned();
     let (code, started) = env.forged(&[
         "run",
         "start",
-        "--bead",
+        "--work",
         "bead-edited",
         "--repo",
         &repo,
@@ -313,7 +313,7 @@ fn a_seat_claim_refuses_an_edited_bead_but_survives_a_moved_write_token() {
     // and so does the shim — but it is the changed BODY that has to refuse
     // the claim, exactly as the hash check refuses a file edited under an
     // open packet.
-    env.set_bead_field("bead-edited", "acceptance", "- revised acceptance");
+    env.set_work_field("bead-edited", "acceptance", "- revised acceptance");
     let (code, drifted) = env.forged(&["packet", "claim", "--packet", &packet.packet_id]);
     assert_ne!(code, 0, "an edited bead must refuse the claim: {drifted}");
     assert_eq!(drifted["error"]["code"], json!("SPEC_DRIFT"));
@@ -322,9 +322,9 @@ fn a_seat_claim_refuses_an_edited_bead_but_survives_a_moved_write_token() {
     // will never return to the value the packet pinned — bd's revision is a
     // write token, not a digest — so a fence on the token alone would refuse
     // this claim forever. The body is what is pinned, and it matches.
-    env.set_bead_field("bead-edited", "acceptance", ACCEPTANCE);
+    env.set_work_field("bead-edited", "acceptance", ACCEPTANCE);
     assert_ne!(
-        env.bead_revision("bead-edited"),
+        env.work_revision("bead-edited"),
         pinned_revision,
         "the write token must have moved off the pinned value"
     );
@@ -338,7 +338,7 @@ fn a_seat_claim_refuses_an_edited_bead_but_survives_a_moved_write_token() {
     ledger.close().expect("close");
     assert_eq!(
         row.spec_revision.as_deref(),
-        Some(env.bead_revision("bead-edited").as_str()),
+        Some(env.work_revision("bead-edited").as_str()),
         "the claim re-pins the write token: {row:?}"
     );
     assert_eq!(
@@ -358,19 +358,19 @@ fn a_seat_claim_refuses_an_edited_bead_but_survives_a_moved_write_token() {
 }
 
 #[test]
-fn a_bead_edited_under_an_open_packet_is_re_pinned_and_claimed_at_the_new_body() {
+fn a_work_edited_under_an_open_packet_is_re_pinned_and_claimed_at_the_new_body() {
     // The wedge this closes: `honor_await`'s claim-again branch reached
     // `execute_packet` without ever re-opening the packet, so a packet whose
-    // bead moved underneath it refused `SpecDrift` on the fence and then
+    // work moved underneath it refused `SpecDrift` on the fence and then
     // retried the identical refusal, forever, with no path back.
     let env = TestEnv::new("forged-bead-spec-recover");
     assert_eq!(env.forged(&["init"]).0, 0);
-    env.seed_bead_spec("bead-recovered", DESCRIPTION, ACCEPTANCE);
+    env.seed_work_spec("bead-recovered", DESCRIPTION, ACCEPTANCE);
     let repo = env.repos.repo.to_string_lossy().into_owned();
     let (code, started) = env.forged(&[
         "run",
         "start",
-        "--bead",
+        "--work",
         "bead-recovered",
         "--repo",
         &repo,
@@ -384,7 +384,7 @@ fn a_bead_edited_under_an_open_packet_is_re_pinned_and_claimed_at_the_new_body()
     let opened_at = packet.spec_sha256.clone();
 
     // The operator revises the spec while the packet is open and unclaimed.
-    env.set_bead_field("bead-recovered", "acceptance", "- revised acceptance");
+    env.set_work_field("bead-recovered", "acceptance", "- revised acceptance");
 
     // One advance: the claim-again branch re-pins the packet and claims it.
     let (code, advanced) = env.forged(&["run", "advance", "--run", "bead-recovered"]);
@@ -424,12 +424,12 @@ fn an_adoption_that_finds_drift_settles_its_attempt_instead_of_looping() {
     // identically forever.
     let env = TestEnv::new("forged-bead-spec-adopt");
     assert_eq!(env.forged(&["init"]).0, 0);
-    env.seed_bead_spec("bead-adopted", DESCRIPTION, ACCEPTANCE);
+    env.seed_work_spec("bead-adopted", DESCRIPTION, ACCEPTANCE);
     let repo = env.repos.repo.to_string_lossy().into_owned();
     let (code, started) = env.forged(&[
         "run",
         "start",
-        "--bead",
+        "--work",
         "bead-adopted",
         "--repo",
         &repo,
@@ -445,7 +445,7 @@ fn an_adoption_that_finds_drift_settles_its_attempt_instead_of_looping() {
     assert_eq!(code, 0, "packet claim: {claimed}");
 
     // The operator revises the spec while that pid-less attempt is live.
-    env.set_bead_field("bead-adopted", "acceptance", "- revised acceptance");
+    env.set_work_field("bead-adopted", "acceptance", "- revised acceptance");
 
     let (code, drifted) = env.forged(&["run", "advance", "--run", "bead-adopted"]);
     assert_ne!(code, 0, "adoption must refuse a drifted bead: {drifted}");
@@ -473,7 +473,7 @@ fn an_adoption_that_finds_drift_settles_its_attempt_instead_of_looping() {
 #[test]
 fn a_file_sourced_run_still_works_and_is_recorded_as_deprecated() {
     let env = TestEnv::new("forged-bead-spec-file");
-    // The file route still binds to a real work item: `ready_slice_bead`
+    // The file route still binds to a real work item: `ready_slice_work`
     // runs before the spec source is chosen.
     env.seed_frontier("bead-file");
     assert_eq!(env.forged(&["init"]).0, 0);
@@ -482,7 +482,7 @@ fn a_file_sourced_run_still_works_and_is_recorded_as_deprecated() {
     let (code, started) = env.forged(&[
         "run",
         "start",
-        "--bead",
+        "--work",
         "bead-file",
         "--repo",
         &repo,
@@ -522,12 +522,12 @@ fn a_spec_edit_between_stages_pins_the_new_body_on_the_next_packet_open() {
     // could not be revised for a live run at all.
     let env = TestEnv::new("forged-bead-spec-repin");
     assert_eq!(env.forged(&["init"]).0, 0);
-    env.seed_bead_spec("bead-repinned", DESCRIPTION, ACCEPTANCE);
+    env.seed_work_spec("bead-repinned", DESCRIPTION, ACCEPTANCE);
     let repo = env.repos.repo.to_string_lossy().into_owned();
     let (code, started) = env.forged(&[
         "run",
         "start",
-        "--bead",
+        "--work",
         "bead-repinned",
         "--repo",
         &repo,
@@ -549,8 +549,8 @@ fn a_spec_edit_between_stages_pins_the_new_body_on_the_next_packet_open() {
         });
         if implement_done && !edited {
             // The edit alone: bd mints the new revision for the write, the
-            // way it does for every write to a bead.
-            env.set_bead_field("bead-repinned", "acceptance", "- revised acceptance");
+            // way it does for every write to a work.
+            env.set_work_field("bead-repinned", "acceptance", "- revised acceptance");
             edited = true;
         }
         let ledger = env.ledger();
@@ -599,21 +599,21 @@ fn a_spec_edit_between_stages_pins_the_new_body_on_the_next_packet_open() {
 }
 
 #[test]
-fn a_bead_edited_back_to_the_body_the_packet_opened_at_still_re_pins() {
+fn a_work_edited_back_to_the_body_the_packet_opened_at_still_re_pins() {
     // The replay wedge INSIDE the re-pin. `packet_open` is keyed on the
-    // target fence, so a bead moved A -> B -> A re-opens under the key the
+    // target fence, so a work moved A -> B -> A re-opens under the key the
     // first open at A already stored: the operation replays its recorded
     // response, the ledger UPDATE never runs, and the re-pin reports success
     // with the row still pinned at B. Every claim afterwards refuses
     // `SpecDrift`, forever — the wedge the re-pin exists to close, reopened.
     let env = TestEnv::new("forged-bead-spec-cycle");
     assert_eq!(env.forged(&["init"]).0, 0);
-    env.seed_bead_spec("bead-cycled", DESCRIPTION, ACCEPTANCE);
+    env.seed_work_spec("bead-cycled", DESCRIPTION, ACCEPTANCE);
     let repo = env.repos.repo.to_string_lossy().into_owned();
     let (code, started) = env.forged(&[
         "run",
         "start",
-        "--bead",
+        "--work",
         "bead-cycled",
         "--repo",
         &repo,
@@ -628,7 +628,7 @@ fn a_bead_edited_back_to_the_body_the_packet_opened_at_still_re_pins() {
 
     // A -> B. The seat fails transport, which hands the packet back
     // re-claimable instead of completing it.
-    env.set_bead_field("bead-cycled", "acceptance", "- revised acceptance");
+    env.set_work_field("bead-cycled", "acceptance", "- revised acceptance");
     env.set_scenario("implement", "rate-limit", 1);
     let (code, advanced) = env.forged(&["run", "advance", "--run", "bead-cycled"]);
     assert_eq!(code, 0, "advance at the revised body: {advanced}");
@@ -644,7 +644,7 @@ fn a_bead_edited_back_to_the_body_the_packet_opened_at_still_re_pins() {
     );
 
     // B -> A: back to the exact body this packet was OPENED at.
-    env.set_bead_field("bead-cycled", "acceptance", ACCEPTANCE);
+    env.set_work_field("bead-cycled", "acceptance", ACCEPTANCE);
     expire_retry_deadline(&env, "bead-cycled");
     let (code, advanced) = env.forged(&["run", "advance", "--run", "bead-cycled"]);
     assert_eq!(code, 0, "advance back at the original body: {advanced}");
@@ -695,12 +695,12 @@ fn the_re_pins_refusals_still_stand_now_that_it_bypasses_the_operation() {
     // dropping the fence must not drop a refusal with it.
     let env = TestEnv::new("forged-bead-spec-guards");
     assert_eq!(env.forged(&["init"]).0, 0);
-    env.seed_bead_spec("bead-guarded", DESCRIPTION, ACCEPTANCE);
+    env.seed_work_spec("bead-guarded", DESCRIPTION, ACCEPTANCE);
     let repo = env.repos.repo.to_string_lossy().into_owned();
     let (code, started) = env.forged(&[
         "run",
         "start",
-        "--bead",
+        "--work",
         "bead-guarded",
         "--repo",
         &repo,
@@ -762,7 +762,7 @@ fn the_re_pins_refusals_still_stand_now_that_it_bypasses_the_operation() {
     // `assert_pinned`, NOT from the re-pin guard above — a live attempt is
     // adopted rather than re-claimed, so the drive path never reaches the
     // re-pin. Both doors are shut; they are different doors.
-    env.set_bead_field("bead-guarded", "acceptance", "- revised acceptance");
+    env.set_work_field("bead-guarded", "acceptance", "- revised acceptance");
     let (code, drifted) = env.forged(&["run", "advance", "--run", "bead-guarded"]);
     assert_ne!(
         code, 0,
@@ -773,13 +773,13 @@ fn the_re_pins_refusals_still_stand_now_that_it_bypasses_the_operation() {
 
 #[test]
 fn a_spec_file_edited_under_an_open_packet_is_still_refused() {
-    // The re-pin is for BEAD-sourced packets alone. A file-sourced spec is
+    // The re-pin is for WORK-sourced packets alone. A file-sourced spec is
     // fenced by the hash of a file the operator owns; adopting an edit to it
     // silently would retire the one fence that route has, and nothing
     // downstream would catch it — `assert_pinned` returns early for a file
     // spec.
     let env = TestEnv::new("forged-bead-spec-file-edit");
-    // The file route still binds to a real work item: `ready_slice_bead`
+    // The file route still binds to a real work item: `ready_slice_work`
     // runs before the spec source is chosen.
     env.seed_frontier("bead-file-edit");
     assert_eq!(env.forged(&["init"]).0, 0);
@@ -788,7 +788,7 @@ fn a_spec_file_edited_under_an_open_packet_is_still_refused() {
     let (code, started) = env.forged(&[
         "run",
         "start",
-        "--bead",
+        "--work",
         "bead-file-edit",
         "--repo",
         &repo,
@@ -856,11 +856,11 @@ fn expire_retry_deadline(env: &TestEnv, run: &str) {
 // The bd-outage claim-time tests are retired: the work store is in-process,
 // so no transport failure mode exists on the spec path to charge the bounded
 // budget. The transport-retry budget itself stays covered by
-// `a_bead_edited_back_to_the_body_the_packet_opened_at_still_re_pins`, which
+// `a_work_edited_back_to_the_body_the_packet_opened_at_still_re_pins`, which
 // reaches it through a provider rate limit.
 
 #[test]
-fn an_epic_child_prefers_its_bead_fields_over_its_spec_pointer() {
+fn an_epic_child_prefers_its_work_fields_over_its_spec_pointer() {
     let env = TestEnv::new("forged-bead-spec-epic");
     env.enable_dynamic_gh();
     assert_eq!(env.forged(&["init"]).0, 0);
@@ -873,16 +873,16 @@ fn an_epic_child_prefers_its_bead_fields_over_its_spec_pointer() {
             ("child-pointer", &env.spec, false),
         ],
     );
-    env.set_bead_field(
+    env.set_work_field(
         "child-fields",
         "description",
         &format!("spec: {}\\n{DESCRIPTION}", env.spec.display()),
     );
-    env.set_bead_field("child-fields", "acceptance", ACCEPTANCE);
+    env.set_work_field("child-fields", "acceptance", ACCEPTANCE);
     // The old `ready: false` flag is inert — readiness is a query. Withhold
     // the pointer-only child structurally so the epic schedules the
-    // bead-sourced one.
-    env.set_bead_field("child-pointer", "status", "blocked");
+    // work-sourced one.
+    env.set_work_field("child-pointer", "status", "blocked");
 
     let repo = env.repos.repo.to_string_lossy().into_owned();
     let spec = env.spec.to_string_lossy().into_owned();
@@ -900,7 +900,7 @@ fn an_epic_child_prefers_its_bead_fields_over_its_spec_pointer() {
     assert_eq!(started["result"]["specSource"], json!("bead"));
     assert!(
         started["result"]["specPath"].is_null(),
-        "the epic Bead replaces a separate spec file: {started}"
+        "the epic work item replaces a separate spec file: {started}"
     );
 
     let children = started["result"]["children"]
@@ -916,7 +916,7 @@ fn an_epic_child_prefers_its_bead_fields_over_its_spec_pointer() {
     };
     assert!(
         by_id("child-fields")["specPath"].is_null(),
-        "a child carrying spec fields is frozen bead-sourced: {:?}",
+        "a child carrying spec fields is frozen work-sourced: {:?}",
         by_id("child-fields")
     );
     assert_eq!(
@@ -925,7 +925,7 @@ fn an_epic_child_prefers_its_bead_fields_over_its_spec_pointer() {
         "a child carrying only a `spec:` pointer keeps the file route"
     );
 
-    // And the bead-sourced child's run really is fenced on its own bead.
+    // And the work-sourced child's run really is fenced on its own work.
     let mut packet = None;
     for _ in 0..12 {
         let (code, advanced) = env.forged(&["epic", "advance", "--epic", "epic-bead"]);
@@ -941,10 +941,10 @@ fn an_epic_child_prefers_its_bead_fields_over_its_spec_pointer() {
             break;
         }
     }
-    let packet = packet.expect("the epic started the bead-sourced child");
+    let packet = packet.expect("the epic started the work-sourced child");
     assert!(
         packet.spec_revision.is_some(),
-        "the child run is bead-sourced, not file-sourced: {packet:?}"
+        "the child run is work-sourced, not file-sourced: {packet:?}"
     );
     assert!(
         packet.spec_path.ends_with("/spec.md") && !packet.spec_path.starts_with(&spec),
@@ -954,12 +954,12 @@ fn an_epic_child_prefers_its_bead_fields_over_its_spec_pointer() {
 }
 
 #[test]
-fn a_no_diff_epic_child_holds_for_direct_beads_completion_then_counts_as_accounted() {
+fn a_no_diff_epic_child_holds_for_direct_work_completion_then_counts_as_accounted() {
     let env = TestEnv::new("forged-epic-no-diff");
     env.enable_dynamic_gh();
     assert_eq!(env.forged(&["init"]).0, 0);
     env.seed_epic("epic-no-diff", &[("record-decision", &env.spec, true)]);
-    env.set_bead_field("record-decision", "type", "decision");
+    env.set_work_field("record-decision", "type", "decision");
     let repo = env.repos.repo.to_string_lossy().into_owned();
 
     let (code, started) = env.forged(&[
@@ -993,7 +993,7 @@ fn a_no_diff_epic_child_holds_for_direct_beads_completion_then_counts_as_account
         "no empty slice run or PR is created for a decision"
     );
 
-    env.set_bead_field("record-decision", "status", "closed");
+    env.set_work_field("record-decision", "status", "closed");
     let (code, resolved) = env.forged(&[
         "epic",
         "resolve",

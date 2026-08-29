@@ -113,7 +113,7 @@ impl Ledger {
     /// Claim a specific work item for `holder`.
     ///
     /// Refusals preserve the bd-era contract: custody by another holder is
-    /// `BeadLeaseHeld` naming the observed holder (regardless of lease
+    /// `WorkLeaseHeld` naming the observed holder (regardless of lease
     /// expiry — reclaim is the only door); a blocked item refuses on
     /// mechanism with the stable [`WORK_BLOCKED_CLAIM_REFUSAL`] message; a
     /// closed item refuses. A same-holder re-claim renews the lease.
@@ -131,7 +131,7 @@ impl Ledger {
             if let Some(current) = &item.assignee {
                 if current != &holder {
                     return Err(refused(
-                        ErrorCode::BeadLeaseHeld,
+                        ErrorCode::WorkLeaseHeld,
                         format!("work item {work_id:?} lease is held by {current:?}"),
                     ));
                 }
@@ -198,7 +198,7 @@ impl Ledger {
     }
 
     /// Heartbeat a held lease, pushing expiry to `now + ttl_s`. Owner-only:
-    /// a missing lease or a different holder refuses with `BeadLeaseHeld` —
+    /// a missing lease or a different holder refuses with `WorkLeaseHeld` —
     /// callers treat that as "lease lost", never as retryable contention.
     pub fn heartbeat_work_lease(
         &self,
@@ -221,14 +221,14 @@ impl Ledger {
                     Ok(())
                 }
                 Some(row) => Err(refused(
-                    ErrorCode::BeadLeaseHeld,
+                    ErrorCode::WorkLeaseHeld,
                     format!(
                         "heartbeat refused: work item {work_id:?} lease is held by {:?}",
                         row.holder
                     ),
                 )),
                 None => Err(refused(
-                    ErrorCode::BeadLeaseHeld,
+                    ErrorCode::WorkLeaseHeld,
                     format!("heartbeat refused: work item {work_id:?} has no lease"),
                 )),
             }
@@ -435,7 +435,7 @@ mod tests {
         let err = l
             .claim_specific_work("beads-steal", "second", 300)
             .unwrap_err();
-        assert_eq!(err.code(), ErrorCode::BeadLeaseHeld);
+        assert_eq!(err.code(), ErrorCode::WorkLeaseHeld);
         assert!(err.to_string().contains("\"first\""), "{err}");
     }
 
@@ -480,7 +480,7 @@ mod tests {
         let err = l
             .heartbeat_work_lease("beads-hb", "impostor", 600)
             .unwrap_err();
-        assert_eq!(err.code(), ErrorCode::BeadLeaseHeld);
+        assert_eq!(err.code(), ErrorCode::WorkLeaseHeld);
         let err = l.heartbeat_work_lease("beads-hb", "me", 600).map(|_| ());
         assert!(err.is_ok());
         seed(&l, "beads-nolease", WorkStatus::Open, None);

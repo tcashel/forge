@@ -124,7 +124,7 @@ fn complete(
         schema: "forged.packet/1".to_owned(),
         packet_id: packet_id.clone(),
         run_id: view.run.run_id.clone(),
-        bead_id: view.run.bead_id.clone(),
+        work_id: view.run.work_id.clone(),
         stage: intent.stage,
         execution: Some(execution),
         lane_seq: Some(intent.seq),

@@ -9,7 +9,7 @@
 //! everything under that token.
 //!
 //! `revoking` has TWO terminal exits because the revocation has two scopes.
-//! `reclaimed` is the bead-scoped one: the reclaim saga confirmed a dead
+//! `reclaimed` is the work-scoped one: the reclaim saga confirmed a dead
 //! worker and took its work lease back. `stopped` is the attempt-local one: an
 //! operator ended one attempt, the lease was never in scope and is untouched.
 //! Both are kill-confirmed; a reader tells them apart to know which happened.
@@ -17,7 +17,7 @@
 //! Which exit a marker is HEADED for is durable too, in `revoke_scope`,
 //! committed with the marker itself. Without it a stop whose `kill_confirmed`
 //! failed is a `revoking` row indistinguishable from a dead worker's, and the
-//! next reconcile pass resumes it through the bead-scoped reclaim the stop
+//! next reconcile pass resumes it through the work-scoped reclaim the stop
 //! exists to avoid.
 
 use forged_types::{new_claim_token, ErrorCode, PacketResult};
@@ -57,7 +57,7 @@ fn attempt_state(idx: usize, s: &str) -> Result<AttemptState, rusqlite::Error> {
 fn revoke_scope(idx: usize, s: Option<String>) -> Result<Option<RevokeScope>, rusqlite::Error> {
     match s.as_deref() {
         None => Ok(None),
-        Some("bead") => Ok(Some(RevokeScope::Bead)),
+        Some("bead") => Ok(Some(RevokeScope::Work)),
         Some("attempt") => Ok(Some(RevokeScope::Attempt)),
         Some("deadline") => Ok(Some(RevokeScope::Deadline)),
         Some(other) => Err(column_decode_error(idx, "revoke scope", other)),
@@ -301,16 +301,16 @@ impl Ledger {
     ///
     /// The packet must exist and have no completed attempt
     /// (`PacketNotClaimable`); `current` — the fence the caller observed
-    /// just now, by re-hashing the spec file or re-rendering the bead's
+    /// just now, by re-hashing the spec file or re-rendering the work's
     /// body, because the ledger does no file or process IO — must equal the
     /// stored fence, else `SpecDrift`. Re-claim is legal after `failed`
     /// or `reclaimed`, refused while any attempt is `running` or `revoking`
     /// (the partial unique index is the race backstop), and refused after
     /// `completed`.
     ///
-    /// RE-PIN OF THE WRITE TOKEN: for a bead-sourced packet the comparison
+    /// RE-PIN OF THE WRITE TOKEN: for a work-sourced packet the comparison
     /// is over `body_sha256` alone. bd mints a fresh `revision` on every
-    /// write to the bead — the lease claim and status change forged itself
+    /// write to the work — the lease claim and status change forged itself
     /// performs before it resumes a packet included — so a moved revision
     /// over an UNCHANGED body is not drift, and the row's `spec_revision`
     /// is re-pinned to the observed value in this same transaction. A moved
@@ -398,10 +398,10 @@ impl Ledger {
             // THE DRIFT FENCE, and the contract it is deliberately not:
             //
             // The fence is the SHA-256 of the rendered spec body, never the
-            // bead's `revision`. A moved revision alone is not drift because
+            // work's `revision`. A moved revision alone is not drift because
             // forged's OWN bd writes move it: `bd update --claim --actor
             // <holder>` takes the run's lease and `bd update --status open`
-            // reopens the bead, and every bd write mints a fresh revision.
+            // reopens the work, and every bd write mints a fresh revision.
             // Fenced on the revision, the first claim after forged's own
             // lease acquisition would refuse — on every run, forever — while
             // the spec had not changed by one byte.
@@ -664,12 +664,12 @@ impl Ledger {
         })
     }
 
-    /// Durably mark `running → revoking` under [`RevokeScope::Bead`] — the
+    /// Durably mark `running → revoking` under [`RevokeScope::Work`] — the
     /// reclaim saga's marker. See [`Ledger::revoke_attempt_scoped`] for the
     /// contract; an operator's attempt-local stop calls that one with
     /// [`RevokeScope::Attempt`] instead.
     pub fn revoke_attempt(&self, attempt_id: i64, reason: &str) -> Result<(), LedgerError> {
-        self.revoke_attempt_scoped(attempt_id, reason, RevokeScope::Bead)
+        self.revoke_attempt_scoped(attempt_id, reason, RevokeScope::Work)
     }
 
     /// Durably mark `running → revoking` and COMMIT — this marker lands
@@ -746,7 +746,7 @@ impl Ledger {
             if attempt.revoke_scope == Some(RevokeScope::Deadline) {
                 return Err(refused(
                     ErrorCode::InvalidRequest,
-                    format!("deadline attempt {attempt_id} cannot reclaim a Bead lease"),
+                    format!("deadline attempt {attempt_id} cannot reclaim a work lease"),
                 ));
             }
             let now = now_iso();
@@ -775,7 +775,7 @@ impl Ledger {
     /// the only path into `reclaimed`.
     ///
     /// Callers invoke this only after kill-confirmed. NOTHING external is
-    /// reclaimed on this path: the work lease is bead-scoped and shared with
+    /// reclaimed on this path: the work lease is work-scoped and shared with
     /// every sibling generation, so an attempt-local stop has no standing to
     /// take it. Sets `updated_at` and `ended_at`; the event's reason is the
     /// stored `revoke_reason`.
@@ -1005,7 +1005,7 @@ mod tests {
         assert_eq!(revoke_scope(6, None).expect("null"), None);
         assert_eq!(
             revoke_scope(6, Some("bead".to_owned())).expect("bead"),
-            Some(RevokeScope::Bead)
+            Some(RevokeScope::Work)
         );
         assert_eq!(
             revoke_scope(6, Some("attempt".to_owned())).expect("attempt"),

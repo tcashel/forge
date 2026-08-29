@@ -1370,7 +1370,7 @@ mod tests {
             schema: "forged.packet/1".to_owned(),
             packet_id: "run-1/implement/1".to_owned(),
             run_id: "run-1".to_owned(),
-            bead_id: "beads-1".to_owned(),
+            work_id: "beads-1".to_owned(),
             stage: Stage::Implement,
             execution: None,
             lane_seq: None,

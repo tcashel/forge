@@ -21,7 +21,7 @@ fn packet(provider: &str, worktree: &Path) -> WorkPacket {
         schema: "forged.packet/1".to_owned(),
         packet_id: "run-private/implement/1".to_owned(),
         run_id: "run-private".to_owned(),
-        bead_id: "beads-private".to_owned(),
+        work_id: "beads-private".to_owned(),
         stage: Stage::Implement,
         execution: None,
         lane_seq: None,

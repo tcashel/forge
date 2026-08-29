@@ -171,7 +171,7 @@ fn rolling_plan_templates_are_read_only_and_carry_exact_candidates() {
     let authored = templates
         .render(PromptStage::EpicPlan, &epic_plan_context())
         .expect("plan renders");
-    assert!(authored.contains("Do not edit the repository, Beads, GitHub"));
+    assert!(authored.contains("Do not edit the repository, the work store, GitHub"));
     assert!(authored.contains("acceptanceCriteria"));
 
     let candidate = r#"{"description":"d","acceptanceCriteria":"a","design":"x","notes":"n"}"#;

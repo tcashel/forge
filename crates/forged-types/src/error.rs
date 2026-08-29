@@ -22,9 +22,14 @@ pub enum ErrorCode {
     HostUnavailable,
     HerdrProtocolMismatch,
     ProviderSpawnFailed,
-    BeadsContention,
-    BeadLeaseHeld,
-    BeadsError,
+    // Historical bead spellings are frozen wire contracts. Keep the Rust
+    // vocabulary current while preserving the exact serialized codes.
+    #[serde(rename = "BEADS_CONTENTION")]
+    WorkContention,
+    #[serde(rename = "BEAD_LEASE_HELD")]
+    WorkLeaseHeld,
+    #[serde(rename = "BEADS_ERROR")]
+    WorkError,
     GraphScopeTooLarge,
     GhError,
     Internal,
@@ -55,9 +60,9 @@ mod tests {
         (ErrorCode::HostUnavailable, "HOST_UNAVAILABLE"),
         (ErrorCode::HerdrProtocolMismatch, "HERDR_PROTOCOL_MISMATCH"),
         (ErrorCode::ProviderSpawnFailed, "PROVIDER_SPAWN_FAILED"),
-        (ErrorCode::BeadsContention, "BEADS_CONTENTION"),
-        (ErrorCode::BeadLeaseHeld, "BEAD_LEASE_HELD"),
-        (ErrorCode::BeadsError, "BEADS_ERROR"),
+        (ErrorCode::WorkContention, "BEADS_CONTENTION"),
+        (ErrorCode::WorkLeaseHeld, "BEAD_LEASE_HELD"),
+        (ErrorCode::WorkError, "BEADS_ERROR"),
         (ErrorCode::GraphScopeTooLarge, "GRAPH_SCOPE_TOO_LARGE"),
         (ErrorCode::GhError, "GH_ERROR"),
         (ErrorCode::Internal, "INTERNAL"),

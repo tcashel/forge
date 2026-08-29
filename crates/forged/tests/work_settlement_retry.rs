@@ -1,4 +1,4 @@
-//! Supervisor retry of pending whole-run bead settlement: the read-only
+//! Supervisor retry of pending whole-run work settlement: the read-only
 //! convergence probe with its per-run throttle, per-outcome predicates,
 //! recorded-holder custody discrimination, the bounded per-episode mutating
 //! budget, and the untouched `run stop` replay discipline.
@@ -11,12 +11,12 @@ use support::{fabricate_run, TestEnv};
 
 const FRONTIER: &str = "forged:frontier:0";
 
-fn pending_payload(bead: &str, outcome: &str, error: &str, observed: Option<&str>) -> Value {
+fn pending_payload(work: &str, outcome: &str, error: &str, observed: Option<&str>) -> Value {
     let mut payload = json!({
         "schemaVersion": 1,
-        "beadId": bead,
+        "beadId": work,
         "outcome": outcome,
-        "expectedAssignee": format!("forged:{bead}:0"),
+        "expectedAssignee": format!("forged:{work}:0"),
         "settled": false,
         "pending": true,
         "error": error,
@@ -27,7 +27,7 @@ fn pending_payload(bead: &str, outcome: &str, error: &str, observed: Option<&str
     payload
 }
 
-/// Fabricate a terminally settled run whose bead settlement is still owed:
+/// Fabricate a terminally settled run whose work settlement is still owed:
 /// the run row carries the rebuild inputs and the ledger carries the exact
 /// pending event `run stop` records. `observed` is the custody identity
 /// `run stop` recorded at pend time; `None` seeds a legacy payload.
@@ -43,7 +43,7 @@ fn seed_pending(
     error: &str,
     observed: Option<&str>,
 ) -> String {
-    let bead = format!("bead-{run}");
+    let work = format!("bead-{run}");
     fabricate_run(env, run);
     let ledger = env.ledger();
     ledger
@@ -53,11 +53,11 @@ fn seed_pending(
         .append_event(
             Some(run),
             "run.bead-settlement.pending",
-            pending_payload(&bead, outcome.as_str(), error, observed),
+            pending_payload(&work, outcome.as_str(), error, observed),
         )
         .expect("pending event");
     ledger.close().expect("close");
-    bead
+    work
 }
 
 /// Seed with the derived run holder recorded, the way `run stop` records
@@ -114,7 +114,7 @@ fn maybe_settlement_action(report: &Value, run: &str) -> Option<Value> {
 /// oldest first. Work coordination events carry no run id, so the scan is
 /// over the whole stream. Claims are deliberately absent — they write rows,
 /// not events — which matches the old helper: reads were never mutations.
-fn work_updates(env: &TestEnv, bead: &str) -> Vec<Value> {
+fn work_updates(env: &TestEnv, work: &str) -> Vec<Value> {
     let ledger = env.ledger();
     let events = ledger.list_events(None, 0, 65_536).expect("events");
     ledger.close().expect("close");
@@ -122,22 +122,22 @@ fn work_updates(env: &TestEnv, bead: &str) -> Vec<Value> {
         .into_iter()
         .filter(|event| event.kind == "work.updated")
         .map(|event| serde_json::from_str::<Value>(&event.payload_json).expect("payload"))
-        .filter(|payload| payload["workId"] == json!(bead))
+        .filter(|payload| payload["workId"] == json!(work))
         .collect()
 }
 
 /// The `work.updated` verbs recorded for one work item, oldest first.
-fn mutation_verbs(env: &TestEnv, bead: &str) -> Vec<String> {
-    work_updates(env, bead)
+fn mutation_verbs(env: &TestEnv, work: &str) -> Vec<String> {
+    work_updates(env, work)
         .into_iter()
         .filter_map(|payload| payload["verb"].as_str().map(str::to_owned))
         .collect()
 }
 
 /// The live status of one work item.
-fn work_status(env: &TestEnv, bead: &str) -> String {
+fn work_status(env: &TestEnv, work: &str) -> String {
     let ledger = env.ledger();
-    let item = ledger.work_item(bead).expect("work item read");
+    let item = ledger.work_item(work).expect("work item read");
     ledger.close().expect("close");
     item.expect("the work item exists")
         .status
@@ -168,9 +168,9 @@ fn latest_pending_event_id(env: &TestEnv, run: &str) -> i64 {
         .expect("a pending event exists")
 }
 
-fn retry_row(env: &TestEnv, run: &str) -> Option<forged_ledger::BeadSettlementRetryRow> {
+fn retry_row(env: &TestEnv, run: &str) -> Option<forged_ledger::WorkSettlementRetryRow> {
     let ledger = env.ledger();
-    let row = ledger.get_bead_settlement_retry(run).expect("retry row");
+    let row = ledger.get_work_settlement_retry(run).expect("retry row");
     ledger.close().expect("close");
     row
 }
@@ -239,19 +239,19 @@ fn queue_blocker(env: &TestEnv, run: &str) -> Value {
 }
 
 #[test]
-fn a_closed_bead_converges_read_only_and_clears_the_operator_surfaces() {
+fn a_closed_work_converges_read_only_and_clears_the_operator_surfaces() {
     let env = TestEnv::new("bsr-closed");
     env.forged(&["init"]);
     let run = "bsr-closed";
-    let bead = seed_pending_derived(
+    let work = seed_pending_derived(
         &env,
         run,
         RunOutcome::Landed,
         "delivery verified",
         "bead bead-bsr-closed lease held by another actor",
     );
-    // The operator already closed the bead by hand after the lease expired.
-    env.set_bead_field(&bead, "status", "closed");
+    // The operator already closed the work by hand after the lease expired.
+    env.set_work_field(&work, "status", "closed");
 
     assert_eq!(
         attention_conditions(&env, run),
@@ -260,28 +260,28 @@ fn a_closed_bead_converges_read_only_and_clears_the_operator_surfaces() {
     );
     assert!(queue_blocker(&env, run)
         .as_str()
-        .is_some_and(|blocker| blocker.contains("Beads reconciliation is pending")));
+        .is_some_and(|blocker| blocker.contains("Work reconciliation is pending")));
 
-    let mutations_before = mutation_verbs(&env, &bead).len();
+    let mutations_before = mutation_verbs(&env, &work).len();
     let report = supervise_once(&env);
     let action = settlement_action(&report, run);
     assert_eq!(action["action"], json!("converged"), "{report}");
     assert_eq!(action["appended"], json!(true));
 
     assert_eq!(
-        mutation_verbs(&env, &bead).len(),
+        mutation_verbs(&env, &work).len(),
         mutations_before,
         "convergence is read-only: zero work mutations"
     );
-    assert_eq!(work_status(&env, &bead), "closed");
-    assert_eq!(env.assignee(&bead), None);
+    assert_eq!(work_status(&env, &work), "closed");
+    assert_eq!(env.assignee(&work), None);
     let succeeded = settlement_events(&env, run, "run.bead-settlement.succeeded");
     assert_eq!(succeeded.len(), 1);
     assert_eq!(
         succeeded[0],
         json!({
             "schema": "forged.bead-settlement/1",
-            "beadId": bead,
+            "beadId": work,
             "outcome": "landed",
             "settled": true,
         })
@@ -320,9 +320,9 @@ fn per_outcome_convergence_hands_off_foreign_custody_and_releases_held_closed() 
     let env = TestEnv::new("bsr-outcomes");
     env.forged(&["init"]);
 
-    // Superseded, with the successor holding the bead: foreign custody
+    // Superseded, with the successor holding the work: foreign custody
     // converges and the settlement hands off without touching the claim.
-    let superseded_bead = seed_pending(
+    let superseded_work = seed_pending(
         &env,
         "bsr-superseded",
         RunOutcome::Superseded,
@@ -333,22 +333,22 @@ fn per_outcome_convergence_hands_off_foreign_custody_and_releases_held_closed() 
         "bead is claimed by the successor",
         Some("forged:bead-bsr-superseded:0"),
     );
-    env.set_bead_field(&superseded_bead, "status", "in_progress");
-    env.set_assignee(&superseded_bead, "forged:successor:0");
+    env.set_work_field(&superseded_work, "status", "in_progress");
+    env.set_assignee(&superseded_work, "forged:successor:0");
 
-    // Blocked, with the bead already unassigned: converges as-is.
-    let blocked_bead = seed_pending_derived(
+    // Blocked, with the work already unassigned: converges as-is.
+    let blocked_work = seed_pending_derived(
         &env,
         "bsr-blocked",
         RunOutcome::Blocked,
         "waiting on a migration decision",
         "bd was unreachable",
     );
-    env.set_bead_field(&blocked_bead, "status", "open");
+    env.set_work_field(&blocked_work, "status", "open");
 
     // Closed but still held by this run's own lease identity: exactly one
     // guarded release is permitted, then the settlement succeeds.
-    let held_bead = seed_pending(
+    let held_work = seed_pending(
         &env,
         "bsr-held",
         RunOutcome::Landed,
@@ -359,8 +359,8 @@ fn per_outcome_convergence_hands_off_foreign_custody_and_releases_held_closed() 
         "bd timed out mid-close",
         Some("forged:bead-bsr-held:0"),
     );
-    env.set_bead_field(&held_bead, "status", "closed");
-    env.set_assignee(&held_bead, &format!("forged:{held_bead}:0"));
+    env.set_work_field(&held_work, "status", "closed");
+    env.set_assignee(&held_work, &format!("forged:{held_work}:0"));
 
     let report = supervise_once(&env);
     assert_eq!(
@@ -376,15 +376,15 @@ fn per_outcome_convergence_hands_off_foreign_custody_and_releases_held_closed() 
     assert_eq!(held["attempt"], json!(1));
     assert_eq!(held["settled"], json!(true));
 
-    assert!(mutation_verbs(&env, &superseded_bead).is_empty());
+    assert!(mutation_verbs(&env, &superseded_work).is_empty());
     assert_eq!(
-        env.assignee(&superseded_bead).as_deref(),
+        env.assignee(&superseded_work).as_deref(),
         Some("forged:successor:0"),
         "foreign custody hands off: the successor claim is never touched"
     );
-    assert!(mutation_verbs(&env, &blocked_bead).is_empty());
+    assert!(mutation_verbs(&env, &blocked_work).is_empty());
 
-    let releases = work_updates(&env, &held_bead);
+    let releases = work_updates(&env, &held_work);
     assert_eq!(
         releases.len(),
         1,
@@ -397,7 +397,7 @@ fn per_outcome_convergence_hands_off_foreign_custody_and_releases_held_closed() 
     );
     assert_eq!(
         releases[0]["actor"],
-        json!(format!("forged:{held_bead}:0")),
+        json!(format!("forged:{held_work}:0")),
         "the release runs under this settlement's own recorded identity"
     );
     assert_eq!(
@@ -405,8 +405,8 @@ fn per_outcome_convergence_hands_off_foreign_custody_and_releases_held_closed() 
         json!("closed"),
         "releasing custody must not reopen the closed item"
     );
-    assert_eq!(env.assignee(&held_bead), None);
-    assert_eq!(work_status(&env, &held_bead), "closed");
+    assert_eq!(env.assignee(&held_work), None);
+    assert_eq!(work_status(&env, &held_work), "closed");
     let held_retry = retry_row(&env, "bsr-held").expect("charged retry row");
     assert_eq!(
         held_retry.used, 1,
@@ -433,10 +433,10 @@ fn a_recorded_frontier_epoch_settles_under_the_frontier_identity() {
     let env = TestEnv::new("bsr-frontier-own");
     env.forged(&["init"]);
 
-    // Cancelled, with the bead still held under the frontier identity its
+    // Cancelled, with the work still held under the frontier identity its
     // pending payload RECORDED at pend time: forged's own claim-next claim,
     // owed its release, guarded by the frontier actor.
-    let cancelled_bead = seed_pending(
+    let cancelled_work = seed_pending(
         &env,
         "bsr-fr-cancel",
         RunOutcome::Cancelled,
@@ -447,12 +447,12 @@ fn a_recorded_frontier_epoch_settles_under_the_frontier_identity() {
         "bd was unreachable",
         Some(FRONTIER),
     );
-    env.set_bead_field(&cancelled_bead, "status", "in_progress");
-    env.set_assignee(&cancelled_bead, FRONTIER);
+    env.set_work_field(&cancelled_work, "status", "in_progress");
+    env.set_assignee(&cancelled_work, FRONTIER);
 
     // Landed under the recorded frontier claim — the exact claim-next-run
     // wedge: the close must fire under the frontier identity.
-    let landed_bead = seed_pending(
+    let landed_work = seed_pending(
         &env,
         "bsr-fr-landed",
         RunOutcome::Landed,
@@ -463,8 +463,8 @@ fn a_recorded_frontier_epoch_settles_under_the_frontier_identity() {
         "bd timed out mid-close",
         Some(FRONTIER),
     );
-    env.set_bead_field(&landed_bead, "status", "in_progress");
-    env.set_assignee(&landed_bead, FRONTIER);
+    env.set_work_field(&landed_work, "status", "in_progress");
+    env.set_assignee(&landed_work, FRONTIER);
 
     let report = supervise_once(&env);
     for run in ["bsr-fr-cancel", "bsr-fr-landed"] {
@@ -483,7 +483,7 @@ fn a_recorded_frontier_epoch_settles_under_the_frontier_identity() {
         );
     }
 
-    let cancel_updates = work_updates(&env, &cancelled_bead);
+    let cancel_updates = work_updates(&env, &cancelled_work);
     assert_eq!(cancel_updates.len(), 1, "{cancel_updates:?}");
     assert_eq!(cancel_updates[0]["verb"], json!("release-unresolved"));
     assert_eq!(
@@ -493,9 +493,9 @@ fn a_recorded_frontier_epoch_settles_under_the_frontier_identity() {
     );
     assert_eq!(cancel_updates[0]["assignee"]["from"], json!(FRONTIER));
     assert_eq!(cancel_updates[0]["assignee"]["to"], Value::Null);
-    assert_eq!(env.assignee(&cancelled_bead), None);
+    assert_eq!(env.assignee(&cancelled_work), None);
 
-    let closes: Vec<Value> = work_updates(&env, &landed_bead)
+    let closes: Vec<Value> = work_updates(&env, &landed_work)
         .into_iter()
         .filter(|update| update["status"]["to"] == json!("closed"))
         .collect();
@@ -510,7 +510,7 @@ fn a_recorded_frontier_epoch_settles_under_the_frontier_identity() {
         json!(FRONTIER),
         "the close CAS names the frontier claim: {closes:?}"
     );
-    assert_eq!(env.assignee(&landed_bead), None);
+    assert_eq!(env.assignee(&landed_work), None);
 }
 
 #[test]
@@ -519,32 +519,32 @@ fn unrecorded_frontier_custody_is_foreign_and_never_mutated() {
     env.forged(&["init"]);
 
     // Release-shaped promise whose payload recorded the DERIVED holder, but
-    // whose bead is now frontier-held by a later claim-next: hands off.
-    let cancelled_bead = seed_pending_derived(
+    // whose work is now frontier-held by a later claim-next: hands off.
+    let cancelled_work = seed_pending_derived(
         &env,
         "bsr-uf-cancel",
         RunOutcome::Cancelled,
         "operator cancelled",
         "bd was unreachable",
     );
-    env.set_bead_field(&cancelled_bead, "status", "in_progress");
-    env.set_assignee(&cancelled_bead, FRONTIER);
+    env.set_work_field(&cancelled_work, "status", "in_progress");
+    env.set_assignee(&cancelled_work, FRONTIER);
 
     // Landed with the same recorded-derived payload: not delivered, not
     // ours — neither converges nor mutates.
-    let landed_bead = seed_pending_derived(
+    let landed_work = seed_pending_derived(
         &env,
         "bsr-uf-landed",
         RunOutcome::Landed,
         "delivery verified",
         "bd timed out mid-close",
     );
-    env.set_bead_field(&landed_bead, "status", "in_progress");
-    env.set_assignee(&landed_bead, FRONTIER);
+    env.set_work_field(&landed_work, "status", "in_progress");
+    env.set_assignee(&landed_work, FRONTIER);
 
     // A legacy payload with no observedHolder gets the same conservative
     // frontier-is-foreign rule.
-    let legacy_bead = seed_pending(
+    let legacy_work = seed_pending(
         &env,
         "bsr-uf-legacy",
         RunOutcome::Landed,
@@ -555,8 +555,8 @@ fn unrecorded_frontier_custody_is_foreign_and_never_mutated() {
         "bd timed out mid-close",
         None,
     );
-    env.set_bead_field(&legacy_bead, "status", "in_progress");
-    env.set_assignee(&legacy_bead, FRONTIER);
+    env.set_work_field(&legacy_work, "status", "in_progress");
+    env.set_assignee(&legacy_work, FRONTIER);
 
     let report = supervise_once(&env);
     let cancelled = settlement_action(&report, "bsr-uf-cancel");
@@ -587,18 +587,18 @@ fn unrecorded_frontier_custody_is_foreign_and_never_mutated() {
 
     // The load-bearing negative: no coordination write of any kind was ever
     // issued against frontier custody the payloads did not record.
-    for bead in [&cancelled_bead, &landed_bead, &legacy_bead] {
+    for work in [&cancelled_work, &landed_work, &legacy_work] {
         assert!(
-            mutation_verbs(&env, bead).is_empty(),
+            mutation_verbs(&env, work).is_empty(),
             "unrecorded frontier custody must never be mutated: {:?}",
-            mutation_verbs(&env, bead)
+            mutation_verbs(&env, work)
         );
         assert_eq!(
-            env.assignee(bead).as_deref(),
+            env.assignee(work).as_deref(),
             Some(FRONTIER),
             "the later claim-next's frontier claim stands untouched"
         );
-        assert_eq!(work_status(&env, bead), "in_progress");
+        assert_eq!(work_status(&env, work), "in_progress");
     }
 }
 
@@ -606,11 +606,11 @@ fn unrecorded_frontier_custody_is_foreign_and_never_mutated() {
 fn run_stop_settles_a_frontier_claimed_run_under_the_frontier_identity() {
     let env = TestEnv::new("bsr-stop-frontier");
     env.forged(&["init"]);
-    let bead = "bead-bsr-stop-frontier";
+    let work = "bead-bsr-stop-frontier";
     // The REAL claim-next flow, not a fabricated assignee: the fresh
-    // frontier bead is claimed under forged:frontier:0 and that identity is
+    // frontier work is claimed under forged:frontier:0 and that identity is
     // the run's whole-run lease end to end.
-    env.seed_frontier(bead);
+    env.seed_frontier(work);
     let (code, claimed) = env.forged(&[
         "claim-next",
         "--holder",
@@ -619,9 +619,9 @@ fn run_stop_settles_a_frontier_claimed_run_under_the_frontier_identity() {
         "op:claim_next:bsr-stop-frontier",
     ]);
     assert_eq!(code, 0, "claim-next: {claimed}");
-    assert_eq!(claimed["result"]["claimed"]["bead_id"], json!(bead));
+    assert_eq!(claimed["result"]["claimed"]["bead_id"], json!(work));
     assert_eq!(
-        env.assignee(bead).as_deref(),
+        env.assignee(work).as_deref(),
         Some(FRONTIER),
         "the real claim-next claim holds the frontier identity"
     );
@@ -655,7 +655,7 @@ fn run_stop_settles_a_frontier_claimed_run_under_the_frontier_identity() {
     assert_eq!(stopped["result"]["bead"]["closed"], json!(true));
     assert_eq!(stopped["result"]["bead"]["released"], json!(true));
 
-    let closes: Vec<Value> = work_updates(&env, bead)
+    let closes: Vec<Value> = work_updates(&env, work)
         .into_iter()
         .filter(|update| update["status"]["to"] == json!("closed"))
         .collect();
@@ -677,7 +677,7 @@ fn run_stop_settles_a_frontier_claimed_run_under_the_frontier_identity() {
 }
 
 #[test]
-fn a_landed_promise_over_a_blocked_unassigned_bead_takes_guarded_custody_then_closes() {
+fn a_landed_promise_over_a_blocked_unassigned_work_takes_guarded_custody_then_closes() {
     let env = TestEnv::new("bsr-unassigned");
     env.forged(&["init"]);
 
@@ -686,11 +686,11 @@ fn a_landed_promise_over_a_blocked_unassigned_bead_takes_guarded_custody_then_cl
     // status blocked, then the landed stop pends over that blocked,
     // unassigned residue.
     let run = "bsr-unassigned";
-    let bead = format!("bead-{run}");
-    let expected = format!("forged:{bead}:0");
+    let work = format!("bead-{run}");
+    let expected = format!("forged:{work}:0");
     fabricate_run(&env, run);
-    env.set_bead_field(&bead, "status", "in_progress");
-    env.set_assignee(&bead, &expected);
+    env.set_work_field(&work, "status", "in_progress");
+    env.set_assignee(&work, &expected);
     let (code, blocked) = env.forged(&[
         "run",
         "stop",
@@ -703,12 +703,12 @@ fn a_landed_promise_over_a_blocked_unassigned_bead_takes_guarded_custody_then_cl
     ]);
     assert_eq!(code, 0, "blocked stop: {blocked}");
     assert_eq!(
-        env.assignee(&bead),
+        env.assignee(&work),
         None,
         "the blocked settlement released the claim: {blocked}"
     );
     assert_eq!(
-        work_status(&env, &bead),
+        work_status(&env, &work),
         "blocked",
         "the residue this fixture exists for IS blocked-unassigned: {blocked}"
     );
@@ -757,17 +757,17 @@ fn a_landed_promise_over_a_blocked_unassigned_bead_takes_guarded_custody_then_cl
         "the held close refuses the unassigned bead and pends: {landed}"
     );
 
-    // A second landed pending whose bead a stranger holds still refuses.
+    // A second landed pending whose work a stranger holds still refuses.
     let thief_run = "bsr-unassigned-thief";
-    let thief_bead = seed_pending_derived(
+    let thief_work = seed_pending_derived(
         &env,
         thief_run,
         RunOutcome::Landed,
         "delivery verified",
         "bd refused the close",
     );
-    env.set_bead_field(&thief_bead, "status", "in_progress");
-    env.set_assignee(&thief_bead, "forged:thief:0");
+    env.set_work_field(&thief_work, "status", "in_progress");
+    env.set_assignee(&thief_work, "forged:thief:0");
 
     // The real stops above recorded no mutations of their own (the refusals
     // fired before any write); the retry pass adds the guarded custody take
@@ -777,7 +777,7 @@ fn a_landed_promise_over_a_blocked_unassigned_bead_takes_guarded_custody_then_cl
     assert_eq!(action["action"], json!("retried"), "{report}");
     assert_eq!(action["settled"], json!(true));
 
-    let updates = work_updates(&env, &bead);
+    let updates = work_updates(&env, &work);
     let custody: Vec<&Value> = updates
         .iter()
         .filter(|update| update["verb"] == json!("assign-unassigned"))
@@ -805,7 +805,7 @@ fn a_landed_promise_over_a_blocked_unassigned_bead_takes_guarded_custody_then_cl
         "the close stays the guarded held close: {closes:?}"
     );
     assert_eq!(closes[0]["actor"], json!(expected));
-    assert_eq!(env.assignee(&bead), None);
+    assert_eq!(env.assignee(&work), None);
     // The blocked and accepted-risk settlements each recorded their own
     // succeeded; the retry's convergence is the third and the stream head,
     // so the run no longer discovers as pending.
@@ -815,7 +815,7 @@ fn a_landed_promise_over_a_blocked_unassigned_bead_takes_guarded_custody_then_cl
     );
     let ledger = env.ledger();
     let still_pending = ledger
-        .list_pending_bead_settlements()
+        .list_pending_work_settlements()
         .expect("discovery")
         .into_iter()
         .any(|row| row.run_id == run);
@@ -823,16 +823,16 @@ fn a_landed_promise_over_a_blocked_unassigned_bead_takes_guarded_custody_then_cl
     assert!(!still_pending, "the landed promise no longer pends");
     assert_eq!(retry_row(&env, run).expect("row").used, 1);
 
-    // The stranger-held bead refused: no custody write was even attempted.
+    // The stranger-held work refused: no custody write was even attempted.
     let refused = settlement_action(&report, thief_run);
     assert_eq!(refused["action"], json!("retry-failed"), "{report}");
     assert!(
-        !mutation_verbs(&env, &thief_bead)
+        !mutation_verbs(&env, &thief_work)
             .iter()
             .any(|verb| verb == "assign-unassigned"),
         "a non-null unexpected holder refuses without a custody attempt"
     );
-    assert_eq!(env.assignee(&thief_bead).as_deref(), Some("forged:thief:0"));
+    assert_eq!(env.assignee(&thief_work).as_deref(), Some("forged:thief:0"));
 }
 
 #[test]
@@ -840,21 +840,21 @@ fn an_open_unassigned_landed_promise_takes_guarded_custody_then_closes() {
     let env = TestEnv::new("bsr-open-unassigned");
     env.forged(&["init"]);
     let run = "bsr-open-unassigned";
-    let bead = seed_pending_derived(
+    let work = seed_pending_derived(
         &env,
         run,
         RunOutcome::Landed,
         "delivery verified",
         "bd refused the close",
     );
-    let expected = format!("forged:{bead}:0");
-    env.set_bead_field(&bead, "status", "open");
+    let expected = format!("forged:{work}:0");
+    env.set_work_field(&work, "status", "open");
 
     let report = supervise_once(&env);
     let action = settlement_action(&report, run);
     assert_eq!(action["action"], json!("retried"), "{report}");
     assert_eq!(action["settled"], json!(true));
-    let updates = work_updates(&env, &bead);
+    let updates = work_updates(&env, &work);
     let custody: Vec<&Value> = updates
         .iter()
         .filter(|update| update["verb"] == json!("assign-unassigned"))
@@ -870,8 +870,8 @@ fn an_open_unassigned_landed_promise_takes_guarded_custody_then_closes() {
         "the landed retry does not need claimable-status semantics: {custody:?}"
     );
     assert_eq!(custody[0]["status"]["to"], json!("open"));
-    assert_eq!(env.assignee(&bead), None);
-    assert_eq!(work_status(&env, &bead), "closed");
+    assert_eq!(env.assignee(&work), None);
+    assert_eq!(work_status(&env, &work), "closed");
     assert_eq!(
         settlement_events(&env, run, "run.bead-settlement.succeeded").len(),
         1
@@ -889,15 +889,15 @@ fn a_new_settlement_episode_resets_the_budget_and_the_pass_own_records_never_do(
     let env = TestEnv::new("bsr-episode");
     env.forged(&["init"]);
     let run = "bsr-episode";
-    let bead = seed_pending_derived(
+    let work = seed_pending_derived(
         &env,
         run,
         RunOutcome::Landed,
         "delivery verified",
         "bd refused the close",
     );
-    env.set_bead_field(&bead, "status", "in_progress");
-    env.set_assignee(&bead, "forged:thief:0");
+    env.set_work_field(&work, "status", "in_progress");
+    env.set_assignee(&work, "forged:thief:0");
 
     // A failed retry re-pends and stamps the watermark with its own event:
     // the budget is NOT reset by the pass's own evidence.
@@ -932,10 +932,10 @@ fn a_new_settlement_episode_resets_the_budget_and_the_pass_own_records_never_do(
             Some(run),
             "run.bead-settlement.pending",
             pending_payload(
-                &bead,
+                &work,
                 "landed",
                 "second stop failed too",
-                Some(&format!("forged:{bead}:0")),
+                Some(&format!("forged:{work}:0")),
             ),
         )
         .expect("new episode pending");
@@ -962,17 +962,17 @@ fn a_deterministic_custody_refusal_parks_after_one_charge_and_a_new_episode_retr
     let env = TestEnv::new("bsr-mechanism-refused");
     env.forged(&["init"]);
     let run = "bsr-mechanism-refused";
-    let bead = seed_pending_derived(
+    let work = seed_pending_derived(
         &env,
         run,
         RunOutcome::Landed,
         "delivery verified",
         "bd refused the close",
     );
-    // A landed promise over an unassigned bead in a status landed custody
+    // A landed promise over an unassigned work in a status landed custody
     // may not overwrite: the deterministic mechanism refusal, answered
     // before any store write.
-    env.set_bead_field(&bead, "status", "deferred");
+    env.set_work_field(&work, "status", "deferred");
     let refusal = format!(
         "{}deferred is not a shape landed custody may overwrite",
         forged_ledger::WORK_CLAIM_REFUSAL_PREFIX
@@ -991,7 +991,7 @@ fn a_deterministic_custody_refusal_parks_after_one_charge_and_a_new_episode_retr
     assert_eq!(evidence["attempts"], json!(1), "{evidence}");
     assert_eq!(evidence["error"], json!(refusal), "{evidence}");
 
-    let mutations = mutation_verbs(&env, &bead).len();
+    let mutations = mutation_verbs(&env, &work).len();
     rewind_wake(&env, run);
     let parked = settlement_action(&supervise_once(&env), run);
     assert_eq!(parked["action"], json!("exhausted"), "{parked}");
@@ -999,7 +999,7 @@ fn a_deterministic_custody_refusal_parks_after_one_charge_and_a_new_episode_retr
     assert_eq!(parked["stamped"], json!(false));
     assert_eq!(retry_row(&env, run).expect("row").used, 1);
     assert_eq!(
-        mutation_verbs(&env, &bead).len(),
+        mutation_verbs(&env, &work).len(),
         mutations,
         "the parked episode performs no more work writes"
     );
@@ -1018,8 +1018,8 @@ fn a_deterministic_custody_refusal_parks_after_one_charge_and_a_new_episode_retr
         "{attention}"
     );
 
-    // The operator repairs the bead by hand; the eternal probe converges it.
-    env.set_bead_field(&bead, "status", "closed");
+    // The operator repairs the work by hand; the eternal probe converges it.
+    env.set_work_field(&work, "status", "closed");
     rewind_probe(&env, run);
     let resumed = settlement_action(&supervise_once(&env), run);
     assert_eq!(
@@ -1046,15 +1046,15 @@ fn probe_reads_decay_per_the_schedule_and_reset_to_the_floor_on_change() {
     // Permanently stuck shape that neither converges nor charges: a landed
     // promise over frontier custody the payload did not record.
     let run = "bsr-probe";
-    let bead = seed_pending_derived(
+    let work = seed_pending_derived(
         &env,
         run,
         RunOutcome::Landed,
         "delivery verified",
         "bd timed out mid-close",
     );
-    env.set_bead_field(&bead, "status", "in_progress");
-    env.set_assignee(&bead, FRONTIER);
+    env.set_work_field(&work, "status", "in_progress");
+    env.set_assignee(&work, FRONTIER);
 
     let action = settlement_action(&supervise_once(&env), run);
     assert_eq!(action["action"], json!("frontier-held"), "{action}");
@@ -1085,8 +1085,8 @@ fn probe_reads_decay_per_the_schedule_and_reset_to_the_floor_on_change() {
     assert_eq!(after.probe_wake_at, parked.probe_wake_at, "no read fired");
     assert_eq!(after.probe_interval_s, parked.probe_interval_s);
 
-    // The live bead moving resets the schedule to the floor.
-    env.set_bead_field(&bead, "notes", "operator touched the bead");
+    // The live work moving resets the schedule to the floor.
+    env.set_work_field(&work, "notes", "operator touched the bead");
     rewind_probe(&env, run);
     supervise_once(&env);
     let row = retry_row(&env, run).expect("row");
@@ -1104,14 +1104,14 @@ fn a_pass_over_nine_due_runs_probes_the_eight_earliest_and_defers_the_rest() {
     env.forged(&["init"]);
     let runs: Vec<String> = (0..9).map(|index| format!("bsr-batch-{index}")).collect();
     for run in &runs {
-        let bead = seed_pending_derived(
+        let work = seed_pending_derived(
             &env,
             run,
             RunOutcome::Landed,
             "delivery verified",
             "bd lease held",
         );
-        env.set_bead_field(&bead, "status", "closed");
+        env.set_work_field(&work, "status", "closed");
     }
 
     // Never-probed rows are the most overdue; ties order by run id, so the
@@ -1151,7 +1151,7 @@ fn a_failing_close_charges_monotonically_backs_off_and_exhausts_while_the_probe_
     let env = TestEnv::new("bsr-stuck");
     env.forged(&["init"]);
     let run = "bsr-stuck";
-    let bead = seed_pending(
+    let work = seed_pending(
         &env,
         run,
         RunOutcome::Landed,
@@ -1164,8 +1164,8 @@ fn a_failing_close_charges_monotonically_backs_off_and_exhausts_while_the_probe_
     );
     // A foreign, unexpired holder that never yields: landed promises a
     // close, so every guarded attempt is refused without converging.
-    env.set_bead_field(&bead, "status", "in_progress");
-    env.set_assignee(&bead, "forged:thief:0");
+    env.set_work_field(&work, "status", "in_progress");
+    env.set_assignee(&work, "forged:thief:0");
 
     let first = settlement_action(&supervise_once(&env), run);
     assert_eq!(first["action"], json!("retry-failed"), "{first}");
@@ -1210,7 +1210,7 @@ fn a_failing_close_charges_monotonically_backs_off_and_exhausts_while_the_probe_
         );
         assert_eq!(
             payload["observedHolder"],
-            json!(format!("forged:{bead}:0")),
+            json!(format!("forged:{work}:0")),
             "the recorded custody epoch travels with every re-pend: {payload}"
         );
     }
@@ -1220,13 +1220,13 @@ fn a_failing_close_charges_monotonically_backs_off_and_exhausts_while_the_probe_
 
     // Budget spent: mutation stops, the read-only probe keeps running.
     rewind_wake(&env, run);
-    let mutations_at_exhaustion = mutation_verbs(&env, &bead).len();
+    let mutations_at_exhaustion = mutation_verbs(&env, &work).len();
     let probe_before = retry_row(&env, run).expect("row").probe_wake_at;
     let exhausted = settlement_action(&supervise_once(&env), run);
     assert_eq!(exhausted["action"], json!("exhausted"), "{exhausted}");
     assert_eq!(exhausted["attempts"], json!(8));
     assert_eq!(retry_row(&env, run).expect("row").used, 8);
-    assert_eq!(mutation_verbs(&env, &bead).len(), mutations_at_exhaustion);
+    assert_eq!(mutation_verbs(&env, &work).len(), mutations_at_exhaustion);
     assert_ne!(
         retry_row(&env, run).expect("row").probe_wake_at,
         probe_before,
@@ -1254,14 +1254,14 @@ fn a_failing_close_charges_monotonically_backs_off_and_exhausts_while_the_probe_
     assert_eq!(evidence["retriesExhausted"], json!(true), "{evidence}");
     assert_eq!(evidence["attempts"], json!(8), "{evidence}");
 
-    // Manual repair: the operator closes the bead by hand. The eternal
+    // Manual repair: the operator closes the work by hand. The eternal
     // probe converges it read-only on the next pass.
-    env.set_bead_field(&bead, "status", "closed");
-    env.set_bead_field(&bead, "assignee", "");
+    env.set_work_field(&work, "status", "closed");
+    env.set_work_field(&work, "assignee", "");
     rewind_probe(&env, run);
     let repaired = settlement_action(&supervise_once(&env), run);
     assert_eq!(repaired["action"], json!("converged"), "{repaired}");
-    assert_eq!(mutation_verbs(&env, &bead).len(), mutations_at_exhaustion);
+    assert_eq!(mutation_verbs(&env, &work).len(), mutations_at_exhaustion);
     assert_eq!(
         settlement_events(&env, run, "run.bead-settlement.succeeded").len(),
         1
@@ -1279,20 +1279,20 @@ fn an_unreadable_probe_defers_the_wake_on_the_decaying_schedule() {
     let env = TestEnv::new("bsr-probe-outage");
     env.forged(&["init"]);
     let run = "bsr-probe-outage";
-    let bead = seed_pending_derived(
+    let work = seed_pending_derived(
         &env,
         run,
         RunOutcome::Landed,
         "delivery verified",
         "bd unreachable",
     );
-    // The promise names a bead the store has no row for: the probe read
+    // The promise names a work the store has no row for: the probe read
     // refuses, exactly as an unresolvable read must. (seed_pending_derived
     // fabricates the promise without materializing the item.)
     let probe_ledger = env.ledger();
     assert!(
         probe_ledger
-            .work_item(&bead)
+            .work_item(&work)
             .expect("work item read")
             .is_none(),
         "the fixture leaves the bead unresolvable on purpose"
@@ -1328,8 +1328,8 @@ fn an_unreadable_probe_defers_the_wake_on_the_decaying_schedule() {
         Some(120)
     );
 
-    // The bead becomes readable and is already settled: normal convergence.
-    env.set_bead_field(&bead, "status", "closed");
+    // The work becomes readable and is already settled: normal convergence.
+    env.set_work_field(&work, "status", "closed");
     rewind_probe(&env, run);
     let action = settlement_action(&supervise_once(&env), run);
     assert_eq!(action["action"], json!("converged"), "{action}");
@@ -1340,15 +1340,15 @@ fn a_settled_retry_clears_the_stored_error() {
     let env = TestEnv::new("bsr-clear-error");
     env.forged(&["init"]);
     let run = "bsr-clear-error";
-    let bead = seed_pending_derived(
+    let work = seed_pending_derived(
         &env,
         run,
         RunOutcome::Landed,
         "delivery verified",
         "bd refused the close",
     );
-    env.set_bead_field(&bead, "status", "in_progress");
-    env.set_assignee(&bead, "forged:thief:0");
+    env.set_work_field(&work, "status", "in_progress");
+    env.set_assignee(&work, "forged:thief:0");
 
     let action = settlement_action(&supervise_once(&env), run);
     assert_eq!(action["action"], json!("retry-failed"), "{action}");
@@ -1359,7 +1359,7 @@ fn a_settled_retry_clears_the_stored_error() {
 
     // Custody returns to the expected assignee; the settled retry clears
     // the stale error with the claim instead of preserving it forever.
-    env.set_assignee(&bead, &format!("forged:{bead}:0"));
+    env.set_assignee(&work, &format!("forged:{work}:0"));
     rewind_wake(&env, run);
     rewind_probe(&env, run);
     let action = settlement_action(&supervise_once(&env), run);
@@ -1376,7 +1376,7 @@ fn an_unresolved_pend_time_epoch_is_re_resolved_and_stamped() {
     let env = TestEnv::new("bsr-unresolved");
     env.forged(&["init"]);
     let run = "bsr-unresolved";
-    let bead = format!("bead-{run}");
+    let work = format!("bead-{run}");
     fabricate_run(&env, run);
     let ledger = env.ledger();
     ledger
@@ -1391,14 +1391,14 @@ fn an_unresolved_pend_time_epoch_is_re_resolved_and_stamped() {
         .expect("settle run");
     // The pend-time resolution failed (the same bd outage that pended), so
     // the payload carries the unresolved marker instead of a holder.
-    let mut payload = pending_payload(&bead, "landed", "bd unreachable at stop", None);
+    let mut payload = pending_payload(&work, "landed", "bd unreachable at stop", None);
     payload["observedHolderUnresolved"] = json!(true);
     ledger
         .append_event(Some(run), "run.bead-settlement.pending", payload)
         .expect("pending event");
     ledger.close().expect("close");
-    env.set_bead_field(&bead, "status", "in_progress");
-    env.set_assignee(&bead, FRONTIER);
+    env.set_work_field(&work, "status", "in_progress");
+    env.set_assignee(&work, FRONTIER);
 
     // First pass: the epoch is re-resolved from the live lease and stamped
     // durably; nothing is probed, charged, or mutated.
@@ -1412,14 +1412,14 @@ fn an_unresolved_pend_time_epoch_is_re_resolved_and_stamped() {
         stamped.get("observedHolderUnresolved").is_none(),
         "{stamped}"
     );
-    assert!(mutation_verbs(&env, &bead).is_empty());
+    assert!(mutation_verbs(&env, &work).is_empty());
     assert!(retry_row(&env, run).is_none_or(|row| row.used == 0));
 
     // Second pass: the recorded frontier epoch retries and closes under the
     // frontier identity — the machine repair path re-resolution restores.
     let action = settlement_action(&supervise_once(&env), run);
     assert_eq!(action["action"], json!("retried"), "{action}");
-    let closes: Vec<Value> = work_updates(&env, &bead)
+    let closes: Vec<Value> = work_updates(&env, &work)
         .into_iter()
         .filter(|update| update["status"]["to"] == json!("closed"))
         .collect();
@@ -1437,14 +1437,14 @@ fn replaying_the_original_run_stop_is_untouched_by_supervisor_convergence() {
     let env = TestEnv::new("bsr-replay");
     env.forged(&["init"]);
     let run = "bsr-replay";
-    let bead = format!("bead-{run}");
+    let work = format!("bead-{run}");
     fabricate_run(&env, run);
     // The competing state is constructed BEFORE the stop, not injected into
     // its middle — the transactional store has no mid-CAS window. The
-    // successor already holds the bead, so the settlement release refuses
+    // successor already holds the work, so the settlement release refuses
     // under the holder CAS and run stop records the promise as pending.
-    env.set_bead_field(&bead, "status", "in_progress");
-    env.set_assignee(&bead, "forged:successor:0");
+    env.set_work_field(&work, "status", "in_progress");
+    env.set_assignee(&work, "forged:successor:0");
 
     let stop_args = [
         "run",
@@ -1464,16 +1464,16 @@ fn replaying_the_original_run_stop_is_untouched_by_supervisor_convergence() {
     assert_eq!(stopped["result"]["bead"]["settled"], json!(false));
     assert_eq!(
         stopped["result"]["bead"]["observedHolder"],
-        json!(format!("forged:{bead}:0")),
+        json!(format!("forged:{work}:0")),
         "the pend records the custody epoch in force at pend time"
     );
 
     // The supervisor converges the promise: superseded with foreign custody
     // hands off, read-only.
-    let mutations_before = mutation_verbs(&env, &bead).len();
+    let mutations_before = mutation_verbs(&env, &work).len();
     let action = settlement_action(&supervise_once(&env), run);
     assert_eq!(action["action"], json!("converged"), "{action}");
-    assert_eq!(mutation_verbs(&env, &bead).len(), mutations_before);
+    assert_eq!(mutation_verbs(&env, &work).len(), mutations_before);
     assert_eq!(
         settlement_events(&env, run, "run.bead-settlement.succeeded").len(),
         1
@@ -1481,14 +1481,14 @@ fn replaying_the_original_run_stop_is_untouched_by_supervisor_convergence() {
 
     // Replay discipline unchanged: the original operation still answers
     // with its stored response, verbatim, firing nothing.
-    let mutations_before_replay = mutation_verbs(&env, &bead).len();
+    let mutations_before_replay = mutation_verbs(&env, &work).len();
     let (code, replayed) = env.forged(&stop_args);
     assert_eq!(code, 0, "run stop replay: {replayed}");
     assert_eq!(replayed["reused"], json!(true));
     assert_eq!(replayed["result"], stopped["result"]);
-    assert_eq!(mutation_verbs(&env, &bead).len(), mutations_before_replay);
+    assert_eq!(mutation_verbs(&env, &work).len(), mutations_before_replay);
     assert_eq!(
-        env.assignee(&bead).as_deref(),
+        env.assignee(&work).as_deref(),
         Some("forged:successor:0"),
         "replay leaves the successor claim untouched"
     );

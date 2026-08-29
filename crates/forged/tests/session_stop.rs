@@ -12,9 +12,9 @@ use serde_json::{json, Value};
 use support::{fabricate_run, TestEnv};
 
 const RUN: &str = "ss-run";
-/// `fabricate_run` names the bead after the run.
-const BEAD: &str = "bead-ss-run";
-/// The bd LEASE holder: bead-scoped, `0` pid segment, shared by every
+/// `fabricate_run` names the work after the run.
+const WORK: &str = "bead-ss-run";
+/// The bd LEASE holder: work-scoped, `0` pid segment, shared by every
 /// generation of the run.
 const HOLDER: &str = "forged:bead-ss-run:0";
 
@@ -65,8 +65,8 @@ fn a_session_stop_settles_the_attempt_and_leaves_the_bd_lease_where_it_was() {
 
     // The lease as bd holds it before the stop: taken under the run holder,
     // and young enough that a scoped reclaim would refuse it anyway.
-    env.set_assignee(BEAD, HOLDER);
-    env.set_lease_unexpired(BEAD);
+    env.set_assignee(WORK, HOLDER);
+    env.set_lease_unexpired(WORK);
     let before = env.bd_calls().len();
 
     let (code, response) = env.forged(&[
@@ -102,7 +102,7 @@ fn a_session_stop_settles_the_attempt_and_leaves_the_bd_lease_where_it_was() {
     assert_eq!(row.state, forged_ledger::AttemptState::Stopped);
     assert_eq!(row.revoke_reason.as_deref(), Some("operator requested"));
     // The marker recorded WHOSE revocation it was, which is what keeps a
-    // later reconcile from finishing it through the bead-scoped reclaim.
+    // later reconcile from finishing it through the work-scoped reclaim.
     assert_eq!(
         row.revoke_scope,
         Some(forged_ledger::RevokeScope::Attempt),
@@ -132,7 +132,7 @@ fn a_session_stop_settles_the_attempt_and_leaves_the_bd_lease_where_it_was() {
         "an attempt-local stop must not reclaim the bead's lease: {calls:?}"
     );
     assert_eq!(
-        env.assignee(BEAD).as_deref(),
+        env.assignee(WORK).as_deref(),
         Some(HOLDER),
         "the work lease holder is unchanged by an attempt stop"
     );
@@ -144,7 +144,7 @@ fn a_repeated_session_stop_replays_under_the_derived_key() {
     env.forged(&["init"]);
     fabricate_run(&env, RUN);
     let (_, attempt_id, _) = seat(&env);
-    env.set_assignee(BEAD, HOLDER);
+    env.set_assignee(WORK, HOLDER);
 
     let stop = |env: &TestEnv| -> (i32, Value) {
         env.forged(&[
@@ -188,8 +188,8 @@ fn forged_reconcile_reports_a_stopped_attempt_without_resuming_the_saga() {
     env.forged(&["init"]);
     fabricate_run(&env, RUN);
     let (_, attempt_id, _) = seat(&env);
-    env.set_assignee(BEAD, HOLDER);
-    env.set_lease_unexpired(BEAD);
+    env.set_assignee(WORK, HOLDER);
+    env.set_lease_unexpired(WORK);
 
     let (code, stopped) = env.forged(&[
         "session",
@@ -218,7 +218,7 @@ fn forged_reconcile_reports_a_stopped_attempt_without_resuming_the_saga() {
         !calls.iter().any(|c| c.contains("reclaim")),
         "reconcile must not resume the saga for a stopped attempt: {calls:?}"
     );
-    assert_eq!(env.assignee(BEAD).as_deref(), Some(HOLDER));
+    assert_eq!(env.assignee(WORK).as_deref(), Some(HOLDER));
     let ledger = env.ledger();
     assert_eq!(
         ledger.get_attempt(attempt_id).expect("attempt").state,

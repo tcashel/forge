@@ -518,7 +518,7 @@ fn a_ledger_past_the_cap_reports_the_newest_entries_and_states_the_total() {
         ledger
             .create_run(forged_ledger::NewRun {
                 run_id: forged_types::RunId::new(format!("pf-{seq:03}")).expect("run id"),
-                bead_id: format!("bead-pf-{seq:03}"),
+                work_id: format!("bead-pf-{seq:03}"),
                 repo: env.repos.repo.to_string_lossy().into_owned(),
                 base_ref: env.repos.base.clone(),
                 branch: format!("forged/pf-{seq:03}"),
@@ -549,10 +549,10 @@ fn a_compatibility_group_states_what_it_excluded_instead_of_reporting_zero() {
     let env = TestEnv::new("forged-portfolio-excluded");
     env.forged(&["init"]);
     fabricate_run(&env, "pf-durable");
-    env.set_bead_field("bead-pf-durable", "status", "open");
+    env.set_work_field("bead-pf-durable", "status", "open");
     for plan in ["pf-plan-one", "pf-plan-two"] {
-        env.set_bead_field(plan, "title", "Planned only");
-        env.set_bead_field(plan, "status", "open");
+        env.set_work_field(plan, "title", "Planned only");
+        env.set_work_field(plan, "status", "open");
     }
 
     let value = portfolio(&env);

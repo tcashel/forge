@@ -75,7 +75,7 @@ fn start_run(env: &TestEnv, run: &str) {
     let (code, response) = env.forged(&[
         "run",
         "start",
-        "--bead",
+        "--work",
         run,
         "--repo",
         &repo,
@@ -1003,7 +1003,7 @@ fn unresolved_input_reparks_but_resolution_wakes_the_next_tick() {
     let env = TestEnv::new("supervise-input-resolution");
     env.enable_dynamic_gh();
     env.seed_epic("epic-input", &[("direct-decision", &env.spec, true)]);
-    env.set_bead_field("direct-decision", "type", "decision");
+    env.set_work_field("direct-decision", "type", "decision");
     assert_eq!(env.forged(&["init"]).0, 0);
     let repo = env.repos.repo.to_string_lossy().into_owned();
     let spec = env.spec.to_string_lossy().into_owned();
@@ -1081,7 +1081,7 @@ fn unresolved_input_reparks_but_resolution_wakes_the_next_tick() {
     );
     ledger.close().expect("close");
 
-    env.set_bead_field("direct-decision", "type", "task");
+    env.set_work_field("direct-decision", "type", "task");
     let (code, resolved) = env.forged(&[
         "epic",
         "resolve",

@@ -24,9 +24,9 @@ fn reclaims(env: &TestEnv) -> Vec<Value> {
 }
 
 /// The live status of one work item.
-fn work_status(env: &TestEnv, bead: &str) -> String {
+fn work_status(env: &TestEnv, work: &str) -> String {
     let ledger = env.ledger();
-    let item = ledger.work_item(bead).expect("work item read");
+    let item = ledger.work_item(work).expect("work item read");
     ledger.close().expect("close");
     item.expect("the work item exists")
         .status
@@ -35,13 +35,13 @@ fn work_status(env: &TestEnv, bead: &str) -> String {
 }
 
 fn fabricate_resumable(env: &TestEnv, run_id: &str) {
-    // The run's bead must exist as a ledger row: the resume reads its lease
+    // The run's work must exist as a ledger row: the resume reads its lease
     // holder, and an absent work item refuses instead of defaulting open.
     env.ensure_work_item(run_id);
     let ledger = env.ledger();
     let run = forged_ledger::NewRun {
         run_id: forged_types::RunId::new(run_id).expect("run id"),
-        bead_id: run_id.to_owned(),
+        work_id: run_id.to_owned(),
         repo: env.repos.repo.to_string_lossy().into_owned(),
         base_ref: env.repos.base.clone(),
         branch: format!("forged/{run_id}"),
@@ -140,11 +140,11 @@ fn fabricate_resumable(env: &TestEnv, run_id: &str) {
 }
 
 #[test]
-fn a_fresh_bead_is_never_claimed_while_a_resumable_run_exists() {
+fn a_fresh_work_is_never_claimed_while_a_resumable_run_exists() {
     let env = TestEnv::new("forged-claim-next");
     env.forged(&["init"]);
     fabricate_resumable(&env, "bead-cn");
-    // The dead driver's lease is still on the bead, and a fresh bead sits
+    // The dead driver's lease is still on the work, and a fresh work sits
     // ready on the frontier.
     env.set_assignee("bead-cn", "forged:bead-cn:0");
     env.seed_frontier("bead-fresh");
@@ -164,7 +164,7 @@ fn a_fresh_bead_is_never_claimed_while_a_resumable_run_exists() {
     assert!(claimed["attempt_id"].as_i64().is_some());
     assert!(claimed["claim_token"].as_str().is_some());
 
-    // The fresh bead was NOT claimed: it is still open and unheld on the
+    // The fresh work was NOT claimed: it is still open and unheld on the
     // frontier, which is now a query over exactly those two facts.
     assert_eq!(
         env.assignee("bead-fresh"),
@@ -173,7 +173,7 @@ fn a_fresh_bead_is_never_claimed_while_a_resumable_run_exists() {
     );
     assert_eq!(work_status(&env, "bead-fresh"), "open");
 
-    // The reclaim was scoped: it names this run's bead and the derived
+    // The reclaim was scoped: it names this run's work and the derived
     // holder, and nothing else was reclaimed.
     let reclaimed = reclaims(&env);
     assert_eq!(
@@ -278,7 +278,7 @@ fn a_refusal_skips_that_run_and_the_scan_reaches_the_next_resumable() {
     );
     assert_eq!(claimed["packet_id"], json!("bead-next/implement/1"));
 
-    // No fresh bead was pulled while a resumable run remained.
+    // No fresh work was pulled while a resumable run remained.
     assert_eq!(
         env.assignee("bead-fresh"),
         None,
@@ -393,7 +393,7 @@ fn a_lease_already_under_our_identity_resumes_without_retaking_it() {
 }
 
 #[test]
-fn an_unheld_bead_resumes_and_retakes_the_lease() {
+fn an_unheld_work_resumes_and_retakes_the_lease() {
     // Whitelisted resume branch (ii): no lease at all — expired and already
     // reclaimed, released by an earlier reconcile pass, or never taken.
     // Nothing can overlap, so resume and (re-)take the lease.
@@ -420,15 +420,15 @@ fn an_unheld_bead_resumes_and_retakes_the_lease() {
 }
 
 #[test]
-fn a_frontier_claimed_in_progress_bead_starts_and_drives_under_one_lease_identity() {
-    // The composed path, end to end: claim-next pulls a FRESH bead, the
+fn a_frontier_claimed_in_progress_work_starts_and_drives_under_one_lease_identity() {
+    // The composed path, end to end: claim-next pulls a FRESH work, the
     // caller starts the run from it, and `run drive` resolves — which claims
-    // the same bead again. One identity throughout, so the second claim is
+    // the same work again. One identity throughout, so the second claim is
     // this driver finding its own lease, never BEAD_LEASE_HELD against
     // itself. The operator's `--holder` never reaches bd.
     let env = TestEnv::new("forged-claim-next-composed");
     env.forged(&["init"]);
-    env.seed_bead_spec(
+    env.seed_work_spec(
         "bead-composed",
         "## Context\\n\\nthe frontier claim composes with run start.",
         "- the claimed bead starts and drives",
@@ -468,7 +468,7 @@ fn a_frontier_claimed_in_progress_bead_starts_and_drives_under_one_lease_identit
     let (code, started) = env.forged(&[
         "run",
         "start",
-        "--bead",
+        "--work",
         "bead-composed",
         "--repo",
         &repo,
@@ -508,7 +508,7 @@ fn a_frontier_claimed_in_progress_bead_starts_and_drives_under_one_lease_identit
         "no work event may carry the operator holder"
     );
     // ONE identity end to end. Lease renewal rides the attempt heartbeat,
-    // and a renewal under any other identity refuses with BeadLeaseHeld and
+    // and a renewal under any other identity refuses with WorkLeaseHeld and
     // self-terminates the attempt — so reaching Done over a lease still
     // held by the frontier identity IS the proof the renewal used it.
     assert_eq!(
@@ -520,17 +520,17 @@ fn a_frontier_claimed_in_progress_bead_starts_and_drives_under_one_lease_identit
         Some("forged:frontier:0")
     );
 
-    env.seed_bead_spec(
+    env.seed_work_spec(
         "bead-foreign-claimed",
         "## Context\\n\\na foreign claim must not start.",
         "- only frontier custody is accepted",
     );
-    env.set_bead_field("bead-foreign-claimed", "status", "in_progress");
+    env.set_work_field("bead-foreign-claimed", "status", "in_progress");
     env.set_assignee("bead-foreign-claimed", "other-worker");
     let (code, refused) = env.forged(&[
         "run",
         "start",
-        "--bead",
+        "--work",
         "bead-foreign-claimed",
         "--repo",
         &repo,
@@ -549,7 +549,7 @@ fn a_frontier_claimed_in_progress_bead_starts_and_drives_under_one_lease_identit
 }
 
 #[test]
-fn a_bead_sourced_packet_resumes_and_its_lease_writes_never_move_the_revision() {
+fn a_work_sourced_packet_resumes_and_its_lease_writes_never_move_the_revision() {
     // The crash-resume path for the supported route. `claim-next` RECLAIMS
     // and then RE-CLAIMS the run's lease before it re-reads the spec. Those
     // are coordination writes, and coordination never mints a revision — so
@@ -557,7 +557,7 @@ fn a_bead_sourced_packet_resumes_and_its_lease_writes_never_move_the_revision() 
     // resume is fenced on the rendered body either way.
     let env = TestEnv::new("forged-claim-next-bead");
     env.forged(&["init"]);
-    env.seed_bead_spec(
+    env.seed_work_spec(
         "bead-resume",
         "## Context\\n\\nthe bead is the spec.",
         "- the resume survives its own lease write",
@@ -566,7 +566,7 @@ fn a_bead_sourced_packet_resumes_and_its_lease_writes_never_move_the_revision() 
     let (code, started) = env.forged(&[
         "run",
         "start",
-        "--bead",
+        "--work",
         "bead-resume",
         "--repo",
         &repo,
@@ -632,13 +632,13 @@ fn a_bead_sourced_packet_resumes_and_its_lease_writes_never_move_the_revision() 
     let row = ledger.get_packet(&packet.packet_id).expect("packet row");
     ledger.close().expect("close");
     assert_eq!(
-        env.bead_revision("bead-resume"),
+        env.work_revision("bead-resume"),
         opened_at,
         "custody and lease churn must never move the revision"
     );
     assert_eq!(
         row.spec_revision.as_deref(),
-        Some(env.bead_revision("bead-resume").as_str()),
+        Some(env.work_revision("bead-resume").as_str()),
         "the resuming claim pins the live write token: {row:?}"
     );
     assert_eq!(
@@ -661,16 +661,16 @@ fn a_bead_sourced_packet_resumes_and_its_lease_writes_never_move_the_revision() 
 /// The ledger-first resume must recover a spec edit, exactly as `run advance`
 /// does.
 ///
-/// `beads-fbt` taught `execute_packet` to re-pin an edited bead under an open
+/// `beads-fbt` taught `execute_packet` to re-pin an edited work under an open
 /// packet, because a packet pinned to bytes nobody can reach refuses every
 /// claim as drift, forever. `claim-next` is the OTHER claim path and it did
 /// not get that fix — so the recovery workflow an operator reaches for by
 /// hand was the one that could not recover.
 #[test]
-fn a_bead_edited_under_an_open_packet_is_re_pinned_by_the_resume() {
+fn a_work_edited_under_an_open_packet_is_re_pinned_by_the_resume() {
     let env = TestEnv::new("forged-claim-next-repin");
     env.forged(&["init"]);
-    env.seed_bead_spec(
+    env.seed_work_spec(
         "bead-repin",
         "## Context\\n\\nthe bead is the spec.",
         "- the resume re-pins an edited spec",
@@ -679,7 +679,7 @@ fn a_bead_edited_under_an_open_packet_is_re_pinned_by_the_resume() {
     let (code, started) = env.forged(&[
         "run",
         "start",
-        "--bead",
+        "--work",
         "bead-repin",
         "--repo",
         &repo,
@@ -727,8 +727,8 @@ fn a_bead_edited_under_an_open_packet_is_re_pinned_by_the_resume() {
     ledger.close().expect("close");
 
     // The operator revises the spec while the packet sits open and unclaimed
-    // — the whole reason the bead is the source of truth.
-    env.set_bead_field("bead-repin", "acceptance", "- revised acceptance");
+    // — the whole reason the work is the source of truth.
+    env.set_work_field("bead-repin", "acceptance", "- revised acceptance");
 
     let (code, resumed) = env.forged(&[
         "claim-next",

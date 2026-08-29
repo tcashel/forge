@@ -473,11 +473,11 @@ mod tests {
     use super::*;
     use crate::{NewPacket, NewRun, SpecFence};
 
-    fn claim_named(ledger: &Ledger, run_id: &str, bead_id: &str) -> i64 {
+    fn claim_named(ledger: &Ledger, run_id: &str, work_id: &str) -> i64 {
         ledger
             .create_run(NewRun {
                 run_id: RunId::new(run_id).expect("run id"),
-                bead_id: bead_id.to_owned(),
+                work_id: work_id.to_owned(),
                 repo: "/repo".to_owned(),
                 base_ref: "main".to_owned(),
                 branch: format!("forged/{run_id}"),

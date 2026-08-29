@@ -5,9 +5,9 @@ use forged_ledger::{InventoryUsageSelection, Ledger, NewRun, NewRunDefinition};
 use forged_types::{
     canonical_json_bytes, repository_label, work_display_title, ErrorCode, ExecutionPackageV1,
     ExecutionPolicyV1, HostPolicyV1, ProfileDefinitionV1, ProfileRef, ProtocolRef,
-    ResolvedRosterV1, RosterRef, RunId, WorkIdentityBeadV1, WorkIdentityContextV1,
-    WorkIdentityRepositoryV1, WorkIdentitySource, WorkIdentitySubjectKind, WorkIdentitySubjectV1,
-    WorkIdentityV1, EXECUTION_PACKAGE_SCHEMA_V1, PROFILE_SCHEMA_V1, RESOLVED_ROSTER_SCHEMA_V1,
+    ResolvedRosterV1, RosterRef, RunId, WorkIdentityContextV1, WorkIdentityRepositoryV1,
+    WorkIdentitySource, WorkIdentitySubjectKind, WorkIdentitySubjectV1, WorkIdentityV1,
+    WorkIdentityWorkV1, EXECUTION_PACKAGE_SCHEMA_V1, PROFILE_SCHEMA_V1, RESOLVED_ROSTER_SCHEMA_V1,
     WORK_IDENTITY_SCHEMA_V1,
 };
 use serde::Serialize;
@@ -81,7 +81,7 @@ fn definition() -> NewRunDefinition {
 fn identity(
     kind: WorkIdentitySubjectKind,
     subject_id: &str,
-    bead_id: &str,
+    work_id: &str,
     title: Option<&str>,
     captured_at: &str,
     source: WorkIdentitySource,
@@ -96,8 +96,8 @@ fn identity(
             kind,
             id: subject_id.to_owned(),
         },
-        bead: WorkIdentityBeadV1 {
-            id: bead_id.to_owned(),
+        work: WorkIdentityWorkV1 {
+            id: work_id.to_owned(),
             title: title.map(str::to_owned),
             revision: Some("opaque-revision".to_owned()),
         },
@@ -117,7 +117,7 @@ fn low_level_run_creation_always_gets_atomic_fallback_identity() {
     ledger
         .create_run(NewRun {
             run_id: RunId::new("legacy-run").expect("run id"),
-            bead_id: "bead-legacy".to_owned(),
+            work_id: "bead-legacy".to_owned(),
             repo: "relative/legacy".to_owned(),
             base_ref: "main".to_owned(),
             branch: "forged/legacy-run".to_owned(),
@@ -150,7 +150,7 @@ fn complete_run_bundle_is_atomic_and_exactly_replayable() {
     let ledger = Ledger::open(&dir.path().join("state.db")).expect("ledger");
     let new_run = NewRun {
         run_id: RunId::new("run-identity").expect("run id"),
-        bead_id: "bead-identity".to_owned(),
+        work_id: "bead-identity".to_owned(),
         repo: "/Users/tripp/repositories/forge".to_owned(),
         base_ref: "main".to_owned(),
         branch: "forged/run-identity".to_owned(),
@@ -214,7 +214,7 @@ fn complete_run_bundle_is_atomic_and_exactly_replayable() {
         .create_run_with_identity(
             NewRun {
                 run_id: RunId::new("run-conflict").expect("run id"),
-                bead_id: "bead-conflict".to_owned(),
+                work_id: "bead-conflict".to_owned(),
                 repo: "/Users/tripp/repositories/forge".to_owned(),
                 base_ref: "main".to_owned(),
                 branch: "forged/run-conflict".to_owned(),
@@ -441,8 +441,8 @@ fn migration_015_uses_only_durable_events_and_child_epic_context() {
         .get_work_identity(WorkIdentitySubjectKind::Epic, "epic-one")
         .expect("read")
         .expect("epic identity");
-    assert_eq!(epic.bead.title.as_deref(), Some("Epic One"));
-    assert_eq!(epic.bead.revision.as_deref(), Some("-42"));
+    assert_eq!(epic.work.title.as_deref(), Some("Epic One"));
+    assert_eq!(epic.work.revision.as_deref(), Some("-42"));
     assert_eq!(epic.source, WorkIdentitySource::Durable);
     let child = ledger
         .get_work_identity(WorkIdentitySubjectKind::Run, "child-run")
@@ -475,7 +475,7 @@ fn migration_015_uses_only_durable_events_and_child_epic_context() {
         .get_work_identity(WorkIdentitySubjectKind::Run, "fallback-run")
         .expect("read")
         .expect("fallback");
-    assert_eq!(fallback.bead.title, None, "migration invents no title");
+    assert_eq!(fallback.work.title, None, "migration invents no title");
     assert_eq!(fallback.source, WorkIdentitySource::LegacyFallback);
     assert_eq!(fallback.display_title, "fallback-run [repositories/forge]");
 }

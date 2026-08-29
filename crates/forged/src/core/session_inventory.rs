@@ -1,7 +1,7 @@
 //! Pure durable projection for `forged.provider-session-inventory/1`.
 //!
 //! Its only read is the dedicated transaction-consistent ledger snapshot.
-//! No host, provider, process, filesystem, Beads, or GitHub boundary is used.
+//! No host, provider, process, filesystem, work-store, or GitHub boundary is used.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -1107,8 +1107,8 @@ mod tests {
     fn owned_snapshot() -> ProviderSessionInventorySnapshot {
         use forged_ledger::{AttemptRow, PacketRow, RunRow, RunState};
         use forged_types::{
-            Deliverable, ProviderHints, Sandbox, Stage, StageContract, WorkIdentityBeadV1,
-            WorkIdentityRepositoryV1, WorkIdentitySource, WorkIdentitySubjectV1, WorkIdentityV1,
+            Deliverable, ProviderHints, Sandbox, Stage, StageContract, WorkIdentityRepositoryV1,
+            WorkIdentitySource, WorkIdentitySubjectV1, WorkIdentityV1, WorkIdentityWorkV1,
             WORK_IDENTITY_SCHEMA_V1,
         };
 
@@ -1116,7 +1116,7 @@ mod tests {
             schema: "forged.packet/1".to_owned(),
             packet_id: "run-a/implement/1".to_owned(),
             run_id: "run-a".to_owned(),
-            bead_id: "bead-a".to_owned(),
+            work_id: "bead-a".to_owned(),
             stage: Stage::Implement,
             execution: None,
             lane_seq: None,
@@ -1149,7 +1149,7 @@ mod tests {
                 kind: WorkIdentitySubjectKind::Run,
                 id: "run-a".to_owned(),
             },
-            bead: WorkIdentityBeadV1 {
+            work: WorkIdentityWorkV1 {
                 id: "bead-a".to_owned(),
                 title: Some("Same title".to_owned()),
                 revision: Some("revision-a".to_owned()),
@@ -1195,7 +1195,7 @@ mod tests {
             }],
             runs: vec![RunRow {
                 run_id: "run-a".to_owned(),
-                bead_id: "bead-a".to_owned(),
+                work_id: "bead-a".to_owned(),
                 repo: "/tmp/repo".to_owned(),
                 base_ref: "main".to_owned(),
                 branch: "work/a".to_owned(),

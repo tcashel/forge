@@ -62,7 +62,7 @@ pub use herdr_projection::{
 };
 pub use ids::{claude_session_id, new_claim_token, RunId, RunIdError};
 pub use packet::{
-    AcceptedRisk, Deliverable, Finding, GateRow, NativeBeadSpecV1, Outcome, PacketColumns,
+    AcceptedRisk, Deliverable, Finding, GateRow, NativeWorkSpecV1, Outcome, PacketColumns,
     PacketResult, PlanTraceabilityV1, ProviderHints, Sandbox, Severity, SpecAmendment, SpecRef,
     Stage, StageContract, Verdict, WorkPacket,
 };
@@ -89,8 +89,8 @@ pub use work_history::{
 };
 pub use work_identity::{
     normalize_repository_path, repository_label, resolve_work_title, work_display_title,
-    WorkIdentityBeadV1, WorkIdentityContextV1, WorkIdentityRepositoryV1, WorkIdentitySource,
-    WorkIdentitySubjectKind, WorkIdentitySubjectV1, WorkIdentityV1, WorkIdentityValidationError,
+    WorkIdentityContextV1, WorkIdentityRepositoryV1, WorkIdentitySource, WorkIdentitySubjectKind,
+    WorkIdentitySubjectV1, WorkIdentityV1, WorkIdentityValidationError, WorkIdentityWorkV1,
     WorkTitleSource, WorkTitleV1, WORK_IDENTITY_SCHEMA_V1,
 };
 pub use work_map::{

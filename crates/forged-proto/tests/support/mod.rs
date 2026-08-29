@@ -358,7 +358,7 @@ impl ViewBuilder {
         RunView {
             run: RunRow {
                 run_id: self.run_id.clone(),
-                bead_id: "bead-1".to_owned(),
+                work_id: "bead-1".to_owned(),
                 repo: "octo/demo".to_owned(),
                 base_ref: "main".to_owned(),
                 branch: "feat/x".to_owned(),
@@ -458,10 +458,10 @@ pub enum PortCall {
         /// Whether this call returned `KillOutcome::Killed`.
         returned_killed: bool,
     },
-    /// `reclaim_lease(bead, holder, older_than_s)`.
+    /// `reclaim_lease(work, holder, older_than_s)`.
     ReclaimLease {
-        /// The bead argument.
-        bead: String,
+        /// The work argument.
+        work: String,
         /// The holder argument, verbatim.
         holder: String,
         /// The grace window.
@@ -610,7 +610,7 @@ impl ReconcilePorts for FakePorts {
 
     async fn reclaim_lease(
         &self,
-        bead: &str,
+        work: &str,
         holder: &str,
         older_than_s: u64,
     ) -> Result<LeaseReclaim, PortError> {
@@ -635,7 +635,7 @@ impl ReconcilePorts for FakePorts {
                 }
             });
         self.push(PortCall::ReclaimLease {
-            bead: bead.to_owned(),
+            work: work.to_owned(),
             holder: holder.to_owned(),
             older_than_s,
         });

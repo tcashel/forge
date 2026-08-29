@@ -1091,8 +1091,8 @@ impl ForgedServer {
         self.call("definition_validate", args.0).await
     }
 
-    /// Start a run for a bead.
-    #[tool(name = "run_start", description = "Create a run for a bead.")]
+    /// Start a run for a work item.
+    #[tool(name = "run_start", description = "Create a run for a work item.")]
     pub async fn run_start(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
         self.call("run_start", args.0).await
     }
@@ -1167,7 +1167,7 @@ impl ForgedServer {
     }
 
     /// Freeze an epic inventory and child execution defaults.
-    #[tool(name = "epic_start", description = "Start a durable Beads epic run.")]
+    #[tool(name = "epic_start", description = "Start a durable work epic run.")]
     pub async fn epic_start(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
         self.call("epic_start", args.0).await
     }
@@ -1348,7 +1348,7 @@ impl ForgedServer {
     #[tool(
         name = "session_stop",
         description = "Revoke and stop ONE provider attempt: confirmed death, terminal \
-                       `stopped`, the bead's work lease left where it is. Returns attemptId, \
+                       `stopped`, the work item's lease left where it is. Returns attemptId, \
                        runId, state and the reconcile report."
     )]
     pub async fn session_stop(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
@@ -1358,7 +1358,7 @@ impl ForgedServer {
     /// The stateless resume verb.
     #[tool(
         name = "claim_next",
-        description = "Resume a ledger run or claim the next ready bead."
+        description = "Resume a ledger run or claim the next ready work item."
     )]
     pub async fn claim_next(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
         self.call("claim_next", args.0).await
@@ -1540,7 +1540,7 @@ impl ForgedServer {
     /// Bounded authority-preserving work graph for navigation.
     #[tool(
         name = "work_map",
-        description = "Project a bounded graph of current Beads plans and distinct durable run/epic executions. Accepts operator, exact repository, or exact epic scope; canonical queue/source filters; an optional half-open history window; maxNodes up to 500; and a complete forged.work-ref/1 focus.",
+        description = "Project a bounded graph of current work plans and distinct durable run/epic executions. Accepts operator, exact repository, or exact epic scope; canonical queue/source filters; an optional half-open history window; maxNodes up to 500; and a complete forged.work-ref/1 focus.",
         meta = work_map_tool_meta()
     )]
     pub async fn work_map(&self, args: Parameters<WorkMapArgs>) -> CallToolResult {

@@ -146,7 +146,7 @@ fn fixture_socket_path(tag: &str) -> std::path::PathBuf {
 }
 
 fn start_run(env: &TestEnv, run: &str) {
-    env.seed_bead_spec(
+    env.seed_work_spec(
         run,
         "Recover the submit.",
         "The replacement controller starts.",
@@ -157,7 +157,7 @@ fn start_run(env: &TestEnv, run: &str) {
     let (code, started) = env.forged(&[
         "run",
         "start",
-        "--bead",
+        "--work",
         run,
         "--repo",
         &repo,
@@ -178,12 +178,12 @@ fn seed_orphaned_reservation(env: &TestEnv, run: &str) {
         subject_kind: AdmissionSubjectKind::Run,
         subject_id: run.to_owned(),
         control_revision: 0,
-        bead_id: run.to_owned(),
-        bead_revision: Some("fixture-revision".to_owned()),
-        bead_status: Some("open".to_owned()),
+        work_id: run.to_owned(),
+        work_revision: Some("fixture-revision".to_owned()),
+        work_status: Some("open".to_owned()),
         priority: Some(1),
         repository: repository.clone(),
-        bead_repository: Some(repository.clone()),
+        work_repository: Some(repository.clone()),
         input_error: None,
         desired_wake_at: None,
         provider: Some("claude".to_owned()),
