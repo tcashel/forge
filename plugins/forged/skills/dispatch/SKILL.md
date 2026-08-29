@@ -123,7 +123,11 @@ forged session read --attempt "$ATTEMPT_ID" --lines 120
 
 Explain the terminal contract: a reviewed draft PR or an explicit
 input-required stop. A slice has no generic `resolve` command; report the exact
-blocker and typed remedy instead of blindly resubmitting or replacing the run.
+blocker and typed remedy instead of blindly resubmitting. After the requested
+decision or an in-place Work amendment, `forged run retry --id "$RUN_ID"`
+mints and submits a fresh successor on that same Work. Use `work supersede`
+only when a new Work item must replace the specification; never reconstruct the
+old stop/create/supersede/start/submit dance for a same-Work retry.
 
 ## Never
 

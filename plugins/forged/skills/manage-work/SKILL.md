@@ -35,6 +35,7 @@ execution, or an existing-work control become a new submission.
 | Express intended priority for an existing item | Guarded notes update and readback | Records intent only; scheduling priority is unchanged |
 | Pause or resume an existing epic | One typed epic control and readback | That already-started epic only |
 | Cancel an existing slice run | Confirm, then one `run stop` with `cancelled` | That run's terminal transition only |
+| Re-execute an eligible terminal slice after the world changed or its Work spec was amended in place | One `run retry` and readback | One fresh successor run on the same Work |
 | Settle a run whose `run stop` refuses for missing durable driver identity | Confirm the evidence gap, then one `run adjudicate-settlement` | That run's terminal transition only |
 | Acknowledge, resolve, or reopen attention | One occurrence-fenced attention control and readback | Custody only |
 | Inspect provider work | Agent Sessions, only when explicitly requested | Diagnostic only |
@@ -328,6 +329,27 @@ source work item complete. Do not substitute attempt-level stop or several
 child mutations. If `run stop` returns `ADJUDICATION_REQUIRED` because durable
 driver identity is missing, route only that exact refusal to settlement
 adjudication below.
+
+## Retry a terminal slice
+
+Use retry when the Work identity is unchanged: transient world state changed,
+or an input-required decision amended the same Work revision in place. Read the
+terminal run, current Work, and advertised action, then invoke exactly once:
+
+```bash
+forged run retry --id "$RUN_ID" --idempotency-key "$OPERATION_KEY"
+forged work detail --subject-kind run --subject-id "$SUCCESSOR_RUN_ID"
+```
+
+The response's `runId` is the fresh flat successor and `retryOf` is the actual
+terminal run. Retry compiles live profile/roster config, reads the Work's
+current revision, mints fresh packets and a fresh default restart budget, and
+submits through the existing supervisor path. It never un-settles the source.
+
+Use `work supersede` only when a new Work item must replace the specification.
+Do not recreate the old five-verb stop/create/supersede/start/submit dance for
+a same-Work retry. Landed runs, superseded runs or Work, and closed Work follow
+the exact `forged.remedy/1` refusal instead.
 
 ## Adjudicate settlement of an unfenceable run
 

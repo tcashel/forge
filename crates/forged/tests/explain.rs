@@ -134,7 +134,7 @@ fn an_exact_work_item_outranks_its_same_named_run_and_names_that_run() {
 }
 
 #[test]
-fn a_stopped_run_uses_its_health_and_supersede_action() {
+fn a_stopped_run_uses_its_health_and_retry_first_action() {
     let env = TestEnv::new("forged-explain-run");
     assert_eq!(env.forged(&["init"]).0, 0);
     fabricate_run(&env, "explain-stopped");
@@ -155,7 +155,7 @@ fn a_stopped_run_uses_its_health_and_supersede_action() {
     assert_eq!(code, 0, "explain run: {response}");
     assert_eq!(result(&response)["kind"], json!("run"));
     assert_eq!(result(&response)["how"]["verdict"], json!("terminal"));
-    assert_next(&response, "work supersede");
+    assert_next(&response, "run retry");
 }
 
 #[test]

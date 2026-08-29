@@ -2037,6 +2037,23 @@ impl Ledger {
         })
     }
 
+    /// Work items whose `supersedes` provenance points at this item.
+    pub fn work_superseders(&self, work_id: &str) -> Result<Vec<String>, LedgerError> {
+        let work_id = work_id.to_owned();
+        self.submit(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT from_id FROM work_deps \
+                 WHERE to_id = ?1 AND kind = 'supersedes' ORDER BY from_id",
+            )?;
+            let rows = stmt.query_map([&work_id], |row| row.get::<_, String>(0))?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+    }
+
     /// Children of an epic: items carrying a `parent-child` edge to it,
     /// id-ordered.
     pub fn work_epic_children(&self, epic_id: &str) -> Result<Vec<WorkItemSnapshot>, LedgerError> {

@@ -1269,6 +1269,15 @@ impl ForgedServer {
         self.call("run_start", args.0).await
     }
 
+    /// Re-execute a terminal run on the same Work's current revision.
+    #[tool(
+        name = "run_retry",
+        description = "Mint and submit a fresh successor for a terminal non-landed run. Uses current Work revision and live execution config; the successor receives a fresh restart budget."
+    )]
+    pub async fn run_retry(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
+        self.call("run_retry", args.0).await
+    }
+
     /// One project → advance → honor iteration.
     #[tool(name = "run_advance", description = "Advance a run by one action.")]
     pub async fn run_advance(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {

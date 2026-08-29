@@ -83,13 +83,24 @@ fn every_seam_member_is_consumable() {
     );
     let run = run_row.run_id.clone();
     ledger.get_run(&run).expect("get_run");
+    let stopped_run = ledger
+        .create_run(NewRun {
+            run_id: RunId::new("run-seam-stopped").expect("valid"),
+            work_id: "bead-stopped".to_owned(),
+            repo: "repo".to_owned(),
+            base_ref: "main".to_owned(),
+            branch: "feat/seam-stopped".to_owned(),
+        })
+        .expect("create stopped seam run")
+        .run_id;
     ledger
-        .set_run_state(&run, RunState::Stopped, Some("pause".to_owned()))
+        .set_run_state(&stopped_run, RunState::Stopped, Some("pause".to_owned()))
         .expect("set_run_state");
-    ledger
-        .set_run_state(&run, RunState::Active, None)
-        .expect("set_run_state back");
-    assert_eq!(ledger.list_runs().expect("list_runs").len(), 1);
+    let reactivation = ledger
+        .set_run_state(&stopped_run, RunState::Active, None)
+        .expect_err("set_run_state refuses reactivation");
+    assert_eq!(reactivation.code(), ErrorCode::InvalidRequest);
+    assert_eq!(ledger.list_runs().expect("list_runs").len(), 2);
 
     // Packets.
     let packet_id = ledger

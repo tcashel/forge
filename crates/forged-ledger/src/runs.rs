@@ -1064,15 +1064,42 @@ impl Ledger {
         self.submit(move |conn| list_runs_tx(conn))
     }
 
-    /// Transition a run between `active` and `stopped`.
+    /// Bounded candidates for one flat retry chain. Callers still validate
+    /// the numeric suffix and work identity; this read only bounds discovery.
+    pub fn retry_chain_runs(&self, root: &str, limit: usize) -> Result<Vec<RunRow>, LedgerError> {
+        if limit == 0 {
+            return Err(refused(
+                ErrorCode::InvalidRequest,
+                "retry chain limit must be positive",
+            ));
+        }
+        let root = root.to_owned();
+        self.submit(move |conn| {
+            let pattern = format!("{root}-r*");
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {RUN_COLUMNS} FROM runs \
+                 WHERE run_id = ?1 OR run_id GLOB ?2 \
+                 ORDER BY created_at, rowid LIMIT ?3"
+            ))?;
+            let rows = stmt.query_map(
+                rusqlite::params![root, pattern, i64::try_from(limit).unwrap_or(i64::MAX)],
+                run_row,
+            )?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+    }
+
+    /// Stop a run without settling it.
     ///
-    /// `Stopped` REQUIRES a reason (`None` refuses with `InvalidRequest`);
-    /// `Active` forbids one and CLEARS `stop_reason` to NULL. Re-setting the
-    /// current state is an idempotent `Ok(())` that writes nothing and
-    /// appends no event. Stopping never cascades to live attempts — the
-    /// revoking saga is the only path that moves an attempt out of
-    /// `running`. Every effective change appends a `run.state` event in the
-    /// same transaction.
+    /// `Stopped` requires a reason. `Active` is refused: terminal truth is
+    /// append-only and re-execution mints a successor run. Re-stopping is an
+    /// idempotent `Ok(())` that writes nothing and preserves the first reason.
+    /// Stopping never cascades to live attempts — the revoking saga is the
+    /// only path that moves an attempt out of `running`.
     pub fn set_run_state(
         &self,
         run_id: &str,
@@ -1088,13 +1115,13 @@ impl Ledger {
                         "stopping a run requires a reason",
                     ));
                 }
-                (RunState::Active, Some(_)) => {
+                (RunState::Active, _) => {
                     return Err(refused(
                         ErrorCode::InvalidRequest,
-                        "reactivating a run takes no reason",
+                        "set_run_state only stops runs; mint a successor to re-execute",
                     ));
                 }
-                _ => {}
+                (RunState::Stopped, Some(_)) => {}
             }
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let current = get_run_tx(&tx, &run_id)?;

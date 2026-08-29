@@ -14,7 +14,7 @@ use crate::adapters::ports::ForgedPorts;
 use crate::config::now_iso;
 use crate::core::{
     default_key, derive_key, err_response, fenced, lease_identity, ok_response, on_ledger,
-    param_opt_str, param_str, remedy_response, run_holder, work_supersede_action, Ctx, Failure,
+    param_opt_str, param_str, remedy_response, run_holder, Ctx, Failure,
 };
 
 /// One validated whole-run settlement request.
@@ -597,7 +597,7 @@ struct VerifiedAdjudication {
 
 struct VerificationFailure {
     failure: Failure,
-    supersede_work_id: Option<String>,
+    stopped_remedy: Option<(String, String)>,
 }
 
 impl VerificationFailure {
@@ -610,7 +610,7 @@ impl VerificationFailure {
                     run.run_id, run.terminal_outcome
                 ),
             ),
-            supersede_work_id: Some(run.work_id.clone()),
+            stopped_remedy: Some((run.run_id.clone(), run.work_id.clone())),
         }
     }
 
@@ -623,7 +623,7 @@ impl From<Failure> for VerificationFailure {
     fn from(failure: Failure) -> Self {
         Self {
             failure,
-            supersede_work_id: None,
+            stopped_remedy: None,
         }
     }
 }
@@ -1150,15 +1150,20 @@ pub async fn run_adjudicate_settlement(ctx: &Ctx, req: &mut OperationRequest) ->
     if let Err(error) = verify_adjudicable(ctx, &run_id, &adjudication).await {
         let VerificationFailure {
             failure,
-            supersede_work_id,
+            stopped_remedy,
         } = error;
-        return supersede_work_id.map_or_else(
+        return stopped_remedy.map_or_else(
             || err_response(&req.idempotency_key, &failure),
-            |work_id| {
+            |(run_id, work_id)| {
                 remedy_response(
                     &req.idempotency_key,
                     &failure,
-                    forged_types::RemedyV1::from(work_supersede_action(&work_id)),
+                    forged_types::RemedyV1::from(super::ops::retry_action(
+                        &run_id,
+                        format!(
+                            "retry the current spec; use work supersede on {work_id} when the spec must change"
+                        ),
+                    )),
                 )
             },
         );

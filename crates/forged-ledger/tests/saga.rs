@@ -525,7 +525,7 @@ fn set_run_state_rules_hold() {
     assert_eq!(err.code(), ErrorCode::InvalidRequest);
     let err = ledger
         .set_run_state(&run, RunState::Active, Some("why".to_owned()))
-        .expect_err("active takes no reason");
+        .expect_err("reactivation is unavailable");
     assert_eq!(err.code(), ErrorCode::InvalidRequest);
 
     ledger
@@ -559,20 +559,22 @@ fn set_run_state_rules_hold() {
         json!({"runId": run, "old": "active", "new": "stopped", "reason": "budget"})
     );
 
-    // Reactivation clears stop_reason and appends a second run.state event.
-    ledger
+    // Reactivation is deliberately unavailable; the stopped row and its one
+    // transition remain append-only truth.
+    let err = ledger
         .set_run_state(&run, RunState::Active, None)
-        .expect("reactivate");
+        .expect_err("reactivation is unavailable");
+    assert_eq!(err.code(), ErrorCode::InvalidRequest);
     let row = ledger.get_run(&run).expect("get");
-    assert_eq!(row.state, RunState::Active);
-    assert_eq!(row.stop_reason, None);
+    assert_eq!(row.state, RunState::Stopped);
+    assert_eq!(row.stop_reason.as_deref(), Some("budget"));
     let run_events: Vec<_> = ledger
         .list_events(Some(&run), 0, 100)
         .expect("events")
         .into_iter()
         .filter(|e| e.kind == "run.state")
         .collect();
-    assert_eq!(run_events.len(), 2);
+    assert_eq!(run_events.len(), 1);
     ledger.close().expect("close");
 }
 

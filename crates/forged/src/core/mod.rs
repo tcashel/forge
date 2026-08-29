@@ -1155,8 +1155,10 @@ where
         class,
         req,
         FenceAdmission::Ordinary(assert_token),
-        None,
-        effect,
+        move |operation_id| async move {
+            let result = effect(operation_id).await?;
+            Ok((result, None))
+        },
     )
     .await
 }
@@ -1182,8 +1184,10 @@ where
         class,
         req,
         FenceAdmission::Machine(generation),
-        None,
-        effect,
+        move |operation_id| async move {
+            let result = effect(operation_id).await?;
+            Ok((result, None))
+        },
     )
     .await
 }
@@ -1209,8 +1213,38 @@ where
         class,
         req,
         FenceAdmission::Ordinary(None),
-        Some(authorization),
-        effect,
+        move |operation_id| async move {
+            let result = effect(operation_id).await?;
+            Ok((result, Some(authorization)))
+        },
+    )
+    .await
+}
+
+/// Fence an effect whose successful execution determines its desired-work
+/// authorization. The operation response and fresh restart budget become
+/// durable in the same ledger transaction.
+pub(crate) async fn fenced_dynamic_authorizing_desired<F, Fut>(
+    ctx: &Ctx,
+    name: &str,
+    class: EffectClass,
+    req: &OperationRequest,
+    effect: F,
+) -> OperationResponse
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = Result<(Value, DesiredAuthorization), Failure>>,
+{
+    fenced_inner(
+        ctx,
+        name,
+        class,
+        req,
+        FenceAdmission::Ordinary(None),
+        move |operation_id| async move {
+            let (result, authorization) = effect(operation_id).await?;
+            Ok((result, Some(authorization)))
+        },
     )
     .await
 }
@@ -1221,12 +1255,11 @@ async fn fenced_inner<F, Fut>(
     class: EffectClass,
     req: &OperationRequest,
     admission: FenceAdmission<'_>,
-    desired_authorization: Option<DesiredAuthorization>,
     effect: F,
 ) -> OperationResponse
 where
     F: FnOnce(String) -> Fut,
-    Fut: std::future::Future<Output = CoreResult>,
+    Fut: std::future::Future<Output = Result<(Value, Option<DesiredAuthorization>), Failure>>,
 {
     let key = req.idempotency_key.clone();
     let request = req.clone();
@@ -1326,7 +1359,7 @@ where
     }
 
     match effect(operation_id.clone()).await {
-        Ok(result) => {
+        Ok((result, desired_authorization)) => {
             let resp = ok_response(&operation_id, false, result);
             if desired_authorization.is_some() {
                 failpoint::hit("submit.desired.before");
@@ -1444,6 +1477,7 @@ pub async fn dispatch(ctx: &Ctx, name: &str, mut req: OperationRequest) -> Opera
         "init" => ops::init(ctx, &mut req).await,
         "definition_validate" => ops::definition_validate(ctx, &req).await,
         "run_start" => ops::run_start(ctx, &mut req).await,
+        "run_retry" => ops::run_retry(ctx, &mut req).await,
         "run_advance" => drive::run_advance(ctx, &req).await,
         "run_drive" => drive::run_drive(ctx, &req).await,
         "run_submit" => handoff::run_submit(ctx, &mut req).await,

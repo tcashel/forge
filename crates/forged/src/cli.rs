@@ -205,6 +205,8 @@ pub struct ServiceStopArgs {
 pub enum RunCmd {
     /// Create a run for a work item.
     Start(RunStartArgs),
+    /// Re-execute a terminal run on its current Work revision.
+    Retry(RunRetryArgs),
     /// One project → advance → honor iteration.
     Advance(RunScoped),
     /// Loop advance until the run stops.
@@ -586,6 +588,27 @@ pub struct RunStartArgs {
     #[arg(long)]
     pub profile: Option<String>,
     /// Named model roster; defaults from config.
+    #[arg(long)]
+    pub roster: Option<String>,
+    /// Override the derived idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+/// `run retry` flags. A fresh successor desired row also receives a fresh
+/// default restart budget; retry never resets budgets on the terminal run.
+#[derive(Debug, Args)]
+pub struct RunRetryArgs {
+    /// Terminal run to retry.
+    #[arg(long)]
+    pub id: String,
+    /// Override the flat `<root>-r<N>` successor id.
+    #[arg(long)]
+    pub run_id: Option<String>,
+    /// Named assurance profile; defaults from current config.
+    #[arg(long)]
+    pub profile: Option<String>,
+    /// Named model roster; defaults from current config.
     #[arg(long)]
     pub roster: Option<String>,
     /// Override the derived idempotency key.
@@ -1816,6 +1839,7 @@ pub fn command_name(command: &Command) -> &'static str {
         },
         Command::Run { command } => match command {
             RunCmd::Start(_) => "run_start",
+            RunCmd::Retry(_) => "run_retry",
             RunCmd::Advance(_) => "run_advance",
             RunCmd::Drive(_) => "run_drive",
             RunCmd::Submit(_) => "run_submit",
@@ -1942,6 +1966,19 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
                         "repo": a.repo,
                         "spec": a.spec,
                         "baseRef": a.base_ref,
+                        "profile": a.profile,
+                        "roster": a.roster,
+                    }),
+                ),
+            ),
+            RunCmd::Retry(a) => (
+                "run_retry",
+                request(
+                    a.idempotency_key,
+                    Some(a.id.clone()),
+                    json!({
+                        "id": a.id,
+                        "runId": a.run_id,
                         "profile": a.profile,
                         "roster": a.roster,
                     }),
