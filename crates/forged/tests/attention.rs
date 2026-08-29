@@ -41,7 +41,7 @@ fn attention(value: &Value, run: &str, condition: &str) -> Option<Value> {
 }
 
 #[test]
-fn attention_is_identical_across_surfaces_and_controls_are_occurrence_fenced() {
+fn attention_identity_matches_across_surfaces_and_controls_are_occurrence_fenced() {
     let env = TestEnv::new("forged-attention-controls");
     env.forged(&["init"]);
     fabricate_run(&env, "attention-run");
@@ -69,6 +69,24 @@ fn attention_is_identical_across_surfaces_and_controls_are_occurrence_fenced() {
     );
     let attention_id = item["attentionId"].as_str().expect("attention id");
     let occurrence_id = item["occurrenceId"].as_str().expect("occurrence id");
+
+    let (code, detail) = env.forged(&[
+        "work",
+        "detail",
+        "--subject-kind",
+        "run",
+        "--subject-id",
+        "attention-run",
+    ]);
+    assert_eq!(code, 0, "{detail}");
+    let mut expected_observation = item.clone();
+    expected_observation["detail"] = json!("result evidence is quarantined");
+    assert_eq!(
+        detail["result"]["attention"],
+        json!([expected_observation]),
+        "Work Detail must preserve the observation projection's exact bytes"
+    );
+    assert_eq!(detail["result"]["attentionTotal"], json!(1));
 
     let (code, listed) = env.forged(&["work", "list"]);
     assert_eq!(code, 0, "{listed}");
