@@ -183,6 +183,17 @@ fn run_status_projects_live_position_and_latest_gate_outcome() {
     ledger
         .complete_packet(&packet_id, &claim.claim_token, &result)
         .expect("complete implement packet");
+    ledger.close().expect("close ledger");
+
+    let (code, status) = env.forged(&["run", "status", "--run", run_id]);
+    assert_eq!(code, 0, "fallback-gate run status: {status}");
+    assert_eq!(
+        status["result"]["run"]["gateState"],
+        json!("failed"),
+        "mid-migration runs fall back to the Implement outcome: {status}"
+    );
+
+    let ledger = env.ledger();
     settle_machine_operation(
         &ledger,
         run_id,
@@ -220,6 +231,111 @@ fn run_status_projects_live_position_and_latest_gate_outcome() {
             .iter()
             .any(|operation| operation["name"] == json!("gate")),
         "gate settlement remains independently visible: {status}"
+    );
+
+    let ledger = env.ledger();
+    forged_proto::record(
+        &ledger,
+        run_id,
+        forged_proto::ProtoEvent::Gate {
+            phase: forged_proto::GatePhase::Regate,
+            seq: 1,
+            passed: true,
+            rows: Vec::new(),
+        },
+    )
+    .expect("record newer passing gate");
+    ledger.close().expect("close ledger");
+
+    let (code, status) = env.forged(&["run", "status", "--run", run_id]);
+    assert_eq!(code, 0, "newer-gate run status: {status}");
+    assert_eq!(
+        status["result"]["run"]["gateState"],
+        json!("passed"),
+        "the newest proto.gate event must override the Implement outcome: {status}"
+    );
+}
+
+#[test]
+fn adaptive_run_status_prefers_semantic_stage_in_every_packet_position() {
+    let env = TestEnv::new("forged-run-status-adaptive-stage");
+    env.forged(&["init"]);
+    let run_id = "adaptive-stage";
+    env.seed_frontier(run_id);
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let spec = env.spec.to_string_lossy().into_owned();
+    let (code, started) = env.forged(&[
+        "run",
+        "start",
+        "--work",
+        run_id,
+        "--repo",
+        &repo,
+        "--spec",
+        &spec,
+        "--base-ref",
+        "main",
+    ]);
+    assert_eq!(code, 0, "start adaptive run: {started}");
+
+    let (code, resolved) = env.forged(&["run", "advance", "--run", run_id]);
+    assert_eq!(code, 0, "resolve adaptive run: {resolved}");
+    assert_eq!(resolved["result"]["action"]["runMachine"], json!("resolve"));
+
+    let (code, status) = env.forged(&["run", "status", "--run", run_id]);
+    assert_eq!(code, 0, "open-packet adaptive status: {status}");
+    assert_eq!(status["result"]["run"]["protocolMode"], json!("adaptive"));
+    assert_eq!(
+        status["result"]["run"]["currentStage"],
+        json!("implementation")
+    );
+
+    let (code, opened) = env.forged(&["run", "advance", "--run", run_id]);
+    assert_eq!(code, 0, "open adaptive packet: {opened}");
+
+    let (code, status) = env.forged(&["run", "status", "--run", run_id]);
+    assert_eq!(code, 0, "await-packet adaptive status: {status}");
+    assert_eq!(
+        status["result"]["run"]["currentStage"],
+        json!("implementation")
+    );
+    assert_eq!(
+        status["result"]["run"]["packets"][0]["stage"],
+        json!("implementation")
+    );
+    assert_eq!(
+        status["result"]["run"]["packets"][0]["storageLane"],
+        json!("implement")
+    );
+
+    let ledger = env.ledger();
+    let packet = ledger
+        .list_packets(run_id)
+        .expect("list adaptive packets")
+        .into_iter()
+        .next()
+        .expect("adaptive packet");
+    let fence = packet.spec_revision.as_ref().map_or_else(
+        || forged_ledger::SpecFence::Sha256(packet.spec_sha256.clone()),
+        |revision| forged_ledger::SpecFence::Revision {
+            revision: revision.clone(),
+            body_sha256: packet.spec_sha256.clone(),
+        },
+    );
+    let attempt = ledger
+        .claim_packet(&packet.packet_id, "fixture-seat", &fence)
+        .expect("claim adaptive packet");
+    ledger.close().expect("close ledger");
+
+    let (code, status) = env.forged(&["run", "status", "--run", run_id]);
+    assert_eq!(code, 0, "live adaptive status: {status}");
+    assert_eq!(
+        status["result"]["run"]["currentStage"],
+        json!("implementation")
+    );
+    assert_eq!(
+        status["result"]["run"]["liveAttempts"][0]["attemptId"],
+        json!(attempt.attempt_id)
     );
 }
 

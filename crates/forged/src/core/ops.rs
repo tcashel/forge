@@ -806,17 +806,22 @@ pub(crate) async fn default_branch_of(repo: &str) -> String {
 
 // ------------------------------------------------------------ run status
 
-fn packet_stage<'a>(view: &'a forged_proto::RunView, packet_id: &str) -> Option<&'a str> {
+fn packet_stage(view: &forged_proto::RunView, packet_id: &str) -> Option<String> {
     view.packets
         .iter()
         .find(|packet| packet.packet_id == packet_id)
-        .map(|packet| stage_str(packet.stage))
+        .map(|packet| {
+            forged_proto::stored_packet(packet)
+                .ok()
+                .and_then(|packet| packet.execution.map(|value| value.stage_id))
+                .unwrap_or_else(|| stage_str(packet.stage).to_owned())
+        })
 }
 
 fn run_status_position<'a>(
     view: &'a forged_proto::RunView,
     action: &'a forged_proto::NextAction,
-) -> (Option<&'a str>, Option<&'a str>) {
+) -> (Option<String>, Option<&'a str>) {
     if let Some(attempt) = view
         .live_attempts
         .iter()
@@ -828,10 +833,14 @@ fn run_status_position<'a>(
         );
     }
     let stage = match action {
-        forged_proto::NextAction::RunMachine(step) => Some(step.as_str()),
-        forged_proto::NextAction::OpenPackets(intents) => {
-            intents.first().map(|intent| stage_str(intent.stage))
-        }
+        forged_proto::NextAction::RunMachine(step) => Some(step.as_str().to_owned()),
+        forged_proto::NextAction::OpenPackets(intents) => intents.first().map(|intent| {
+            intent
+                .execution
+                .as_ref()
+                .map(|value| value.stage_id.clone())
+                .unwrap_or_else(|| stage_str(intent.stage).to_owned())
+        }),
         forged_proto::NextAction::AwaitPacket { packet_id, .. } => packet_stage(view, packet_id),
         forged_proto::NextAction::EscalateProfile(_) | forged_proto::NextAction::Stop(_) => None,
     };
@@ -839,6 +848,17 @@ fn run_status_position<'a>(
 }
 
 fn run_status_gate_state(view: &forged_proto::RunView) -> Option<&'static str> {
+    if let Some(passed) = view
+        .proto_events
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            forged_proto::ProtoEvent::Gate { passed, .. } => Some(*passed),
+            _ => None,
+        })
+    {
+        return Some(if passed { "passed" } else { "failed" });
+    }
     view.terminal_attempts
         .values()
         .flatten()
@@ -1135,7 +1155,7 @@ pub async fn run_status(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
         if let Some(current_stage) = current_stage {
             run.insert(
                 "currentStage".to_owned(),
-                Value::String(current_stage.to_owned()),
+                Value::String(current_stage),
             );
         }
         if let Some(gate_state) = gate_state {

@@ -99,6 +99,22 @@ fn deadline_kills_project_from_revoke_scope_while_ordinary_retries_do_not() {
         .expect("deadline advance spawns");
     wait_until("provider.spawn.after", || reached.exists());
     std::thread::sleep(Duration::from_millis(1_100));
+    let ledger = env.ledger();
+    ledger
+        .revoke_attempt_scoped(
+            1,
+            "transport: stage deadline exceeded: projection test marker",
+            forged_ledger::RevokeScope::Deadline,
+        )
+        .expect("mark deadline revocation");
+    let deadline_attempt = ledger.get_attempt(1).expect("revoking deadline attempt");
+    assert_eq!(
+        deadline_attempt.state,
+        forged_ledger::AttemptState::Revoking
+    );
+    ledger.close().expect("close ledger");
+    assert_deadline_kills(&env, deadline_run, 0);
+
     std::fs::write(&release, b"").expect("release deadline failpoint");
     let output = child.wait_with_output().expect("deadline advance exits");
     assert!(
