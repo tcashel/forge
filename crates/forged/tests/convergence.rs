@@ -515,6 +515,70 @@ fn non_runnable_status_defers_only_that_row_in_a_mixed_admission_batch() {
 }
 
 #[test]
+fn priority_update_repairs_a_priorityless_item_before_admission() {
+    let env = TestEnv::new("adm-priority-update");
+    let run = "adm-priority-update";
+    start_run(&env, run);
+    env.set_scenario("implement", "hang", 1);
+    env.set_work_field(run, "priority", "");
+
+    let (code, before) = env.forged(&["work", "show", "--id", run]);
+    assert_eq!(code, 0, "show priority-less work: {before}");
+    assert_eq!(before["result"]["work"]["priority"], Value::Null);
+    let revision = before["result"]["work"]["revision"]
+        .as_i64()
+        .expect("ledger revision");
+    let revision_arg = revision.to_string();
+    let (code, repaired) = env.forged(&[
+        "work",
+        "update",
+        "--id",
+        run,
+        "--expected-revision",
+        &revision_arg,
+        "--priority",
+        "2",
+    ]);
+    assert_eq!(code, 0, "repair priority: {repaired}");
+    assert_eq!(repaired["result"]["work"]["priority"], json!(2));
+    assert_eq!(
+        repaired["result"]["work"]["revision"],
+        json!(revision),
+        "priority repair must not mint a spec revision"
+    );
+
+    let (code, submitted) = env.forged(&[
+        "run",
+        "submit",
+        "--run",
+        run,
+        "--idempotency-key",
+        "adm-priority-update-submit",
+    ]);
+    assert_eq!(code, 0, "submit after priority repair: {submitted}");
+    assert!(
+        submitted["result"]["controller"].is_object(),
+        "the repaired work item must admit immediately: {submitted}"
+    );
+    let ledger = env.ledger();
+    let admitted = ledger
+        .latest_admission_decisions(Some(AdmissionSubjectKind::Run), Some(run))
+        .expect("run admission decision")
+        .into_iter()
+        .any(|decision| {
+            decision.subject_id == run && decision.outcome == AdmissionOutcome::Admitted
+        });
+    ledger.close().expect("close ledger");
+    assert!(
+        admitted,
+        "priority repair must clear WorkMalformed admission"
+    );
+
+    stop_run(&env, run);
+    no_live_reservations(&env);
+}
+
+#[test]
 fn malformed_packet_facts_defer_without_reservation_or_provider_effect() {
     let env = TestEnv::new("adm-null");
     let run = "adm-null";

@@ -899,6 +899,72 @@ fn insert_revision_tx(
     Ok(())
 }
 
+fn apply_work_planning_spec_tx(
+    conn: &Connection,
+    work_id: &str,
+    actor: &str,
+    expected_revision: Option<i64>,
+    allow_deferred: bool,
+    spec: &WorkSpecFields,
+) -> Result<WorkItemSnapshot, LedgerError> {
+    let current = require_snapshot_tx(conn, work_id)?;
+    if let Some(expected_revision) = expected_revision {
+        if current.revision != expected_revision {
+            return Err(refused(
+                ErrorCode::WorkContention,
+                format!(
+                    "work item {work_id:?} revision moved: expected {expected_revision}, \
+                     current {}",
+                    current.revision
+                ),
+            ));
+        }
+    }
+    let promotable = current.status == WorkStatus::Blocked
+        || (allow_deferred && current.status == WorkStatus::Deferred);
+    if !promotable {
+        let message = if allow_deferred {
+            format!(
+                "work promote requires a blocked or deferred stub; {work_id:?} is {}; \
+                 use work update for open items or work reopen for closed items",
+                current.status.as_str()
+            )
+        } else {
+            format!(
+                "planning apply requires a blocked stub; {work_id:?} is {}",
+                current.status.as_str()
+            )
+        };
+        return Err(refused(ErrorCode::InvalidRequest, message));
+    }
+    if current.assignee.is_some() {
+        return Err(refused(
+            ErrorCode::InvalidRequest,
+            format!("planning apply requires empty custody on {work_id:?}"),
+        ));
+    }
+    let next = current.revision + 1;
+    insert_revision_tx(conn, work_id, next, spec, WorkRevisionCause::PlanningApply)?;
+    conn.execute(
+        "UPDATE work_items SET current_revision = ?2, status = 'open', updated_at = ?3 \
+         WHERE work_id = ?1",
+        rusqlite::params![work_id, next, now_iso()],
+    )?;
+    append_event_tx(
+        conn,
+        None,
+        "work.updated",
+        &json!({
+            "workId": work_id,
+            "verb": "planning-apply",
+            "actor": actor,
+            "status": { "from": current.status, "to": WorkStatus::Open },
+            "revision": next,
+        }),
+    )?;
+    require_snapshot_tx(conn, work_id)
+}
+
 /// Update coordination state and stamp `updated_at`; a spec revision is
 /// deliberately NOT minted here.
 fn set_coordination_tx(
@@ -1314,6 +1380,89 @@ impl Ledger {
         })
     }
 
+    /// Apply a revision-CAS update to scheduling priority and/or spec fields
+    /// in one transaction. Priority is coordination state and never mints a
+    /// revision; a supplied spec mints exactly one `Authored` revision even
+    /// when priority changes in the same write.
+    pub fn update_work_item(
+        &self,
+        work_id: &str,
+        expected_revision: i64,
+        spec: Option<WorkSpecFields>,
+        priority: Option<i64>,
+        actor: &str,
+    ) -> Result<WorkItemSnapshot, LedgerError> {
+        if spec.is_none() && priority.is_none() {
+            return Err(refused(
+                ErrorCode::InvalidRequest,
+                "work update requires at least one spec field or priority",
+            ));
+        }
+        let work_id = work_id.to_owned();
+        let actor = actor.to_owned();
+        self.submit(move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let current = require_snapshot_tx(&tx, &work_id)?;
+            if current.revision != expected_revision {
+                return Err(refused(
+                    ErrorCode::WorkContention,
+                    format!(
+                        "work item {work_id:?} revision moved: expected {expected_revision}, \
+                         current {}",
+                        current.revision
+                    ),
+                ));
+            }
+            let next_revision = if let Some(spec) = &spec {
+                let next = expected_revision + 1;
+                insert_revision_tx(&tx, &work_id, next, spec, WorkRevisionCause::Authored)?;
+                next
+            } else {
+                expected_revision
+            };
+            match (spec.is_some(), priority) {
+                (true, Some(priority)) => {
+                    tx.execute(
+                        "UPDATE work_items SET current_revision = ?2, priority = ?3, \
+                         updated_at = ?4 WHERE work_id = ?1",
+                        rusqlite::params![work_id, next_revision, priority, now_iso()],
+                    )?;
+                }
+                (true, None) => {
+                    tx.execute(
+                        "UPDATE work_items SET current_revision = ?2, updated_at = ?3 \
+                         WHERE work_id = ?1",
+                        rusqlite::params![work_id, next_revision, now_iso()],
+                    )?;
+                }
+                (false, Some(priority)) => {
+                    tx.execute(
+                        "UPDATE work_items SET priority = ?2, updated_at = ?3 WHERE work_id = ?1",
+                        rusqlite::params![work_id, priority, now_iso()],
+                    )?;
+                }
+                (false, None) => unreachable!("empty updates refuse before the transaction"),
+            }
+            if let Some(priority) = priority {
+                append_event_tx(
+                    &tx,
+                    None,
+                    "work.updated",
+                    &json!({
+                        "workId": work_id,
+                        "verb": "update",
+                        "actor": actor,
+                        "priority": { "from": current.priority, "to": priority },
+                        "revision": { "from": current.revision, "to": next_revision },
+                    }),
+                )?;
+            }
+            let snapshot = require_snapshot_tx(&tx, &work_id)?;
+            tx.commit()?;
+            Ok(snapshot)
+        })
+    }
+
     /// The planning run's guarded apply, exactly the bd-era contract in one
     /// transaction: refuses unless the item is `Blocked` with EMPTY custody,
     /// mints the next spec revision with cause `PlanningApply`, and promotes
@@ -1330,44 +1479,78 @@ impl Ledger {
         let actor = actor.to_owned();
         self.submit(move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let current = require_snapshot_tx(&tx, &work_id)?;
-            if current.status != WorkStatus::Blocked {
-                return Err(refused(
-                    ErrorCode::InvalidRequest,
-                    format!(
-                        "planning apply requires a blocked stub; {work_id:?} is {}",
-                        current.status.as_str()
-                    ),
-                ));
-            }
-            if current.assignee.is_some() {
-                return Err(refused(
-                    ErrorCode::InvalidRequest,
-                    format!("planning apply requires empty custody on {work_id:?}"),
-                ));
-            }
-            let next = current.revision + 1;
-            insert_revision_tx(&tx, &work_id, next, &spec, WorkRevisionCause::PlanningApply)?;
-            tx.execute(
-                "UPDATE work_items SET current_revision = ?2, status = 'open', updated_at = ?3 \
-                 WHERE work_id = ?1",
-                rusqlite::params![work_id, next, now_iso()],
-            )?;
-            append_event_tx(
-                &tx,
-                None,
-                "work.updated",
-                &json!({
-                    "workId": work_id,
-                    "verb": "planning-apply",
-                    "actor": actor,
-                    "status": { "from": WorkStatus::Blocked, "to": WorkStatus::Open },
-                    "revision": next,
-                }),
-            )?;
-            let snapshot = require_snapshot_tx(&tx, &work_id)?;
+            let snapshot = apply_work_planning_spec_tx(&tx, &work_id, &actor, None, false, &spec)?;
             tx.commit()?;
             Ok(snapshot)
+        })
+    }
+
+    /// Atomically fence and promote one blocked or deferred stub. The
+    /// operation receipt, `PlanningApply` revision, open status, and
+    /// coordination event commit together; revision drift refuses before
+    /// any of them land.
+    pub fn apply_work_promote_operation(
+        &self,
+        request: &OperationRequest,
+        work_id: &str,
+        expected_revision: i64,
+        actor: &str,
+        spec: WorkSpecFields,
+    ) -> Result<OperationResponse, LedgerError> {
+        let request = request.clone();
+        let work_id = work_id.to_owned();
+        let actor = actor.to_owned();
+        self.submit(move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if let Some(response) = replay_ledger_operation_tx(&tx, "work_promote", &request)? {
+                tx.commit()?;
+                return Ok(response);
+            }
+            let hash = request_sha256(&request).map_err(|error| {
+                refused(
+                    ErrorCode::InvalidRequest,
+                    format!("params cannot be canonicalized: {error}"),
+                )
+            })?;
+            let operation_id = uuid::Uuid::now_v7().to_string();
+            let written_at = now_iso();
+            tx.execute(
+                "INSERT INTO operations (operation_id, name, idempotency_key, \
+                 request_sha256, effect_class, run_id, claim_token, state, \
+                 created_at, updated_at) \
+                 VALUES (?1, 'work_promote', ?2, ?3, 'safe-retry', ?4, NULL, \
+                 'in_progress', ?5, ?5)",
+                rusqlite::params![
+                    operation_id,
+                    request.idempotency_key,
+                    hash,
+                    request.run_id,
+                    written_at,
+                ],
+            )?;
+            let snapshot = apply_work_planning_spec_tx(
+                &tx,
+                &work_id,
+                &actor,
+                Some(expected_revision),
+                true,
+                &spec,
+            )?;
+            let response = OperationResponse {
+                operation_id: operation_id.clone(),
+                reused: false,
+                ok: true,
+                result: Some(json!({
+                    "work": snapshot,
+                    "nextSteps": [
+                        "the stub is open; use work_update for later spec or priority changes"
+                    ],
+                })),
+                error: None,
+            };
+            settle_operation(&tx, &operation_id, &response, true)?;
+            tx.commit()?;
+            Ok(response)
         })
     }
 
@@ -2191,6 +2374,39 @@ mod tests {
     }
 
     #[test]
+    fn priority_update_is_cas_fenced_without_minting_a_revision() {
+        let (_dir, l) = ledger();
+        l.create_work_item(item("beads-priority", WorkStatus::Open))
+            .unwrap();
+
+        let priority_only = l
+            .update_work_item("beads-priority", 1, None, Some(2), "operator")
+            .unwrap();
+        assert_eq!(priority_only.priority, Some(2));
+        assert_eq!(priority_only.revision, 1);
+        assert_eq!(l.work_revision("beads-priority", 2).unwrap(), None);
+
+        let combined = l
+            .update_work_item(
+                "beads-priority",
+                1,
+                Some(spec("combined")),
+                Some(1),
+                "operator",
+            )
+            .unwrap();
+        assert_eq!(combined.priority, Some(1));
+        assert_eq!(combined.revision, 2);
+        assert_eq!(combined.spec.title, "combined");
+
+        let updates = l.list_events_by_kind("work.updated").unwrap();
+        let payload: serde_json::Value =
+            serde_json::from_str(&updates.last().unwrap().payload_json).unwrap();
+        assert_eq!(payload["priority"], json!({"from": 2, "to": 1}));
+        assert_eq!(payload["revision"], json!({"from": 1, "to": 2}));
+    }
+
+    #[test]
     fn coordination_churn_never_mints_a_revision() {
         let (_dir, l) = ledger();
         l.create_work_item(item("beads-churn", WorkStatus::Open))
@@ -2318,6 +2534,128 @@ mod tests {
             applied.status,
             WorkStatus::Open,
             "the guarded apply promotes the stub to the frontier"
+        );
+    }
+
+    #[test]
+    fn public_promote_atomically_fences_revision_status_and_receipt() {
+        let (_dir, l) = ledger();
+        l.create_work_item(item("beads-promote", WorkStatus::Blocked))
+            .unwrap();
+        let request = OperationRequest {
+            schema_version: 1,
+            idempotency_key: "op:work_promote:beads-promote:-:1".to_owned(),
+            run_id: None,
+            params: json!({
+                "id": "beads-promote",
+                "expectedRevision": 1,
+                "description": "planned description",
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        };
+        let response = l
+            .apply_work_promote_operation(&request, "beads-promote", 1, "operator", spec("planned"))
+            .unwrap();
+        assert!(response.ok);
+        let promoted = l.work_item("beads-promote").unwrap().unwrap();
+        assert_eq!(promoted.revision, 2);
+        assert_eq!(promoted.status, WorkStatus::Open);
+        let cause: String = l
+            .submit(|conn| {
+                Ok(conn.query_row(
+                    "SELECT cause FROM work_revisions WHERE work_id = 'beads-promote' \
+                     AND revision = 2",
+                    [],
+                    |row| row.get(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(cause, "planning-apply");
+        let operation = l
+            .find_operation("work_promote", &request.idempotency_key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(operation.state, crate::OperationState::Terminal);
+
+        l.create_work_item(item("beads-promote-race", WorkStatus::Blocked))
+            .unwrap();
+        l.update_work_spec(
+            "beads-promote-race",
+            1,
+            spec("raced"),
+            WorkRevisionCause::Authored,
+        )
+        .unwrap();
+        let mut raced_request = request.clone();
+        raced_request.idempotency_key = "op:work_promote:beads-promote-race:-:1".to_owned();
+        raced_request.params.insert(
+            "id".to_owned(),
+            serde_json::Value::String("beads-promote-race".to_owned()),
+        );
+        let error = l
+            .apply_work_promote_operation(
+                &raced_request,
+                "beads-promote-race",
+                1,
+                "operator",
+                spec("never lands"),
+            )
+            .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::WorkContention);
+        let raced = l.work_item("beads-promote-race").unwrap().unwrap();
+        assert_eq!(raced.revision, 2);
+        assert_eq!(raced.status, WorkStatus::Blocked);
+
+        let mut open_request = request.clone();
+        open_request.idempotency_key = "op:work_promote:beads-open:-:1".to_owned();
+        open_request.params.insert(
+            "id".to_owned(),
+            serde_json::Value::String("beads-open".to_owned()),
+        );
+        l.create_work_item(item("beads-open", WorkStatus::Open))
+            .unwrap();
+        let error = l
+            .apply_work_promote_operation(
+                &open_request,
+                "beads-open",
+                1,
+                "operator",
+                spec("never lands"),
+            )
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("work update"), "{message}");
+        assert!(message.contains("work reopen"), "{message}");
+
+        l.create_work_item(item("beads-deferred", WorkStatus::Blocked))
+            .unwrap();
+        l.submit(|conn| {
+            conn.execute(
+                "UPDATE work_items SET status = 'deferred' WHERE work_id = 'beads-deferred'",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let mut deferred_request = request;
+        deferred_request.idempotency_key = "op:work_promote:beads-deferred:-:1".to_owned();
+        deferred_request.params.insert(
+            "id".to_owned(),
+            serde_json::Value::String("beads-deferred".to_owned()),
+        );
+        l.apply_work_promote_operation(
+            &deferred_request,
+            "beads-deferred",
+            1,
+            "operator",
+            spec("deferred plan"),
+        )
+        .unwrap();
+        assert_eq!(
+            l.work_item("beads-deferred").unwrap().unwrap().status,
+            WorkStatus::Open
         );
     }
 
