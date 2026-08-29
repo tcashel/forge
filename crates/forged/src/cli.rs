@@ -117,6 +117,9 @@ pub enum Command {
     },
     /// Serve MCP over stdio (prints no envelope).
     Mcp,
+    /// Regenerate the committed operation-surface reference artifacts.
+    #[command(name = "generate-surface-manifest", hide = true)]
+    GenerateSurfaceManifest,
 }
 
 /// A command with no flags beyond the key override.
@@ -1905,6 +1908,7 @@ pub fn command_name(command: &Command) -> &'static str {
             WorktreeCmd::Retire(_) => "worktree_retire",
         },
         Command::Mcp => "mcp",
+        Command::GenerateSurfaceManifest => "generate_surface_manifest",
     }
 }
 
@@ -2854,6 +2858,9 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
             ),
         },
         Command::Mcp => unreachable!("mcp is handled before request mapping"),
+        Command::GenerateSurfaceManifest => {
+            unreachable!("surface generation is handled before runtime initialization")
+        }
     })
 }
 

@@ -1,0 +1,689 @@
+{
+  "operations": [
+    {
+      "class": "fenced",
+      "cli": true,
+      "cliVerb": "artifact compact",
+      "dispatch": true,
+      "explicitKey": true,
+      "mcp": true,
+      "name": "artifact_compact"
+    },
+    {
+      "class": "read_only",
+      "cli": true,
+      "cliVerb": "artifact verify",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": true,
+      "name": "artifact_verify"
+    },
+    {
+      "class": "fenced",
+      "cli": true,
+      "cliVerb": "attention acknowledge",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": true,
+      "name": "attention_acknowledge"
+    },
+    {
+      "class": "read_only",
+      "cli": true,
+      "cliVerb": "attention list",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": true,
+      "name": "attention_list"
+    },
+    {
+      "class": "fenced",
+      "cli": true,
+      "cliVerb": "attention reopen",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": true,
+      "name": "attention_reopen"
+    },
+    {
+      "class": "fenced",
+      "cli": true,
+      "cliVerb": "attention resolve",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": true,
+      "name": "attention_resolve"
+    },
+    {
+      "class": "fenced",
+      "cli": true,
+      "cliVerb": "claim-next",
+      "dispatch": true,
+      "explicitKey": true,
+      "mcp": true,
+      "name": "claim_next"
+    },
+    {
+      "class": "read_only",
+      "cli": true,
+      "cliVerb": "definition validate",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": true,
+      "name": "definition_validate"
+    },
+    {
+      "class": "read_only",
+      "cli": true,
+      "cliVerb": "doctor",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": true,
+      "name": "doctor"
+    },
+    {
+      "class": "fenced",
+      "cli": true,
+      "cliVerb": "epic abandon",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": true,
+      "name": "epic_abandon"
+    },
+    {
+      "class": "machine-fenced",
+      "cli": true,
+      "cliVerb": "epic advance",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": true,
+      "name": "epic_advance"
+    },
+    {
+      "class": "machine-fenced",
+      "cli": true,
+      "cliVerb": "epic drive",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": true,
+      "name": "epic_drive"
+    },
+    {
+      "class": "fenced",
+      "cli": true,
+      "cliVerb": "epic pause",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": true,
+      "name": "epic_pause"
+    },
+    {
+      "class": "read_only",
+      "cli": true,
+      "cliVerb": "epic preflight",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": true,
+      "name": "epic_preflight"
+    },
+    {
+      "class": "fenced",
+      "cli": true,
+      "cliVerb": "epic resolve",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": true,
+      "name": "epic_resolve"
+    },
+    {
+      "class": "fenced",
+      "cli": true,
+      "cliVerb": "epic resume",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": true,
+      "name": "epic_resume"
+    },
+    {
+      "class": "fenced",
+      "cli": true,
+      "cliVerb": "epic revise-roster",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": true,
+      "name": "epic_revise_roster"
+    },
+    {
+      "class": "fenced",
+      "cli": true,
+      "cliVerb": "epic start",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": true,
+      "name": "epic_start"
+    },
+    {
+      "class": "read_only",
+      "cli": true,
+      "cliVerb": "epic status",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": true,
+      "name": "epic_status"
+    },
+    {
+      "class": "fenced",
+      "cli": true,
+      "cliVerb": "epic submit",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": true,
+      "name": "epic_submit"
+    },
+    {
+      "class": "read_only",
+      "cli": true,
+      "cliVerb": "events",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": true,
+      "name": "events_tail"
+    },
+    {
+      "class": "read_only",
+      "cli": true,
+      "cliVerb": "explain",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": true,
+      "name": "explain"
+    },
+    {
+      "class": "fenced",
+      "cli": true,
+      "cliVerb": "gate run",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": true,
+      "name": "gate_run"
+    },
+    {
+      "class": "fenced",
+      "cli": true,
+      "cliVerb": "init",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": false,
+      "name": "init"
+    },
+    {
+      "class": null,
+      "cli": true,
+      "cliVerb": "mcp",
+      "dispatch": false,
+      "explicitKey": false,
+      "mcp": false,
+      "name": "mcp"
+    },
+    {
+      "class": "read_only",
+      "cli": true,
+      "cliVerb": "operations overview",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": true,
+      "name": "operations_overview"
+    },
+    {
+      "class": "read_only",
+      "cli": true,
+      "cliVerb": "overview",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": true,
+      "name": "overview"
+    },
+    {
+      "class": "fenced",
+      "cli": true,
+      "cliVerb": "packet claim",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": true,
+      "name": "packet_claim"
+    },
+    {
+      "class": "fenced",
+      "cli": true,
+      "cliVerb": "packet complete",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": true,
+      "name": "packet_complete"
+    },
+    {
+      "class": "fenced",
+      "cli": true,
+      "cliVerb": "packet fail",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": true,
+      "name": "packet_fail"
+    },
+    {
+      "class": "unfenced_write",
+      "cli": true,
+      "cliVerb": "packet heartbeat",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": false,
+      "name": "packet_heartbeat"
+    },
+    {
+      "class": "read_only",
+      "cli": true,
+      "cliVerb": "packet show",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": true,
+      "name": "packet_show"
+    },
+    {
+      "class": "fenced",
+      "cli": true,
+      "cliVerb": "reconcile",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": true,
+      "name": "reconcile"
+    },
+    {
+      "class": "fenced",
+      "cli": true,
+      "cliVerb": "review publish",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": true,
+      "name": "review_publish"
+    },
+    {
+      "class": "fenced",
+      "cli": true,
+      "cliVerb": "run accept-risk",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": true,
+      "name": "run_accept_risk"
+    },
+    {
+      "class": "fenced",
+      "cli": true,
+      "cliVerb": "run adjudicate-settlement",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": true,
+      "name": "run_adjudicate_settlement"
+    },
+    {
+      "class": "machine-fenced",
+      "cli": true,
+      "cliVerb": "run advance",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": true,
+      "name": "run_advance"
+    },
+    {
+      "class": "machine-fenced",
+      "cli": true,
+      "cliVerb": "run drive",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": false,
+      "name": "run_drive"
+    },
+    {
+      "class": "fenced",
+      "cli": true,
+      "cliVerb": "run revise-roster",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": true,
+      "name": "run_revise_roster"
+    },
+    {
+      "class": "fenced",
+      "cli": true,
+      "cliVerb": "run start",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": true,
+      "name": "run_start"
+    },
+    {
+      "class": "read_only",
+      "cli": true,
+      "cliVerb": "run status",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": true,
+      "name": "run_status"
+    },
+    {
+      "class": "fenced",
+      "cli": true,
+      "cliVerb": "run stop",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": true,
+      "name": "run_stop"
+    },
+    {
+      "class": "fenced",
+      "cli": true,
+      "cliVerb": "run submit",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": true,
+      "name": "run_submit"
+    },
+    {
+      "class": null,
+      "cli": true,
+      "cliVerb": "service install",
+      "dispatch": false,
+      "explicitKey": false,
+      "mcp": false,
+      "name": "service_install"
+    },
+    {
+      "class": null,
+      "cli": true,
+      "cliVerb": "service restart",
+      "dispatch": false,
+      "explicitKey": false,
+      "mcp": false,
+      "name": "service_restart"
+    },
+    {
+      "class": null,
+      "cli": true,
+      "cliVerb": "service start",
+      "dispatch": false,
+      "explicitKey": false,
+      "mcp": false,
+      "name": "service_start"
+    },
+    {
+      "class": null,
+      "cli": true,
+      "cliVerb": "service status",
+      "dispatch": false,
+      "explicitKey": false,
+      "mcp": false,
+      "name": "service_status"
+    },
+    {
+      "class": null,
+      "cli": true,
+      "cliVerb": "service stop",
+      "dispatch": false,
+      "explicitKey": false,
+      "mcp": false,
+      "name": "service_stop"
+    },
+    {
+      "class": null,
+      "cli": true,
+      "cliVerb": "service uninstall",
+      "dispatch": false,
+      "explicitKey": false,
+      "mcp": false,
+      "name": "service_uninstall"
+    },
+    {
+      "class": "read_only",
+      "cli": true,
+      "cliVerb": "session inventory",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": true,
+      "name": "session_inventory"
+    },
+    {
+      "class": "read_only",
+      "cli": true,
+      "cliVerb": "session list",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": true,
+      "name": "session_list"
+    },
+    {
+      "class": "fenced",
+      "cli": true,
+      "cliVerb": "session message",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": true,
+      "name": "session_message"
+    },
+    {
+      "class": "read_only",
+      "cli": true,
+      "cliVerb": "session read",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": true,
+      "name": "session_read"
+    },
+    {
+      "class": "fenced",
+      "cli": true,
+      "cliVerb": "session stop",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": true,
+      "name": "session_stop"
+    },
+    {
+      "class": "machine-fenced",
+      "cli": true,
+      "cliVerb": "supervise",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": false,
+      "name": "supervise"
+    },
+    {
+      "class": "unfenced_write",
+      "cli": true,
+      "cliVerb": "usage ingest",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": true,
+      "name": "usage_ingest"
+    },
+    {
+      "class": "read_only",
+      "cli": true,
+      "cliVerb": "usage",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": true,
+      "name": "usage_report"
+    },
+    {
+      "class": "fenced",
+      "cli": true,
+      "cliVerb": "work close",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": true,
+      "name": "work_close"
+    },
+    {
+      "class": "fenced",
+      "cli": true,
+      "cliVerb": "work create",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": true,
+      "name": "work_create"
+    },
+    {
+      "class": "read_only",
+      "cli": true,
+      "cliVerb": "work detail",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": true,
+      "name": "work_detail"
+    },
+    {
+      "class": "read_only",
+      "cli": true,
+      "cliVerb": "work history",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": true,
+      "name": "work_history"
+    },
+    {
+      "class": "unfenced_write",
+      "cli": true,
+      "cliVerb": "work import-beads",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": false,
+      "name": "work_import_beads"
+    },
+    {
+      "class": "fenced",
+      "cli": true,
+      "cliVerb": "work link",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": true,
+      "name": "work_link"
+    },
+    {
+      "class": "read_only",
+      "cli": true,
+      "cliVerb": "work list",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": true,
+      "name": "work_list"
+    },
+    {
+      "class": "read_only",
+      "cli": true,
+      "cliVerb": "work map",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": true,
+      "name": "work_map"
+    },
+    {
+      "class": "fenced",
+      "cli": true,
+      "cliVerb": "work note add",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": true,
+      "name": "work_note_add"
+    },
+    {
+      "class": "read_only",
+      "cli": true,
+      "cliVerb": "work note list",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": true,
+      "name": "work_note_list"
+    },
+    {
+      "class": "fenced",
+      "cli": true,
+      "cliVerb": "work promote",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": true,
+      "name": "work_promote"
+    },
+    {
+      "class": "read_only",
+      "cli": true,
+      "cliVerb": "work ready",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": true,
+      "name": "work_ready"
+    },
+    {
+      "class": "fenced",
+      "cli": true,
+      "cliVerb": "work release",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": true,
+      "name": "work_release"
+    },
+    {
+      "class": "fenced",
+      "cli": true,
+      "cliVerb": "work reopen",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": true,
+      "name": "work_reopen"
+    },
+    {
+      "class": "fenced",
+      "cli": true,
+      "cliVerb": "work revert",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": true,
+      "name": "work_revert"
+    },
+    {
+      "class": "read_only",
+      "cli": true,
+      "cliVerb": "work show",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": true,
+      "name": "work_show"
+    },
+    {
+      "class": "fenced",
+      "cli": true,
+      "cliVerb": "work supersede",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": true,
+      "name": "work_supersede"
+    },
+    {
+      "class": "fenced",
+      "cli": true,
+      "cliVerb": "work update",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": true,
+      "name": "work_update"
+    },
+    {
+      "class": "fenced",
+      "cli": true,
+      "cliVerb": "worktree retire",
+      "dispatch": true,
+      "explicitKey": true,
+      "mcp": true,
+      "name": "worktree_retire"
+    }
+  ],
+  "schema": "forged.operation-surface/1"
+}

@@ -308,7 +308,7 @@ NODE
 }
 
 check_manage_work_host_parity_contract() {
-  node - "$1" <<'NODE'
+  node - "$1" "$2" <<'NODE'
 'use strict';
 
 const fs = require('fs');
@@ -316,6 +316,7 @@ const path = require('path');
 const crypto = require('crypto');
 
 const parityPathArgument = process.argv[2];
+const surfacePathArgument = process.argv[3];
 const repoRoot = fs.realpathSync('.');
 
 function invariant(condition, message) {
@@ -583,17 +584,7 @@ const expectedForbiddenEffects = [
   'plugin-install',
   'plugin-cache-access',
 ];
-const expectedTools = [
-  'artifact_compact', 'artifact_verify', 'attention_acknowledge', 'attention_list', 'attention_reopen',
-  'attention_resolve', 'claim_next', 'definition_validate', 'doctor', 'epic_advance',
-  'epic_drive', 'epic_pause', 'epic_preflight', 'epic_resolve', 'epic_resume', 'epic_revise_roster',
-  'epic_start', 'epic_status', 'epic_submit', 'events_tail', 'operations_overview',
-  'overview', 'packet_claim', 'packet_complete', 'packet_fail', 'reconcile',
-  'review_publish', 'run_accept_risk', 'run_adjudicate_settlement', 'run_advance', 'run_revise_roster',
-  'run_start', 'run_status', 'run_stop', 'run_submit', 'session_inventory', 'session_list',
-  'session_message', 'session_read', 'session_stop', 'usage_ingest', 'usage_report',
-  'work_detail', 'work_history', 'work_list', 'work_map',
-];
+let expectedTools;
 const surfaceShared = {
   structuredContent: 'required',
   jsonTextFallback: 'identical',
@@ -689,8 +680,11 @@ function validateParityFixture(registration) {
   invariant(stableJson(fixture.allowedHostDifferences) === stableJson(expectedAllowedDifferences), 'allowed host differences moved');
   invariant(stableJson(fixture.forbiddenHostDifferences) === stableJson(expectedForbiddenDifferences), 'forbidden host differences moved');
   invariant(stableJson(fixture.forbiddenEffects) === stableJson(expectedForbiddenEffects), 'forbidden validation effects moved');
-  invariant(stableJson(fixture.tools) === stableJson(expectedTools), 'exact 46-tool declaration moved');
-  invariant(fixture.tools.length === 46 && new Set(fixture.tools).size === 46, 'tool declaration must contain 46 unique tools');
+  invariant(stableJson(fixture.tools) === stableJson(expectedTools), 'manifest-derived tool declaration moved');
+  invariant(
+    fixture.tools.length === expectedTools.length && new Set(fixture.tools).size === expectedTools.length,
+    'tool declaration must contain every unique manifest MCP tool',
+  );
   invariant(stableJson(fixture.surfaces) === stableJson(expectedSurfaces), 'exact five-surface declaration moved');
   invariant(fixture.surfaces.length === 5, 'surface declaration must contain five resources');
   exactKeys(fixture.contracts, ['intent', 'portfolioControl'], 'host parity contracts');
@@ -725,8 +719,24 @@ function validateParityFixture(registration) {
 
 try {
   invariant(typeof parityPathArgument === 'string', 'host parity fixture argument is missing');
+  invariant(typeof surfacePathArgument === 'string', 'operation-surface manifest argument is missing');
   const parityReal = fs.realpathSync(parityPathArgument);
+  const surfaceReal = fs.realpathSync(surfacePathArgument);
   invariant(isInside(repoRoot, parityReal), 'host parity fixture argument escapes the repository');
+  invariant(isInside(repoRoot, surfaceReal), 'operation-surface manifest escapes the repository');
+  const operationSurface = readJson(surfaceReal, 'operation-surface manifest');
+  invariant(
+    operationSurface.schema === 'forged.operation-surface/1' && Array.isArray(operationSurface.operations),
+    'operation-surface manifest contract moved',
+  );
+  expectedTools = operationSurface.operations
+    .filter((row) => row?.mcp === true)
+    .map((row) => row?.name);
+  invariant(
+    expectedTools.every((name) => typeof name === 'string') &&
+      new Set(expectedTools).size === expectedTools.length,
+    'operation-surface MCP names must be unique strings',
+  );
 
   const claude = loadHost('claude');
   const codex = loadHost('codex');
@@ -744,7 +754,7 @@ try {
   console.log(
     `HOST PARITY: claudeRoot=${claude.pluginRoot} codexRoot=${codex.pluginRoot} ` +
       `version=${claude.manifest.version} skills=9 inventorySha256=${claude.inventory.digest} ` +
-      `cases=15+31 tools=46 surfaces=5 evidence=declarative-contract-only`,
+      `cases=15+31 tools=${expectedTools.length} surfaces=5 evidence=declarative-contract-only`,
   );
 } catch (error) {
   console.error(`host parity validation failed: ${error.message}`);
@@ -947,6 +957,86 @@ for (const token of [
 NODE
 }
 
+check_skill_cli_verbs() {
+  node - "$1" "$2" <<'NODE'
+const fs = require('fs');
+const path = require('path');
+
+const [skillsRoot, manifestPath] = process.argv.slice(2);
+const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+if (manifest.schema !== 'forged.operation-surface/1' || !Array.isArray(manifest.operations)) {
+  console.error(`${manifestPath}: invalid operation-surface manifest`);
+  process.exit(1);
+}
+const cliVerbs = manifest.operations
+  .filter((row) => row?.cli === true && typeof row.cliVerb === 'string' && row.cliVerb.trim())
+  .map((row) => row.cliVerb)
+  .sort((left, right) => right.length - left.length || left.localeCompare(right));
+
+function skillFiles(root) {
+  const files = [];
+  for (const entry of fs.readdirSync(root, {withFileTypes: true})) {
+    const candidate = path.join(root, entry.name);
+    if (entry.isDirectory()) files.push(...skillFiles(candidate));
+    else if (entry.isFile() && entry.name === 'SKILL.md') files.push(candidate);
+  }
+  return files.sort();
+}
+
+function codeSpans(markdown) {
+  const spans = [];
+  const withoutFences = markdown.replace(/```[^\n]*\n([\s\S]*?)```/g, (_all, body) => {
+    spans.push({body, fenced: true});
+    return '';
+  });
+  for (const match of withoutFences.matchAll(/`([^`\n]+)`/g)) {
+    spans.push({body: match[1], fenced: false});
+  }
+  return spans;
+}
+
+function displayedVerb(tail) {
+  return tail
+    .split(/\s+/)
+    .filter(Boolean)
+    .slice(0, 3)
+    .join(' ');
+}
+
+for (const skillPath of skillFiles(skillsRoot)) {
+  const markdown = fs.readFileSync(skillPath, 'utf8');
+  for (const span of codeSpans(markdown)) {
+    for (const match of span.body.matchAll(/\bforged[ \t]+([^\n;|]+)/g)) {
+      const tail = match[1].trim();
+      if (!tail || tail.startsWith('-')) continue;
+      const found = cliVerbs.some((verb) => tail === verb || tail.startsWith(`${verb} `));
+      // An inline family name such as `forged work` is prose, not an
+      // invocation. Fenced commands and multi-token inline paths are exact.
+      if (!found && !span.fenced && /^[a-z][a-z0-9-]*$/.test(tail)) continue;
+      if (!found) {
+        console.error(`${skillPath}: forged verb is absent from the operation surface: ${displayedVerb(tail)}`);
+        process.exit(1);
+      }
+    }
+  }
+}
+NODE
+}
+
+check_skill_cli_verb_negative_fixture() {
+  local fixture=$1
+  local manifest=$2
+  local scratch
+  scratch=$(mktemp -d "${TMPDIR:-/tmp}/forged-plugin-verbs.XXXXXX")
+  cp -R "$plugin/skills" "$scratch/skills"
+  cp -R "$fixture" "$scratch/skills/retired-forged-verb"
+  if check_skill_cli_verbs "$scratch/skills" "$manifest" >/dev/null 2>&1; then
+    rm -rf -- "$scratch"
+    return 1
+  fi
+  rm -rf -- "$scratch"
+}
+
 required=(
   "$plugin/README.md"
   "$plugin/LEARNINGS.md"
@@ -961,6 +1051,9 @@ required=(
   "$plugin/skills/manage-work/intent-fixtures.json"
   "$plugin/skills/manage-work/portfolio-control-fixtures.json"
   "$plugin/skills/manage-work/host-parity-fixtures.json"
+  "docs/reference/operation-surface.json"
+  "docs/reference/operation-surface.md"
+  "scripts/fixtures/validate-plugin/retired-forged-verb/SKILL.md"
 )
 for path in "${required[@]}"; do
   [[ -f "$path" ]] && pass "required companion $path" || fail "required companion $path"
@@ -988,7 +1081,13 @@ check "manage-work portfolio/control contract" check_manage_work_portfolio_contr
 check "manage-work host-parity fixture JSON" check_json \
   "$plugin/skills/manage-work/host-parity-fixtures.json"
 check "manage-work dual-host registration and contract parity" check_manage_work_host_parity_contract \
-  "$plugin/skills/manage-work/host-parity-fixtures.json"
+  "$plugin/skills/manage-work/host-parity-fixtures.json" \
+  docs/reference/operation-surface.json
+check "skill Forged verbs match the operation surface" check_skill_cli_verbs \
+  "$plugin/skills" docs/reference/operation-surface.json
+check "retired Forged verb negative fixture" check_skill_cli_verb_negative_fixture \
+  scripts/fixtures/validate-plugin/retired-forged-verb \
+  docs/reference/operation-surface.json
 
 skill_files=("$plugin"/skills/*/SKILL.md)
 [[ ${#skill_files[@]} -eq 9 ]] && pass "exactly nine skills" || fail "exactly nine skills"

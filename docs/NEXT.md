@@ -28,6 +28,9 @@ plane.
 
 ## Install a release
 
+The generated [operation surface](reference/operation-surface.md) is the
+reference for CLI/MCP availability, fencing class, and explicit-key policy.
+
 Starting with the published `v0.5.0` release, the installer verifies the
 platform archive against `SHA256SUMS` and installs into `$HOME/.local` by
 default. It does not use `sudo`, edit shell profiles, register an agent

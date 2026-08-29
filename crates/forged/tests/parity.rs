@@ -1,12 +1,42 @@
-//! CLI/MCP parity (the two-adapters-over-one-core criterion): for each of
-//! the sixty-four public core functions, the CLI path and the MCP tool path produce
-//! identical `OperationResponse` values — modulo the minted `operationId` —
-//! from the same core call.
+//! CLI/MCP parity (the two-adapters-over-one-core criterion): every manifest
+//! operation exposed through both adapters produces identical `OperationResponse`
+//! values — modulo the minted `operationId` — from the same core call.
 
 mod support;
 
 use serde_json::{json, Value};
 use support::{fabricate_run, McpClient, TestEnv};
+
+const OPERATION_SURFACE: &str = include_str!("../../../docs/reference/operation-surface.json");
+const HOST_PARITY_FIXTURES: &str =
+    include_str!("../../../plugins/forged/skills/manage-work/host-parity-fixtures.json");
+
+fn manifest_mcp_tools() -> Vec<String> {
+    let manifest: Value = serde_json::from_str(OPERATION_SURFACE).expect("surface manifest JSON");
+    manifest["operations"]
+        .as_array()
+        .expect("surface manifest operations")
+        .iter()
+        .filter(|row| row["mcp"] == json!(true))
+        .map(|row| {
+            row["name"]
+                .as_str()
+                .expect("surface operation name")
+                .to_owned()
+        })
+        .collect()
+}
+
+fn host_fixture_tools() -> Vec<String> {
+    let fixture: Value =
+        serde_json::from_str(HOST_PARITY_FIXTURES).expect("host-parity fixture JSON");
+    fixture["tools"]
+        .as_array()
+        .expect("host-parity fixture tools")
+        .iter()
+        .map(|name| name.as_str().expect("host-parity tool name").to_owned())
+        .collect()
+}
 
 /// Normalize the minted operationId (a per-call uuid) out of an envelope;
 /// derived and read-default ids are deterministic and stay.
@@ -122,7 +152,7 @@ fn prepare_run_worktree(env: &TestEnv, run: &str) {
 }
 
 #[test]
-fn all_sixty_four_tools_match_their_cli_counterparts() {
+fn all_manifest_tools_match_their_cli_counterparts() {
     let env = TestEnv::new("forged-parity");
     env.forged(&["init"]);
     fabricate_run(&env, "par-repository");
@@ -137,74 +167,20 @@ fn all_sixty_four_tools_match_their_cli_counterparts() {
     // The server declares exactly the public operation tools.
     let mut tools = mcp.list_tools();
     tools.sort();
-    let mut expected = vec![
-        "claim_next",
-        "artifact_verify",
-        "artifact_compact",
-        "attention_acknowledge",
-        "attention_list",
-        "attention_reopen",
-        "attention_resolve",
-        "doctor",
-        "definition_validate",
-        "events_tail",
-        "explain",
-        "operations_overview",
-        "overview",
-        "epic_advance",
-        "epic_drive",
-        "epic_preflight",
-        "epic_pause",
-        "epic_resolve",
-        "epic_resume",
-        "epic_revise_roster",
-        "epic_start",
-        "epic_status",
-        "epic_submit",
-        "packet_show",
-        "packet_claim",
-        "packet_complete",
-        "packet_fail",
-        "gate_run",
-        "reconcile",
-        "review_publish",
-        "run_advance",
-        "run_accept_risk",
-        "run_adjudicate_settlement",
-        "run_revise_roster",
-        "run_start",
-        "run_status",
-        "run_stop",
-        "run_submit",
-        "session_list",
-        "session_inventory",
-        "session_message",
-        "session_read",
-        "session_stop",
-        "usage_ingest",
-        "usage_report",
-        "work_detail",
-        "work_list",
-        "work_history",
-        "work_map",
-        "epic_abandon",
-        "work_create",
-        "work_update",
-        "work_promote",
-        "work_note_add",
-        "work_note_list",
-        "work_link",
-        "work_close",
-        "work_reopen",
-        "work_release",
-        "work_supersede",
-        "work_revert",
-        "work_show",
-        "work_ready",
-        "worktree_retire",
-    ];
+    let mut expected = manifest_mcp_tools();
     expected.sort_unstable();
-    assert_eq!(tools, expected, "the sixty-four tools, exactly");
+    assert_eq!(tools, expected, "the manifest MCP tools, exactly");
+
+    let host_tools = host_fixture_tools();
+    let missing = tools
+        .iter()
+        .filter(|name| !host_tools.contains(name))
+        .cloned()
+        .collect::<Vec<_>>();
+    assert!(
+        missing.is_empty(),
+        "host-parity fixture is missing MCP tools: {missing:?}"
+    );
 
     // Both MCP result paths turn a failed operation envelope into a tool
     // error without changing one byte of the CLI-compatible JSON text.
@@ -246,8 +222,8 @@ fn all_sixty_four_tools_match_their_cli_counterparts() {
         overview_tool.pointer("/_meta/ui/resourceUri"),
         Some(&json!("ui://forged/overview.html"))
     );
-    // The one tool a host renders advertises its params concretely, and
-    // says which of them is required.
+    // Host-rendered tools advertise their params concretely, including which
+    // fields are required.
     let properties = overview_tool
         .pointer("/inputSchema/properties/params/properties")
         .cloned()
