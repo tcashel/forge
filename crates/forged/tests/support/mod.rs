@@ -1411,11 +1411,29 @@ impl TestEnv {
     /// shim allowed.
     fn work_db(&self) -> rusqlite::Connection {
         // Seeding may run before `forged init`; opening through the ledger
-        // first applies the migrations exactly as the binary would.
-        forged_ledger::Ledger::open(&self.anvil.join("state.db"))
-            .expect("migrate state.db")
-            .close()
-            .expect("close migrator");
+        // first applies the migrations exactly as the binary would. A live
+        // controller spawned by the same test holds write locks on its own
+        // cadence, and slow runners (coverage instrumentation) can outlast
+        // the ledger's busy timeout — lock contention here is scheduling,
+        // not state, so the migrator open retries under a wall-clock
+        // deadline instead of panicking on the first locked window.
+        let db = self.anvil.join("state.db");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            match forged_ledger::Ledger::open(&db) {
+                Ok(ledger) => {
+                    ledger.close().expect("close migrator");
+                    break;
+                }
+                Err(error)
+                    if error.to_string().contains("database is locked")
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
+                Err(error) => panic!("migrate state.db: {error:?}"),
+            }
+        }
         let conn = rusqlite::Connection::open(self.anvil.join("state.db")).expect("open state.db");
         conn.busy_timeout(std::time::Duration::from_millis(5000))
             .expect("busy timeout");
