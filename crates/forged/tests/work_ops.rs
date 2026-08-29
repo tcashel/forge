@@ -7,7 +7,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
 use std::process::Stdio;
 
-use forged_ledger::{NewWorkItem, WorkKind, WorkRevisionCause, WorkSpecFields, WorkStatus};
+use forged_ledger::{
+    NewWorkItem, NewWorkNote, WorkKind, WorkNoteKind, WorkRevisionCause, WorkSpecFields, WorkStatus,
+};
 use serde_json::{json, Value};
 use support::TestEnv;
 
@@ -378,7 +380,25 @@ fn work_notes_round_trip_canonically_without_minting_revisions() {
             "approval evidence follows",
         ],
     );
-    std::fs::write(body_path, r#"{"approved":true}"#).expect("replace body");
+    std::fs::write(
+        body_path,
+        serde_json::to_vec(&json!({
+            "schema": "forged.execution-approval/1",
+            "subjectKind": "slice",
+            "workItemId": "noted-work",
+            "observedRevision": "1",
+            "repository": "/tmp/noted-work",
+            "baseRef": "main",
+            "profile": "default",
+            "roster": "default",
+            "action": "run-start-submit",
+            "approvedAt": "2026-08-29T12:00:00Z",
+            "actor": "lead-agent",
+            "basis": "operator approved the bounded tuple",
+        }))
+        .expect("serialize approval"),
+    )
+    .expect("replace body");
     let supplied = result(
         &env,
         &[
@@ -389,8 +409,6 @@ fn work_notes_round_trip_canonically_without_minting_revisions() {
             "noted-work",
             "--kind",
             "approval",
-            "--schema",
-            "example.execution-approval/7",
             "--actor",
             "lead-agent",
             "--body-file",
@@ -399,8 +417,8 @@ fn work_notes_round_trip_canonically_without_minting_revisions() {
     );
     assert_eq!(
         supplied["note"]["schema"],
-        json!("example.execution-approval/7"),
-        "a supplied wire schema is stored verbatim"
+        json!("forged.execution-approval/1"),
+        "the approval schema is stored under its typed contract"
     );
     assert_eq!(supplied["note"]["actor"], json!("lead-agent"));
 
@@ -465,6 +483,285 @@ fn work_notes_round_trip_canonically_without_minting_revisions() {
         json!(1),
         "annotations and close-time evidence never mint revisions"
     );
+}
+
+#[test]
+fn recommendation_notes_round_trip_the_closed_v1_contract() {
+    let env = TestEnv::new("forged-recommendation-note-v1");
+    assert_eq!(env.forged(&["init"]).0, 0);
+    result(
+        &env,
+        &[
+            "work",
+            "create",
+            "--id",
+            "recommended-work",
+            "--title",
+            "Recommended work",
+        ],
+    );
+    let body = json!({
+        "schema": "forged.spec-recommendations/1",
+        "workItem": "recommended-work",
+        "repository": "/tmp/recommended-work",
+        "reviewedAt": "2026-08-29T12:00:00Z",
+        "topology": "normal: one independent critic",
+        "recommendations": [{
+            "target": "design",
+            "correction": "validate typed notes before the ledger call"
+        }],
+        "cruxes": [{
+            "id": "CRUX-1",
+            "evidence": ["work_ops owns the handler"],
+            "options": ["validate in core", "validate in ledger"],
+            "recommendation": "validate in core",
+            "resolution": "validate in core"
+        }],
+        "openQuestions": [],
+        "rejectedFindings": [{
+            "finding": "migrate old rows",
+            "reason": "migration is outside this slice"
+        }],
+        "verification": ["inspected work_ops.rs"]
+    });
+    let body_path = env.root.join("recommendations.json");
+    std::fs::write(
+        &body_path,
+        serde_json::to_vec_pretty(&body).expect("serialize recommendations"),
+    )
+    .expect("write recommendations");
+    let body_path = body_path.to_str().expect("UTF-8 body path");
+
+    let added = result(
+        &env,
+        &[
+            "work",
+            "note",
+            "add",
+            "--id",
+            "recommended-work",
+            "--kind",
+            "recommendation",
+            "--body-file",
+            body_path,
+        ],
+    );
+    assert_eq!(
+        added["note"]["schema"],
+        json!("forged.spec-recommendations/1"),
+        "omitting --schema mints the typed recommendation schema"
+    );
+
+    let listed = result(
+        &env,
+        &[
+            "work",
+            "note",
+            "list",
+            "--id",
+            "recommended-work",
+            "--kind",
+            "recommendation",
+        ],
+    );
+    assert_eq!(listed["totals"], json!({"shown": 1, "total": 1}));
+    assert_eq!(listed["notes"][0]["schema"], added["note"]["schema"]);
+    let listed_body: Value = serde_json::from_str(
+        listed["notes"][0]["bodyJson"]
+            .as_str()
+            .expect("bodyJson string"),
+    )
+    .expect("listed body is JSON");
+    assert_eq!(listed_body, body);
+}
+
+#[test]
+fn typed_work_note_refusals_name_schema_and_first_field() {
+    let env = TestEnv::new("forged-typed-note-refusals");
+    assert_eq!(env.forged(&["init"]).0, 0);
+    result(
+        &env,
+        &[
+            "work",
+            "create",
+            "--id",
+            "typed-note-work",
+            "--title",
+            "Typed note work",
+        ],
+    );
+    let body = env.root.join("typed-note.json");
+    let body_path = body.to_str().expect("UTF-8 body path");
+
+    let cases = [
+        (
+            "recommendation",
+            json!({
+                "schema": "forged.spec-recommendations/1",
+                "repository": "/tmp/typed-note-work",
+                "reviewedAt": "2026-08-29T12:00:00Z",
+                "recommendations": [],
+                "cruxes": []
+            }),
+            "forged.spec-recommendations/1",
+            "workItem",
+        ),
+        (
+            "approval",
+            json!({
+                "schema": "forged.execution-approval/1",
+                "subjectKind": "slice",
+                "workItemId": "typed-note-work",
+                "observedRevision": "1",
+                "repository": "/tmp/typed-note-work",
+                "baseRef": "main",
+                "profile": "default",
+                "roster": "default",
+                "action": "run-start-submit",
+                "approvedAt": "2026-08-29T12:00:00Z",
+                "actor": "operator"
+            }),
+            "forged.execution-approval/1",
+            "basis",
+        ),
+    ];
+    for (kind, payload, schema, field) in cases {
+        std::fs::write(
+            &body,
+            serde_json::to_vec(&payload).expect("serialize invalid typed note"),
+        )
+        .expect("write invalid typed note");
+        let (code, refused) = env.forged(&[
+            "work",
+            "note",
+            "add",
+            "--id",
+            "typed-note-work",
+            "--kind",
+            kind,
+            "--body-file",
+            body_path,
+        ]);
+        assert_ne!(code, 0, "missing field was accepted: {refused}");
+        let message = refused["error"]["message"].as_str().unwrap_or_default();
+        assert!(message.contains(schema), "schema absent from: {message}");
+        assert!(message.contains(field), "field absent from: {message}");
+    }
+
+    let recommendation = json!({
+        "schema": "forged.spec-recommendations/1",
+        "workItem": "typed-note-work",
+        "repository": "/tmp/typed-note-work",
+        "reviewedAt": "2026-08-29T12:00:00Z",
+        "recommendations": [],
+        "cruxes": []
+    });
+    std::fs::write(
+        &body,
+        serde_json::to_vec(&recommendation).expect("serialize recommendation"),
+    )
+    .expect("write recommendation");
+    let (code, mismatch) = env.forged(&[
+        "work",
+        "note",
+        "add",
+        "--id",
+        "typed-note-work",
+        "--kind",
+        "recommendation",
+        "--schema",
+        "forged.execution-approval/1",
+        "--body-file",
+        body_path,
+    ]);
+    assert_ne!(code, 0, "kind/schema mismatch was accepted: {mismatch}");
+    let message = mismatch["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("recommendation"), "{message}");
+    assert!(message.contains("forged.execution-approval/1"), "{message}");
+    assert!(
+        message.contains("forged.spec-recommendations/1"),
+        "{message}"
+    );
+
+    let legacy_approval = json!({
+        "schema": "forged-execution-approval/1",
+        "subjectKind": "slice",
+        "workItemId": "typed-note-work",
+        "observedRevision": "1",
+        "repository": "/tmp/typed-note-work",
+        "baseRef": "main",
+        "profile": "default",
+        "roster": "default",
+        "action": "run-start-submit",
+        "approvedAt": "2026-08-29T12:00:00Z",
+        "actor": "operator",
+        "basis": "approved tuple"
+    });
+    std::fs::write(
+        &body,
+        serde_json::to_vec(&legacy_approval).expect("serialize legacy approval"),
+    )
+    .expect("write legacy approval");
+    let (code, legacy) = env.forged(&[
+        "work",
+        "note",
+        "add",
+        "--id",
+        "typed-note-work",
+        "--kind",
+        "approval",
+        "--body-file",
+        body_path,
+    ]);
+    assert_ne!(code, 0, "legacy approval schema was accepted: {legacy}");
+    let message = legacy["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("forged-execution-approval/1"), "{message}");
+    assert!(message.contains("forged.execution-approval/1"), "{message}");
+    assert!(message.contains("schema"), "{message}");
+}
+
+#[test]
+fn existing_untyped_sentinel_notes_remain_listable() {
+    let env = TestEnv::new("forged-untyped-note-compat");
+    assert_eq!(env.forged(&["init"]).0, 0);
+    result(
+        &env,
+        &[
+            "work",
+            "create",
+            "--id",
+            "legacy-note-work",
+            "--title",
+            "Legacy note work",
+        ],
+    );
+    let ledger = env.ledger();
+    ledger
+        .add_work_note(NewWorkNote {
+            work_id: "legacy-note-work".to_owned(),
+            kind: WorkNoteKind::Recommendation,
+            schema: "recommendation/0".to_owned(),
+            actor: "legacy-critic".to_owned(),
+            body_json: r#"{"legacy":true}"#.to_owned(),
+        })
+        .expect("seed pre-v1 recommendation note");
+    ledger.close().expect("close ledger");
+
+    let listed = result(
+        &env,
+        &[
+            "work",
+            "note",
+            "list",
+            "--id",
+            "legacy-note-work",
+            "--kind",
+            "recommendation",
+        ],
+    );
+    assert_eq!(listed["totals"], json!({"shown": 1, "total": 1}));
+    assert_eq!(listed["notes"][0]["schema"], json!("recommendation/0"));
+    assert_eq!(listed["notes"][0]["bodyJson"], json!(r#"{"legacy":true}"#));
 }
 
 #[test]

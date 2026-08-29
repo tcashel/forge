@@ -14,8 +14,9 @@ use forged_ledger::{
     WORK_NOTE_MAX_LIMIT,
 };
 use forged_types::{
-    canonical_json_bytes, parse_canonical, request_sha256, ErrorCode, OperationRequest,
-    OperationResponse,
+    canonical_json_bytes, parse_canonical, request_sha256, ErrorCode, ExecutionApprovalV1,
+    OperationRequest, OperationResponse, SpecRecommendationsV1, EXECUTION_APPROVAL_SCHEMA_V1,
+    SPEC_RECOMMENDATIONS_SCHEMA_V1,
 };
 use serde_json::{json, Value};
 
@@ -115,7 +116,9 @@ fn work_note_wire_string(
     }
 }
 
-fn canonical_work_note_body(params: &serde_json::Map<String, Value>) -> Result<String, Failure> {
+fn canonical_work_note_body(
+    params: &serde_json::Map<String, Value>,
+) -> Result<(Value, String), Failure> {
     let raw = work_note_wire_string(params, "bodyJson")?
         .ok_or_else(|| Failure::invalid("bodyJson is required: pass JSON from --body-file"))?;
     let value = parse_canonical(&raw).map_err(|error| {
@@ -130,8 +133,47 @@ fn canonical_work_note_body(params: &serde_json::Map<String, Value>) -> Result<S
              {error}"
         ))
     })?;
-    String::from_utf8(bytes)
-        .map_err(|error| Failure::internal(format!("canonical bodyJson is not UTF-8: {error}")))
+    let body = String::from_utf8(bytes)
+        .map_err(|error| Failure::internal(format!("canonical bodyJson is not UTF-8: {error}")))?;
+    Ok((value, body))
+}
+
+fn work_note_schema(kind: WorkNoteKind, supplied: Option<String>) -> Result<String, Failure> {
+    let expected = match kind {
+        WorkNoteKind::Recommendation => Some(SPEC_RECOMMENDATIONS_SCHEMA_V1),
+        WorkNoteKind::Approval => Some(EXECUTION_APPROVAL_SCHEMA_V1),
+        WorkNoteKind::Comment | WorkNoteKind::Critique => None,
+    };
+    match (expected, supplied) {
+        (Some(expected), Some(supplied)) if supplied != expected => Err(Failure::invalid(format!(
+            "work note kind {:?} requires schema {expected:?}; --schema {supplied:?} is a \
+             kind/schema mismatch",
+            kind.as_str()
+        ))),
+        (Some(expected), _) => Ok(expected.to_owned()),
+        (None, Some(supplied)) => Ok(supplied),
+        (None, None) => Ok(format!("{}/0", kind.as_str())),
+    }
+}
+
+fn validate_work_note_contract(
+    kind: WorkNoteKind,
+    schema: &str,
+    body: &Value,
+) -> Result<(), Failure> {
+    let result = match kind {
+        WorkNoteKind::Recommendation => {
+            SpecRecommendationsV1::parse_value(body.clone()).map(|_| ())
+        }
+        WorkNoteKind::Approval => ExecutionApprovalV1::parse_value(body.clone()).map(|_| ()),
+        WorkNoteKind::Comment | WorkNoteKind::Critique => return Ok(()),
+    };
+    result.map_err(|error| {
+        Failure::invalid(format!(
+            "work note {:?} payload for schema {schema:?} violates {error}",
+            kind.as_str()
+        ))
+    })
 }
 
 /// `work_create` — author a new work item with its revision-1 spec.
@@ -308,24 +350,41 @@ pub async fn work_note_add(ctx: &Ctx, req: &mut OperationRequest) -> OperationRe
             return err_response(&derive_key("work_note_add", Some(&id), None, None), &error)
         }
     };
-    let body_json = match canonical_work_note_body(&req.params) {
+    let schema = match work_note_wire_string(&req.params, "schema")
+        .and_then(|schema| work_note_schema(kind, schema))
+    {
+        Ok(schema) => schema,
+        Err(error) => {
+            return err_response(
+                &derive_key("work_note_add", Some(&id), Some(kind.as_str()), None),
+                &error,
+            )
+        }
+    };
+    let (body, body_json) = match canonical_work_note_body(&req.params) {
         Ok(body) => body,
         Err(error) => {
+            let error = if matches!(kind, WorkNoteKind::Recommendation | WorkNoteKind::Approval) {
+                Failure::invalid(format!(
+                    "work note {:?} payload for schema {schema:?} violates field bodyJson: {}",
+                    kind.as_str(),
+                    error.message
+                ))
+            } else {
+                error
+            };
             return err_response(
                 &derive_key("work_note_add", Some(&id), Some(kind.as_str()), None),
                 &error,
-            )
+            );
         }
     };
-    let schema = match work_note_wire_string(&req.params, "schema") {
-        Ok(schema) => schema.unwrap_or_else(|| format!("{}/0", kind.as_str())),
-        Err(error) => {
-            return err_response(
-                &derive_key("work_note_add", Some(&id), Some(kind.as_str()), None),
-                &error,
-            )
-        }
-    };
+    if let Err(error) = validate_work_note_contract(kind, &schema, &body) {
+        return err_response(
+            &derive_key("work_note_add", Some(&id), Some(kind.as_str()), None),
+            &error,
+        );
+    }
     let actor = match work_note_wire_string(&req.params, "actor") {
         Ok(actor) => actor.unwrap_or_else(|| "operator".to_owned()),
         Err(error) => {

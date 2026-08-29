@@ -16,16 +16,45 @@ the later explicit handoff.
 
 ```bash
 forged work show --id "$WORK_ID"
+
+RECOMMENDATION_LIMIT=100
+while :; do
+  RECOMMENDATION_NOTES="$(forged work note list \
+    --id "$WORK_ID" --kind recommendation --limit "$RECOMMENDATION_LIMIT")" || exit 1
+  RECOMMENDATION_SHOWN="$(printf '%s' "$RECOMMENDATION_NOTES" | \
+    jq -er '.result.totals.shown')" || exit 1
+  RECOMMENDATION_TOTAL="$(printf '%s' "$RECOMMENDATION_NOTES" | \
+    jq -er '.result.totals.total')" || exit 1
+  [[ "$RECOMMENDATION_SHOWN" -eq "$RECOMMENDATION_TOTAL" ]] && break
+  if [[ "$RECOMMENDATION_TOTAL" -gt 500 ]]; then
+    printf 'recommendation notes exceed the 500-row read cap: %s; operator action required\n' \
+      "$RECOMMENDATION_TOTAL" >&2
+    exit 1
+  fi
+  RECOMMENDATION_LIMIT="$RECOMMENDATION_TOTAL"
+done
+if [[ "$RECOMMENDATION_TOTAL" -eq 0 ]]; then
+  printf 'no recommendation note exists; run /forged:critique\n' >&2
+  exit 1
+fi
+LATEST_RECOMMENDATION="$(printf '%s' "$RECOMMENDATION_NOTES" | \
+  jq -cer '.result.notes[-1]')" || exit 1
+RECOMMENDATIONS_JSON="$(printf '%s' "$LATEST_RECOMMENDATION" | jq -cer '
+  select(.schema == "forged.spec-recommendations/1") | .bodyJson | fromjson
+')" || {
+  printf 'newest recommendation is not forged.spec-recommendations/1; run /forged:critique\n' >&2
+  exit 1
+}
 ```
 
-Use the newest complete `forged-spec-recommendations` block in `notes` whose
-`workItem` and `repository` match the current record. For migration
-compatibility only, accept the newest complete legacy
-`anvil-spec-recommendations` block if no Forged-tagged block exists. Never use
-a recommendation for another id or repository.
+This is the only newest-of-kind procedure: compare `totals.shown` with
+`totals.total`; when truncated, re-read with `--limit` equal to `total`, capped
+at 500; then take the last row of the requested kind. Tell the operator and
+refuse beyond 500. Verify the decoded payload's `workItem` and `repository`
+match the current record. Never scan backward to make a stale note win.
 
-If no complete block exists, stop and direct the operator to
-`/forged:critique`; do not invent the critic's findings.
+If the newest typed payload is incomplete or mismatched, stop and direct the
+operator to `/forged:critique`; do not invent the critic's findings.
 
 ## Resolve the record
 
@@ -46,9 +75,9 @@ inapplicable with evidence, or remains blocking.
 
 Integrate accepted resolutions into `description`, `design`,
 `acceptanceCriteria`, and `notes` according to the plan schema. Remove resolved
-question checkboxes. Because current main has no commentary lane, retain the
-fully dispositioned recommendation block plus a concise dated adjudication
-summary in `notes`; do not pretend a separate comment was written.
+question checkboxes. Record CRUX resolutions and a concise dated adjudication
+summary in the spec `notes`; accepted corrections belong in the normative
+fields. The immutable recommendation note remains unchanged.
 
 Prepare complete field bodies outside the repository and make one guarded
 update. Fail closed before the update unless every scratch file is readable and

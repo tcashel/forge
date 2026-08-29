@@ -393,7 +393,7 @@ pub struct WorkNoteAddParams {
     pub kind: WorkNoteKindParam,
     /// Raw JSON text; the ledger stores its canonical rendering.
     pub body_json: String,
-    /// Payload schema wire name; omission stores `<kind>/0`.
+    /// Payload schema wire name; typed kinds default to their v1 contract, others to `<kind>/0`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema: Option<String>,
     /// Writing identity; omission stores `operator`.
@@ -1537,8 +1537,9 @@ impl ForgedServer {
         name = "work_note_add",
         description = "Append evidence about a work specification without changing its \
                        revision or coordination state. params: id, kind (comment | critique | \
-                       recommendation | approval), bodyJson (raw JSON string); optional schema \
-                       defaults to <kind>/0 and actor defaults to operator. Duplicate keys and \
+                       recommendation | approval), bodyJson (raw JSON string); recommendation and \
+                       approval require their typed v1 payload and schema, while other omitted \
+                       schemas default to <kind>/0. actor defaults to operator. Duplicate keys and \
                        non-integer numbers are refused. Closed work items are accepted."
     )]
     pub async fn work_note_add(&self, args: Parameters<WorkNoteAddArgs>) -> CallToolResult {

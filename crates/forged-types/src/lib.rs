@@ -19,6 +19,7 @@ pub mod review_publication;
 pub mod work_history;
 pub mod work_identity;
 pub mod work_map;
+pub mod work_note_contract;
 pub mod work_ref;
 
 pub use admission::{
@@ -97,5 +98,10 @@ pub use work_map::{
     WorkMapCapturedAtV1, WorkMapCountsV1, WorkMapEdgeKind, WorkMapEdgeV1, WorkMapGraphHealthV1,
     WorkMapGroup, WorkMapNodeV1, WorkMapScopeKind, WorkMapScopeV1, WorkMapSource, WorkMapV1,
     WORK_MAP_SCHEMA_V1,
+};
+pub use work_note_contract::{
+    ExecutionApprovalAction, ExecutionApprovalSubjectKind, ExecutionApprovalV1,
+    SpecRecommendationCruxV1, SpecRecommendationV1, SpecRecommendationsV1, SpecRejectedFindingV1,
+    WorkNoteContractError, EXECUTION_APPROVAL_SCHEMA_V1, SPEC_RECOMMENDATIONS_SCHEMA_V1,
 };
 pub use work_ref::{WorkRefKind, WorkRefV1, WorkRefValidationError, WORK_REF_SCHEMA_V1};

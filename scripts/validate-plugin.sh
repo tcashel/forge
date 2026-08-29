@@ -79,7 +79,7 @@ const requiredSkillText = [
   '../adjudicate/SKILL.md',
   '../dispatch/SKILL.md',
   '../run-epic/SKILL.md',
-  'forged-execution-approval/1',
+  'forged.execution-approval/1',
   'forged definition validate',
   'forged doctor',
   'forged service status',
@@ -96,11 +96,12 @@ const approvalEnd = skill.indexOf('## Bind every existing-work control', approva
 if (approvalStart < 0 || approvalEnd <= approvalStart) process.exit(1);
 const approvalSection = skill.slice(approvalStart, approvalEnd);
 const requiredApprovalText = [
-  'APPROVED_NOTES_PATH',
-  '[[ ! -r "$APPROVED_NOTES_PATH" || ! -s "$APPROVED_NOTES_PATH" ]]',
-  '[[ -z "$APPROVED_NOTES" ]]',
-  '--expected-revision "$OBSERVED_REVISION"',
-  '--notes="$APPROVED_NOTES"',
+  'APPROVAL_PATH',
+  '[[ ! -r "$APPROVAL_PATH" || ! -s "$APPROVAL_PATH" ]]',
+  'forged work note add',
+  '--kind approval',
+  '--schema forged.execution-approval/1',
+  '--body-file "$APPROVAL_PATH"',
 ];
 if (!requiredApprovalText.every((token) => approvalSection.includes(token))) process.exit(1);
 
@@ -1096,14 +1097,19 @@ for needle in 'newly created id' 'ore-' 'existing or' \
   grep -Fq -- "$needle" "$plugin/skills/plan/checklist.md" \
     && pass "native id contract: $needle" || fail "native id contract: $needle"
 done
-for needle in 'forged work update' '--expected-revision' 'notes' \
-  'no separate ledger commentary operation' 'UPDATED_NOTES_PATH' \
-  '[[ ! -r "$UPDATED_NOTES_PATH" || ! -s "$UPDATED_NOTES_PATH" ]]' \
-  '[[ -z "$UPDATED_NOTES" ]]'; do
+for needle in 'forged work note add' '--kind recommendation' \
+  '--schema forged.spec-recommendations/1' '--body-file "$RECOMMENDATIONS_PATH"' \
+  'RECOMMENDATIONS_PATH' \
+  '[[ ! -r "$RECOMMENDATIONS_PATH" || ! -s "$RECOMMENDATIONS_PATH" ]]' \
+  'critique seat writes kind `recommendation`'; do
   grep -Fq -- "$needle" "$plugin/skills/critique/SKILL.md" \
     && pass "ledger critique contract: $needle" || fail "ledger critique contract: $needle"
 done
-for needle in 'forged work update' 'forged work reopen' 'non-atomic' 'ore-063' \
+for needle in 'forged work note list' '--kind recommendation' \
+  'RECOMMENDATION_SHOWN' 'RECOMMENDATION_TOTAL' \
+  'RECOMMENDATION_LIMIT="$RECOMMENDATION_TOTAL"' '.result.notes[-1]' \
+  'forged.spec-recommendations/1' '500-row read cap' \
+  'forged work update' 'forged work reopen' 'non-atomic' 'ore-063' \
   '[[ ! -r "$FIELD_PATH" || ! -s "$FIELD_PATH" ]]' \
   'adjudication fields must all be nonempty'; do
   grep -Fq -- "$needle" "$plugin/skills/adjudicate/SKILL.md" \

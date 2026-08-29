@@ -1028,7 +1028,7 @@ pub struct WorkNoteAddArgs {
     /// comment | critique | recommendation | approval.
     #[arg(long)]
     pub kind: String,
-    /// Payload schema wire name (default <kind>/0).
+    /// Payload schema wire name (typed kinds default to their v1 contract; others to <kind>/0).
     #[arg(long)]
     pub schema: Option<String>,
     /// Acting identity (default operator).
