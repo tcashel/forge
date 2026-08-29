@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use forged_ledger::{
     AdmissionReservationState, AttemptState, DesiredReconcileOutcome, EffectClass, EventRow,
-    RevokeScope, RunOutcome, WorkObservationSnapshot,
+    RevokeScope, RunOutcome, WorkItemSnapshot, WorkObservationSnapshot,
 };
 use forged_types::{
     attention_id, attention_occurrence_id, AdmissionOutcome, AdmissionReason,
@@ -558,6 +558,449 @@ async fn resolve(ctx: &Ctx, id: &str) -> Result<Resolved, Failure> {
         "reason": if candidates.is_empty() { "unknown" } else { "ambiguous" },
         "candidates": candidates,
     })))
+}
+
+/// What the explain-only resolver selected. Overview's two-kind [`Resolved`]
+/// contract remains untouched; this layer adds exact-only namespaces around
+/// it and defers its prefix result until every exact namespace was checked.
+enum ExplainResolved {
+    WorkItem(Box<WorkItemSnapshot>),
+    Run(String),
+    Epic(String),
+    Attempt(Box<forged_ledger::AttemptRow>),
+    Attention(Box<AttentionItemV1>),
+    Unresolved(Value),
+}
+
+async fn resolve_explain(ctx: &Ctx, id: &str) -> Result<ExplainResolved, Failure> {
+    let work_id = id.to_owned();
+    if let Some(work) = on_ledger(&ctx.ledger, move |ledger| ledger.work_item(&work_id)).await? {
+        return Ok(ExplainResolved::WorkItem(Box::new(work)));
+    }
+
+    // `resolve` owns the established run/epic exact and prefix semantics.
+    // Hold a unique prefix aside: exact attempt and attention ids outrank it,
+    // while exact run/epic ids return immediately at their normative rank.
+    let durable = resolve(ctx, id).await?;
+    match &durable {
+        Resolved::Slice(run) if run == id => return Ok(ExplainResolved::Run(run.clone())),
+        Resolved::Epic(epic) if epic == id => return Ok(ExplainResolved::Epic(epic.clone())),
+        _ => {}
+    }
+
+    if let Ok(attempt_id) = id.parse::<i64>() {
+        if let Some(attempt) =
+            on_ledger(&ctx.ledger, move |ledger| ledger.find_attempt(attempt_id)).await?
+        {
+            return Ok(ExplainResolved::Attempt(Box::new(attempt)));
+        }
+    }
+
+    if let Some(item) = super::ops::all_attention(ctx)
+        .await?
+        .into_iter()
+        .find(|item| item.attention_id == id)
+    {
+        return Ok(ExplainResolved::Attention(Box::new(item)));
+    }
+
+    Ok(match durable {
+        Resolved::Slice(run) => ExplainResolved::Run(run),
+        Resolved::Epic(epic) => ExplainResolved::Epic(epic),
+        Resolved::Unresolved(resolution) => ExplainResolved::Unresolved(resolution),
+    })
+}
+
+const EXPLAIN_COLLECTION_CAP: usize = 50;
+
+async fn explain_observation(
+    ctx: &Ctx,
+    kind: forged_types::WorkIdentitySubjectKind,
+    id: &str,
+) -> Result<WorkObservationSnapshot, Failure> {
+    let id = id.to_owned();
+    on_ledger(&ctx.ledger, move |ledger| {
+        ledger.work_observation_snapshot(
+            kind,
+            &id,
+            0,
+            forged_ledger::WORK_OBSERVATION_MAX_EVENT_LIMIT,
+        )
+    })
+    .await
+}
+
+fn run_observation_inputs<'a>(
+    snapshot: &'a WorkObservationSnapshot,
+    run: &forged_ledger::RunRow,
+) -> super::health::HealthInputs<'a> {
+    let desired = snapshot.desired_work.iter().find(|row| {
+        row.subject_kind == forged_ledger::DesiredSubjectKind::Run && row.subject_id == run.run_id
+    });
+    let admission_deferred = snapshot.admission_decisions.iter().any(|decision| {
+        decision.subject_kind == forged_types::AdmissionSubjectKind::Run
+            && decision.subject_id == run.run_id
+            && decision.outcome == forged_types::AdmissionOutcome::Deferred
+    });
+    let live_attempt = snapshot
+        .attempts
+        .iter()
+        .any(|attempt| attempt.state == AttemptState::Running);
+    super::health::HealthInputs::observation(
+        true,
+        run.state == forged_ledger::RunState::Stopped,
+        false,
+        run.terminal_outcome == Some(RunOutcome::InputRequired),
+        admission_deferred,
+        desired,
+        live_attempt.then_some(true),
+    )
+}
+
+fn epic_observation_inputs(snapshot: &WorkObservationSnapshot) -> super::health::HealthInputs<'_> {
+    let complete_events = snapshot.events.after_event_id == 0 && !snapshot.events.has_more;
+    let mut latest_pause: Option<(&str, i64)> = None;
+    let mut latest_input: Option<(&str, i64)> = None;
+    let mut terminal = false;
+    if complete_events {
+        for event in &snapshot.events.rows {
+            match event.kind.as_str() {
+                super::epic::PAUSED | super::epic::RESUMED => {
+                    latest_pause = Some((&event.kind, event.event_id));
+                }
+                super::epic::INPUT_REQUIRED | super::epic::INPUT_RESOLVED => {
+                    latest_input = Some((&event.kind, event.event_id));
+                }
+                super::epic::EPIC_PR => {
+                    let nonterminal = serde_json::from_str::<Value>(&event.payload_json)
+                        .ok()
+                        .and_then(|payload| payload.get("terminal").and_then(Value::as_bool))
+                        == Some(false);
+                    terminal |= !nonterminal;
+                }
+                super::epic::ASSURANCE_COMPLETED => terminal = true,
+                _ => {}
+            }
+        }
+    }
+    let desired = snapshot.desired_work.iter().find(|row| {
+        row.subject_kind == forged_ledger::DesiredSubjectKind::Epic
+            && row.subject_id == snapshot.subject.id
+    });
+    let admission_deferred = snapshot
+        .admission_decisions
+        .iter()
+        .find(|decision| {
+            decision.subject_kind == forged_types::AdmissionSubjectKind::Epic
+                && decision.subject_id == snapshot.subject.id
+        })
+        .is_some_and(|decision| decision.outcome == forged_types::AdmissionOutcome::Deferred);
+    super::health::HealthInputs::observation(
+        true,
+        terminal,
+        latest_pause.is_some_and(|(kind, _)| kind == super::epic::PAUSED),
+        latest_input.is_some_and(|(kind, _)| kind == super::epic::INPUT_REQUIRED),
+        admission_deferred,
+        desired,
+        None,
+    )
+}
+
+fn observation_inputs(
+    snapshot: &WorkObservationSnapshot,
+) -> Result<super::health::HealthInputs<'_>, Failure> {
+    match snapshot.subject.kind {
+        forged_types::WorkIdentitySubjectKind::Run => {
+            let run = snapshot
+                .runs
+                .iter()
+                .find(|run| run.run_id == snapshot.subject.id)
+                .ok_or_else(|| {
+                    Failure::internal("run observation snapshot omitted its requested run")
+                })?;
+            Ok(run_observation_inputs(snapshot, run))
+        }
+        forged_types::WorkIdentitySubjectKind::Epic => Ok(epic_observation_inputs(snapshot)),
+    }
+}
+
+fn explain_how_with_verdict(inputs: super::health::HealthInputs<'_>, verdict: &str) -> Value {
+    json!({
+        "verdict": verdict,
+        "inputs": inputs.summary(),
+    })
+}
+
+fn explain_how(inputs: super::health::HealthInputs<'_>) -> Value {
+    explain_how_with_verdict(inputs, super::health::execution_health(inputs))
+}
+
+async fn explain_work_item(ctx: &Ctx, work: WorkItemSnapshot) -> Result<Value, Failure> {
+    let work_id = work.work_id.clone();
+    let mut runs = on_ledger(&ctx.ledger, move |ledger| ledger.list_runs()).await?;
+    runs.retain(|run| run.work_id == work_id);
+    let latest = runs.last().cloned();
+    let how = if let Some(run) = latest.as_ref() {
+        let observation =
+            explain_observation(ctx, forged_types::WorkIdentitySubjectKind::Run, &run.run_id)
+                .await?;
+        explain_how(observation_inputs(&observation)?)
+    } else {
+        explain_how(super::health::HealthInputs::observation(
+            false, false, false, false, false, None, None,
+        ))
+    };
+    let total = runs.len();
+    let run_items = runs
+        .iter()
+        .rev()
+        .take(EXPLAIN_COLLECTION_CAP)
+        .map(|run| {
+            json!({
+                "id": run.run_id,
+                "state": run.state.as_str(),
+                "outcome": run.terminal_outcome.map(RunOutcome::as_str),
+                "createdAt": run.created_at,
+                "updatedAt": run.updated_at,
+            })
+        })
+        .collect::<Vec<_>>();
+    let next = super::work_ops::projection_actions(&work);
+    Ok(json!({
+        "schema": "forged.explain/1",
+        "kind": "work-item",
+        "id": work.work_id,
+        "what": {
+            "kind": work.kind.as_str(),
+            "title": work.spec.title,
+            "status": work.status.as_str(),
+            "priority": work.priority,
+            "assignee": work.assignee,
+            "revision": work.revision,
+            "repository": work.metadata.get("repository"),
+            "healthRunId": latest.as_ref().map(|run| run.run_id.as_str()),
+            "runs": {
+                "items": run_items,
+                "total": total,
+                "limit": EXPLAIN_COLLECTION_CAP,
+                "truncated": total > EXPLAIN_COLLECTION_CAP,
+            },
+            "show": {
+                "verb": "work show",
+                "args": {"id": work.work_id},
+            },
+        },
+        "how": how,
+        "next": next,
+    }))
+}
+
+async fn subject_attention_actions(
+    ctx: &Ctx,
+    kind: AttentionSubjectKind,
+    id: &str,
+) -> Result<Vec<forged_types::OperationActionV1>, Failure> {
+    let mut actions = Vec::new();
+    for item in super::ops::all_attention(ctx)
+        .await?
+        .into_iter()
+        .filter(|item| {
+            item.subject_kind == kind
+                && item.subject_id == id
+                && item.state != AttentionState::Resolved
+        })
+    {
+        for action in item.next_actions {
+            if actions.len() == EXPLAIN_COLLECTION_CAP {
+                return Ok(actions);
+            }
+            if !actions.contains(&action) {
+                actions.push(action);
+            }
+        }
+    }
+    Ok(actions)
+}
+
+async fn explain_run(ctx: &Ctx, id: String) -> Result<Value, Failure> {
+    let observation =
+        explain_observation(ctx, forged_types::WorkIdentitySubjectKind::Run, &id).await?;
+    let run = observation
+        .runs
+        .iter()
+        .find(|run| run.run_id == id)
+        .ok_or_else(|| Failure::internal("run observation snapshot omitted its requested run"))?;
+    let inputs = run_observation_inputs(&observation, run);
+    let current_stage = observation
+        .attempts
+        .iter()
+        .filter(|attempt| attempt.state == AttemptState::Running)
+        .max_by_key(|attempt| attempt.attempt_id)
+        .and_then(|attempt| super::split_packet_key(&attempt.packet_id).ok())
+        .map(|(_, stage, _)| stage);
+    let live_attempts = observation
+        .attempts
+        .iter()
+        .filter(|attempt| attempt.state == AttemptState::Running)
+        .count();
+    let next = super::ops::run_projection_actions(run);
+    Ok(json!({
+        "schema": "forged.explain/1",
+        "kind": "run",
+        "id": run.run_id,
+        "what": {
+            "identity": observation.identity,
+            "workId": run.work_id,
+            "state": run.state.as_str(),
+            "outcome": run.terminal_outcome.map(RunOutcome::as_str),
+            "stopReason": run.stop_reason,
+            "currentStage": current_stage,
+            "liveAttempts": live_attempts,
+            "repository": run.repo,
+            "baseRef": run.base_ref,
+            "branch": run.branch,
+            "createdAt": run.created_at,
+            "updatedAt": run.updated_at,
+        },
+        "how": explain_how(inputs),
+        "next": next,
+    }))
+}
+
+async fn explain_epic(ctx: &Ctx, id: String) -> Result<Value, Failure> {
+    let observation =
+        explain_observation(ctx, forged_types::WorkIdentitySubjectKind::Epic, &id).await?;
+    let (status, delivery, inputs) = epic_status_delivery(&observation)?;
+    let verdict = status
+        .get("executionHealth")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Failure::internal("epic observation omitted execution health"))?;
+    let total = observation.epic_children.len();
+    let children = observation
+        .epic_children
+        .iter()
+        .take(EXPLAIN_COLLECTION_CAP)
+        .map(|child| {
+            json!({
+                "childId": child.child_id,
+                "runId": child.run_id,
+                "phase": child.phase.as_str(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let next = subject_attention_actions(ctx, AttentionSubjectKind::Epic, &id).await?;
+    Ok(json!({
+        "schema": "forged.explain/1",
+        "kind": "epic",
+        "id": id,
+        "what": {
+            "identity": observation.identity,
+            "workId": observation.identity.work.id,
+            "state": status.get("state"),
+            "delivery": delivery,
+            "children": {
+                "items": children,
+                "total": total,
+                "limit": EXPLAIN_COLLECTION_CAP,
+                "truncated": total > EXPLAIN_COLLECTION_CAP,
+            },
+        },
+        "how": explain_how_with_verdict(inputs, verdict),
+        "next": next,
+    }))
+}
+
+async fn explain_attempt(ctx: &Ctx, resolved: forged_ledger::AttemptRow) -> Result<Value, Failure> {
+    let (run_id, stage, _) = super::split_packet_key(&resolved.packet_id)?;
+    let observation =
+        explain_observation(ctx, forged_types::WorkIdentitySubjectKind::Run, &run_id).await?;
+    let run = observation
+        .runs
+        .iter()
+        .find(|run| run.run_id == run_id)
+        .ok_or_else(|| Failure::internal("attempt observation omitted its owning run"))?;
+    let attempt = observation
+        .attempts
+        .iter()
+        .find(|attempt| attempt.attempt_id == resolved.attempt_id)
+        .ok_or_else(|| Failure::internal("attempt observation omitted its requested attempt"))?;
+    let inputs = run_observation_inputs(&observation, run);
+    let mut how = explain_how(inputs);
+    how["attempt"] = json!({"state": attempt.state.as_str(), "stage": stage});
+    let next = super::ops::run_projection_actions(run);
+    Ok(json!({
+        "schema": "forged.explain/1",
+        "kind": "attempt",
+        "id": attempt.attempt_id,
+        "what": {
+            "runId": run_id,
+            "packetId": attempt.packet_id,
+            "state": attempt.state.as_str(),
+            "stage": stage,
+            "startedAt": attempt.started_at,
+            "updatedAt": attempt.updated_at,
+            "endedAt": attempt.ended_at,
+        },
+        "how": how,
+        "next": next,
+    }))
+}
+
+async fn explain_attention(ctx: &Ctx, item: AttentionItemV1) -> Result<Value, Failure> {
+    let observation_kind = match item.subject_kind {
+        AttentionSubjectKind::Run => forged_types::WorkIdentitySubjectKind::Run,
+        AttentionSubjectKind::Epic => forged_types::WorkIdentitySubjectKind::Epic,
+    };
+    let observation = explain_observation(ctx, observation_kind, &item.subject_id).await?;
+    let inputs = observation_inputs(&observation)?;
+    let mut how = explain_how(inputs);
+    how["attention"] = json!({
+        "state": item.state,
+        "condition": item.condition,
+    });
+    Ok(json!({
+        "schema": "forged.explain/1",
+        "kind": "attention",
+        "id": item.attention_id,
+        "what": {
+            "occurrenceId": item.occurrence_id,
+            "subjectKind": item.subject_kind,
+            "subjectId": item.subject_id,
+            "subjectTitle": item.subject_title,
+            "repository": item.repository,
+            "condition": item.condition,
+            "severity": item.severity,
+            "owner": item.owner,
+            "state": item.state,
+            "openedAt": item.opened_at,
+            "updatedAt": item.updated_at,
+        },
+        "how": how,
+        "next": item.next_actions,
+    }))
+}
+
+/// Resolve and explain any operator-visible durable id without requiring a
+/// kind guess. The response is deliberately compact: identity and lifecycle,
+/// one health verdict with its exact inputs, then existing typed actions.
+pub async fn explain(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
+    read_only("explain", req, || async {
+        let id = param_named_str(&req.params, "id")
+            .ok_or_else(|| Failure::invalid("explain param \"id\" must name a subject"))?
+            .to_owned();
+        match resolve_explain(ctx, &id).await? {
+            ExplainResolved::WorkItem(work) => explain_work_item(ctx, *work).await,
+            ExplainResolved::Run(run) => explain_run(ctx, run).await,
+            ExplainResolved::Epic(epic) => explain_epic(ctx, epic).await,
+            ExplainResolved::Attempt(attempt) => explain_attempt(ctx, *attempt).await,
+            ExplainResolved::Attention(item) => explain_attention(ctx, *item).await,
+            ExplainResolved::Unresolved(resolution) => Ok(json!({
+                "schema": "forged.explain/1",
+                "resolution": resolution,
+            })),
+        }
+    })
+    .await
 }
 
 /// Read-only aggregate used by reconnecting agents and the MCP App.
@@ -1238,7 +1681,9 @@ fn child_rows(snapshot: &WorkObservationSnapshot) -> Vec<Value> {
         .collect()
 }
 
-fn epic_status_delivery(snapshot: &WorkObservationSnapshot) -> Result<(Value, Value), Failure> {
+fn epic_status_delivery(
+    snapshot: &WorkObservationSnapshot,
+) -> Result<(Value, Value, super::health::HealthInputs<'_>), Failure> {
     let desired = snapshot.desired_work.iter().find(|row| {
         row.subject_kind == forged_ledger::DesiredSubjectKind::Epic
             && row.subject_id == snapshot.subject.id
@@ -1303,23 +1748,8 @@ fn epic_status_delivery(snapshot: &WorkObservationSnapshot) -> Result<(Value, Va
                 })
         })
         .flatten();
-    let admission_deferred = snapshot
-        .admission_decisions
-        .iter()
-        .find(|decision| {
-            decision.subject_kind == forged_types::AdmissionSubjectKind::Epic
-                && decision.subject_id == snapshot.subject.id
-        })
-        .is_some_and(|decision| decision.outcome == forged_types::AdmissionOutcome::Deferred);
-    let execution_health = super::health::execution_health(super::health::HealthInputs {
-        started: true,
-        terminal: latest_terminal_pr.is_some() || latest_assurance_completion.is_some(),
-        paused: latest_pause.is_some_and(|(kind, _)| kind == super::epic::PAUSED),
-        input_required: latest_input.is_some_and(|(kind, _)| kind == super::epic::INPUT_REQUIRED),
-        admission_deferred,
-        desired,
-        controller_live: None,
-    });
+    let health_inputs = epic_observation_inputs(snapshot);
+    let execution_health = super::health::execution_health(health_inputs);
     let status = json!({
         "source": "ledger",
         "state": state,
@@ -1356,7 +1786,7 @@ fn epic_status_delivery(snapshot: &WorkObservationSnapshot) -> Result<(Value, Va
             "eventCoverageComplete": complete_events,
         })
     };
-    Ok((status, delivery))
+    Ok((status, delivery, health_inputs))
 }
 
 #[derive(Clone)]
@@ -2371,7 +2801,10 @@ async fn project_work_detail(
                 })?;
             (run_status(run), run_delivery(run))
         }
-        forged_types::WorkIdentitySubjectKind::Epic => epic_status_delivery(&snapshot)?,
+        forged_types::WorkIdentitySubjectKind::Epic => {
+            let (status, delivery, _) = epic_status_delivery(&snapshot)?;
+            (status, delivery)
+        }
     };
 
     let desired = bounded(

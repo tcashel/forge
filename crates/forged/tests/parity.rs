@@ -1,5 +1,5 @@
 //! CLI/MCP parity (the two-adapters-over-one-core criterion): for each of
-//! the sixty-three public core functions, the CLI path and the MCP tool path produce
+//! the sixty-four public core functions, the CLI path and the MCP tool path produce
 //! identical `OperationResponse` values — modulo the minted `operationId` —
 //! from the same core call.
 
@@ -122,7 +122,7 @@ fn prepare_run_worktree(env: &TestEnv, run: &str) {
 }
 
 #[test]
-fn all_sixty_three_tools_match_their_cli_counterparts() {
+fn all_sixty_four_tools_match_their_cli_counterparts() {
     let env = TestEnv::new("forged-parity");
     env.forged(&["init"]);
     fabricate_run(&env, "par-repository");
@@ -148,6 +148,7 @@ fn all_sixty_three_tools_match_their_cli_counterparts() {
         "doctor",
         "definition_validate",
         "events_tail",
+        "explain",
         "operations_overview",
         "overview",
         "epic_advance",
@@ -203,7 +204,7 @@ fn all_sixty_three_tools_match_their_cli_counterparts() {
         "worktree_retire",
     ];
     expected.sort_unstable();
-    assert_eq!(tools, expected, "the sixty-three tools, exactly");
+    assert_eq!(tools, expected, "the sixty-four tools, exactly");
 
     // Both MCP result paths turn a failed operation envelope into a tool
     // error without changing one byte of the CLI-compatible JSON text.
@@ -228,6 +229,16 @@ fn all_sixty_three_tools_match_their_cli_counterparts() {
     assert_eq!(
         raw["structuredContent"],
         serde_json::from_str::<Value>(&cli_text).expect("structured failure envelope")
+    );
+
+    let (code, cli_text) = cli_envelope_text(&env, &["explain", "--id", "bead-par-repository"]);
+    assert_eq!(code, 0);
+    let raw = mcp.call_tool_result("explain", envelope(json!({"id": "bead-par-repository"})));
+    assert_eq!(raw["isError"], json!(false));
+    assert_eq!(raw["content"][0]["text"], json!(cli_text));
+    assert_eq!(
+        raw["structuredContent"],
+        serde_json::from_str::<Value>(&cli_text).expect("structured explain envelope")
     );
 
     let overview_tool = mcp.tool("overview");
@@ -267,6 +278,7 @@ fn all_sixty_three_tools_match_their_cli_counterparts() {
         "overview must state that no scope is the portfolio: {description}"
     );
     for name in [
+        "explain",
         "overview",
         "operations_overview",
         "run_status",
@@ -492,6 +504,13 @@ fn all_sixty_three_tools_match_their_cli_counterparts() {
             "work_detail advertises params.{param}: {detail_properties}"
         );
     }
+    let explain = mcp.tool("explain");
+    assert!(
+        explain
+            .pointer("/inputSchema/properties/params/properties/id")
+            .is_some(),
+        "explain advertises its required id: {explain}"
+    );
     let work_map = mcp.tool("work_map");
     assert_eq!(
         work_map.pointer("/_meta/ui/resourceUri"),
@@ -520,6 +539,7 @@ fn all_sixty_three_tools_match_their_cli_counterparts() {
         );
     }
     for (name, tool) in [
+        ("explain", &explain),
         ("work_list", &work_list),
         ("operations_overview", &operations),
         ("work_detail", &detail),
@@ -738,6 +758,12 @@ fn all_sixty_three_tools_match_their_cli_counterparts() {
             .is_some_and(Value::is_array),
         "work_show keeps every old field and adds nextActions: {tool}"
     );
+
+    let cli = env.forged(&["explain", "--id", "bead-par-repository"]).1;
+    let tool = mcp.call_tool("explain", envelope(json!({"id": "bead-par-repository"})));
+    assert_eq!(normalized(cli), normalized(tool.clone()), "explain parity");
+    assert_eq!(tool["result"]["kind"], json!("work-item"));
+    assert!(tool["result"]["next"].is_array(), "{tool}");
 
     // run_start: an invalid (relative) repo path refuses identically.
     let cli = env

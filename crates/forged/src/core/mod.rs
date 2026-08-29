@@ -1450,6 +1450,7 @@ pub async fn dispatch(ctx: &Ctx, name: &str, mut req: OperationRequest) -> Opera
         "epic_abandon" => epic::epic_abandon(ctx, &mut req).await,
         "epic_revise_roster" => epic::epic_revise_roster(ctx, &mut req).await,
         "overview" => observe::overview(ctx, &req).await,
+        "explain" => observe::explain(ctx, &req).await,
         "operations_overview" => ops::operations_overview(ctx, &req).await,
         "work_detail" => observe::work_detail(ctx, &req).await,
         "work_map" => work_map::work_map(ctx, &req).await,

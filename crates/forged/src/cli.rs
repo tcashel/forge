@@ -81,6 +81,8 @@ pub enum Command {
     Events(EventsArgs),
     /// Reconnect projection for one slice or epic (read-only).
     Overview(OverviewArgs),
+    /// Explain any durable id without guessing its kind (read-only).
+    Explain(ExplainArgs),
     /// Bounded operator-facing operations projection.
     Operations {
         /// Operations subcommand.
@@ -949,6 +951,18 @@ pub struct OverviewArgs {
     /// Maximum event rows in the polling page (default 100).
     #[arg(long)]
     pub limit: Option<u64>,
+    /// Override the read-only idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+/// `explain` flags.
+#[derive(Debug, Args)]
+pub struct ExplainArgs {
+    /// Exact work-item, run, epic, attempt, or attention id; run/epic ids
+    /// also retain their established unique-prefix behavior.
+    #[arg(long)]
+    pub id: String,
     /// Override the read-only idempotency key.
     #[arg(long)]
     pub idempotency_key: Option<String>,
@@ -1853,6 +1867,7 @@ pub fn command_name(command: &Command) -> &'static str {
         },
         Command::Events(_) => "events_tail",
         Command::Overview(_) => "overview",
+        Command::Explain(_) => "explain",
         Command::Operations { command } => match command {
             OperationsCmd::Overview(_) => "operations_overview",
         },
@@ -2352,6 +2367,10 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
                 request(a.idempotency_key, scope, Value::Object(params)),
             )
         }
+        Command::Explain(a) => (
+            "explain",
+            request(a.idempotency_key, Some(a.id.clone()), json!({"id": a.id})),
+        ),
         Command::Operations { command } => match command {
             OperationsCmd::Overview(a) => {
                 let mut params = Map::new();

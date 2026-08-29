@@ -1,4 +1,4 @@
-//! `forged mcp` — the rmcp stdio server. Sixty-three tools, each taking the same
+//! `forged mcp` — the rmcp stdio server. Sixty-four tools, each taking the same
 //! operation envelope in and returning the same envelope out; every tool
 //! routes through the identical core dispatch the CLI uses, so the two
 //! surfaces are two adapters over one core. Five dispatcher operations remain
@@ -231,6 +231,47 @@ impl OverviewArgs {
             schema_version: self.schema_version,
             idempotency_key: self.idempotency_key,
             run_id: self.run_id,
+            params,
+        }
+    }
+}
+
+/// Typed MCP envelope for the kind-blind reconnect explanation.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExplainArgs {
+    /// Envelope schema version; always 1.
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
+    /// Optional read-only operation identity.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+    /// The one id to explain.
+    pub params: ExplainParams,
+}
+
+/// Exact-only cross-kind selector; run and epic ids also retain unique-prefix
+/// resolution after every exact namespace has missed.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars", inline)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExplainParams {
+    #[serde(deserialize_with = "named_string")]
+    pub id: String,
+}
+
+impl ExplainArgs {
+    fn into_envelope(self) -> EnvelopeArgs {
+        let run_id = Some(self.params.id.clone());
+        let params = match serde_json::to_value(&self.params) {
+            Ok(Value::Object(map)) => map,
+            _ => serde_json::Map::new(),
+        };
+        EnvelopeArgs {
+            schema_version: self.schema_version,
+            idempotency_key: self.idempotency_key,
+            run_id,
             params,
         }
     }
@@ -1372,6 +1413,16 @@ impl ForgedServer {
     )]
     pub async fn overview(&self, args: Parameters<OverviewArgs>) -> CallToolResult {
         self.call_structured("overview", args.0.into_envelope())
+            .await
+    }
+
+    /// Kind-blind reconnect explanation for any durable id.
+    #[tool(
+        name = "explain",
+        description = "Explain one work item, run, epic, attempt, or attention id without a kind guess: bounded identity and lifecycle position, one centralized health verdict with its observed inputs, and existing honesty-tested nextActions. Exact precedence is work item, run or epic, attempt, then attention; only run and epic ids accept a unique prefix."
+    )]
+    pub async fn explain(&self, args: Parameters<ExplainArgs>) -> CallToolResult {
+        self.call_structured("explain", args.0.into_envelope())
             .await
     }
 
