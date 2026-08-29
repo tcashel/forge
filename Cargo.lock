@@ -381,6 +381,7 @@ name = "forged"
 version = "0.6.2"
 dependencies = [
  "async-trait",
+ "base64",
  "clap",
  "forged-beads",
  "forged-gate",

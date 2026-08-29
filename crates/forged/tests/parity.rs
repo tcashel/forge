@@ -216,7 +216,7 @@ fn all_fifty_nine_tools_match_their_cli_counterparts() {
         .pointer("/inputSchema/properties/params/properties")
         .cloned()
         .unwrap_or(Value::Null);
-    for param in ["repo", "detail", "limit"] {
+    for param in ["repo", "cursor", "detail", "limit"] {
         assert!(
             ready_schema.get(param).is_some(),
             "work_ready advertises params.{param}: {ready_schema}"
@@ -230,8 +230,10 @@ fn all_fifty_nine_tools_match_their_cli_counterparts() {
     for statement in [
         "summary rows by default",
         "params.repo",
+        "params.cursor",
         "params.detail",
         "params.limit",
+        "nextCursor",
         "100",
         "500",
     ] {

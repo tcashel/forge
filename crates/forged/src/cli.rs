@@ -1076,6 +1076,9 @@ pub struct WorkReadyArgs {
     /// Exact repository identity from work metadata.repository.
     #[arg(long)]
     pub repo: Option<String>,
+    /// Opaque continuation cursor returned by the preceding page.
+    #[arg(long)]
+    pub cursor: Option<String>,
     /// Return complete work-item snapshots instead of summary rows.
     #[arg(long)]
     pub full: bool,
@@ -2439,6 +2442,9 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
                 let mut params = Map::new();
                 if let Some(repo) = a.repo {
                     params.insert("repo".to_owned(), json!(repo));
+                }
+                if let Some(cursor) = a.cursor {
+                    params.insert("cursor".to_owned(), json!(cursor));
                 }
                 if a.full {
                     params.insert("detail".to_owned(), json!("full"));

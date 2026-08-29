@@ -1206,6 +1206,15 @@ CREATE INDEX work_items_ready
 CREATE INDEX operations_state_run ON operations(state, run_id);
 ";
 
+/// Migration 025: materialize the system partition key from canonical work
+/// metadata without duplicating write authority. SQLite can add a VIRTUAL
+/// generated column in place, and indexes it in the bundled runtime.
+const MIGRATION_025: &str = "
+ALTER TABLE work_items ADD COLUMN repository TEXT GENERATED ALWAYS AS
+  (json_extract(metadata_json, '$.repository')) VIRTUAL;
+CREATE INDEX work_items_repository_status ON work_items(repository, status);
+";
+
 /// Embedded ordered migrations; `user_version` records the last applied index.
 const MIGRATIONS: &[&str] = &[
     MIGRATION_001,
@@ -1232,6 +1241,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_022,
     MIGRATION_023,
     MIGRATION_024,
+    MIGRATION_025,
 ];
 
 /// Configure pragmas and apply pending migrations on a fresh connection.
@@ -1455,7 +1465,7 @@ mod tests {
         assert_eq!(pragmas.synchronous, 2);
         assert!(pragmas.foreign_keys);
         assert_eq!(pragmas.busy_timeout_ms, 5000);
-        assert_eq!(pragmas.user_version, 24);
+        assert_eq!(pragmas.user_version, 25);
         ledger.close().expect("close");
 
         // Table names via a separate connection: sqlite_master is data, and
@@ -1536,7 +1546,11 @@ mod tests {
             )
             .expect("active layout index");
         assert_eq!(active_layout_index, "one_active_herdr_layout");
-        for index in ["work_items_ready", "operations_state_run"] {
+        for index in [
+            "work_items_ready",
+            "operations_state_run",
+            "work_items_repository_status",
+        ] {
             let found: String = conn
                 .query_row(
                     "SELECT name FROM sqlite_master WHERE type='index' AND name = ?1",
@@ -1562,7 +1576,7 @@ mod tests {
         }
 
         let ledger = Ledger::open(&path).expect("upgrade v23 database");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 24);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 25);
         ledger.close().expect("close");
 
         let conn = rusqlite::Connection::open(&path).expect("raw migrated database");
@@ -1576,6 +1590,62 @@ mod tests {
                 .unwrap_or_else(|_| panic!("migration 024 index {index} missing"));
             assert_eq!(found, index);
         }
+    }
+
+    #[test]
+    fn migration_025_exposes_repository_for_v24_rows_without_backfill() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state-v24.db");
+        {
+            let conn = rusqlite::Connection::open(&path).expect("raw database");
+            for migration in MIGRATIONS.iter().take(24) {
+                conn.execute_batch(migration).expect("seed migration");
+            }
+            conn.execute(
+                "INSERT INTO work_items
+                 (work_id, kind, status, priority, assignee, metadata_json,
+                  current_revision, created_at, updated_at)
+                 VALUES (?1, 'task', 'open', 1, NULL, ?2, 1, 't', 't')",
+                rusqlite::params![
+                    "pre-migration",
+                    r#"{"repository":"/repo/before-v25","source":"import"}"#
+                ],
+            )
+            .expect("seed v24 work item");
+            conn.execute(
+                "INSERT INTO work_revisions
+                 (work_id, revision, title, description, acceptance_criteria,
+                  design, notes, cause, written_at)
+                 VALUES (?1, 1, 'Pre-migration', '', '', '', '', 'import', 't')",
+                ["pre-migration"],
+            )
+            .expect("seed v24 work revision");
+            conn.execute_batch("PRAGMA user_version=24;")
+                .expect("mark schema version");
+        }
+
+        let ledger = Ledger::open(&path).expect("upgrade v24 database");
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 25);
+        ledger.close().expect("close");
+
+        let conn = rusqlite::Connection::open(path).expect("raw migrated database");
+        let repository: String = conn
+            .query_row(
+                "SELECT repository FROM work_items WHERE work_id = ?1",
+                ["pre-migration"],
+                |row| row.get(0),
+            )
+            .expect("generated repository");
+        assert_eq!(repository, "/repo/before-v25");
+        let source: String = conn
+            .query_row(
+                "SELECT json_extract(metadata_json, '$.source') FROM work_items
+                 WHERE work_id = ?1",
+                ["pre-migration"],
+                |row| row.get(0),
+            )
+            .expect("metadata pass-through");
+        assert_eq!(source, "import");
     }
 
     #[test]
@@ -1623,7 +1693,7 @@ mod tests {
         }
 
         let ledger = Ledger::open(&path).expect("open migration-013 database");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 24);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 25);
         ledger.close().expect("close");
 
         let conn = rusqlite::Connection::open(&path).expect("open upgraded database");
@@ -1683,7 +1753,7 @@ mod tests {
 
             let ledger = Ledger::open(&path)
                 .unwrap_or_else(|error| panic!("upgrade from v{version} failed: {error}"));
-            assert_eq!(ledger.pragmas().expect("pragmas").user_version, 24);
+            assert_eq!(ledger.pragmas().expect("pragmas").user_version, 25);
             assert_eq!(
                 ledger
                     .list_events_by_kind("legacy.progress")
@@ -1783,7 +1853,7 @@ mod tests {
         }
 
         let ledger = Ledger::open(&path).expect("upgrade owned v20 database");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 24);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 25);
         assert!(ledger
             .get_owned_herdr_session("migration-owned")
             .expect("owned row")
@@ -1827,7 +1897,7 @@ mod tests {
             .close()
             .expect("close");
         let ledger = Ledger::open(&path).expect("second open");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 24);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 25);
         ledger.close().expect("close");
     }
 
@@ -1888,7 +1958,7 @@ mod tests {
                 .expect("mark v0");
         }
         let ledger = Ledger::open(&path).expect("migrate");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 24);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 25);
         let old = ledger.get_run("old-run").expect("old run");
         assert_eq!(old.work_id, "old-bead");
         assert_eq!(old.stop_reason.as_deref(), Some("legacy stop"));
@@ -1931,7 +2001,7 @@ mod tests {
         }
 
         let ledger = Ledger::open(&path).expect("migrate");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 24);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 25);
         let first = ledger.get_attempt(1).expect("attempt 1 survived");
         assert_eq!(first.claim_token, "tok-1");
         assert_eq!(first.state, crate::AttemptState::Reclaimed);

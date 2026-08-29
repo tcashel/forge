@@ -355,12 +355,8 @@ async fn ready_slice_work(
         }
     }
     if frontier_claimed {
-        let rows =
-            super::workstore::plan_issues(&ctx.ledger, std::slice::from_ref(&issue.id)).await?;
-        let readiness = rows
-            .iter()
-            .find(|row| row.issue.id == issue.id)
-            .map(crate::core::work_types::PlanIssue::readiness);
+        let row = super::workstore::plan_issue(&ctx.ledger, &issue.id).await?;
+        let readiness = Some(row.readiness());
         if readiness != Some(crate::core::work_types::PlanReadiness::Claimed) {
             return Err(Failure::invalid(format!(
                 "work {work} is frontier-claimed but its dependencies do not prove it ready \

@@ -28,7 +28,7 @@ fn seed_ready_items(env: &TestEnv, count: usize) {
                 work_id: format!("ready-{index:03}"),
                 kind: WorkKind::Task,
                 status: WorkStatus::Open,
-                priority: Some(index as i64),
+                priority: (index < count.saturating_sub(150)).then_some(index as i64),
                 metadata: BTreeMap::from([("repository".to_owned(), "/tmp/ready-repo".to_owned())]),
                 spec: WorkSpecFields {
                     title: format!("Ready item {index}"),
@@ -169,6 +169,87 @@ fn work_ready_repository_filter_composes_with_summary_bounds() {
     );
     assert_eq!(ready["totals"], json!({"shown": 1, "total": 2}));
     assert_eq!(ready["ready"][0]["id"], json!("ready-a-1"));
+}
+
+#[test]
+fn work_ready_cursor_pages_two_hundred_fifty_rows_without_gaps() {
+    let env = TestEnv::new("forged-work-ready-cursor");
+    assert_eq!(env.forged(&["init"]).0, 0);
+    seed_ready_items(&env, 250);
+    let ledger = env.ledger();
+    for index in 0..25 {
+        ledger
+            .create_work_item(NewWorkItem {
+                work_id: format!("foreign-{index:03}"),
+                kind: WorkKind::Task,
+                status: WorkStatus::Open,
+                priority: Some(index as i64),
+                metadata: BTreeMap::from([(
+                    "repository".to_owned(),
+                    "/tmp/foreign-repo".to_owned(),
+                )]),
+                spec: WorkSpecFields {
+                    title: format!("Foreign item {index}"),
+                    description: String::new(),
+                    acceptance_criteria: String::new(),
+                    design: String::new(),
+                    notes: String::new(),
+                },
+                cause: WorkRevisionCause::Authored,
+            })
+            .expect("create foreign ready item");
+    }
+    ledger.close().expect("close test ledger");
+
+    let mut cursor: Option<String> = None;
+    let mut ids = Vec::new();
+    for (page_index, shown) in [100, 100, 50].into_iter().enumerate() {
+        let mut args = vec![
+            "work".to_owned(),
+            "ready".to_owned(),
+            "--repo".to_owned(),
+            "/tmp/ready-repo".to_owned(),
+            "--full".to_owned(),
+            "--limit".to_owned(),
+            "100".to_owned(),
+        ];
+        if let Some(value) = &cursor {
+            args.push("--cursor".to_owned());
+            args.push(value.clone());
+        }
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let page = result(&env, &refs);
+        assert_eq!(page["totals"], json!({"shown": shown, "total": 250}));
+        ids.extend(
+            page["ready"]
+                .as_array()
+                .expect("ready page")
+                .iter()
+                .map(|row| row["workId"].as_str().expect("full work id").to_owned()),
+        );
+        cursor = page["nextCursor"].as_str().map(str::to_owned);
+        assert_eq!(
+            cursor.is_some(),
+            page_index < 2,
+            "nextCursor must advertise only a following page"
+        );
+    }
+
+    let expected: Vec<String> = (0..250).map(|index| format!("ready-{index:03}")).collect();
+    assert_eq!(ids, expected);
+    assert_eq!(ids.iter().collect::<BTreeSet<_>>().len(), 250);
+
+    let (code, refusal) = env.forged(&["work", "ready", "--cursor", "not-base64"]);
+    assert_ne!(code, 0, "invalid cursor was accepted: {refusal}");
+    let message = refusal["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("cursor"),
+        "parameter is unnamed: {message}"
+    );
+    assert!(
+        message.contains("work ready without --cursor"),
+        "recovery verb is absent: {message}"
+    );
 }
 
 #[test]

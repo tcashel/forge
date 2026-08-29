@@ -19,8 +19,8 @@ use crate::core::work_types::{
     PlanIssue, PlanReadiness,
 };
 use forged_ledger::{
-    Ledger, WorkDepKind, WorkItemFilters, WorkItemSnapshot, WorkSpecFields, WorkStatus,
-    WORK_LEASE_TTL_S,
+    Ledger, WorkDepKind, WorkDependencyStatus, WorkItemFilters, WorkItemSnapshot, WorkPlanRow,
+    WorkSpecFields, WorkStatus, WORK_LEASE_TTL_S,
 };
 
 use crate::core::{on_ledger, Failure};
@@ -106,17 +106,38 @@ pub async fn list_issues_filtered(
 /// Hydrated plan rows for exact ids; every requested id must exist, exactly
 /// as the bd hydrate refused an omitted selection.
 pub async fn plan_issues(ledger: &Ledger, ids: &[String]) -> Result<Vec<PlanIssue>, Failure> {
-    let mut out = Vec::with_capacity(ids.len());
-    for id in ids {
-        out.push(plan_issue(ledger, id).await?);
+    let ids_owned = ids.to_vec();
+    let snapshot = on_ledger(ledger, move |l| l.work_plan_snapshot(&ids_owned, None)).await?;
+    if snapshot.exact.len() != ids.len() {
+        let found: BTreeSet<&str> = snapshot
+            .exact
+            .iter()
+            .map(|row| row.item.work_id.as_str())
+            .collect();
+        let missing = ids
+            .iter()
+            .find(|id| !found.contains(id.as_str()))
+            .expect("a short exact snapshot omits an id");
+        return Err(Failure::invalid(format!(
+            "work item {missing:?} does not exist"
+        )));
     }
-    Ok(out)
+    Ok(snapshot.exact.into_iter().map(plan_row_of).collect())
 }
 
-async fn plan_issue(ledger: &Ledger, id: &str) -> Result<PlanIssue, Failure> {
+/// Hydrate one plan row for a caller that already selected a single id.
+pub async fn plan_issue(ledger: &Ledger, id: &str) -> Result<PlanIssue, Failure> {
     let issue = show_issue(ledger, id).await?;
     let id_owned = id.to_owned();
     let deps = on_ledger(ledger, move |l| l.work_dependencies(&id_owned)).await?;
+    Ok(plan_issue_of(issue, deps))
+}
+
+fn plan_row_of(row: WorkPlanRow) -> PlanIssue {
+    plan_issue_of(issue_of(&row.item), row.dependencies)
+}
+
+fn plan_issue_of(issue: IssueSummary, deps: Vec<WorkDependencyStatus>) -> PlanIssue {
     let mut parent = None;
     let mut dependencies = Vec::new();
     for dep in deps {
@@ -129,11 +150,11 @@ async fn plan_issue(ledger: &Ledger, id: &str) -> Result<PlanIssue, Failure> {
             status: dep.status.map(dep_status_of),
         });
     }
-    Ok(PlanIssue {
+    PlanIssue {
         issue,
         parent,
         dependencies,
-    })
+    }
 }
 
 /// The ready frontier.
@@ -420,13 +441,15 @@ pub async fn plan_inventory(
     if limit == 0 {
         return Err(Failure::invalid("plan inventory limit must be positive"));
     }
-    let matching = on_ledger(ledger, move |l| l.nonterminal_work_items_filtered(filters)).await?;
-    let discovered = matching.len().min(limit.saturating_add(1));
-    let truncated = matching.len() > limit;
-    let mut issues = Vec::new();
-    for snapshot in matching.iter().take(limit) {
-        issues.push(plan_issue(ledger, &snapshot.work_id).await?);
-    }
+    let snapshot = on_ledger(ledger, move |l| l.work_plan_snapshot(&[], Some(filters))).await?;
+    let discovered = snapshot.matching.len().min(limit.saturating_add(1));
+    let truncated = snapshot.matching.len() > limit;
+    let issues = snapshot
+        .matching
+        .into_iter()
+        .take(limit)
+        .map(plan_row_of)
+        .collect();
     Ok(crate::core::work_types::PlanInventory {
         issues,
         truncated,
@@ -450,30 +473,42 @@ pub async fn work_map_plan_inventory(
     if exact_ids.iter().any(|id| id.trim().is_empty()) {
         return Err(Failure::invalid("work map exact ids must be non-empty"));
     }
+    if matches!(
+        scope,
+        WorkMapPlanScope::Operator | WorkMapPlanScope::Repository(_)
+    ) {
+        let filters = WorkItemFilters {
+            repository: match scope {
+                WorkMapPlanScope::Repository(value) => Some(value.clone()),
+                _ => None,
+            },
+            ..WorkItemFilters::default()
+        };
+        let ids = exact_ids.to_vec();
+        let snapshot =
+            on_ledger(ledger, move |l| l.work_plan_snapshot(&ids, Some(filters))).await?;
+        let discovered = snapshot.matching.len().min(limit.saturating_add(1));
+        let truncated = snapshot.matching.len() > limit;
+        let selected: Vec<WorkPlanRow> = snapshot.matching.into_iter().take(limit).collect();
+        let issues = selected.iter().cloned().map(plan_row_of).collect();
+        let mut seen = BTreeSet::new();
+        let mut exact_issues = Vec::new();
+        for row in selected.iter().chain(snapshot.exact.iter()) {
+            if seen.insert(row.item.work_id.clone()) {
+                exact_issues.push(issue_of(&row.item));
+            }
+        }
+        return Ok(crate::core::work_types::WorkMapPlanInventory {
+            issues,
+            exact_issues,
+            truncated,
+            discovered,
+        });
+    }
+
     let live = |s: &WorkStatus| *s != WorkStatus::Closed;
     let (selected_plan_ids, discovered, truncated) = match scope {
-        WorkMapPlanScope::Operator | WorkMapPlanScope::Repository(_) => {
-            let repository = match scope {
-                WorkMapPlanScope::Repository(value) => Some(value.as_str()),
-                _ => None,
-            };
-            let rows = on_ledger(ledger, |l| l.nonterminal_work_items()).await?;
-            let ids: Vec<String> = rows
-                .iter()
-                .filter(|s| match repository {
-                    Some(want) => s.metadata.get("repository").map(String::as_str) == Some(want),
-                    None => true,
-                })
-                .map(|s| s.work_id.clone())
-                .collect();
-            let discovered = ids.len().min(limit.saturating_add(1));
-            let truncated = ids.len() > limit;
-            (
-                ids.into_iter().take(limit).collect::<Vec<_>>(),
-                discovered,
-                truncated,
-            )
-        }
+        WorkMapPlanScope::Operator | WorkMapPlanScope::Repository(_) => unreachable!("returned"),
         WorkMapPlanScope::Epic(epic) => {
             if epic.trim().is_empty() {
                 return Err(Failure::invalid("epic id must be non-empty"));
@@ -526,15 +561,97 @@ pub async fn work_map_plan_inventory(
             union.push(id.clone());
         }
     }
-    let mut issues = Vec::with_capacity(selected_plan_ids.len());
-    for id in &selected_plan_ids {
-        issues.push(plan_issue(ledger, id).await?);
-    }
-    let exact_issues = list_issues(ledger, &union).await?;
+    let snapshot = on_ledger(ledger, move |l| l.work_plan_snapshot(&union, None)).await?;
+    let issues = snapshot
+        .exact
+        .iter()
+        .take(selected_plan_ids.len())
+        .cloned()
+        .map(plan_row_of)
+        .collect();
+    let exact_issues = snapshot
+        .exact
+        .iter()
+        .map(|row| issue_of(&row.item))
+        .collect();
     Ok(crate::core::work_types::WorkMapPlanInventory {
         issues,
         exact_issues,
         truncated,
         discovered,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use forged_ledger::{NewWorkItem, WorkKind, WorkRevisionCause};
+
+    #[tokio::test]
+    async fn two_hundred_item_inventory_matches_single_row_hydration_bytes() {
+        let target_tmp = std::env::var_os("CARGO_TARGET_TMPDIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp")
+            });
+        std::fs::create_dir_all(&target_tmp).expect("target temp root");
+        let dir = tempfile::Builder::new()
+            .prefix("forged-plan-snapshot-")
+            .tempdir_in(target_tmp)
+            .expect("target tempdir");
+        let ledger = Ledger::open(&dir.path().join("state.db")).expect("ledger");
+        let ids: Vec<String> = (0..200).map(|index| format!("plan-{index:03}")).collect();
+        for (index, id) in ids.iter().enumerate() {
+            ledger
+                .create_work_item(NewWorkItem {
+                    work_id: id.clone(),
+                    kind: WorkKind::Task,
+                    status: WorkStatus::Open,
+                    priority: Some(index as i64),
+                    metadata: BTreeMap::from([(
+                        "repository".to_owned(),
+                        "/repo/plan-snapshot".to_owned(),
+                    )]),
+                    spec: WorkSpecFields {
+                        title: format!("Plan item {index}"),
+                        description: format!("description {index}"),
+                        acceptance_criteria: format!("acceptance {index}"),
+                        design: format!("design {index}"),
+                        notes: format!("notes {index}"),
+                    },
+                    cause: WorkRevisionCause::Authored,
+                })
+                .expect("create plan item");
+            if index > 0 {
+                ledger
+                    .add_work_dep(id, &ids[index - 1], WorkDepKind::Related)
+                    .expect("link plan item");
+            }
+        }
+
+        let single = plan_issue(&ledger, ids.last().expect("last id"))
+            .await
+            .expect("single plan row");
+        let batch = plan_issues(&ledger, &ids).await.expect("batch plan rows");
+        assert_eq!(batch.len(), 200);
+        assert_eq!(
+            serde_json::to_vec(batch.last().expect("last batch row")).expect("batch bytes"),
+            serde_json::to_vec(&single).expect("single bytes")
+        );
+
+        let inventory = plan_inventory(
+            &ledger,
+            WorkItemFilters {
+                repository: Some("/repo/plan-snapshot".to_owned()),
+                ..WorkItemFilters::default()
+            },
+            200,
+        )
+        .await
+        .expect("bounded inventory");
+        assert_eq!(inventory.discovered, 200);
+        assert!(!inventory.truncated);
+        assert_eq!(inventory.issues, batch);
+        ledger.close().expect("close ledger");
+    }
 }
