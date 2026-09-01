@@ -236,6 +236,8 @@ pub(crate) fn policy(
 pub(crate) fn recommendation_actions(
     recommendation: &AttentionRecommendedActionV1,
     subject_id: &str,
+    attention_id: &str,
+    occurrence_id: &str,
     subject_kind: AttentionSubjectKind,
     run: Option<&forged_ledger::RunRow>,
     desired_state: Option<DesiredState>,
@@ -257,7 +259,14 @@ pub(crate) fn recommendation_actions(
     let attention_resolution = |disposition: Value, reason: &str| {
         action(
             "attention resolve",
-            json!({"id": subject_id, "disposition": disposition, "note": Value::Null}),
+            json!({
+                "subject": subject_id,
+                "attentionId": attention_id,
+                "occurrenceId": occurrence_id,
+                "actor": Value::Null,
+                "disposition": disposition,
+                "note": Value::Null,
+            }),
             reason,
         )
     };
@@ -508,12 +517,17 @@ fn exhausted_run_has_live_successor(input: &ProjectionInput<'_>, subject_id: &st
     };
     let terminal = subject.state == RunState::Stopped || subject.terminal_outcome.is_some();
     terminal
-        && input.runs.iter().any(|candidate| {
-            candidate.run_id != subject.run_id
-                && candidate.work_id == subject.work_id
-                && candidate.state == RunState::Active
-                && candidate.terminal_outcome.is_none()
-        })
+        && match &input.surface {
+            ProjectionSurface::Inventory => input.runs.iter().any(|candidate| {
+                candidate.run_id != subject.run_id
+                    && candidate.work_id == subject.work_id
+                    && candidate.state == RunState::Active
+                    && candidate.terminal_outcome.is_none()
+            }),
+            ProjectionSurface::Observation { snapshot, .. } => snapshot
+                .runs_with_live_same_work_successors
+                .contains(subject_id),
+        }
 }
 
 fn persisted_risk_acceptance_allowed(input: &ProjectionInput<'_>, subject_id: &str) -> bool {
@@ -1983,6 +1997,8 @@ fn project(input: ProjectionInput<'_>) -> Result<Vec<AttentionItemV1>, Failure> 
         let next_actions = recommendation_actions(
             &recommended_action,
             &subject_id,
+            &stable_id,
+            &occurrence_id,
             subject_kind,
             run,
             desired_state,
@@ -2246,6 +2262,8 @@ mod tests {
         recommendation_actions(
             &policy(condition).2,
             "subject-1",
+            "attention-1",
+            "occurrence-1",
             subject_kind,
             run,
             desired_state,
@@ -2256,6 +2274,38 @@ mod tests {
         .into_iter()
         .map(|action| action.verb)
         .collect()
+    }
+
+    #[test]
+    fn attention_resolution_action_carries_the_complete_control_address() {
+        let actions = recommendation_actions(
+            &policy(AttentionCondition::Quarantined).2,
+            "run-1",
+            "attention-1",
+            "occurrence-1",
+            AttentionSubjectKind::Run,
+            None,
+            None,
+            None,
+            true,
+            false,
+        );
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].verb, "attention resolve");
+        assert_eq!(
+            actions[0].args,
+            json!({
+                "subject": "run-1",
+                "attentionId": "attention-1",
+                "occurrenceId": "occurrence-1",
+                "actor": null,
+                "disposition": null,
+                "note": null,
+            })
+            .as_object()
+            .expect("action arguments")
+            .clone()
+        );
     }
 
     #[test]

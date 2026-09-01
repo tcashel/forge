@@ -158,7 +158,14 @@ fn attention_is_identical_across_surfaces_and_controls_are_occurrence_fenced() {
         item["nextActions"],
         json!([{
             "verb": "attention resolve",
-            "args": {"id": "attention-run", "disposition": null, "note": null},
+            "args": {
+                "subject": "attention-run",
+                "attentionId": item["attentionId"],
+                "occurrenceId": item["occurrenceId"],
+                "actor": null,
+                "disposition": null,
+                "note": null,
+            },
             "reason": "bind the adjudicated disposition and note for this exact quarantined occurrence",
         }]),
         "ore-070.5 deliberately moves the quarantined action pin"
@@ -382,6 +389,12 @@ fn restart_exhaustion_advertises_stop_then_retry_and_clears_on_the_live_successo
         attention(&overview(&env), run, "restart-budget-exhausted").is_none(),
         "a terminal exhausted source with a live same-work successor clears"
     );
+    let (code, detail) = env.forged(&["work", "detail", "--id", run]);
+    assert_eq!(code, 0, "original run Work Detail: {detail}");
+    assert!(
+        attention(&detail["result"], run, "restart-budget-exhausted").is_none(),
+        "exact Work Detail must not retain a retry action after a live same-work successor: {detail}"
+    );
 }
 
 #[test]
@@ -534,7 +547,14 @@ fn review_disagreement_advertises_accept_risk_only_after_a_persisted_terminal_re
         ungated_item["nextActions"],
         json!([{
             "verb": "attention resolve",
-            "args": {"id": ungated, "disposition": null, "note": null},
+            "args": {
+                "subject": ungated,
+                "attentionId": ungated_item["attentionId"],
+                "occurrenceId": ungated_item["occurrenceId"],
+                "actor": null,
+                "disposition": null,
+                "note": null,
+            },
             "reason": "bind the adjudicated disposition and note for this exact review disagreement",
         }]),
         "accept-risk must be absent while terminal review evidence is not in the required stopped-blocked state"
@@ -724,7 +744,14 @@ fn missing_cost_only_accepts_the_explicit_unknown_disposition() {
     assert_eq!(action["verb"], json!("attention resolve"));
     assert_eq!(
         action["args"],
-        json!({"id": "attention-cost", "disposition": "accepted-unknown", "note": null})
+        json!({
+            "subject": "attention-cost",
+            "attentionId": item["attentionId"],
+            "occurrenceId": item["occurrenceId"],
+            "actor": null,
+            "disposition": "accepted-unknown",
+            "note": null,
+        })
     );
     assert!(action["reason"]
         .as_str()
@@ -861,7 +888,14 @@ fn missing_evidence_is_adjudicated_per_occurrence_with_its_full_attempt_scope() 
         item["nextActions"],
         json!([{
             "verb": "attention resolve",
-            "args": {"id": "attention-evidence", "disposition": "evidence-absent", "note": null},
+            "args": {
+                "subject": "attention-evidence",
+                "attentionId": item["attentionId"],
+                "occurrenceId": item["occurrenceId"],
+                "actor": null,
+                "disposition": "evidence-absent",
+                "note": null,
+            },
             "reason": "bind a nonblank note explaining why this attempt-only evidence was never captured",
         }])
     );
