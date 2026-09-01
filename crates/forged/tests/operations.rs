@@ -294,7 +294,25 @@ fn run_status_next_actions_execute_after_binding_declared_placeholders() {
 
     let (code, terminal) = env.forged(&["run", "status", "--run", run_id]);
     assert_eq!(code, 0, "stopped status: {terminal}");
-    let action = &terminal["result"]["run"]["nextActions"][0];
+    let retry = &terminal["result"]["run"]["nextActions"][0];
+    assert_eq!(retry["verb"], json!("run retry"));
+    assert_eq!(
+        retry["args"],
+        json!({"id": run_id, "runId": null}),
+        "the successor override is a declared placeholder"
+    );
+    assert!(retry["reason"]
+        .as_str()
+        .is_some_and(|reason| reason.contains("current spec")));
+    env.set_work_field(work_id, "description", "Retry the current spec");
+    env.set_work_field(work_id, "acceptance", "- retry succeeds");
+    let advertised_run = retry["args"]["id"].as_str().expect("advertised run");
+    let (code, retried) = env.forged(&["run", "retry", "--id", advertised_run]);
+    assert_eq!(code, 0, "advertised run retry succeeds: {retried}");
+    assert_eq!(retried["result"]["runId"], json!("status-actions-r1"));
+    assert_eq!(retried["result"]["retryOf"], json!(run_id));
+
+    let action = &terminal["result"]["run"]["nextActions"][1];
     assert_eq!(action["verb"], json!("work supersede"));
     assert_eq!(
         action["args"],
@@ -303,7 +321,9 @@ fn run_status_next_actions_execute_after_binding_declared_placeholders() {
     );
     assert_eq!(
         action["reason"],
-        json!("create the successor first with work create")
+        json!(
+            "use work supersede when the spec must change; create the successor first with work create"
+        )
     );
 
     let successor = "status-actions-v2";
@@ -331,6 +351,16 @@ fn run_status_next_actions_execute_after_binding_declared_placeholders() {
     );
 
     let held_run = "status-input-required";
+    env.set_work_field(
+        "bead-status-input-required",
+        "description",
+        "Apply operator input",
+    );
+    env.set_work_field(
+        "bead-status-input-required",
+        "acceptance",
+        "- amended work retries",
+    );
     fabricate_run(&env, held_run);
     let ledger = env.ledger();
     ledger
@@ -346,11 +376,323 @@ fn run_status_next_actions_execute_after_binding_declared_placeholders() {
     ledger.close().expect("close ledger");
     let (code, held) = env.forged(&["run", "status", "--run", held_run]);
     assert_eq!(code, 0, "input-required status: {held}");
-    assert_eq!(
-        held["result"]["run"]["nextActions"],
-        json!([]),
-        "input resolution stays deferred until its artifact records a verb"
+    let held_retry = &held["result"]["run"]["nextActions"][0];
+    assert_eq!(held_retry["verb"], json!("run retry"));
+    assert!(held_retry["reason"]
+        .as_str()
+        .is_some_and(|reason| reason.contains("decision or amendment")));
+}
+
+#[test]
+fn run_retry_mints_and_submits_one_flat_successor_at_the_amended_revision() {
+    let env = TestEnv::new("forged-run-retry-amended");
+    env.forged(&["init"]);
+    let run_id = "retry-amended";
+    env.set_work_field(run_id, "description", "Execute the original decision");
+    env.set_work_field(run_id, "acceptance", "- the original decision executes");
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let (code, started) = env.forged(&[
+        "run",
+        "start",
+        "--work",
+        run_id,
+        "--repo",
+        &repo,
+        "--base-ref",
+        "main",
+    ]);
+    assert_eq!(code, 0, "start source run: {started}");
+    let ledger = env.ledger();
+    ledger
+        .settle_run(
+            run_id,
+            forged_ledger::RunOutcome::InputRequired,
+            "operator decision required".to_owned(),
+            None,
+            None,
+            None,
+        )
+        .expect("settle source run");
+    ledger.close().expect("close ledger");
+
+    env.set_work_field(
+        run_id,
+        "notes",
+        "The operator adjudicated the decision; execute the amended spec.",
     );
+    let (code, retried) = env.forged(&[
+        "run",
+        "retry",
+        "--id",
+        run_id,
+        "--idempotency-key",
+        "retry-amended-key",
+    ]);
+    assert_eq!(code, 0, "retry amended run: {retried}");
+    assert_eq!(retried["result"]["runId"], json!("retry-amended-r1"));
+    assert_eq!(retried["result"]["retryOf"], json!(run_id));
+    assert_eq!(retried["result"]["workId"], json!(run_id));
+    assert_eq!(retried["result"]["revision"], json!("4"));
+    assert_eq!(retried["result"]["submission"]["phase"], json!("queued"));
+    assert!(retried["result"]["packageSha256"].is_string());
+
+    let ledger = env.ledger();
+    let successor = ledger
+        .get_run("retry-amended-r1")
+        .expect("successor run exists");
+    assert_eq!(successor.work_id, run_id);
+    let desired = ledger
+        .get_desired_work(forged_ledger::DesiredSubjectKind::Run, "retry-amended-r1")
+        .expect("desired read")
+        .expect("retry successor is submitted");
+    assert_eq!(desired.restart_budget, 5);
+    assert_eq!(desired.restart_used, 0);
+    let events = ledger
+        .list_events(Some("retry-amended-r1"), 0, 100)
+        .expect("successor events");
+    let spec = events
+        .iter()
+        .find(|event| event.kind == "forged.run.spec")
+        .expect("successor spec event");
+    let spec: Value = serde_json::from_str(&spec.payload_json).expect("spec payload");
+    assert_eq!(spec["retryOf"], json!(run_id));
+    assert_eq!(spec["beadRevision"], json!("4"));
+    ledger.close().expect("close ledger");
+
+    let (code, replayed) = env.forged(&[
+        "run",
+        "retry",
+        "--id",
+        run_id,
+        "--idempotency-key",
+        "retry-amended-key",
+    ]);
+    assert_eq!(code, 0, "retry replay: {replayed}");
+    assert_eq!(replayed["reused"], json!(true));
+    assert_eq!(replayed["result"], retried["result"]);
+
+    let (code, status) = env.forged(&["run", "status", "--run", "retry-amended-r1"]);
+    assert_eq!(code, 0, "successor status: {status}");
+    assert_eq!(status["result"]["run"]["retryOf"], json!(run_id));
+
+    let ledger = env.ledger();
+    ledger
+        .settle_run(
+            "retry-amended-r1",
+            forged_ledger::RunOutcome::Cancelled,
+            "retry generation settled".to_owned(),
+            None,
+            None,
+            None,
+        )
+        .expect("settle retry generation");
+    ledger.close().expect("close ledger");
+    let (code, flat) = env.forged(&[
+        "run",
+        "retry",
+        "--id",
+        "retry-amended-r1",
+        "--idempotency-key",
+        "retry-flat-key",
+    ]);
+    assert_eq!(code, 0, "retry retry-generation: {flat}");
+    assert_eq!(flat["result"]["runId"], json!("retry-amended-r2"));
+    assert_eq!(flat["result"]["retryOf"], json!("retry-amended-r1"));
+}
+
+#[test]
+fn run_retry_precondition_remedies_bind_and_execute_the_exact_recovery_verb() {
+    let env = TestEnv::new("forged-run-retry-remedies");
+    env.forged(&["init"]);
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+
+    let live = "retry-remedy-live";
+    env.seed_work_spec(
+        live,
+        "Exercise the live refusal.",
+        "The stop remedy executes.",
+    );
+    assert_eq!(
+        env.forged(&[
+            "run",
+            "start",
+            "--work",
+            live,
+            "--repo",
+            &repo,
+            "--base-ref",
+            "main"
+        ])
+        .0,
+        0
+    );
+    let (_, refused) = env.forged(&["run", "retry", "--id", live]);
+    let remedy = &refused["error"]["detail"];
+    assert_eq!(remedy["schema"], json!("forged.remedy/1"));
+    assert_eq!(remedy["verb"], json!("run stop"));
+    let remedy_run = remedy["args"]["run"].as_str().expect("remedy run");
+    let (code, stopped) = env.forged(&[
+        "run",
+        "stop",
+        "--run",
+        remedy_run,
+        "--outcome",
+        "cancelled",
+        "--reason",
+        "honesty-bound stop",
+    ]);
+    assert_eq!(code, 0, "run-stop remedy executes: {stopped}");
+
+    env.set_work_field(live, "status", "closed");
+    let (_, refused) = env.forged(&["run", "retry", "--id", live]);
+    let remedy = &refused["error"]["detail"];
+    assert_eq!(remedy["verb"], json!("work reopen"));
+    let remedy_work = remedy["args"]["id"].as_str().expect("remedy work");
+    let (code, reopened) = env.forged(&["work", "reopen", "--id", remedy_work]);
+    assert_eq!(code, 0, "work-reopen remedy executes: {reopened}");
+
+    let landed = "retry-remedy-landed";
+    env.seed_work_spec(
+        landed,
+        "Exercise the delivery refusal.",
+        "The work-show remedy executes.",
+    );
+    assert_eq!(
+        env.forged(&[
+            "run",
+            "start",
+            "--work",
+            landed,
+            "--repo",
+            &repo,
+            "--base-ref",
+            "main"
+        ])
+        .0,
+        0
+    );
+    let ledger = env.ledger();
+    ledger
+        .settle_run(
+            landed,
+            forged_ledger::RunOutcome::Landed,
+            "delivery landed".to_owned(),
+            Some(91),
+            Some("a".repeat(40)),
+            None,
+        )
+        .expect("settle landed run");
+    ledger.close().expect("close ledger");
+    let (_, refused) = env.forged(&["run", "retry", "--id", landed]);
+    let remedy = &refused["error"]["detail"];
+    assert_eq!(remedy["verb"], json!("work show"));
+    let remedy_work = remedy["args"]["id"].as_str().expect("remedy work");
+    let (code, shown) = env.forged(&["work", "show", "--id", remedy_work]);
+    assert_eq!(code, 0, "landed work-show remedy executes: {shown}");
+
+    let superseded = "retry-remedy-superseded";
+    env.seed_work_spec(
+        superseded,
+        "Exercise the run successor refusal.",
+        "The run-status remedy executes.",
+    );
+    assert_eq!(
+        env.forged(&[
+            "run",
+            "start",
+            "--work",
+            superseded,
+            "--repo",
+            &repo,
+            "--base-ref",
+            "main",
+        ])
+        .0,
+        0
+    );
+    fabricate_run(&env, "retry-remedy-successor");
+    let ledger = env.ledger();
+    ledger
+        .settle_run(
+            superseded,
+            forged_ledger::RunOutcome::Superseded,
+            "replaced by successor".to_owned(),
+            None,
+            None,
+            Some("retry-remedy-successor".to_owned()),
+        )
+        .expect("settle superseded run");
+    ledger.close().expect("close ledger");
+    let (_, refused) = env.forged(&["run", "retry", "--id", superseded]);
+    let remedy = &refused["error"]["detail"];
+    assert_eq!(remedy["verb"], json!("run status"));
+    let remedy_run = remedy["args"]["run"].as_str().expect("successor run");
+    let (code, status) = env.forged(&["run", "status", "--run", remedy_run]);
+    assert_eq!(code, 0, "successor run-status remedy executes: {status}");
+
+    let replaced_work = "retry-remedy-work";
+    env.seed_work_spec(
+        replaced_work,
+        "Exercise the Work successor refusal.",
+        "The successor work-show remedy executes.",
+    );
+    assert_eq!(
+        env.forged(&[
+            "run",
+            "start",
+            "--work",
+            replaced_work,
+            "--repo",
+            &repo,
+            "--base-ref",
+            "main",
+        ])
+        .0,
+        0
+    );
+    let ledger = env.ledger();
+    ledger
+        .settle_run(
+            replaced_work,
+            forged_ledger::RunOutcome::Cancelled,
+            "terminal source".to_owned(),
+            None,
+            None,
+            None,
+        )
+        .expect("settle Work source run");
+    ledger.close().expect("close ledger");
+    let work_successor = "retry-remedy-work-v2";
+    assert_eq!(
+        env.forged(&[
+            "work",
+            "create",
+            "--id",
+            work_successor,
+            "--title",
+            "Retry remedy Work successor",
+        ])
+        .0,
+        0
+    );
+    assert_eq!(
+        env.forged(&[
+            "work",
+            "supersede",
+            "--id",
+            replaced_work,
+            "--successor",
+            work_successor,
+        ])
+        .0,
+        0
+    );
+    let (_, refused) = env.forged(&["run", "retry", "--id", replaced_work]);
+    let remedy = &refused["error"]["detail"];
+    assert_eq!(remedy["verb"], json!("work show"));
+    assert_eq!(remedy["args"]["id"], json!(work_successor));
+    let (code, shown) = env.forged(&["work", "show", "--id", work_successor]);
+    assert_eq!(code, 0, "successor work-show remedy executes: {shown}");
 }
 
 #[test]

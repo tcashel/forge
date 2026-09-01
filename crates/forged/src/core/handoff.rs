@@ -1672,7 +1672,7 @@ async fn submit(ctx: &Ctx, req: &mut OperationRequest, scope: Scope) -> Operatio
             }
             return ok_response(
                 &key,
-                true,
+                false,
                 json!({
                     "submitted": false,
                     "phase": "already-running",
@@ -2178,6 +2178,54 @@ async fn submit(ctx: &Ctx, req: &mut OperationRequest, scope: Scope) -> Operatio
 /// Detach a slice driver and return its durable controller identity.
 pub async fn run_submit(ctx: &Ctx, req: &mut OperationRequest) -> OperationResponse {
     submit(ctx, req, Scope::Run).await
+}
+
+/// Prepare a fresh retry successor for the ordinary supervisor path while the
+/// caller holds its run-scoped submit guard. The caller's fence atomically
+/// seals this authorization and therefore mints the default restart budget.
+pub(crate) async fn authorize_retry_successor(
+    ctx: &Ctx,
+    run_id: &str,
+    _guard: &SubmitGuard,
+) -> Result<(Value, DesiredAuthorization), Failure> {
+    let id = run_id.to_owned();
+    let (run, desired) = on_ledger(&ctx.ledger, move |ledger| {
+        Ok((
+            ledger.get_run(&id)?,
+            ledger.get_desired_work(DesiredSubjectKind::Run, &id)?,
+        ))
+    })
+    .await?;
+    if run.state != forged_ledger::RunState::Active {
+        return Err(Failure::refused(
+            ErrorCode::InvalidRequest,
+            format!("retry successor {run_id} is already terminal"),
+        ));
+    }
+    if desired.is_some() {
+        return Err(Failure::refused(
+            ErrorCode::InvalidRequest,
+            format!("retry successor {run_id} is already submitted"),
+        ));
+    }
+    Ok((
+        json!({
+            "submitted": true,
+            "phase": "queued",
+            "queued": true,
+            "alreadyRunning": false,
+            "controller": Value::Null,
+        }),
+        DesiredAuthorization {
+            kind: DesiredSubjectKind::Run,
+            id: run_id.to_owned(),
+            generation: 0,
+            queued_until: None,
+            admission_reason: Some(
+                "retry successor awaits ordinary supervisor admission".to_owned(),
+            ),
+        },
+    ))
 }
 
 /// Detach an epic driver and return its durable controller identity.

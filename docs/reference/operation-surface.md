@@ -44,6 +44,7 @@ Generated from the dispatch table, clap tree, MCP router, and fenced-call audit.
 | `run_adjudicate_settlement` | `forged run adjudicate-settlement` | yes | yes | fenced | no | yes |
 | `run_advance` | `forged run advance` | yes | yes | machine-fenced | no | yes |
 | `run_drive` | `forged run drive` | yes | no | machine-fenced | no | yes |
+| `run_retry` | `forged run retry` | yes | yes | fenced | no | yes |
 | `run_revise_roster` | `forged run revise-roster` | yes | yes | fenced | no | yes |
 | `run_start` | `forged run start` | yes | yes | fenced | no | yes |
 | `run_status` | `forged run status` | yes | yes | read_only | no | yes |

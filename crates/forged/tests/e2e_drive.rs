@@ -3086,6 +3086,15 @@ fn concurrent_submit_keys_share_one_controller_generation() {
         1,
         "the other request adopts: {responses:?}"
     );
+    let adopted = responses
+        .iter()
+        .find(|response| response["result"]["alreadyRunning"] == json!(true))
+        .expect("one submit adopts the live controller");
+    assert_eq!(
+        adopted["reused"],
+        json!(false),
+        "a fresh authorization is not an operation replay: {adopted}"
+    );
 
     let status = wait_for(
         &env,

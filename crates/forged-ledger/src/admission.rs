@@ -195,37 +195,6 @@ pub(crate) fn decode_admission_decision(raw: &str) -> Result<AdmissionDecisionV1
     Ok(decision)
 }
 
-fn packet_resource(body: &str) -> Result<(String, String, AdmissionResourceClass), LedgerError> {
-    let value: Value = serde_json::from_str(body)
-        .map_err(|error| internal(format!("malformed stored packet body: {error}")))?;
-    let hints = value
-        .get("providerHints")
-        .and_then(Value::as_object)
-        .ok_or_else(|| internal("stored packet has no providerHints"))?;
-    let provider = hints
-        .get("provider")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| internal("stored packet has no provider"))?
-        .to_owned();
-    let model = hints
-        .get("model")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| internal("stored packet has no model"))?
-        .to_owned();
-    let class = match hints.get("sandbox").and_then(Value::as_str) {
-        Some("workspaceWrite") => AdmissionResourceClass::RepositoryWrite,
-        Some("readOnly") => AdmissionResourceClass::Read,
-        other => {
-            return Err(internal(format!(
-                "stored packet has unknown sandbox {other:?}"
-            )))
-        }
-    };
-    Ok((provider, model, class))
-}
-
 /// Resolve the desired-work epoch that authorizes a packet. Ordinary runs
 /// own their own epoch; an epic child is delegated to the parent epic's
 /// epoch recorded by the durable child, rolling-plan, or assurance event.
@@ -274,7 +243,7 @@ fn capacity(conn: &Connection) -> Result<AdmissionCapacityV1, LedgerError> {
     let mut result = AdmissionCapacityV1::default();
     let mut live_attempt_ids = BTreeSet::new();
     let mut statement = conn.prepare(
-        "SELECT a.attempt_id, p.body_json, r.repo, ar.provider, ar.model, \
+        "SELECT a.attempt_id, a.packet_id, r.repo, ar.provider, ar.model, \
                 ar.resource_class, ar.repository FROM attempts a \
          JOIN packets p ON p.packet_id = a.packet_id \
          JOIN runs r ON r.run_id = p.run_id \
@@ -295,7 +264,7 @@ fn capacity(conn: &Connection) -> Result<AdmissionCapacityV1, LedgerError> {
         ))
     })?;
     for row in rows {
-        let (attempt_id, body, run_repository, provider, model, class, reservation_repository) =
+        let (attempt_id, packet_id, run_repository, provider, model, class, reservation_repository) =
             row?;
         live_attempt_ids.insert(attempt_id.to_string());
         let (provider, model, class, repository) = match (provider, model, class) {
@@ -306,8 +275,13 @@ fn capacity(conn: &Connection) -> Result<AdmissionCapacityV1, LedgerError> {
                 reservation_repository.unwrap_or(run_repository),
             ),
             _ => {
-                let (provider, model, class) = packet_resource(&body)?;
-                (provider, model, class, run_repository)
+                let facts = packet_effective_facts_tx(conn, &packet_id)?;
+                (
+                    facts.provider,
+                    facts.model,
+                    facts.resource_class,
+                    facts.repository,
+                )
             }
         };
         result.total_active = result.total_active.saturating_add(1);

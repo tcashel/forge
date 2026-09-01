@@ -72,6 +72,7 @@ const OPERATION_CLASSES: &[(&str, OperationClass)] = &[
     ("run_adjudicate_settlement", OperationClass::Fenced),
     ("run_advance", OperationClass::MachineFenced),
     ("run_drive", OperationClass::MachineFenced),
+    ("run_retry", OperationClass::Fenced),
     ("run_revise_roster", OperationClass::Fenced),
     ("run_start", OperationClass::Fenced),
     ("run_status", OperationClass::ReadOnly),

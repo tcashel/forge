@@ -753,6 +753,17 @@ fn all_manifest_tools_match_their_cli_counterparts() {
     );
     assert_eq!(normalized(cli), normalized(tool), "run_start parity");
 
+    let cli = env.forged(&["run", "retry", "--id", "absent"]).1;
+    let tool = mcp.call_tool(
+        "run_retry",
+        json!({
+            "schemaVersion": 1,
+            "runId": "absent",
+            "params": {"id": "absent", "runId": null, "profile": null, "roster": null}
+        }),
+    );
+    assert_eq!(normalized(cli), normalized(tool), "run_retry parity");
+
     // run_advance / run_submit / run_status: a nonexistent run refuses identically.
     let cli = env.forged(&["run", "advance", "--run", "absent"]).1;
     let tool = mcp.call_tool(
