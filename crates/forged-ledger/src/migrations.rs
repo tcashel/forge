@@ -1215,9 +1215,199 @@ ALTER TABLE work_items ADD COLUMN repository TEXT GENERATED ALWAYS AS
 CREATE INDEX work_items_repository_status ON work_items(repository, status);
 ";
 
-/// Migration 026: append-only execution-policy revisions and the policy
-/// revision that froze each packet's stage contract.
+/// Migration 026: a conservative sequence over every admission scheduling
+/// fact. Triggers keep cross-connection and compatibility writes inside the
+/// same transaction as the fact they invalidate.
 const MIGRATION_026: &str = "
+CREATE TABLE admission_revision (
+  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+  revision  INTEGER NOT NULL CHECK (revision >= 0)
+);
+INSERT INTO admission_revision (singleton, revision) VALUES (1, 0);
+
+CREATE TRIGGER admission_revision_desired_work_insert
+AFTER INSERT ON desired_work
+BEGIN
+  UPDATE admission_revision SET revision = revision + 1 WHERE singleton = 1;
+END;
+CREATE TRIGGER admission_revision_desired_work_update
+AFTER UPDATE OF subject_kind, subject_id, desired_state, control_revision,
+                controller_generation, restart_used, next_wake_at, exhausted_at,
+                reconcile_token ON desired_work
+BEGIN
+  UPDATE admission_revision SET revision = revision + 1 WHERE singleton = 1;
+END;
+CREATE TRIGGER admission_revision_desired_work_delete
+AFTER DELETE ON desired_work
+BEGIN
+  UPDATE admission_revision SET revision = revision + 1 WHERE singleton = 1;
+END;
+
+CREATE TRIGGER admission_revision_runs_insert
+AFTER INSERT ON runs
+BEGIN
+  UPDATE admission_revision SET revision = revision + 1 WHERE singleton = 1;
+END;
+CREATE TRIGGER admission_revision_runs_update
+AFTER UPDATE OF run_id, bead_id, repo, state, terminal_outcome ON runs
+BEGIN
+  UPDATE admission_revision SET revision = revision + 1 WHERE singleton = 1;
+END;
+CREATE TRIGGER admission_revision_runs_delete
+AFTER DELETE ON runs
+BEGIN
+  UPDATE admission_revision SET revision = revision + 1 WHERE singleton = 1;
+END;
+
+CREATE TRIGGER admission_revision_packets_insert
+AFTER INSERT ON packets
+BEGIN
+  UPDATE admission_revision SET revision = revision + 1 WHERE singleton = 1;
+END;
+CREATE TRIGGER admission_revision_packets_update
+AFTER UPDATE OF packet_id, run_id, stage, seq, body_json, created_at ON packets
+BEGIN
+  UPDATE admission_revision SET revision = revision + 1 WHERE singleton = 1;
+END;
+CREATE TRIGGER admission_revision_packets_delete
+AFTER DELETE ON packets
+BEGIN
+  UPDATE admission_revision SET revision = revision + 1 WHERE singleton = 1;
+END;
+
+CREATE TRIGGER admission_revision_run_definitions_insert
+AFTER INSERT ON run_definitions
+BEGIN
+  UPDATE admission_revision SET revision = revision + 1 WHERE singleton = 1;
+END;
+CREATE TRIGGER admission_revision_run_definitions_update
+AFTER UPDATE OF run_id, package_sha256, package_json ON run_definitions
+BEGIN
+  UPDATE admission_revision SET revision = revision + 1 WHERE singleton = 1;
+END;
+CREATE TRIGGER admission_revision_run_definitions_delete
+AFTER DELETE ON run_definitions
+BEGIN
+  UPDATE admission_revision SET revision = revision + 1 WHERE singleton = 1;
+END;
+
+CREATE TRIGGER admission_revision_run_package_migrations_insert
+AFTER INSERT ON run_package_migrations
+BEGIN
+  UPDATE admission_revision SET revision = revision + 1 WHERE singleton = 1;
+END;
+CREATE TRIGGER admission_revision_run_package_migrations_update
+AFTER UPDATE OF run_id, package_sha256, package_json ON run_package_migrations
+BEGIN
+  UPDATE admission_revision SET revision = revision + 1 WHERE singleton = 1;
+END;
+CREATE TRIGGER admission_revision_run_package_migrations_delete
+AFTER DELETE ON run_package_migrations
+BEGIN
+  UPDATE admission_revision SET revision = revision + 1 WHERE singleton = 1;
+END;
+
+CREATE TRIGGER admission_revision_roster_revisions_insert
+AFTER INSERT ON roster_revisions
+BEGIN
+  UPDATE admission_revision SET revision = revision + 1 WHERE singleton = 1;
+END;
+CREATE TRIGGER admission_revision_roster_revisions_update
+AFTER UPDATE OF run_id, revision, roster_sha256, roster_json, created_at ON roster_revisions
+BEGIN
+  UPDATE admission_revision SET revision = revision + 1 WHERE singleton = 1;
+END;
+CREATE TRIGGER admission_revision_roster_revisions_delete
+AFTER DELETE ON roster_revisions
+BEGIN
+  UPDATE admission_revision SET revision = revision + 1 WHERE singleton = 1;
+END;
+
+CREATE TRIGGER admission_revision_events_insert
+AFTER INSERT ON events
+WHEN NEW.kind IN ('forged.epic.started','forged.epic.execution-package-migrated',
+                  'forged.epic.child.started','forged.epic.plan.started',
+                  'forged.epic.assurance.started')
+BEGIN
+  UPDATE admission_revision SET revision = revision + 1 WHERE singleton = 1;
+END;
+CREATE TRIGGER admission_revision_events_update
+AFTER UPDATE OF event_id, run_id, kind, payload_json ON events
+WHEN OLD.kind IN ('forged.epic.started','forged.epic.execution-package-migrated',
+                  'forged.epic.child.started','forged.epic.plan.started',
+                  'forged.epic.assurance.started')
+  OR NEW.kind IN ('forged.epic.started','forged.epic.execution-package-migrated',
+                  'forged.epic.child.started','forged.epic.plan.started',
+                  'forged.epic.assurance.started')
+BEGIN
+  UPDATE admission_revision SET revision = revision + 1 WHERE singleton = 1;
+END;
+CREATE TRIGGER admission_revision_events_delete
+AFTER DELETE ON events
+WHEN OLD.kind IN ('forged.epic.started','forged.epic.execution-package-migrated',
+                  'forged.epic.child.started','forged.epic.plan.started',
+                  'forged.epic.assurance.started')
+BEGIN
+  UPDATE admission_revision SET revision = revision + 1 WHERE singleton = 1;
+END;
+
+CREATE TRIGGER admission_revision_usage_insert
+AFTER INSERT ON usage
+BEGIN
+  UPDATE admission_revision SET revision = revision + 1 WHERE singleton = 1;
+END;
+CREATE TRIGGER admission_revision_usage_update
+AFTER UPDATE OF usage_id ON usage
+BEGIN
+  UPDATE admission_revision SET revision = revision + 1 WHERE singleton = 1;
+END;
+CREATE TRIGGER admission_revision_usage_delete
+AFTER DELETE ON usage
+BEGIN
+  UPDATE admission_revision SET revision = revision + 1 WHERE singleton = 1;
+END;
+
+CREATE TRIGGER admission_revision_attempts_insert
+AFTER INSERT ON attempts
+BEGIN
+  UPDATE admission_revision SET revision = revision + 1 WHERE singleton = 1;
+END;
+CREATE TRIGGER admission_revision_attempts_update
+AFTER UPDATE OF state, fail_note ON attempts
+BEGIN
+  UPDATE admission_revision SET revision = revision + 1 WHERE singleton = 1;
+END;
+CREATE TRIGGER admission_revision_attempts_delete
+AFTER DELETE ON attempts
+BEGIN
+  UPDATE admission_revision SET revision = revision + 1 WHERE singleton = 1;
+END;
+
+CREATE TRIGGER admission_revision_reservations_insert
+AFTER INSERT ON admission_reservations
+WHEN NEW.state != 'released'
+BEGIN
+  UPDATE admission_revision SET revision = revision + 1 WHERE singleton = 1;
+END;
+CREATE TRIGGER admission_revision_reservations_update
+AFTER UPDATE OF reservation_id, work_key, state, owner_kind, owner_id,
+                control_revision, repository, provider, model, resource_class
+ON admission_reservations
+WHEN OLD.state != 'released' OR NEW.state != 'released'
+BEGIN
+  UPDATE admission_revision SET revision = revision + 1 WHERE singleton = 1;
+END;
+CREATE TRIGGER admission_revision_reservations_delete
+AFTER DELETE ON admission_reservations
+WHEN OLD.state != 'released'
+BEGIN
+  UPDATE admission_revision SET revision = revision + 1 WHERE singleton = 1;
+END;
+";
+
+/// Migration 027: append-only execution-policy revisions and the policy
+/// revision that froze each packet's stage contract.
+const MIGRATION_027: &str = "
 CREATE TABLE policy_revisions (
   run_id        TEXT NOT NULL REFERENCES runs(run_id),
   revision      INTEGER NOT NULL CHECK (revision > 0),
@@ -1231,7 +1421,6 @@ CREATE TABLE policy_revisions (
 CREATE UNIQUE INDEX policy_revision_operation
   ON policy_revisions(operation_id) WHERE operation_id IS NOT NULL;
 ALTER TABLE packets ADD COLUMN policy_revision INTEGER;
-";
 
 /// Embedded ordered migrations; `user_version` records the last applied index.
 const MIGRATIONS: &[&str] = &[
@@ -1261,6 +1450,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_024,
     MIGRATION_025,
     MIGRATION_026,
+    MIGRATION_027,
 ];
 
 /// Configure pragmas and apply pending migrations on a fresh connection.
@@ -1484,7 +1674,7 @@ mod tests {
         assert_eq!(pragmas.synchronous, 2);
         assert!(pragmas.foreign_keys);
         assert_eq!(pragmas.busy_timeout_ms, 5000);
-        assert_eq!(pragmas.user_version, 26);
+        assert_eq!(pragmas.user_version, 27);
         ledger.close().expect("close");
 
         // Table names via a separate connection: sqlite_master is data, and
@@ -1520,6 +1710,7 @@ mod tests {
             "work_deps",
             "work_leases",
             "work_notes",
+            "admission_revision",
         ] {
             let found: String = conn
                 .query_row(
@@ -1597,6 +1788,47 @@ mod tests {
                 .unwrap_or_else(|_| panic!("index {index} missing"));
             assert_eq!(found, index);
         }
+        for trigger in [
+            "admission_revision_desired_work_insert",
+            "admission_revision_desired_work_update",
+            "admission_revision_desired_work_delete",
+            "admission_revision_runs_insert",
+            "admission_revision_runs_update",
+            "admission_revision_runs_delete",
+            "admission_revision_packets_insert",
+            "admission_revision_packets_update",
+            "admission_revision_packets_delete",
+            "admission_revision_run_definitions_insert",
+            "admission_revision_run_definitions_update",
+            "admission_revision_run_definitions_delete",
+            "admission_revision_run_package_migrations_insert",
+            "admission_revision_run_package_migrations_update",
+            "admission_revision_run_package_migrations_delete",
+            "admission_revision_roster_revisions_insert",
+            "admission_revision_roster_revisions_update",
+            "admission_revision_roster_revisions_delete",
+            "admission_revision_events_insert",
+            "admission_revision_events_update",
+            "admission_revision_events_delete",
+            "admission_revision_usage_insert",
+            "admission_revision_usage_update",
+            "admission_revision_usage_delete",
+            "admission_revision_attempts_insert",
+            "admission_revision_attempts_update",
+            "admission_revision_attempts_delete",
+            "admission_revision_reservations_insert",
+            "admission_revision_reservations_update",
+            "admission_revision_reservations_delete",
+        ] {
+            let found: String = conn
+                .query_row(
+                    "SELECT name FROM sqlite_master WHERE type='trigger' AND name = ?1",
+                    [trigger],
+                    |row| row.get(0),
+                )
+                .unwrap_or_else(|_| panic!("trigger {trigger} missing"));
+            assert_eq!(found, trigger);
+        }
     }
 
     #[test]
@@ -1613,7 +1845,7 @@ mod tests {
         }
 
         let ledger = Ledger::open(&path).expect("upgrade v23 database");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 26);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 27);
         ledger.close().expect("close");
 
         let conn = rusqlite::Connection::open(&path).expect("raw migrated database");
@@ -1662,7 +1894,7 @@ mod tests {
         }
 
         let ledger = Ledger::open(&path).expect("upgrade v24 database");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 26);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 27);
         ledger.close().expect("close");
 
         let conn = rusqlite::Connection::open(path).expect("raw migrated database");
@@ -1730,7 +1962,7 @@ mod tests {
         }
 
         let ledger = Ledger::open(&path).expect("open migration-013 database");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 26);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 27);
         ledger.close().expect("close");
 
         let conn = rusqlite::Connection::open(&path).expect("open upgraded database");
@@ -1790,7 +2022,7 @@ mod tests {
 
             let ledger = Ledger::open(&path)
                 .unwrap_or_else(|error| panic!("upgrade from v{version} failed: {error}"));
-            assert_eq!(ledger.pragmas().expect("pragmas").user_version, 26);
+            assert_eq!(ledger.pragmas().expect("pragmas").user_version, 27);
             assert_eq!(
                 ledger
                     .list_events_by_kind("legacy.progress")
@@ -1890,7 +2122,7 @@ mod tests {
         }
 
         let ledger = Ledger::open(&path).expect("upgrade owned v20 database");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 26);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 27);
         assert!(ledger
             .get_owned_herdr_session("migration-owned")
             .expect("owned row")
@@ -1934,7 +2166,7 @@ mod tests {
             .close()
             .expect("close");
         let ledger = Ledger::open(&path).expect("second open");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 26);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 27);
         ledger.close().expect("close");
     }
 
@@ -1995,7 +2227,7 @@ mod tests {
                 .expect("mark v0");
         }
         let ledger = Ledger::open(&path).expect("migrate");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 26);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 27);
         let old = ledger.get_run("old-run").expect("old run");
         assert_eq!(old.work_id, "old-bead");
         assert_eq!(old.stop_reason.as_deref(), Some("legacy stop"));
@@ -2038,7 +2270,7 @@ mod tests {
         }
 
         let ledger = Ledger::open(&path).expect("migrate");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 26);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 27);
         let first = ledger.get_attempt(1).expect("attempt 1 survived");
         assert_eq!(first.claim_token, "tok-1");
         assert_eq!(first.state, crate::AttemptState::Reclaimed);

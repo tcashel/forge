@@ -1,11 +1,11 @@
 //! Admission snapshots, decisions, and durable capacity ownership.
 //!
 //! Snapshot reads are isolated in one SQLite transaction. The subsequent
-//! `BEGIN IMMEDIATE` writer re-computes the revision of every scheduling fact
+//! `BEGIN IMMEDIATE` writer re-reads the revision of every scheduling fact
 //! before recording decisions and reservations, so an interleaving process
 //! can only make the complete batch stale; it can never oversubscribe it.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 use forged_types::{
@@ -239,7 +239,10 @@ pub(crate) fn packet_authorization_subject_tx(
 /// Active attempt facts plus non-released reservations. A reservation already
 /// transferred to a live attempt is deliberately excluded from the second
 /// half so one unit of work consumes exactly one slot.
-fn capacity(conn: &Connection) -> Result<AdmissionCapacityV1, LedgerError> {
+fn capacity(
+    conn: &Connection,
+    packet_facts: &mut PacketFactsCache,
+) -> Result<AdmissionCapacityV1, LedgerError> {
     let mut result = AdmissionCapacityV1::default();
     let mut live_attempt_ids = BTreeSet::new();
     let mut statement = conn.prepare(
@@ -275,7 +278,7 @@ fn capacity(conn: &Connection) -> Result<AdmissionCapacityV1, LedgerError> {
                 reservation_repository.unwrap_or(run_repository),
             ),
             _ => {
-                let facts = packet_effective_facts_tx(conn, &packet_id)?;
+                let facts = packet_facts.get(conn, &packet_id)?;
                 (
                     facts.provider,
                     facts.model,
@@ -549,9 +552,36 @@ pub(crate) fn packet_effective_facts_tx(
     })
 }
 
+#[derive(Default)]
+struct PacketFactsCache {
+    facts: BTreeMap<String, AdmissionPacketFacts>,
+    #[cfg(test)]
+    resolutions: usize,
+}
+
+impl PacketFactsCache {
+    fn get(
+        &mut self,
+        conn: &Connection,
+        packet_id: &str,
+    ) -> Result<AdmissionPacketFacts, LedgerError> {
+        if let Some(facts) = self.facts.get(packet_id) {
+            return Ok(facts.clone());
+        }
+        let facts = packet_effective_facts_tx(conn, packet_id)?;
+        #[cfg(test)]
+        {
+            self.resolutions += 1;
+        }
+        self.facts.insert(packet_id.to_owned(), facts.clone());
+        Ok(facts)
+    }
+}
+
 fn requested_packet_facts(
     conn: &Connection,
     targets: &[(AdmissionSubjectKind, String)],
+    packet_facts: &mut PacketFactsCache,
 ) -> Result<Vec<AdmissionPacketFacts>, LedgerError> {
     let packet_ids = targets
         .iter()
@@ -559,7 +589,7 @@ fn requested_packet_facts(
         .collect::<BTreeSet<_>>();
     packet_ids
         .into_iter()
-        .map(|packet_id| packet_effective_facts_tx(conn, packet_id))
+        .map(|packet_id| packet_facts.get(conn, packet_id))
         .collect()
 }
 
@@ -736,159 +766,49 @@ fn durable_candidates(
 
 /// Revision over every durable fact that can change eligibility or capacity.
 fn ledger_revision(conn: &Connection) -> Result<String, LedgerError> {
-    let mut desired = Vec::new();
-    let mut stmt = conn.prepare(
-        "SELECT subject_kind, subject_id, desired_state, control_revision, controller_generation, \
-                restart_used, next_wake_at, exhausted_at, reconcile_token \
-         FROM desired_work ORDER BY subject_kind, subject_id",
+    let revision: i64 = conn.query_row(
+        "SELECT revision FROM admission_revision WHERE singleton = 1",
+        [],
+        |row| row.get(0),
     )?;
-    for row in stmt.query_map([], |row| {
-        Ok(json!([
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, i64>(3)?,
-            row.get::<_, i64>(4)?,
-            row.get::<_, i64>(5)?,
-            row.get::<_, Option<String>>(6)?,
-            row.get::<_, Option<String>>(7)?,
-            row.get::<_, Option<String>>(8)?,
-        ]))
-    })? {
-        desired.push(row?);
+    Ok(revision.to_string())
+}
+
+fn reservation_decisions(
+    conn: &Connection,
+    reservations: &[AdmissionReservationRow],
+) -> Result<Vec<AdmissionDecisionV1>, LedgerError> {
+    if reservations.is_empty() {
+        return Ok(Vec::new());
     }
-    let mut runs = Vec::new();
-    let mut stmt = conn.prepare(
-        "SELECT run_id, bead_id, repo, state, terminal_outcome FROM runs ORDER BY run_id",
-    )?;
-    for row in stmt.query_map([], |row| {
-        Ok(json!([
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-            row.get::<_, Option<String>>(4)?,
-        ]))
-    })? {
-        runs.push(row?);
-    }
-    let mut packets = Vec::new();
-    let mut stmt = conn.prepare(
-        "SELECT packet_id, run_id, stage, seq, body_json, created_at \
-         FROM packets ORDER BY packet_id",
-    )?;
-    for row in stmt.query_map([], |row| {
-        Ok(json!([
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, i64>(3)?,
-            row.get::<_, String>(4)?,
-            row.get::<_, String>(5)?,
-        ]))
-    })? {
-        packets.push(row?);
-    }
-    let mut run_definitions = Vec::new();
-    let mut stmt = conn.prepare(
-        "SELECT d.run_id, COALESCE(m.package_sha256, d.package_sha256), \
-                COALESCE(m.package_json, d.package_json) \
-         FROM run_definitions d LEFT JOIN run_package_migrations m ON m.run_id = d.run_id \
-         ORDER BY d.run_id",
-    )?;
-    for row in stmt.query_map([], |row| {
-        Ok(json!([
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-        ]))
-    })? {
-        run_definitions.push(row?);
-    }
-    let mut roster_revisions = Vec::new();
-    let mut stmt = conn.prepare(
-        "SELECT run_id, revision, roster_sha256, roster_json, created_at \
-         FROM roster_revisions ORDER BY run_id, revision",
-    )?;
-    for row in stmt.query_map([], |row| {
-        Ok(json!([
-            row.get::<_, String>(0)?,
-            row.get::<_, i64>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-            row.get::<_, String>(4)?,
-        ]))
-    })? {
-        roster_revisions.push(row?);
-    }
-    let mut epic_events = Vec::new();
-    let mut stmt = conn.prepare(
-        "SELECT event_id, run_id, kind, payload_json FROM events \
-         WHERE kind IN ('forged.epic.started','forged.epic.execution-package-migrated', \
-                        'forged.epic.child.started','forged.epic.plan.started', \
-                        'forged.epic.assurance.started') ORDER BY event_id",
-    )?;
-    for row in stmt.query_map([], |row| {
-        Ok(json!([
-            row.get::<_, i64>(0)?,
-            row.get::<_, Option<String>>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-        ]))
-    })? {
-        epic_events.push(row?);
-    }
-    let mut attempts = Vec::new();
-    let mut stmt = conn.prepare(
-        "SELECT attempt_id, packet_id, state, fail_note, started_at FROM attempts \
-         ORDER BY attempt_id",
-    )?;
-    for row in stmt.query_map([], |row| {
-        Ok(json!([
-            row.get::<_, i64>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, Option<String>>(3)?,
-            row.get::<_, String>(4)?,
-        ]))
-    })? {
-        attempts.push(row?);
-    }
-    let reservations = live_reservations(conn)?
-        .into_iter()
-        .map(|row| {
-            json!([
-                row.reservation_id,
-                row.work_key,
-                row.state.as_str(),
-                row.owner_kind,
-                row.owner_id,
-                row.control_revision,
-                row.repository,
-                row.provider,
-                row.model,
-                match row.resource_class {
-                    AdmissionResourceClass::Read => "read",
-                    AdmissionResourceClass::RepositoryWrite => "repository-write",
-                },
-            ])
-        })
+    let decision_ids = reservations
+        .iter()
+        .map(|reservation| reservation.decision_id.as_str())
         .collect::<Vec<_>>();
-    let usage_id: i64 =
-        conn.query_row("SELECT COALESCE(MAX(usage_id), 0) FROM usage", [], |row| {
-            row.get(0)
-        })?;
-    canonical_sha(&json!({
-        "desired": desired,
-        "runs": runs,
-        "packets": packets,
-        "runDefinitions": run_definitions,
-        "rosterRevisions": roster_revisions,
-        "epicEvents": epic_events,
-        "attempts": attempts,
-        "reservations": reservations,
-        "usageId": usage_id,
-    }))
+    let decision_ids_json = serde_json::to_string(&decision_ids)?;
+    let mut statement = conn.prepare(
+        "SELECT decision_id, decision_json FROM admission_decisions \
+         WHERE decision_id IN (SELECT value FROM json_each(?1))",
+    )?;
+    let rows = statement.query_map([decision_ids_json], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut by_id = BTreeMap::new();
+    for row in rows {
+        let (decision_id, raw) = row?;
+        by_id.insert(decision_id, decode_admission_decision(&raw)?);
+    }
+    reservations
+        .iter()
+        .map(|reservation| {
+            by_id.remove(&reservation.decision_id).ok_or_else(|| {
+                internal(format!(
+                    "admission reservation {:?} has no persisted decision",
+                    reservation.reservation_id
+                ))
+            })
+        })
+        .collect()
 }
 
 fn snapshot_tx(
@@ -897,21 +817,14 @@ fn snapshot_tx(
     targets: &[(AdmissionSubjectKind, String)],
 ) -> Result<AdmissionLedgerSnapshot, LedgerError> {
     let reservations = live_reservations(conn)?;
-    let mut reservation_decisions = Vec::new();
-    for reservation in &reservations {
-        let raw: String = conn.query_row(
-            "SELECT decision_json FROM admission_decisions WHERE decision_id = ?1",
-            [&reservation.decision_id],
-            |row| row.get(0),
-        )?;
-        reservation_decisions.push(decode_admission_decision(&raw)?);
-    }
+    let reservation_decisions = reservation_decisions(conn, &reservations)?;
+    let mut packet_fact_cache = PacketFactsCache::default();
     Ok(AdmissionLedgerSnapshot {
         as_of: now_iso(),
         ledger_revision: ledger_revision(conn)?,
         candidates: durable_candidates(conn, extra)?,
-        packet_facts: requested_packet_facts(conn, targets)?,
-        capacity: capacity(conn)?,
+        packet_facts: requested_packet_facts(conn, targets, &mut packet_fact_cache)?,
+        capacity: capacity(conn, &mut packet_fact_cache)?,
         spend: spend(conn)?,
         latest_rate_limits: latest_rate_limits(conn)?,
         reservations,
@@ -1523,6 +1436,7 @@ impl Ledger {
 mod tests {
     use super::*;
     use crate::types::{NewPacket, NewRun, RevokeScope, SpecFence};
+    use crate::{NewWorkItem, WorkKind, WorkRevisionCause, WorkSpecFields, WorkStatus};
     use forged_types::{
         AdmissionCandidateV1, AdmissionInputsV1, AdmissionReason, Outcome, PacketResult, RunId,
         Stage, ADMISSION_DECISION_SCHEMA_V1, ADMISSION_INPUTS_SCHEMA_V1,
@@ -2177,6 +2091,12 @@ mod tests {
             .commit_admission_batch(write)
             .expect_err("mutable scheduler inputs invalidate the batch");
         assert_eq!(error.code(), ErrorCode::OperationInProgress);
+        assert!(
+            error
+                .to_string()
+                .ends_with("admission ledger facts changed before allocation"),
+            "wire refusal text changed: {error}"
+        );
     }
 
     #[test]
@@ -2605,6 +2525,101 @@ mod tests {
         let after = ledger.admission_snapshot(None).expect("after");
         assert_eq!(before.ledger_revision, after.ledger_revision);
         assert_eq!(before.capacity, after.capacity);
+    }
+
+    #[test]
+    fn revision_is_column_scoped_and_usage_insert_is_fenced() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.db");
+        let ledger = Ledger::open(&path).expect("ledger");
+        let (run_id, _) = seed_packet(&ledger, "revision-scope");
+        ledger
+            .create_work_item(NewWorkItem {
+                work_id: "uncovered-work".to_owned(),
+                kind: WorkKind::Task,
+                status: WorkStatus::Open,
+                priority: None,
+                metadata: BTreeMap::new(),
+                spec: WorkSpecFields {
+                    title: "uncovered".to_owned(),
+                    description: String::new(),
+                    acceptance_criteria: String::new(),
+                    design: String::new(),
+                    notes: String::new(),
+                },
+                cause: WorkRevisionCause::Authored,
+            })
+            .expect("work note parent");
+        let before = ledger.admission_snapshot(None).expect("before");
+        let _: u64 = before
+            .ledger_revision
+            .parse()
+            .expect("revision is a stringified integer");
+
+        let connection = rusqlite::Connection::open(&path).expect("second process");
+        connection
+            .execute(
+                "INSERT INTO work_notes \
+                 (note_id, work_id, kind, schema, actor, body_json, written_at) \
+                 VALUES ('uncovered-note', 'uncovered-work', 'comment', 'comment/1', \
+                         'operator', '{}', '2030-01-01T00:00:00Z')",
+                [],
+            )
+            .expect("write genuinely uncovered table");
+        let after_note = ledger.admission_snapshot(None).expect("after note");
+        assert_eq!(before.ledger_revision, after_note.ledger_revision);
+
+        connection
+            .execute(
+                "INSERT INTO usage \
+                 (run_id, provider, model, input_tokens, output_tokens, ts) \
+                 VALUES (?1, 'codex', 'gpt-test', 1, 1, '2030-01-01T00:00:00Z')",
+                [&run_id],
+            )
+            .expect("append admission spend fact");
+        let after_usage = ledger.admission_snapshot(None).expect("after usage");
+        assert!(
+            after_usage
+                .ledger_revision
+                .parse::<u64>()
+                .expect("usage revision")
+                > after_note
+                    .ledger_revision
+                    .parse::<u64>()
+                    .expect("note revision")
+        );
+    }
+
+    #[test]
+    fn snapshot_memoizes_effective_facts_per_distinct_packet() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.db");
+        let ledger = Ledger::open(&path).expect("ledger");
+        let (_, packet_id) = seed_packet(&ledger, "facts-cache");
+        ledger
+            .claim_packet(
+                &packet_id,
+                "codex:facts-cache:1",
+                &SpecFence::Sha256("feed".to_owned()),
+            )
+            .expect("reservation-less live attempt");
+
+        let connection = rusqlite::Connection::open(path).expect("snapshot connection");
+        let targets = vec![(AdmissionSubjectKind::Packet, packet_id)];
+        let mut packet_facts = PacketFactsCache::default();
+        assert_eq!(
+            requested_packet_facts(&connection, &targets, &mut packet_facts)
+                .expect("target packet facts")
+                .len(),
+            1
+        );
+        assert_eq!(
+            capacity(&connection, &mut packet_facts)
+                .expect("capacity")
+                .total_active,
+            1
+        );
+        assert_eq!(packet_facts.resolutions, 1);
     }
 
     #[test]

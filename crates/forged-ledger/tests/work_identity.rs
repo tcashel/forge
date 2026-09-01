@@ -383,6 +383,37 @@ fn migration_015_uses_only_durable_events_and_child_epic_context() {
             r#"DROP INDEX policy_revision_operation;
              DROP TABLE policy_revisions;
              ALTER TABLE packets DROP COLUMN policy_revision;
+DROP TRIGGER admission_revision_desired_work_insert;
+             DROP TRIGGER admission_revision_desired_work_update;
+             DROP TRIGGER admission_revision_desired_work_delete;
+             DROP TRIGGER admission_revision_runs_insert;
+             DROP TRIGGER admission_revision_runs_update;
+             DROP TRIGGER admission_revision_runs_delete;
+             DROP TRIGGER admission_revision_packets_insert;
+             DROP TRIGGER admission_revision_packets_update;
+             DROP TRIGGER admission_revision_packets_delete;
+             DROP TRIGGER admission_revision_run_definitions_insert;
+             DROP TRIGGER admission_revision_run_definitions_update;
+             DROP TRIGGER admission_revision_run_definitions_delete;
+             DROP TRIGGER admission_revision_run_package_migrations_insert;
+             DROP TRIGGER admission_revision_run_package_migrations_update;
+             DROP TRIGGER admission_revision_run_package_migrations_delete;
+             DROP TRIGGER admission_revision_roster_revisions_insert;
+             DROP TRIGGER admission_revision_roster_revisions_update;
+             DROP TRIGGER admission_revision_roster_revisions_delete;
+             DROP TRIGGER admission_revision_events_insert;
+             DROP TRIGGER admission_revision_events_update;
+             DROP TRIGGER admission_revision_events_delete;
+             DROP TRIGGER admission_revision_usage_insert;
+             DROP TRIGGER admission_revision_usage_update;
+             DROP TRIGGER admission_revision_usage_delete;
+             DROP TRIGGER admission_revision_attempts_insert;
+             DROP TRIGGER admission_revision_attempts_update;
+             DROP TRIGGER admission_revision_attempts_delete;
+             DROP TRIGGER admission_revision_reservations_insert;
+             DROP TRIGGER admission_revision_reservations_update;
+             DROP TRIGGER admission_revision_reservations_delete;
+             DROP TABLE admission_revision;
              DROP TABLE bead_settlement_retry;
              DROP TABLE review_finding_deliveries;
              DROP TRIGGER herdr_projection_identity_immutable;
@@ -445,7 +476,7 @@ fn migration_015_uses_only_durable_events_and_child_epic_context() {
         .expect("seed v14");
     }
     let ledger = Ledger::open(&path).expect("migrate 015");
-    assert_eq!(ledger.pragmas().expect("pragmas").user_version, 26);
+    assert_eq!(ledger.pragmas().expect("pragmas").user_version, 27);
     let epic = ledger
         .get_work_identity(WorkIdentitySubjectKind::Epic, "epic-one")
         .expect("read")
