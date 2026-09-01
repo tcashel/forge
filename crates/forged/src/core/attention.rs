@@ -8,14 +8,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::core::work_types::IssueSummary;
 use forged_ledger::{
     AdmissionReservationState, AttemptState, DesiredReconcileOutcome, DesiredState, EffectClass,
-    InventorySnapshot, InventoryUsage, RunOutcome,
+    EventRow, InventorySnapshot, InventoryUsage, RunOutcome, WorkObservationSnapshot,
 };
 use forged_types::{
     attention_id, attention_occurrence_id, AdmissionOutcome, AdmissionReason,
     AttentionAcknowledgementV1, AttentionActionCode, AttentionCondition, AttentionEvidenceKind,
     AttentionEvidenceRefV1, AttentionItemV1, AttentionOwner, AttentionRecommendedActionV1,
     AttentionResolutionDisposition, AttentionResolutionV1, AttentionSeverity, AttentionState,
-    AttentionSubjectKind, OperationActionV1, ATTENTION_ITEM_SCHEMA_V1,
+    AttentionSubjectKind, OperationActionV1, Outcome, PacketResult, WorkIdentitySubjectKind,
+    WorkTitleV1, ATTENTION_ITEM_SCHEMA_V1,
 };
 use serde_json::{json, Value};
 
@@ -48,10 +49,7 @@ pub(crate) const ATTENTION_EVENT_KINDS: [&str; 13] = [
 
 #[derive(Debug, Clone)]
 struct RawAttention {
-    subject_kind: AttentionSubjectKind,
     subject_id: String,
-    subject_title: Option<forged_types::WorkTitleV1>,
-    repository: Option<String>,
     condition: AttentionCondition,
     severity: AttentionSeverity,
     owner: AttentionOwner,
@@ -69,6 +67,43 @@ struct RawAttention {
 struct Projected {
     item: AttentionItemV1,
     source_cursor: i64,
+}
+
+enum ProjectionSurface<'a> {
+    Inventory,
+    Observation {
+        snapshot: &'a WorkObservationSnapshot,
+        review_disagreements: &'a [(String, i64, String, Value)],
+        results: &'a BTreeMap<i64, PacketResult>,
+        subject_title: &'a WorkTitleV1,
+    },
+}
+
+impl ProjectionSurface<'_> {
+    fn is_observation(&self) -> bool {
+        matches!(self, Self::Observation { .. })
+    }
+}
+
+struct ProjectionInput<'a> {
+    runs: &'a [forged_ledger::RunRow],
+    attempts: &'a [forged_ledger::AttemptRow],
+    attempts_missing_artifacts: Vec<&'a forged_ledger::AttemptRow>,
+    events: Vec<&'a EventRow>,
+    desired_work: &'a [forged_ledger::DesiredWorkRow],
+    inflight_operations: &'a [forged_ledger::OperationRow],
+    admission_decisions: &'a [forged_types::AdmissionDecisionV1],
+    admission_reservations: &'a [forged_ledger::AdmissionReservationRow],
+    usage: ProjectionUsage<'a>,
+    entries: &'a [Value],
+    work: &'a [IssueSummary],
+    surface: ProjectionSurface<'a>,
+}
+
+#[derive(Clone, Copy)]
+enum ProjectionUsage<'a> {
+    Inventory(&'a InventoryUsage),
+    Observation(&'a WorkObservationSnapshot),
 }
 
 pub(crate) fn policy(
@@ -257,6 +292,60 @@ fn repository(entry: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 
+struct SubjectMetadata {
+    kind: AttentionSubjectKind,
+    title: Option<WorkTitleV1>,
+    repository: Option<String>,
+}
+
+fn subject_metadata(input: &ProjectionInput<'_>, id: &str) -> Option<SubjectMetadata> {
+    let ProjectionSurface::Observation {
+        snapshot,
+        subject_title,
+        ..
+    } = &input.surface
+    else {
+        let entry = input
+            .entries
+            .iter()
+            .find(|entry| entry.get("id").and_then(Value::as_str) == Some(id))?;
+        return Some(SubjectMetadata {
+            kind: subject_kind(entry),
+            title: subject_title(entry),
+            repository: repository(entry),
+        });
+    };
+    if let Some(run) = snapshot.runs.iter().find(|run| run.run_id == id) {
+        let title =
+            if snapshot.subject.kind == WorkIdentitySubjectKind::Run && snapshot.subject.id == id {
+                Some((*subject_title).clone())
+            } else {
+                snapshot
+                    .child_identities
+                    .iter()
+                    .find(|identity| identity.subject.id == id)
+                    .map(|identity| forged_types::resolve_work_title(identity, None))
+            };
+        return Some(SubjectMetadata {
+            kind: AttentionSubjectKind::Run,
+            title,
+            repository: Some(run.repo.clone()),
+        });
+    }
+    (snapshot.subject.id == id).then(|| SubjectMetadata {
+        kind: match snapshot.subject.kind {
+            WorkIdentitySubjectKind::Run => AttentionSubjectKind::Run,
+            WorkIdentitySubjectKind::Epic => AttentionSubjectKind::Epic,
+        },
+        title: Some((*subject_title).clone()),
+        repository: snapshot
+            .identity
+            .repository
+            .as_ref()
+            .map(|repository| repository.path.clone()),
+    })
+}
+
 fn event_value(text: &str) -> Value {
     serde_json::from_str(text).unwrap_or(Value::Null)
 }
@@ -267,7 +356,6 @@ fn event_value(text: &str) -> Value {
 #[allow(clippy::too_many_arguments)]
 fn add_raw(
     raw: &mut Vec<RawAttention>,
-    entries: &BTreeMap<String, &Value>,
     subject_id: &str,
     condition: AttentionCondition,
     opened_at: impl Into<String>,
@@ -279,15 +367,9 @@ fn add_raw(
     evidence_kind: AttentionEvidenceKind,
     evidence_id: impl Into<String>,
 ) {
-    let Some(entry) = entries.get(subject_id) else {
-        return;
-    };
     let (severity, owner, action) = policy(condition);
     raw.push(RawAttention {
-        subject_kind: subject_kind(entry),
         subject_id: subject_id.to_owned(),
-        subject_title: subject_title(entry),
-        repository: repository(entry),
         condition,
         severity,
         owner,
@@ -305,29 +387,38 @@ fn add_raw(
     });
 }
 
-fn settlement_cursor(snapshot: &InventorySnapshot, id: &str) -> i64 {
-    snapshot
-        .events("run.settled")
+fn settlement_cursor(events: &[&EventRow], id: &str) -> i64 {
+    events
         .iter()
         .rev()
-        .find(|event| event.run_id.as_deref() == Some(id))
+        .find(|event| event.kind == "run.settled" && event.run_id.as_deref() == Some(id))
         .map_or(0, |event| event.event_id)
 }
 
-fn collect_domain_sources(
-    snapshot: &InventorySnapshot,
-    entries_slice: &[Value],
-    work: &[IssueSummary],
-) -> Result<Vec<RawAttention>, Failure> {
-    let InventoryUsage::Included {
-        totals: usage_totals,
-        latest_missing,
-    } = &snapshot.usage
-    else {
-        return Err(Failure::internal(
-            "attention projection requires included inventory usage",
-        ));
-    };
+fn events<'a>(input: &'a ProjectionInput<'_>, kind: &'a str) -> impl Iterator<Item = &'a EventRow> {
+    input
+        .events
+        .iter()
+        .copied()
+        .filter(move |event| event.kind == kind)
+}
+
+fn observed_reservation_subject<'a>(
+    observation_subject: &'a str,
+    packet_run: Option<&'a str>,
+    kind: forged_types::AdmissionSubjectKind,
+) -> &'a str {
+    if kind == forged_types::AdmissionSubjectKind::Packet {
+        packet_run.unwrap_or(observation_subject)
+    } else {
+        observation_subject
+    }
+}
+
+fn collect_domain_sources(input: &ProjectionInput<'_>) -> Result<Vec<RawAttention>, Failure> {
+    let entries_slice = input.entries;
+    let work = input.work;
+    let observation = input.surface.is_observation();
     let entries: BTreeMap<String, &Value> = entries_slice
         .iter()
         .filter_map(|entry| Some((entry.get("id")?.as_str()?.to_owned(), entry)))
@@ -339,25 +430,34 @@ fn collect_domain_sources(
     let mut raw = Vec::new();
 
     // Latest input event wins by append order. Resolution self-clears it.
-    let mut input: BTreeMap<String, (&str, &forged_ledger::EventRow)> = BTreeMap::new();
+    let mut latest_input: BTreeMap<String, (&str, &forged_ledger::EventRow)> = BTreeMap::new();
     for kind in [epic::INPUT_REQUIRED, epic::INPUT_RESOLVED] {
-        for event in snapshot.events(kind) {
+        for event in events(input, kind) {
             let Some(id) = event.run_id.as_ref() else {
                 continue;
             };
-            if input
+            if latest_input
                 .get(id)
                 .is_none_or(|(_, seen)| seen.event_id < event.event_id)
             {
-                input.insert(id.clone(), (kind, event));
+                latest_input.insert(id.clone(), (kind, event));
             }
         }
     }
-    for (id, (kind, event)) in input {
+    for (id, (kind, event)) in latest_input {
         if kind != epic::INPUT_REQUIRED {
             continue;
         }
-        let payload = event_value(&event.payload_json);
+        let payload = if observation {
+            serde_json::from_str(&event.payload_json).map_err(|error| {
+                Failure::internal(format!(
+                    "input event {} has invalid stored JSON: {error}",
+                    event.event_id
+                ))
+            })?
+        } else {
+            event_value(&event.payload_json)
+        };
         let explanation = payload
             .get("detail")
             .and_then(Value::as_str)
@@ -371,10 +471,13 @@ fn collect_domain_sources(
             .get("childId")
             .and_then(Value::as_str)
             .unwrap_or("the subject");
-        let detail = format!("{child} is holding on {code}: {explanation}");
+        let detail = if observation {
+            explanation
+        } else {
+            format!("{child} is holding on {code}: {explanation}")
+        };
         add_raw(
             &mut raw,
-            &entries,
             &id,
             AttentionCondition::InputRequired,
             &event.ts,
@@ -395,7 +498,11 @@ fn collect_domain_sources(
             .get("updatedAt")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let cursor = settlement_cursor(snapshot, id);
+        let cursor = if observation {
+            0
+        } else {
+            settlement_cursor(&input.events, id)
+        };
         match outcome {
             Some("blocked") => {
                 let live_status = entry
@@ -406,42 +513,73 @@ fn collect_domain_sources(
                 if live_status.is_some_and(|status| status != "blocked") {
                     continue;
                 }
+                let reason = entry.get("stopReason").and_then(Value::as_str);
+                let (source_id, detail, evidence, evidence_id) = if observation {
+                    (
+                        format!("run:{id}:blocked"),
+                        reason
+                            .unwrap_or("terminal run requires intervention")
+                            .to_owned(),
+                        json!({"runId": id, "outcome": "blocked", "reason": entry.get("stopReason")}),
+                        format!("run:{id}"),
+                    )
+                } else {
+                    (
+                        format!("settlement:{cursor}:blocked"),
+                        format!("run is blocked: {}", reason.unwrap_or("no reason recorded")),
+                        json!({"outcome": "blocked", "reason": entry.get("stopReason")}),
+                        cursor.to_string(),
+                    )
+                };
                 add_raw(
                     &mut raw,
-                    &entries,
                     id,
                     AttentionCondition::Blocked,
                     updated,
                     updated,
                     cursor,
-                    format!("settlement:{cursor}:blocked"),
-                    format!(
-                        "run is blocked: {}",
+                    source_id,
+                    detail,
+                    evidence,
+                    AttentionEvidenceKind::Event,
+                    evidence_id,
+                );
+            }
+            Some("input-required") => {
+                let (source_id, detail, evidence, evidence_id) = if observation {
+                    (
+                        format!("run:{id}:input-required"),
                         entry
                             .get("stopReason")
                             .and_then(Value::as_str)
-                            .unwrap_or("no reason recorded")
-                    ),
-                    json!({"outcome": "blocked", "reason": entry.get("stopReason")}),
+                            .unwrap_or("terminal run requires intervention")
+                            .to_owned(),
+                        json!({"runId": id, "outcome": "input-required", "reason": entry.get("stopReason")}),
+                        format!("run:{id}"),
+                    )
+                } else {
+                    (
+                        format!("settlement:{cursor}:input-required"),
+                        "run needs operator input".to_owned(),
+                        json!({"outcome": "input-required", "reason": entry.get("stopReason")}),
+                        cursor.to_string(),
+                    )
+                };
+                add_raw(
+                    &mut raw,
+                    id,
+                    AttentionCondition::InputRequired,
+                    updated,
+                    updated,
+                    cursor,
+                    source_id,
+                    detail,
+                    evidence,
                     AttentionEvidenceKind::Event,
-                    cursor.to_string(),
+                    evidence_id,
                 );
             }
-            Some("input-required") => add_raw(
-                &mut raw,
-                &entries,
-                id,
-                AttentionCondition::InputRequired,
-                updated,
-                updated,
-                cursor,
-                format!("settlement:{cursor}:input-required"),
-                "run needs operator input",
-                json!({"outcome": "input-required", "reason": entry.get("stopReason")}),
-                AttentionEvidenceKind::Event,
-                cursor.to_string(),
-            ),
-            Some(outcome @ ("clean" | "accepted-risk")) => {
+            Some(outcome @ ("clean" | "accepted-risk")) if !observation => {
                 let pr = entry
                     .pointer("/delivery/pr")
                     .cloned()
@@ -468,7 +606,6 @@ fn collect_domain_sources(
                 };
                 add_raw(
                     &mut raw,
-                    &entries,
                     id,
                     condition,
                     updated,
@@ -501,45 +638,48 @@ fn collect_domain_sources(
         }
     }
 
-    // Live work is authoritative for a blocked issue.
-    let by_work: BTreeMap<&str, &str> = entries_slice
-        .iter()
-        .filter_map(|entry| Some((entry.get("beadId")?.as_str()?, entry.get("id")?.as_str()?)))
-        .collect();
-    for issue in work.iter().filter(|issue| issue.status == "blocked") {
-        let Some(id) = by_work.get(issue.id.as_str()) else {
-            continue;
-        };
-        let entry = entries[id.to_owned()];
-        let updated = entry
-            .get("updatedAt")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let source = format!(
-            "bead:{}:{}",
-            issue.id,
-            issue.revision.as_deref().unwrap_or("unknown")
-        );
-        add_raw(
-            &mut raw,
-            &entries,
-            id,
-            AttentionCondition::Blocked,
-            updated,
-            updated,
-            0,
-            source,
-            "Work is blocked in the authoritative live store",
-            json!({"beadId": issue.id, "status": issue.status, "revision": issue.revision}),
-            AttentionEvidenceKind::Work,
-            &issue.id,
-        );
+    if !observation {
+        // Live work is authoritative for a blocked issue on the inventory
+        // surface. Work Detail carries only the requested work row and uses
+        // it as a guard rather than minting a second causal source.
+        let by_work: BTreeMap<&str, &str> = entries_slice
+            .iter()
+            .filter_map(|entry| Some((entry.get("beadId")?.as_str()?, entry.get("id")?.as_str()?)))
+            .collect();
+        for issue in work.iter().filter(|issue| issue.status == "blocked") {
+            let Some(id) = by_work.get(issue.id.as_str()) else {
+                continue;
+            };
+            let entry = entries[id.to_owned()];
+            let updated = entry
+                .get("updatedAt")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let source = format!(
+                "bead:{}:{}",
+                issue.id,
+                issue.revision.as_deref().unwrap_or("unknown")
+            );
+            add_raw(
+                &mut raw,
+                id,
+                AttentionCondition::Blocked,
+                updated,
+                updated,
+                0,
+                source,
+                "Work is blocked in the authoritative live store",
+                json!({"beadId": issue.id, "status": issue.status, "revision": issue.revision}),
+                AttentionEvidenceKind::Work,
+                &issue.id,
+            );
+        }
     }
 
     // A later success clears the exact pending reconciliation promise.
     let mut work_settlement: BTreeMap<String, (&str, &forged_ledger::EventRow)> = BTreeMap::new();
     for kind in [WORK_SETTLEMENT_PENDING, WORK_SETTLEMENT_SUCCEEDED] {
-        for event in snapshot.events(kind) {
+        for event in events(input, kind) {
             let Some(id) = event.run_id.as_ref() else {
                 continue;
             };
@@ -555,21 +695,37 @@ fn collect_domain_sources(
         if kind != WORK_SETTLEMENT_PENDING {
             continue;
         }
-        let payload = event_value(&event.payload_json);
+        let payload = if observation {
+            serde_json::from_str(&event.payload_json).map_err(|error| {
+                Failure::internal(format!(
+                    "settlement event {} has invalid stored JSON: {error}",
+                    event.event_id
+                ))
+            })?
+        } else {
+            event_value(&event.payload_json)
+        };
         let error = payload
             .get("error")
             .and_then(Value::as_str)
-            .unwrap_or("unknown work error");
+            .unwrap_or(if observation {
+                "Work settlement is pending"
+            } else {
+                "unknown work error"
+            });
         add_raw(
             &mut raw,
-            &entries,
             &id,
             AttentionCondition::WorkSettlementPending,
             &event.ts,
             &event.ts,
             event.event_id,
             format!("event:{}", event.event_id),
-            format!("Work reconciliation is pending: {error}"),
+            if observation {
+                error.to_owned()
+            } else {
+                format!("Work reconciliation is pending: {error}")
+            },
             payload,
             AttentionEvidenceKind::Event,
             event.event_id.to_string(),
@@ -577,8 +733,8 @@ fn collect_domain_sources(
     }
 
     // Revocation and quarantine custody.
-    for attempt in snapshot
-        .live_attempts
+    for attempt in input
+        .attempts
         .iter()
         .filter(|attempt| attempt.state == AttemptState::Revoking)
     {
@@ -587,50 +743,65 @@ fn collect_domain_sources(
         };
         add_raw(
             &mut raw,
-            &entries,
             &id,
             AttentionCondition::Revoking,
             &attempt.updated_at,
             &attempt.updated_at,
             attempt.attempt_id,
             format!("attempt:{}", attempt.attempt_id),
-            format!(
-                "attempt {} is revoking: {}",
-                attempt.attempt_id,
-                attempt
-                    .revoke_reason
-                    .as_deref()
-                    .unwrap_or("no reason recorded")
-            ),
+            if observation {
+                format!("attempt {} is revoking", attempt.attempt_id)
+            } else {
+                format!(
+                    "attempt {} is revoking: {}",
+                    attempt.attempt_id,
+                    attempt
+                        .revoke_reason
+                        .as_deref()
+                        .unwrap_or("no reason recorded")
+                )
+            },
             json!({"attemptId": attempt.attempt_id, "packetId": attempt.packet_id, "reason": attempt.revoke_reason}),
             AttentionEvidenceKind::Attempt,
             attempt.attempt_id.to_string(),
         );
     }
     let mut latest_quarantine: BTreeMap<String, &forged_ledger::EventRow> = BTreeMap::new();
-    for event in snapshot.events("proto.quarantine") {
+    for event in events(input, "proto.quarantine") {
         if let Some(id) = event.run_id.as_ref() {
             latest_quarantine.insert(id.clone(), event);
         }
     }
     for (id, event) in latest_quarantine {
-        let payload = event_value(&event.payload_json);
+        let payload = if observation {
+            serde_json::from_str(&event.payload_json).map_err(|error| {
+                Failure::internal(format!(
+                    "quarantine event {} has invalid stored JSON: {error}",
+                    event.event_id
+                ))
+            })?
+        } else {
+            event_value(&event.payload_json)
+        };
         add_raw(
             &mut raw,
-            &entries,
             &id,
             AttentionCondition::Quarantined,
             &event.ts,
             &event.ts,
             event.event_id,
             format!("event:{}", event.event_id),
-            format!(
-                "result was quarantined: {}",
-                payload
-                    .get("reason")
-                    .and_then(Value::as_str)
-                    .unwrap_or("no reason recorded")
-            ),
+            if observation {
+                "result evidence is quarantined".to_owned()
+            } else {
+                format!(
+                    "result was quarantined: {}",
+                    payload
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .unwrap_or("no reason recorded")
+                )
+            },
             payload,
             AttentionEvidenceKind::Event,
             event.event_id.to_string(),
@@ -638,27 +809,81 @@ fn collect_domain_sources(
     }
 
     // Partial spend uses the latest unpriced usage row as the occurrence.
-    for (id, (usage_id, observed_at)) in latest_missing {
-        let count = usage_totals
-            .get(id)
-            .map_or(0, |totals| totals.rows_missing_cost);
-        if count == 0 {
-            continue;
+    if let ProjectionUsage::Observation(observed) = input.usage {
+        for (id, totals) in &observed.usage_totals {
+            if totals.rows_missing_cost == 0 {
+                continue;
+            }
+            let Some((offset, row)) = observed
+                .usage_rows
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(_, row)| row.run_id == *id && row.cost_usd.is_none())
+            else {
+                return Err(Failure::internal(format!(
+                    "usage totals for {id:?} report missing cost without a causal row"
+                )));
+            };
+            let source_id = format!(
+                "usage:{}:{}:{}:{}:{}",
+                id,
+                row.packet_id.as_deref().unwrap_or("-"),
+                row.attempt_id
+                    .map_or_else(|| "-".to_owned(), |id| id.to_string()),
+                row.provider,
+                offset
+            );
+            add_raw(
+                &mut raw,
+                id,
+                AttentionCondition::MissingCost,
+                &row.ts,
+                &row.ts,
+                i64::try_from(offset).unwrap_or(i64::MAX),
+                source_id,
+                format!(
+                    "{} usage rows carry no cost, so spend is partial",
+                    totals.rows_missing_cost
+                ),
+                json!({
+                    "runId": id,
+                    "rowsMissingCost": totals.rows_missing_cost,
+                    "packetId": row.packet_id,
+                    "attemptId": row.attempt_id,
+                }),
+                AttentionEvidenceKind::Event,
+                format!("usage:{id}:{offset}"),
+            );
         }
-        add_raw(
-            &mut raw,
-            &entries,
-            id,
-            AttentionCondition::MissingCost,
-            observed_at,
-            observed_at,
-            *usage_id,
-            format!("usage:{usage_id}"),
-            format!("{count} usage rows carry no cost, so spend is partial"),
-            json!({"rowsMissingCost": count, "usageId": usage_id}),
-            AttentionEvidenceKind::Event,
-            usage_id.to_string(),
-        );
+    } else if let ProjectionUsage::Inventory(InventoryUsage::Included {
+        totals,
+        latest_missing,
+    }) = input.usage
+    {
+        for (id, (usage_id, observed_at)) in latest_missing {
+            let count = totals.get(id).map_or(0, |totals| totals.rows_missing_cost);
+            if count == 0 {
+                continue;
+            }
+            add_raw(
+                &mut raw,
+                id,
+                AttentionCondition::MissingCost,
+                observed_at,
+                observed_at,
+                *usage_id,
+                format!("usage:{usage_id}"),
+                format!("{count} usage rows carry no cost, so spend is partial"),
+                json!({"rowsMissingCost": count, "usageId": usage_id}),
+                AttentionEvidenceKind::Event,
+                usage_id.to_string(),
+            );
+        }
+    } else {
+        return Err(Failure::internal(
+            "attention projection requires included inventory usage",
+        ));
     }
 
     // Desired-work exhaustion is explicit. Controller-dead is narrower:
@@ -667,7 +892,7 @@ fn collect_domain_sources(
     // also represents input/admission holds and must never be relabelled.
     let as_of = now_iso();
     let mut supervisor_attention: BTreeMap<String, &forged_ledger::EventRow> = BTreeMap::new();
-    for event in snapshot.events("forged.supervisor.attention") {
+    for event in events(input, "forged.supervisor.attention") {
         let Some(id) = event.run_id.as_ref() else {
             continue;
         };
@@ -678,13 +903,12 @@ fn collect_domain_sources(
             supervisor_attention.insert(id.clone(), event);
         }
     }
-    for desired in &snapshot.desired_work {
+    for desired in input.desired_work {
         if desired.exhausted_at.is_some()
             || desired.last_outcome == Some(DesiredReconcileOutcome::Exhausted)
         {
             add_raw(
                 &mut raw,
-                &entries,
                 &desired.subject_id,
                 AttentionCondition::RestartBudgetExhausted,
                 desired
@@ -713,6 +937,10 @@ fn collect_domain_sources(
                 AttentionEvidenceKind::DesiredWork,
                 format!("{}:{}", desired.subject_kind.as_str(), desired.subject_id),
             );
+            continue;
+        }
+
+        if observation {
             continue;
         }
 
@@ -781,7 +1009,6 @@ fn collect_domain_sources(
             };
         add_raw(
             &mut raw,
-            &entries,
             &desired.subject_id,
             AttentionCondition::ControllerDead,
             opened_at,
@@ -806,71 +1033,147 @@ fn collect_domain_sources(
     // settled run repairs via a supersedes successor, never in place.
     // Blocked/input-required stops and legacy-stopped rows without a
     // terminal outcome keep flagging.
-    let mut latest_gate: BTreeMap<String, &forged_ledger::EventRow> = BTreeMap::new();
-    for event in snapshot.events("proto.gate") {
-        if let Some(id) = event.run_id.as_ref() {
-            latest_gate.insert(id.clone(), event);
+    if let ProjectionSurface::Observation {
+        snapshot: observed,
+        results,
+        ..
+    } = &input.surface
+    {
+        let mut latest_gate = BTreeMap::<String, (i64, &str)>::new();
+        for (attempt_id, result) in results.iter() {
+            let Outcome::Implement {
+                gate_state: Some(state),
+                ..
+            } = &result.outcome
+            else {
+                continue;
+            };
+            let run_id = observed
+                .packets
+                .iter()
+                .find(|packet| packet.packet_id == result.packet_id)
+                .map(|packet| packet.run_id.clone())
+                .unwrap_or_else(|| observed.subject.id.clone());
+            latest_gate.insert(run_id, (*attempt_id, state));
         }
-    }
-    for (id, event) in latest_gate {
-        let payload = event_value(&event.payload_json);
-        if payload.get("passed").and_then(Value::as_bool) != Some(false) {
-            continue;
+        for (id, (attempt_id, state)) in latest_gate {
+            if state != "fail" {
+                continue;
+            }
+            let has_live = observed.attempts.iter().any(|attempt| {
+                matches!(
+                    attempt.state,
+                    AttemptState::Running | AttemptState::Revoking
+                ) && observed
+                    .packets
+                    .iter()
+                    .any(|packet| packet.packet_id == attempt.packet_id && packet.run_id == id)
+            });
+            let has_scheduled = observed.desired_work.iter().any(|desired| {
+                desired.desired_state == DesiredState::Running
+                    && desired.next_wake_at.is_some()
+                    && (desired.subject_id == id
+                        || (observed.subject.kind == WorkIdentitySubjectKind::Epic
+                            && desired.subject_kind == forged_ledger::DesiredSubjectKind::Epic
+                            && desired.subject_id == observed.subject.id))
+            });
+            if has_live || has_scheduled {
+                continue;
+            }
+            let updated_at = observed
+                .attempts
+                .iter()
+                .find(|attempt| attempt.attempt_id == attempt_id)
+                .map(|attempt| attempt.updated_at.as_str())
+                .unwrap_or(observed.identity.captured_at.as_str());
+            add_raw(
+                &mut raw,
+                &id,
+                AttentionCondition::FailedGate,
+                updated_at,
+                updated_at,
+                attempt_id,
+                format!("attempt:{attempt_id}:gate:{state}"),
+                format!("latest recorded gate state is {state:?}"),
+                json!({"attemptId": attempt_id, "gateState": state}),
+                AttentionEvidenceKind::Attempt,
+                attempt_id.to_string(),
+            );
         }
-        let has_live = snapshot.live_attempts.iter().any(|attempt| {
-            split_packet_key(&attempt.packet_id).is_ok_and(|(run_id, _, _)| run_id == id)
-        });
-        let has_scheduled = snapshot.desired_work.iter().any(|desired| {
-            desired.subject_id == id
-                && desired.desired_state == DesiredState::Running
-                && desired.next_wake_at.is_some()
-        });
-        let has_closing_outcome = snapshot.runs.iter().any(|run| {
-            run.run_id == id
-                && matches!(
-                    run.terminal_outcome,
-                    Some(
-                        RunOutcome::Landed
-                            | RunOutcome::Superseded
-                            | RunOutcome::Cancelled
-                            | RunOutcome::AcceptedRisk
+    } else {
+        let mut latest_gate: BTreeMap<String, &forged_ledger::EventRow> = BTreeMap::new();
+        for event in events(input, "proto.gate") {
+            if let Some(id) = event.run_id.as_ref() {
+                latest_gate.insert(id.clone(), event);
+            }
+        }
+        for (id, event) in latest_gate {
+            let payload = event_value(&event.payload_json);
+            if payload.get("passed").and_then(Value::as_bool) != Some(false) {
+                continue;
+            }
+            let has_live = input.attempts.iter().any(|attempt| {
+                split_packet_key(&attempt.packet_id).is_ok_and(|(run_id, _, _)| run_id == id)
+            });
+            let has_scheduled = input.desired_work.iter().any(|desired| {
+                desired.subject_id == id
+                    && desired.desired_state == DesiredState::Running
+                    && desired.next_wake_at.is_some()
+            });
+            let has_closing_outcome = input.runs.iter().any(|run| {
+                run.run_id == id
+                    && matches!(
+                        run.terminal_outcome,
+                        Some(
+                            RunOutcome::Landed
+                                | RunOutcome::Superseded
+                                | RunOutcome::Cancelled
+                                | RunOutcome::AcceptedRisk
+                        )
                     )
-                )
-        });
-        if has_live || has_scheduled || has_closing_outcome {
-            continue;
+            });
+            if has_live || has_scheduled || has_closing_outcome {
+                continue;
+            }
+            add_raw(
+                &mut raw,
+                &id,
+                AttentionCondition::FailedGate,
+                &event.ts,
+                &event.ts,
+                event.event_id,
+                format!("event:{}", event.event_id),
+                "latest gate failed and no automatic repair path is active",
+                payload,
+                AttentionEvidenceKind::Event,
+                event.event_id.to_string(),
+            );
         }
-        add_raw(
-            &mut raw,
-            &entries,
-            &id,
-            AttentionCondition::FailedGate,
-            &event.ts,
-            &event.ts,
-            event.event_id,
-            format!("event:{}", event.event_id),
-            "latest gate failed and no automatic repair path is active",
-            payload,
-            AttentionEvidenceKind::Event,
-            event.event_id.to_string(),
-        );
     }
 
     // Terminal provider exhaustion.
     let mut latest_terminal: BTreeMap<String, &forged_ledger::EventRow> = BTreeMap::new();
-    for event in snapshot.events("run.protocol-terminal") {
+    for event in events(input, "run.protocol-terminal") {
         if let Some(id) = event.run_id.as_ref() {
             latest_terminal.insert(id.clone(), event);
         }
     }
     for (id, event) in latest_terminal {
-        let payload = event_value(&event.payload_json);
+        let payload = if observation {
+            serde_json::from_str(&event.payload_json).map_err(|error| {
+                Failure::internal(format!(
+                    "terminal event {} has invalid stored JSON: {error}",
+                    event.event_id
+                ))
+            })?
+        } else {
+            event_value(&event.payload_json)
+        };
         if payload.pointer("/terminal/providerUnavailable").is_none() {
             continue;
         }
         add_raw(
             &mut raw,
-            &entries,
             &id,
             AttentionCondition::RetryExhausted,
             &event.ts,
@@ -887,7 +1190,7 @@ fn collect_domain_sources(
     // Only typed rate-limit decisions are provider degradation. Routine
     // capacity deferrals remain queued work until a parked controller
     // crosses its wake threshold and appends the durable marker below.
-    for decision in &snapshot.admission_decisions {
+    for decision in input.admission_decisions {
         if decision.outcome != AdmissionOutcome::Deferred
             || !matches!(
                 decision.reason,
@@ -896,8 +1199,19 @@ fn collect_domain_sources(
         {
             continue;
         }
-        let subject_id = match decision.subject_kind {
-            forged_types::AdmissionSubjectKind::Packet => {
+        let subject_id = match (&input.surface, decision.subject_kind) {
+            (
+                ProjectionSurface::Observation {
+                    snapshot: observed, ..
+                },
+                forged_types::AdmissionSubjectKind::Packet,
+            ) => observed
+                .packets
+                .iter()
+                .find(|packet| packet.packet_id == decision.subject_id)
+                .map(|packet| packet.run_id.clone())
+                .unwrap_or_else(|| observed.subject.id.clone()),
+            (_, forged_types::AdmissionSubjectKind::Packet) => {
                 let Ok((run_id, _, _)) = split_packet_key(&decision.subject_id) else {
                     continue;
                 };
@@ -908,13 +1222,17 @@ fn collect_domain_sources(
         let Some(entry) = entries.get(&subject_id) else {
             continue;
         };
-        let updated = entry
-            .get("updatedAt")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
+        let updated = match &input.surface {
+            ProjectionSurface::Inventory => entry
+                .get("updatedAt")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            ProjectionSurface::Observation {
+                snapshot: observed, ..
+            } => observed.identity.captured_at.as_str(),
+        };
         add_raw(
             &mut raw,
-            &entries,
             &subject_id,
             AttentionCondition::ProviderDegraded,
             updated,
@@ -925,7 +1243,13 @@ fn collect_domain_sources(
                 "provider admission deferred: {}",
                 super::admission::decision_reason(decision)
             ),
-            serde_json::to_value(decision).unwrap_or(Value::Null),
+            if observation {
+                serde_json::to_value(decision).map_err(|error| {
+                    Failure::internal(format!("serializing admission decision: {error}"))
+                })?
+            } else {
+                serde_json::to_value(decision).unwrap_or(Value::Null)
+            },
             AttentionEvidenceKind::AdmissionDecision,
             &decision.batch_id,
         );
@@ -937,7 +1261,7 @@ fn collect_domain_sources(
     // attention control resolves it. Rate-limit deferrals keep their
     // ProviderDegraded projection above.
     let mut parked: BTreeMap<String, (&forged_ledger::EventRow, Value)> = BTreeMap::new();
-    for event in snapshot.events("forged.admission.attention") {
+    for event in events(input, "forged.admission.attention") {
         let Some(id) = event.run_id.as_ref() else {
             continue;
         };
@@ -952,11 +1276,11 @@ fn collect_domain_sources(
             parked.insert(id.clone(), (event, payload));
         }
     }
-    for (id, (event, payload)) in parked {
+    for (event_subject_id, (event, payload)) in parked {
         let Some(packet_id) = payload.get("packetId").and_then(Value::as_str) else {
             continue;
         };
-        let deferred = snapshot.admission_decisions.iter().find(|decision| {
+        let deferred = input.admission_decisions.iter().find(|decision| {
             decision.subject_kind == forged_types::AdmissionSubjectKind::Packet
                 && decision.subject_id == packet_id
                 && decision.outcome == AdmissionOutcome::Deferred
@@ -968,9 +1292,19 @@ fn collect_domain_sources(
         let Some(decision) = deferred else {
             continue;
         };
+        let id = match &input.surface {
+            ProjectionSurface::Inventory => event_subject_id,
+            ProjectionSurface::Observation {
+                snapshot: observed, ..
+            } => observed
+                .packets
+                .iter()
+                .find(|packet| packet.packet_id == packet_id)
+                .map(|packet| packet.run_id.clone())
+                .unwrap_or_else(|| observed.subject.id.clone()),
+        };
         add_raw(
             &mut raw,
-            &entries,
             &id,
             AttentionCondition::AdmissionDeferred,
             &event.ts,
@@ -992,16 +1326,21 @@ fn collect_domain_sources(
     }
 
     // Ambiguous external effects and retained unknown-effect capacity.
-    for operation in &snapshot.inflight_operations {
+    for operation in input.inflight_operations {
         if operation.effect_class != EffectClass::HumanAmbiguous {
             continue;
         }
-        let Some(id) = operation.run_id.as_ref() else {
-            continue;
+        let id = match operation.run_id.as_deref() {
+            Some(id) => id,
+            None => match &input.surface {
+                ProjectionSurface::Inventory => continue,
+                ProjectionSurface::Observation {
+                    snapshot: observed, ..
+                } => observed.subject.id.as_str(),
+            },
         };
         add_raw(
             &mut raw,
-            &entries,
             id,
             AttentionCondition::AmbiguousEffect,
             &operation.created_at,
@@ -1017,13 +1356,27 @@ fn collect_domain_sources(
             &operation.operation_id,
         );
     }
-    for reservation in snapshot
+    for reservation in input
         .admission_reservations
         .iter()
         .filter(|row| row.state == AdmissionReservationState::Orphaned)
     {
-        let subject_id = match reservation.subject_kind {
-            forged_types::AdmissionSubjectKind::Packet => {
+        let subject_id = match &input.surface {
+            ProjectionSurface::Observation {
+                snapshot: observed, ..
+            } => observed_reservation_subject(
+                &observed.subject.id,
+                observed
+                    .packets
+                    .iter()
+                    .find(|packet| packet.packet_id == reservation.subject_id)
+                    .map(|packet| packet.run_id.as_str()),
+                reservation.subject_kind,
+            )
+            .to_owned(),
+            ProjectionSurface::Inventory
+                if reservation.subject_kind == forged_types::AdmissionSubjectKind::Packet =>
+            {
                 let Ok((run_id, _, _)) = split_packet_key(&reservation.subject_id) else {
                     continue;
                 };
@@ -1033,7 +1386,6 @@ fn collect_domain_sources(
         };
         add_raw(
             &mut raw,
-            &entries,
             &subject_id,
             AttentionCondition::AmbiguousEffect,
             &reservation.created_at,
@@ -1049,13 +1401,25 @@ fn collect_domain_sources(
 
     // The snapshot performs the attempt-to-manifest anti-join inside its one
     // transaction. No artifact path is opened by this ordinary projection.
-    for attempt in &snapshot.attempts_missing_artifacts {
-        let Ok((id, _, _)) = split_packet_key(&attempt.packet_id) else {
-            continue;
+    for attempt in &input.attempts_missing_artifacts {
+        let id = match &input.surface {
+            ProjectionSurface::Inventory => {
+                let Ok((id, _, _)) = split_packet_key(&attempt.packet_id) else {
+                    continue;
+                };
+                id
+            }
+            ProjectionSurface::Observation {
+                snapshot: observed, ..
+            } => observed
+                .packets
+                .iter()
+                .find(|packet| packet.packet_id == attempt.packet_id)
+                .map(|packet| packet.run_id.clone())
+                .unwrap_or_else(|| observed.subject.id.clone()),
         };
         add_raw(
             &mut raw,
-            &entries,
             &id,
             AttentionCondition::MissingEvidence,
             &attempt.updated_at,
@@ -1072,59 +1436,89 @@ fn collect_domain_sources(
         );
     }
 
-    // Materially different available verdicts at the newest review sequence.
-    let mut reviews: BTreeMap<String, Vec<(&forged_ledger::EventRow, Value)>> = BTreeMap::new();
-    for event in snapshot.events("proto.review") {
-        let Some(id) = event.run_id.as_ref() else {
-            continue;
-        };
-        let payload = event_value(&event.payload_json);
-        reviews
-            .entry(id.clone())
-            .or_default()
-            .push((event, payload));
-    }
-    for (id, rows) in reviews {
-        let latest_seq = rows
-            .iter()
-            .filter_map(|(_, payload)| payload.get("seq").and_then(Value::as_i64))
-            .max();
-        let selected: Vec<_> = rows
-            .into_iter()
-            .filter(|(_, payload)| {
-                payload.get("seq").and_then(Value::as_i64) == latest_seq
-                    && payload.get("available").and_then(Value::as_bool) == Some(true)
-            })
-            .collect();
-        let verdicts: BTreeSet<&str> = selected
-            .iter()
-            .filter_map(|(_, payload)| payload.get("verdict").and_then(Value::as_str))
-            .collect();
-        if verdicts.len() < 2 {
-            continue;
+    // ReviewProjection is the observation-side authority; inventory uses
+    // the complete proto.review stream. Both normalize into the same raw
+    // source contract before the one item fold below.
+    if let ProjectionSurface::Observation {
+        snapshot: observed,
+        review_disagreements,
+        ..
+    } = &input.surface
+    {
+        for (id, attempt_id, source_id, evidence) in review_disagreements.iter() {
+            let updated_at = observed
+                .attempts
+                .iter()
+                .find(|attempt| attempt.attempt_id == *attempt_id)
+                .map(|attempt| attempt.updated_at.as_str())
+                .unwrap_or(observed.identity.captured_at.as_str());
+            add_raw(
+                &mut raw,
+                id,
+                AttentionCondition::ReviewerDisagreement,
+                updated_at,
+                updated_at,
+                *attempt_id,
+                source_id,
+                "reviewers disagree at the latest available review round",
+                evidence.clone(),
+                AttentionEvidenceKind::Attempt,
+                attempt_id.to_string(),
+            );
         }
-        let newest = selected
-            .iter()
-            .max_by_key(|(event, _)| event.event_id)
-            .expect("nonempty disagreement");
-        let event_ids: Vec<i64> = selected.iter().map(|(event, _)| event.event_id).collect();
-        add_raw(
-            &mut raw,
-            &entries,
-            &id,
-            AttentionCondition::ReviewerDisagreement,
-            &newest.0.ts,
-            &newest.0.ts,
-            newest.0.event_id,
-            format!("reviews:{event_ids:?}"),
-            format!(
-                "reviewers disagree at sequence {:?}: {verdicts:?}",
-                latest_seq
-            ),
-            json!({"seq": latest_seq, "eventIds": event_ids, "verdicts": verdicts}),
-            AttentionEvidenceKind::Event,
-            newest.0.event_id.to_string(),
-        );
+    } else {
+        let mut reviews: BTreeMap<String, Vec<(&forged_ledger::EventRow, Value)>> = BTreeMap::new();
+        for event in events(input, "proto.review") {
+            let Some(id) = event.run_id.as_ref() else {
+                continue;
+            };
+            let payload = event_value(&event.payload_json);
+            reviews
+                .entry(id.clone())
+                .or_default()
+                .push((event, payload));
+        }
+        for (id, rows) in reviews {
+            let latest_seq = rows
+                .iter()
+                .filter_map(|(_, payload)| payload.get("seq").and_then(Value::as_i64))
+                .max();
+            let selected: Vec<_> = rows
+                .into_iter()
+                .filter(|(_, payload)| {
+                    payload.get("seq").and_then(Value::as_i64) == latest_seq
+                        && payload.get("available").and_then(Value::as_bool) == Some(true)
+                })
+                .collect();
+            let verdicts: BTreeSet<&str> = selected
+                .iter()
+                .filter_map(|(_, payload)| payload.get("verdict").and_then(Value::as_str))
+                .collect();
+            if verdicts.len() < 2 {
+                continue;
+            }
+            let newest = selected
+                .iter()
+                .max_by_key(|(event, _)| event.event_id)
+                .expect("nonempty disagreement");
+            let event_ids: Vec<i64> = selected.iter().map(|(event, _)| event.event_id).collect();
+            add_raw(
+                &mut raw,
+                &id,
+                AttentionCondition::ReviewerDisagreement,
+                &newest.0.ts,
+                &newest.0.ts,
+                newest.0.event_id,
+                format!("reviews:{event_ids:?}"),
+                format!(
+                    "reviewers disagree at sequence {:?}: {verdicts:?}",
+                    latest_seq
+                ),
+                json!({"seq": latest_seq, "eventIds": event_ids, "verdicts": verdicts}),
+                AttentionEvidenceKind::Event,
+                newest.0.event_id.to_string(),
+            );
+        }
     }
 
     Ok(raw)
@@ -1138,29 +1532,52 @@ struct TransitionState {
 }
 
 fn transition_state(
-    snapshot: &InventorySnapshot,
+    events: &[&EventRow],
+    complete: bool,
+    observation: bool,
     attention: &str,
     occurrence: &str,
 ) -> Result<TransitionState, Failure> {
+    if !complete {
+        return Ok(TransitionState {
+            state: AttentionState::Open,
+            acknowledgement: None,
+            resolution: None,
+            updated_at: None,
+        });
+    }
     let mut transitions = Vec::new();
-    for kind in [ACKNOWLEDGED, RESOLVED, REOPENED] {
-        for event in snapshot.events(kind) {
-            let payload: Value = serde_json::from_str(&event.payload_json).map_err(|error| {
-                Failure::internal(format!("invalid stored attention transition: {error}"))
-            })?;
-            if payload.get("schema").and_then(Value::as_str)
-                != Some("forged.attention-transition/1")
-            {
-                return Err(Failure::internal(format!(
+    for event in events {
+        if !matches!(event.kind.as_str(), ACKNOWLEDGED | RESOLVED | REOPENED) {
+            continue;
+        }
+        let payload: Value = serde_json::from_str(&event.payload_json).map_err(|error| {
+            Failure::internal(if observation {
+                format!(
+                    "attention transition event {} has invalid stored JSON: {error}",
+                    event.event_id
+                )
+            } else {
+                format!("invalid stored attention transition: {error}")
+            })
+        })?;
+        if payload.get("schema").and_then(Value::as_str) != Some("forged.attention-transition/1") {
+            return Err(Failure::internal(if observation {
+                format!(
+                    "attention transition event {} has an unsupported schema",
+                    event.event_id
+                )
+            } else {
+                format!(
                     "unknown stored attention transition schema in event {}",
                     event.event_id
-                )));
-            }
-            if payload.get("attentionId").and_then(Value::as_str) == Some(attention)
-                && payload.get("occurrenceId").and_then(Value::as_str) == Some(occurrence)
-            {
-                transitions.push((event, payload));
-            }
+                )
+            }));
+        }
+        if payload.get("attentionId").and_then(Value::as_str) == Some(attention)
+            && payload.get("occurrenceId").and_then(Value::as_str) == Some(occurrence)
+        {
+            transitions.push((*event, payload));
         }
     }
     transitions.sort_by_key(|(event, _)| event.event_id);
@@ -1179,6 +1596,9 @@ fn transition_state(
                 // resurrect custody. The writer now refuses it atomically;
                 // retain fail-closed projection for historical/manual rows.
                 if state == AttentionState::Resolved {
+                    if observation {
+                        updated = Some(event.ts.clone());
+                    }
                     continue;
                 }
                 state = AttentionState::Acknowledged;
@@ -1194,7 +1614,11 @@ fn transition_state(
                         || Failure::internal("stored resolution has no disposition"),
                     )?)
                     .map_err(|error| {
-                        Failure::internal(format!("unknown stored resolution disposition: {error}"))
+                        Failure::internal(if observation {
+                            format!("stored resolution has an unknown disposition: {error}")
+                        } else {
+                            format!("unknown stored resolution disposition: {error}")
+                        })
                     })?;
                 state = AttentionState::Resolved;
                 resolution = Some(AttentionResolutionV1 {
@@ -1210,6 +1634,9 @@ fn transition_state(
             }
             REOPENED => {
                 if state != AttentionState::Resolved {
+                    if observation {
+                        updated = Some(event.ts.clone());
+                    }
                     continue;
                 }
                 state = AttentionState::Open;
@@ -1288,20 +1715,19 @@ pub(crate) fn classification(condition: AttentionCondition) -> AttentionClass {
     }
 }
 
-/// Project active and resolved occurrences. Controls use the resolved rows;
-/// operator surfaces filter them through [`project_active`].
-pub(crate) fn project_all(
-    snapshot: &InventorySnapshot,
-    entries: &[Value],
-    work: &[IssueSummary],
-) -> Result<Vec<AttentionItemV1>, Failure> {
-    let raw = collect_domain_sources(snapshot, entries, work)?;
-    let blocked_work: BTreeSet<&str> = work
+/// The only attention fold. Both inventory and Work Detail normalize their
+/// facts into this private input, so transition replay and item assembly
+/// cannot drift into a second implementation.
+fn project(input: ProjectionInput<'_>) -> Result<Vec<AttentionItemV1>, Failure> {
+    let raw = collect_domain_sources(&input)?;
+    let blocked_work: BTreeSet<&str> = input
+        .work
         .iter()
         .filter(|issue| issue.status == "blocked")
         .map(|issue| issue.id.as_str())
         .collect();
-    let work_by_subject: BTreeMap<&str, &str> = entries
+    let work_by_subject: BTreeMap<&str, &str> = input
+        .entries
         .iter()
         .filter_map(|entry| {
             let subject = entry.get("id")?.as_str()?;
@@ -1309,22 +1735,19 @@ pub(crate) fn project_all(
             blocked_work.contains(work_id).then_some((subject, work_id))
         })
         .collect();
-    let mut buckets: BTreeMap<
-        (AttentionSubjectKind, String, AttentionCondition),
-        Vec<RawAttention>,
-    > = BTreeMap::new();
+    let mut buckets: BTreeMap<(String, AttentionCondition), Vec<RawAttention>> = BTreeMap::new();
     for source in raw {
         buckets
-            .entry((
-                source.subject_kind,
-                source.subject_id.clone(),
-                source.condition,
-            ))
+            .entry((source.subject_id.clone(), source.condition))
             .or_default()
             .push(source);
     }
     let mut projected = Vec::new();
-    for ((subject_kind, subject_id, condition), mut sources) in buckets {
+    for ((subject_id, condition), mut sources) in buckets {
+        let Some(subject) = subject_metadata(&input, &subject_id) else {
+            continue;
+        };
+        let subject_kind = subject.kind;
         sources.sort_by(|left, right| {
             (left.source_cursor, &left.source_id).cmp(&(right.source_cursor, &right.source_id))
         });
@@ -1336,7 +1759,34 @@ pub(crate) fn project_all(
             .collect::<Vec<_>>()
             .join("\n");
         let occurrence_id = attention_occurrence_id(&stable_id, &causal);
-        let transition = transition_state(snapshot, &stable_id, &occurrence_id)?;
+        let (transition_events, controls_complete, observation): (Vec<&EventRow>, bool, bool) =
+            match &input.surface {
+                ProjectionSurface::Inventory => (
+                    [ACKNOWLEDGED, RESOLVED, REOPENED]
+                        .into_iter()
+                        .flat_map(|kind| events(&input, kind))
+                        .collect(),
+                    true,
+                    false,
+                ),
+                ProjectionSurface::Observation {
+                    snapshot: observed, ..
+                } => (
+                    observed.events.rows.iter().collect(),
+                    observed.events.after_event_id == 0
+                        && !observed.events.has_more
+                        && !(observed.subject.kind == WorkIdentitySubjectKind::Epic
+                            && subject_kind == AttentionSubjectKind::Run),
+                    true,
+                ),
+            };
+        let transition = transition_state(
+            &transition_events,
+            controls_complete,
+            observation,
+            &stable_id,
+            &occurrence_id,
+        )?;
         let mut evidence_refs: Vec<_> = sources
             .iter()
             .map(|source| source.evidence_ref.clone())
@@ -1345,6 +1795,9 @@ pub(crate) fn project_all(
             (left.kind, left.id.as_str()).cmp(&(right.kind, right.id.as_str()))
         });
         evidence_refs.dedup();
+        if input.surface.is_observation() {
+            evidence_refs.truncate(50);
+        }
         let opened_at = sources
             .iter()
             .map(|source| source.opened_at.as_str())
@@ -1373,8 +1826,8 @@ pub(crate) fn project_all(
                 occurrence_id,
                 subject_kind,
                 subject_id,
-                subject_title: latest.subject_title.clone(),
-                repository: latest.repository.clone(),
+                subject_title: subject.title,
+                repository: subject.repository,
                 condition,
                 severity: latest.severity,
                 owner: latest.owner,
@@ -1412,6 +1865,100 @@ pub(crate) fn project_all(
             ))
     });
     Ok(projected.into_iter().map(|value| value.item).collect())
+}
+
+/// Project active and resolved inventory occurrences. Controls consume the
+/// resolved rows; operator inventory surfaces filter through
+/// [`project_active`].
+pub(crate) fn project_all(
+    snapshot: &InventorySnapshot,
+    entries: &[Value],
+    work: &[IssueSummary],
+) -> Result<Vec<AttentionItemV1>, Failure> {
+    project(ProjectionInput {
+        runs: &snapshot.runs,
+        attempts: &snapshot.live_attempts,
+        attempts_missing_artifacts: snapshot.attempts_missing_artifacts.iter().collect(),
+        events: snapshot.events_by_kind.values().flatten().collect(),
+        desired_work: &snapshot.desired_work,
+        inflight_operations: &snapshot.inflight_operations,
+        admission_decisions: &snapshot.admission_decisions,
+        admission_reservations: &snapshot.admission_reservations,
+        usage: ProjectionUsage::Inventory(&snapshot.usage),
+        entries,
+        work,
+        surface: ProjectionSurface::Inventory,
+    })
+}
+
+/// Adapt one exact Work Detail snapshot into the shared attention projector.
+/// The bounded observation remains the authority for review results and gate
+/// outcomes, while the normalized inventory view supplies the common domain
+/// rows consumed by the fold.
+pub(crate) fn project_observation(
+    observed: &WorkObservationSnapshot,
+    review_disagreements: &[(String, i64, String, Value)],
+    results: &BTreeMap<i64, PacketResult>,
+    subject_title: &WorkTitleV1,
+    live_work: Option<&IssueSummary>,
+) -> Result<Vec<AttentionItemV1>, Failure> {
+    let artifacts = observed
+        .attempt_artifacts
+        .iter()
+        .map(|row| row.attempt_id)
+        .collect::<BTreeSet<_>>();
+    let events_complete = observed.events.after_event_id == 0 && !observed.events.has_more;
+    let events = if events_complete {
+        observed.events.rows.iter().collect()
+    } else {
+        Vec::new()
+    };
+
+    let entries = observed
+        .runs
+        .iter()
+        .map(|run| {
+            json!({
+                "id": run.run_id,
+                "beadId": run.work_id,
+                "outcome": run.terminal_outcome.map(RunOutcome::as_str),
+                "updatedAt": run.updated_at,
+                "stopReason": run.stop_reason,
+            })
+        })
+        .collect::<Vec<_>>();
+    let work = live_work.into_iter().cloned().collect::<Vec<_>>();
+    Ok(project(ProjectionInput {
+        runs: &observed.runs,
+        attempts: &observed.attempts,
+        attempts_missing_artifacts: observed
+            .attempts
+            .iter()
+            .filter(|attempt| {
+                matches!(
+                    attempt.state,
+                    AttemptState::Completed | AttemptState::Failed
+                ) && !artifacts.contains(&attempt.attempt_id)
+            })
+            .collect(),
+        events,
+        desired_work: &observed.desired_work,
+        inflight_operations: &observed.inflight_operations,
+        admission_decisions: &observed.admission_decisions,
+        admission_reservations: &observed.admission_reservations,
+        usage: ProjectionUsage::Observation(observed),
+        entries: &entries,
+        work: &work,
+        surface: ProjectionSurface::Observation {
+            snapshot: observed,
+            review_disagreements,
+            results,
+            subject_title,
+        },
+    })?
+    .into_iter()
+    .filter(|item| item.state != AttentionState::Resolved)
+    .collect())
 }
 
 pub(crate) fn project_active(
@@ -1832,5 +2379,75 @@ mod tests {
             .expect("project admitted packet")
             .iter()
             .all(|item| item.condition != AttentionCondition::AdmissionDeferred));
+    }
+
+    #[test]
+    fn epic_observation_keeps_run_reservation_identity_on_the_epic() {
+        let subject = observed_reservation_subject(
+            "epic-owner",
+            Some("child-run"),
+            AdmissionSubjectKind::Run,
+        );
+        assert_eq!(subject, "epic-owner");
+        let stable = attention_id(
+            AttentionSubjectKind::Epic,
+            subject,
+            AttentionCondition::AmbiguousEffect,
+        );
+        assert_eq!(
+            stable,
+            "fc9d8fb4d7d601fc67b888c24bfb0facbc91b6634f108b76eb5f4ded2071c1fb"
+        );
+        assert_ne!(
+            stable,
+            attention_id(
+                AttentionSubjectKind::Run,
+                "child-run",
+                AttentionCondition::AmbiguousEffect,
+            )
+        );
+        assert_eq!(
+            attention_occurrence_id(&stable, "reservation:reservation-run"),
+            "17007eceae60891f195f5cde6319106b458fd4fe19ed3194d8ad02117f96b848"
+        );
+    }
+
+    #[test]
+    fn observation_transition_noops_advance_time_and_parse_errors_name_the_event() {
+        let resolved = event(
+            7,
+            "run-transition",
+            RESOLVED,
+            json!({
+                "schema": "forged.attention-transition/1",
+                "attentionId": "attention",
+                "occurrenceId": "occurrence",
+                "actor": "operator",
+                "disposition": "fixed",
+            }),
+        );
+        let stale = event(
+            8,
+            "run-transition",
+            ACKNOWLEDGED,
+            json!({
+                "schema": "forged.attention-transition/1",
+                "attentionId": "attention",
+                "occurrenceId": "occurrence",
+                "actor": "lead",
+            }),
+        );
+        let state = transition_state(&[&resolved, &stale], true, true, "attention", "occurrence")
+            .expect("project observation transitions");
+        assert_eq!(state.state, AttentionState::Resolved);
+        assert_eq!(state.updated_at, Some(stale.ts));
+
+        let mut invalid = event(9, "run-transition", ACKNOWLEDGED, Value::Null);
+        invalid.payload_json = "{".to_owned();
+        let error = match transition_state(&[&invalid], true, true, "attention", "occurrence") {
+            Err(error) => error,
+            Ok(_) => panic!("invalid stored transition was accepted"),
+        };
+        assert!(error.message.contains("transition event 9"), "{error:?}");
     }
 }
