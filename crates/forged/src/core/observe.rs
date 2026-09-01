@@ -843,6 +843,7 @@ async fn explain_run(ctx: &Ctx, id: String) -> Result<Value, Failure> {
         .iter()
         .filter(|attempt| attempt.state == AttemptState::Running)
         .count();
+    let retry_of = super::ops::run_retry_of(ctx, &run.run_id).await?;
     let next = super::ops::run_projection_actions(run);
     Ok(json!({
         "schema": "forged.explain/1",
@@ -851,6 +852,7 @@ async fn explain_run(ctx: &Ctx, id: String) -> Result<Value, Failure> {
         "what": {
             "identity": observation.identity,
             "workId": run.work_id,
+            "retryOf": retry_of,
             "state": run.state.as_str(),
             "outcome": run.terminal_outcome.map(RunOutcome::as_str),
             "stopReason": run.stop_reason,

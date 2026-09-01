@@ -21,9 +21,9 @@ use serde_json::{json, Value};
 use crate::adapters::ports::{report_json, ForgedPorts};
 use crate::config::{now_iso, stage_str};
 use crate::core::{
-    default_key, derive_key, epic, err_response, fenced, key_absent, ok_response, on_ledger,
-    param_opt_str, param_str, read_only, remedy_response, session_claimant, split_packet_key,
-    unfenced_write, work_supersede_action, Ctx, Failure,
+    default_key, derive_key, epic, err_response, fenced, fenced_dynamic_authorizing_desired,
+    key_absent, ok_response, on_ledger, param_opt_str, param_str, read_only, remedy_response,
+    session_claimant, split_packet_key, unfenced_write, work_supersede_action, Ctx, Failure,
 };
 
 // ---------------------------------------------------------------- doctor
@@ -494,186 +494,581 @@ pub(crate) async fn run_start_with_definition(
     let params = req.params.clone();
     fenced(ctx, "run_start", EffectClass::SafeRetry, req, None, {
         move |operation_id| async move {
-            let repo = super::work_identity::canonical_repository(param_str(&params, "repo")?)?;
-            let internal_protocol = match (
-                compiled.package.protocol_ref.name.as_str(),
-                compiled.package.protocol_ref.version,
-            ) {
-                ("epic-plan", 1) => Some("epic-plan"),
-                ("epic-assurance", 1) => Some("epic-assurance"),
-                _ => None,
-            };
-            let spec = if let Some(protocol) = internal_protocol {
-                if params.get("spec").is_some_and(|value| !value.is_null()) {
-                    return Err(Failure::invalid(format!(
-                        "{protocol}/v1 internal runs do not accept deprecated spec"
-                    )));
-                }
-                Some(
-                    param_str(&params, "internalSpec")
-                        .map(str::to_owned)
-                        .map_err(|_| {
-                            Failure::invalid(format!(
-                                "{protocol}/v1 internal run requires internalSpec"
-                            ))
-                        })?,
-                )
-            } else {
-                if params
-                    .get("internalSpec")
-                    .is_some_and(|value| !value.is_null())
-                {
-                    return Err(Failure::invalid(
-                        "internalSpec is reserved for runtime-derived epic runs",
-                    ));
-                }
-                if params
-                    .get("internalBranch")
-                    .is_some_and(|value| !value.is_null())
-                {
-                    return Err(Failure::invalid(
-                        "internalBranch is reserved for runtime-derived epic runs",
-                    ));
-                }
-                param_opt_str(&params, "spec").map(str::to_owned)
-            };
-            let issue = if let Some(protocol) = internal_protocol {
-                let issue = super::spec::read_work(ctx, &work).await?;
-                if param_opt_str(&params, "epicId") != Some(work.as_str())
-                    || issue.issue_type != "epic"
-                    || !matches!(issue.status.as_str(), "open" | "in_progress")
-                {
-                    return Err(Failure::invalid(format!(
-                        "{protocol}/v1 run must bind to its open parent epic {work}"
-                    )));
-                }
-                issue
-            } else {
-                ready_slice_work(ctx, &work).await?
-            };
-            // The spec source is settled BEFORE the run row exists: a work
-            // with no spec, or a spec path that is not there, must never
-            // reach a seat as an empty spec.
-            let source = match &spec {
-                Some(path) => {
-                    if !Path::new(path).exists() {
-                        return Err(Failure::invalid(format!("spec {path:?} does not exist")));
-                    }
-                    if internal_protocol.is_none() {
-                        tracing::warn!(
-                            work = %work,
-                            spec = %path,
-                            "--spec is deprecated: the work item's own fields are the spec"
-                        );
-                    }
-                    super::spec::SpecSource::File(path.clone())
-                }
-                None => {
-                    // Resolving proves the work carries a spec, and names
-                    // every empty field when it does not.
-                    super::spec::resolve_issue(&issue)?;
-                    super::spec::SpecSource::Work(work.clone())
-                }
-            };
-            let base_ref = match param_opt_str(&params, "baseRef") {
-                Some(base) => base.to_owned(),
-                None => default_branch_of(&repo).await,
-            };
-            let branch = match internal_protocol {
-                Some("epic-assurance") => param_str(&params, "internalBranch")?.to_owned(),
-                Some(_) => {
-                    if params
-                        .get("internalBranch")
-                        .is_some_and(|value| !value.is_null())
-                    {
-                        return Err(Failure::invalid(
-                            "internalBranch is supported only by epic-assurance/v1",
-                        ));
-                    }
-                    format!("forged/{run_id}")
-                }
-                None => format!("forged/{run_id}"),
-            };
-            let new_run = NewRun {
-                run_id: run_id.clone(),
-                work_id: work.clone(),
-                repo: repo.clone(),
-                base_ref: base_ref.clone(),
-                branch: branch.clone(),
-            };
-            let package = compiled.package.clone();
-            let package_sha256 = compiled.package_sha256.clone();
-            let definition = NewRunDefinition {
-                package: compiled.package,
-                package_sha256: compiled.package_sha256,
-                compatibility_roster: compiled.compatibility_roster,
-            };
-            // Persist the spec SOURCE for packet building — the run row has
-            // no spec column, and every process must resolve the same one.
-            // `specPath` stays in the payload for the deprecated file route,
-            // so an in-flight run started by an older binary still reads.
-            let project = super::work_identity::context_from_params(&params, "project");
-            let epic = super::work_identity::context_from_params(&params, "epic");
-            let identity = super::work_identity::durable_identity(
-                WorkIdentitySubjectKind::Run,
-                run_id.as_str(),
-                &work,
-                Some(&issue.title),
-                issue.revision.as_deref(),
-                Some(&repo),
-                project,
-                epic,
-            )?;
-            let payload = match &source {
-                super::spec::SpecSource::File(path) => json!({
-                    "runId": run_id.as_str(),
-                    "source": "file",
-                    "specPath": path,
-                    "deprecated": true,
-                    "beadId": work,
-                    "beadTitle": identity.work.title.clone(),
-                    "beadRevision": issue.revision,
-                    "repo": repo,
-                    "operationId": operation_id,
-                    "issueType": issue.issue_type,
-                    "metadata": issue.metadata,
-                    "project": identity.project.clone(),
-                    "epic": identity.epic.clone(),
-                }),
-                super::spec::SpecSource::Work(work_id) => json!({
-                    "runId": run_id.as_str(),
-                    "source": "bead",
-                    "beadId": work_id,
-                    "beadTitle": identity.work.title.clone(),
-                    "beadRevision": issue.revision,
-                    "repo": repo,
-                    "operationId": operation_id,
-                    "issueType": issue.issue_type,
-                    "metadata": issue.metadata,
-                    "project": identity.project.clone(),
-                    "epic": identity.epic.clone(),
-                }),
-            };
-            let row = on_ledger(&ctx.ledger, move |ledger| {
-                ledger.create_run_with_identity(new_run, definition, payload, identity)
-            })
-            .await?;
-            crate::failpoint::hit("run.start.bundle.after");
-            Ok(json!({
-                "run_id": row.run_id,
-                "bead_id": row.work_id,
-                "branch": branch,
-                "base_ref": base_ref,
-                "protocol_ref": package.protocol_ref,
-                "profile_ref": package.profile_ref,
-                "roster_ref": package.roster_ref,
-                "package_sha256": package_sha256,
-                "profile_sha256": package.profile_sha256,
-                "roster_sha256": package.roster_sha256,
-            }))
+            create_run_from_definition(ctx, &params, work, run_id, compiled, operation_id, None)
+                .await
         }
     })
     .await
+}
+
+async fn create_run_from_definition(
+    ctx: &Ctx,
+    params: &serde_json::Map<String, Value>,
+    work: String,
+    run_id: RunId,
+    compiled: crate::config::CompiledDefinition,
+    operation_id: String,
+    retry_of: Option<String>,
+) -> Result<Value, Failure> {
+    let repo = super::work_identity::canonical_repository(param_str(params, "repo")?)?;
+    let internal_protocol = match (
+        compiled.package.protocol_ref.name.as_str(),
+        compiled.package.protocol_ref.version,
+    ) {
+        ("epic-plan", 1) => Some("epic-plan"),
+        ("epic-assurance", 1) => Some("epic-assurance"),
+        _ => None,
+    };
+    let spec = if let Some(protocol) = internal_protocol {
+        if params.get("spec").is_some_and(|value| !value.is_null()) {
+            return Err(Failure::invalid(format!(
+                "{protocol}/v1 internal runs do not accept deprecated spec"
+            )));
+        }
+        Some(
+            param_str(params, "internalSpec")
+                .map(str::to_owned)
+                .map_err(|_| {
+                    Failure::invalid(format!("{protocol}/v1 internal run requires internalSpec"))
+                })?,
+        )
+    } else {
+        if params
+            .get("internalSpec")
+            .is_some_and(|value| !value.is_null())
+        {
+            return Err(Failure::invalid(
+                "internalSpec is reserved for runtime-derived epic runs",
+            ));
+        }
+        if params
+            .get("internalBranch")
+            .is_some_and(|value| !value.is_null())
+        {
+            return Err(Failure::invalid(
+                "internalBranch is reserved for runtime-derived epic runs",
+            ));
+        }
+        param_opt_str(params, "spec").map(str::to_owned)
+    };
+    let issue = if let Some(protocol) = internal_protocol {
+        let issue = super::spec::read_work(ctx, &work).await?;
+        if param_opt_str(params, "epicId") != Some(work.as_str())
+            || issue.issue_type != "epic"
+            || !matches!(issue.status.as_str(), "open" | "in_progress")
+        {
+            return Err(Failure::invalid(format!(
+                "{protocol}/v1 run must bind to its open parent epic {work}"
+            )));
+        }
+        issue
+    } else {
+        ready_slice_work(ctx, &work).await?
+    };
+    // The spec source is settled BEFORE the run row exists: a work with no
+    // spec, or a spec path that is not there, must never reach a seat empty.
+    let source = match &spec {
+        Some(path) => {
+            if !Path::new(path).exists() {
+                return Err(Failure::invalid(format!("spec {path:?} does not exist")));
+            }
+            if internal_protocol.is_none() {
+                tracing::warn!(
+                    work = %work,
+                    spec = %path,
+                    "--spec is deprecated: the work item's own fields are the spec"
+                );
+            }
+            super::spec::SpecSource::File(path.clone())
+        }
+        None => {
+            super::spec::resolve_issue(&issue)?;
+            super::spec::SpecSource::Work(work.clone())
+        }
+    };
+    let base_ref = match param_opt_str(params, "baseRef") {
+        Some(base) => base.to_owned(),
+        None => default_branch_of(&repo).await,
+    };
+    let branch = match internal_protocol {
+        Some("epic-assurance") => param_str(params, "internalBranch")?.to_owned(),
+        Some(_) => {
+            if params
+                .get("internalBranch")
+                .is_some_and(|value| !value.is_null())
+            {
+                return Err(Failure::invalid(
+                    "internalBranch is supported only by epic-assurance/v1",
+                ));
+            }
+            format!("forged/{run_id}")
+        }
+        None => format!("forged/{run_id}"),
+    };
+    let new_run = NewRun {
+        run_id: run_id.clone(),
+        work_id: work.clone(),
+        repo: repo.clone(),
+        base_ref: base_ref.clone(),
+        branch: branch.clone(),
+    };
+    let package = compiled.package.clone();
+    let package_sha256 = compiled.package_sha256.clone();
+    let definition = NewRunDefinition {
+        package: compiled.package,
+        package_sha256: compiled.package_sha256,
+        compatibility_roster: compiled.compatibility_roster,
+    };
+    let project = super::work_identity::context_from_params(params, "project");
+    let epic = super::work_identity::context_from_params(params, "epic");
+    let identity = super::work_identity::durable_identity(
+        WorkIdentitySubjectKind::Run,
+        run_id.as_str(),
+        &work,
+        Some(&issue.title),
+        issue.revision.as_deref(),
+        Some(&repo),
+        project,
+        epic,
+    )?;
+    let mut payload = match &source {
+        super::spec::SpecSource::File(path) => json!({
+            "runId": run_id.as_str(),
+            "source": "file",
+            "specPath": path,
+            "deprecated": true,
+            "beadId": work,
+            "beadTitle": identity.work.title.clone(),
+            "beadRevision": issue.revision,
+            "repo": repo,
+            "operationId": operation_id,
+            "issueType": issue.issue_type,
+            "metadata": issue.metadata,
+            "project": identity.project.clone(),
+            "epic": identity.epic.clone(),
+        }),
+        super::spec::SpecSource::Work(work_id) => json!({
+            "runId": run_id.as_str(),
+            "source": "bead",
+            "beadId": work_id,
+            "beadTitle": identity.work.title.clone(),
+            "beadRevision": issue.revision,
+            "repo": repo,
+            "operationId": operation_id,
+            "issueType": issue.issue_type,
+            "metadata": issue.metadata,
+            "project": identity.project.clone(),
+            "epic": identity.epic.clone(),
+        }),
+    };
+    if let Some(retry_of) = &retry_of {
+        payload["retryOf"] = json!(retry_of);
+    }
+    let row = on_ledger(&ctx.ledger, move |ledger| {
+        ledger.create_run_with_identity(new_run, definition, payload, identity)
+    })
+    .await?;
+    crate::failpoint::hit("run.start.bundle.after");
+    Ok(json!({
+        "run_id": row.run_id,
+        "bead_id": row.work_id,
+        "branch": branch,
+        "base_ref": base_ref,
+        "protocol_ref": package.protocol_ref,
+        "profile_ref": package.profile_ref,
+        "roster_ref": package.roster_ref,
+        "package_sha256": package_sha256,
+        "profile_sha256": package.profile_sha256,
+        "roster_sha256": package.roster_sha256,
+    }))
+}
+
+const RETRY_CHAIN_LIMIT: usize = 4096;
+
+fn retry_root(run_id: &str) -> &str {
+    run_id
+        .rsplit_once("-r")
+        .filter(|(_, suffix)| {
+            !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+        })
+        .map_or(run_id, |(root, _)| root)
+}
+
+pub(crate) fn retry_action(
+    run_id: &str,
+    reason: impl Into<String>,
+) -> forged_types::OperationActionV1 {
+    let Value::Object(args) = json!({"id": run_id, "runId": Value::Null}) else {
+        unreachable!("run retry action args are an object")
+    };
+    forged_types::OperationActionV1 {
+        verb: "run retry".to_owned(),
+        args,
+        reason: reason.into(),
+    }
+}
+
+fn action(verb: &str, args: Value, reason: impl Into<String>) -> forged_types::OperationActionV1 {
+    let Value::Object(args) = args else {
+        unreachable!("operation action args are an object")
+    };
+    forged_types::OperationActionV1 {
+        verb: verb.to_owned(),
+        args,
+        reason: reason.into(),
+    }
+}
+
+fn retry_refusal(
+    key: &str,
+    failure: Failure,
+    remedy: forged_types::OperationActionV1,
+) -> OperationResponse {
+    remedy_response(key, &failure, forged_types::RemedyV1::from(remedy))
+}
+
+/// `run retry` — mint a flat successor on the same current Work revision,
+/// compile live execution config, and authorize ordinary supervision. The new
+/// desired row carries its own default restart budget; existing desired rows
+/// and settlement/transport retry budgets remain untouched.
+pub async fn run_retry(ctx: &Ctx, req: &mut OperationRequest) -> OperationResponse {
+    let source_id = match param_str(&req.params, "id") {
+        Ok(value) => value.to_owned(),
+        Err(error) => return err_response(&derive_key("run_retry", None, None, None), &error),
+    };
+    default_key(req, derive_key("run_retry", Some(&source_id), None, None));
+    if req.run_id.is_none() {
+        req.run_id = Some(source_id.clone());
+    }
+    let replay = {
+        let request = req.clone();
+        on_ledger(&ctx.ledger, move |ledger| {
+            ledger.replay_event_operation("run_retry", &request)
+        })
+        .await
+    };
+    match replay {
+        Ok(Some(response)) => return response,
+        Ok(None) => {}
+        Err(error) => return err_response(&req.idempotency_key, &error),
+    }
+
+    let source = {
+        let id = source_id.clone();
+        match on_ledger(&ctx.ledger, move |ledger| ledger.get_run(&id)).await {
+            Ok(run) => run,
+            Err(error) => return err_response(&req.idempotency_key, &error),
+        }
+    };
+    if source.state != RunState::Stopped {
+        return retry_refusal(
+            &req.idempotency_key,
+            Failure::invalid(format!(
+                "run {source_id} is not terminal; stop it before retrying"
+            )),
+            action(
+                "run stop",
+                json!({"run": source_id, "outcome": Value::Null, "reason": Value::Null}),
+                "choose the terminal outcome and reason before stopping the run",
+            ),
+        );
+    }
+    if source.terminal_outcome == Some(forged_ledger::RunOutcome::Landed) {
+        return retry_refusal(
+            &req.idempotency_key,
+            Failure::invalid(format!(
+                "run {source_id} already landed as PR {} at {}; delivery evidence is immutable",
+                source
+                    .delivery_pr
+                    .map(|value| format!("#{value}"))
+                    .unwrap_or_else(|| "<unknown>".to_owned()),
+                source.delivery_sha.as_deref().unwrap_or("<unknown>")
+            )),
+            action(
+                "work show",
+                json!({"id": source.work_id}),
+                "inspect the delivered work and its immutable evidence",
+            ),
+        );
+    }
+    if let Some(successor) = &source.superseded_by {
+        return retry_refusal(
+            &req.idempotency_key,
+            Failure::invalid(format!(
+                "run {source_id} was superseded by {successor}; retry the successor's work instead"
+            )),
+            action(
+                "run status",
+                json!({"run": successor}),
+                format!("inspect successor run {successor}"),
+            ),
+        );
+    }
+
+    let work = match super::workstore::show_issue(&ctx.ledger, &source.work_id).await {
+        Ok(work) => work,
+        Err(error) => return err_response(&req.idempotency_key, &error),
+    };
+    let superseders = {
+        let work_id = source.work_id.clone();
+        match on_ledger(&ctx.ledger, move |ledger| ledger.work_superseders(&work_id)).await {
+            Ok(rows) => rows,
+            Err(error) => return err_response(&req.idempotency_key, &error),
+        }
+    };
+    if let Some(successor) = superseders.first() {
+        return retry_refusal(
+            &req.idempotency_key,
+            Failure::invalid(format!(
+                "work {} was superseded by {successor}",
+                source.work_id
+            )),
+            action(
+                "work show",
+                json!({"id": successor}),
+                format!("inspect successor work {successor}"),
+            ),
+        );
+    }
+    if work.status == "closed" {
+        return retry_refusal(
+            &req.idempotency_key,
+            Failure::invalid(format!(
+                "work {} is closed and cannot admit a retry",
+                source.work_id
+            )),
+            action(
+                "work reopen",
+                json!({"id": source.work_id}),
+                "reopen the work item before retrying",
+            ),
+        );
+    }
+    if work.status != "open" {
+        return err_response(
+            &req.idempotency_key,
+            &Failure::invalid(format!(
+                "work {} must be open before retrying; current status is {}",
+                source.work_id, work.status
+            )),
+        );
+    }
+
+    let explicit_successor = param_opt_str(&req.params, "runId").is_some();
+    let successor_name = if let Some(explicit) = param_opt_str(&req.params, "runId") {
+        explicit.to_owned()
+    } else {
+        let root = retry_root(&source_id).to_owned();
+        let candidates = {
+            let root = root.clone();
+            match on_ledger(&ctx.ledger, move |ledger| {
+                ledger.retry_chain_runs(&root, RETRY_CHAIN_LIMIT + 1)
+            })
+            .await
+            {
+                Ok(rows) => rows,
+                Err(error) => return err_response(&req.idempotency_key, &error),
+            }
+        };
+        if candidates.len() > RETRY_CHAIN_LIMIT {
+            return retry_refusal(
+                &req.idempotency_key,
+                Failure::refused(
+                    ErrorCode::GraphScopeTooLarge,
+                    format!("retry chain {root} exceeds the bounded lookup"),
+                ),
+                retry_action(&source_id, "pass --run-id to choose a successor explicitly"),
+            );
+        }
+        let prefix = format!("{root}-r");
+        let mut highest = 0u64;
+        for candidate in &candidates {
+            let Some(suffix) = candidate.run_id.strip_prefix(&prefix) else {
+                continue;
+            };
+            if suffix.is_empty() || !suffix.bytes().all(|byte| byte.is_ascii_digit()) {
+                continue;
+            }
+            if candidate.work_id != source.work_id {
+                return retry_refusal(
+                    &req.idempotency_key,
+                    Failure::invalid(format!(
+                        "derived retry chain {root} collides with existing run {} on work {}; pass --run-id",
+                        candidate.run_id, candidate.work_id
+                    )),
+                    retry_action(&source_id, "pass --run-id to choose a non-colliding successor"),
+                );
+            }
+            let Some(number) = suffix.parse::<u64>().ok() else {
+                return retry_refusal(
+                    &req.idempotency_key,
+                    Failure::invalid(format!(
+                        "retry suffix for {} exceeds the numeric range; pass --run-id",
+                        candidate.run_id
+                    )),
+                    retry_action(
+                        &source_id,
+                        "pass --run-id to choose the successor explicitly",
+                    ),
+                );
+            };
+            highest = highest.max(number);
+        }
+        let Some(number) = highest.checked_add(1) else {
+            return retry_refusal(
+                &req.idempotency_key,
+                Failure::invalid(format!(
+                    "retry suffix for {root} exceeds the numeric range; pass --run-id"
+                )),
+                retry_action(
+                    &source_id,
+                    "pass --run-id to choose the successor explicitly",
+                ),
+            );
+        };
+        format!("{root}-r{number}")
+    };
+    let successor = match RunId::new(successor_name.clone()) {
+        Ok(id) => id,
+        Err(error) => {
+            return retry_refusal(
+                &req.idempotency_key,
+                Failure::invalid(format!(
+                    "retry successor {successor_name:?} is invalid: {error}; pass --run-id"
+                )),
+                retry_action(&source_id, "pass --run-id with a valid successor id"),
+            )
+        }
+    };
+    let submit_guard = match super::handoff::acquire_run_submit(ctx, successor.as_str()).await {
+        Ok(guard) => guard,
+        Err(error) => return err_response(&req.idempotency_key, &error),
+    };
+    let collision = {
+        let id = successor.as_str().to_owned();
+        on_ledger(&ctx.ledger, move |ledger| ledger.get_run(&id)).await
+    };
+    match collision {
+        Ok(winner) if explicit_successor || winner.work_id != source.work_id => {
+            return retry_refusal(
+                &req.idempotency_key,
+                Failure::invalid(format!(
+                    "retry successor {} already exists on work {}; choose a different --run-id",
+                    winner.run_id, winner.work_id
+                )),
+                retry_action(
+                    &source_id,
+                    "pass a different --run-id to choose a non-colliding successor",
+                ),
+            )
+        }
+        Ok(winner) => {
+            return err_response(
+                &req.idempotency_key,
+                &Failure::invalid(format!(
+                    "retry successor {} already exists on work {}; concurrent retry winner is {}",
+                    winner.run_id, winner.work_id, winner.run_id
+                )),
+            )
+        }
+        Err(error) if error.code == ErrorCode::RunNotFound => {}
+        Err(error) => return err_response(&req.idempotency_key, &error),
+    }
+    let compiled = match ctx.config.compile_definition(
+        param_opt_str(&req.params, "profile"),
+        param_opt_str(&req.params, "roster"),
+    ) {
+        Ok(compiled) => compiled,
+        Err(errors) => {
+            return err_response(
+                &req.idempotency_key,
+                &Failure::invalid(format!(
+                    "execution definition is invalid: {}",
+                    serde_json::to_string(&errors)
+                        .unwrap_or_else(|_| "validation failed".to_owned())
+                )),
+            )
+        }
+    };
+    let mut start_params = req.params.clone();
+    start_params.insert("bead".to_owned(), json!(source.work_id));
+    start_params.insert("repo".to_owned(), json!(source.repo));
+    start_params.insert("baseRef".to_owned(), json!(source.base_ref));
+    start_params.remove("spec");
+    let source_id_for_effect = source_id.clone();
+    let successor_for_effect = successor.clone();
+    let work_id = source.work_id.clone();
+    let response = fenced_dynamic_authorizing_desired(
+        ctx,
+        "run_retry",
+        EffectClass::SafeRetry,
+        req,
+        move |operation_id| async move {
+            let started = create_run_from_definition(
+                ctx,
+                &start_params,
+                work_id.clone(),
+                successor_for_effect.clone(),
+                compiled,
+                operation_id.clone(),
+                Some(source_id_for_effect.clone()),
+            )
+            .await?;
+            let spec_event_run = successor_for_effect.as_str().to_owned();
+            let spec_event = on_ledger(&ctx.ledger, move |ledger| {
+                ledger.latest_event_of_kind(&spec_event_run, "forged.run.spec")
+            })
+            .await?
+            .ok_or_else(|| Failure::internal("retry successor has no frozen spec event"))?;
+            let spec_payload: Value = serde_json::from_str(&spec_event.payload_json)
+                .map_err(|error| Failure::internal(format!("stored retry spec event: {error}")))?;
+            let revision = spec_payload
+                .get("beadRevision")
+                .cloned()
+                .ok_or_else(|| Failure::internal("retry successor spec has no revision"))?;
+            let (submitted, authorization) = super::handoff::authorize_retry_successor(
+                ctx,
+                successor_for_effect.as_str(),
+                &submit_guard,
+            )
+            .await?;
+            let event = json!({
+                "schemaVersion": 1,
+                "runId": successor_for_effect.as_str(),
+                "retryOf": source_id_for_effect,
+                "workId": work_id,
+                "revision": revision,
+                "packageSha256": started.get("package_sha256"),
+                "operationId": operation_id,
+                "submission": submitted,
+            });
+            let event_run = successor_for_effect.as_str().to_owned();
+            on_ledger(&ctx.ledger, move |ledger| {
+                ledger.append_event(Some(&event_run), "forged.run.retry.authorized", event)
+            })
+            .await?;
+            Ok((
+                json!({
+                    "runId": successor_for_effect.as_str(),
+                    "retryOf": source_id_for_effect,
+                    "workId": work_id,
+                    "revision": revision,
+                    "packageSha256": started.get("package_sha256"),
+                    "profileSha256": started.get("profile_sha256"),
+                    "rosterSha256": started.get("roster_sha256"),
+                    "protocolRef": started.get("protocol_ref"),
+                    "profileRef": started.get("profile_ref"),
+                    "rosterRef": started.get("roster_ref"),
+                    "branch": started.get("branch"),
+                    "baseRef": started.get("base_ref"),
+                    "submission": submitted,
+                }),
+                authorization,
+            ))
+        },
+    )
+    .await;
+    response
 }
 
 async fn recover_applied_run_start(
@@ -881,27 +1276,60 @@ fn run_status_gate_state(view: &forged_proto::RunView) -> Option<&'static str> {
 pub(crate) fn run_projection_actions(
     run: &forged_ledger::RunRow,
 ) -> Vec<forged_types::OperationActionV1> {
-    let (verb, args, reason) = match run.state {
-        RunState::Active => (
+    if run.state == RunState::Active {
+        return vec![action(
             "run stop",
             json!({"run": run.run_id, "outcome": null, "reason": null}),
             "choose the terminal outcome and reason before stopping the run",
-        ),
-        RunState::Stopped
-            if run.terminal_outcome != Some(forged_ledger::RunOutcome::InputRequired) =>
-        {
-            return vec![work_supersede_action(&run.work_id)];
-        }
-        RunState::Stopped => return Vec::new(),
+        )];
+    }
+    if run.terminal_outcome == Some(forged_ledger::RunOutcome::Landed) {
+        return vec![action(
+            "work show",
+            json!({"id": run.work_id}),
+            "inspect the delivered work and its immutable evidence",
+        )];
+    }
+    if let Some(successor) = &run.superseded_by {
+        return vec![action(
+            "run status",
+            json!({"run": successor}),
+            format!("inspect successor run {successor}"),
+        )];
+    }
+    let retry_reason = if run.terminal_outcome == Some(forged_ledger::RunOutcome::InputRequired) {
+        "apply the requested decision or amendment, then retry"
+    } else {
+        "re-run the current spec after the world changed"
     };
-    let Value::Object(args) = args else {
-        unreachable!("run next-action args are objects")
-    };
-    vec![forged_types::OperationActionV1 {
-        verb: verb.to_owned(),
-        args,
-        reason: reason.to_owned(),
-    }]
+    let mut supersede = work_supersede_action(&run.work_id);
+    supersede.reason =
+        "use work supersede when the spec must change; create the successor first with work create"
+            .to_owned();
+    vec![retry_action(&run.run_id, retry_reason), supersede]
+}
+
+pub(crate) async fn run_retry_of(ctx: &Ctx, run_id: &str) -> Result<Option<String>, Failure> {
+    let run_id = run_id.to_owned();
+    let event = on_ledger(&ctx.ledger, move |ledger| {
+        Ok(ledger
+            .latest_event_of_kind(&run_id, "forged.run.retry.authorized")?
+            .or(ledger.latest_event_of_kind(&run_id, "forged.run.spec")?))
+    })
+    .await?;
+    event
+        .map(|event| {
+            serde_json::from_str::<Value>(&event.payload_json)
+                .map_err(|error| Failure::internal(format!("stored retry provenance: {error}")))
+                .map(|payload| {
+                    payload
+                        .get("retryOf")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+        })
+        .transpose()
+        .map(Option::flatten)
 }
 
 /// `run status` — read-only projection of one run.
@@ -953,6 +1381,7 @@ pub async fn run_status(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
         let controller = super::handoff::controller_status(ctx, run_id).await?;
         let identity =
             super::work_identity::load(ctx, WorkIdentitySubjectKind::Run, run_id).await?;
+        let retry_of = run_retry_of(ctx, run_id).await?;
         let herdr_layout = super::herdr_layout::status(
             ctx,
             forged_types::HerdrLayoutSubjectV1 {
@@ -1103,6 +1532,7 @@ pub async fn run_status(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
         });
         let mut run = json!({
                 "runId": view.run.run_id,
+                "retryOf": retry_of,
                 "identity": identity,
                 "herdrLayout": herdr_layout,
                 "beadId": view.run.work_id,

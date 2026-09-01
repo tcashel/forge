@@ -345,6 +345,15 @@
     {
       "class": "fenced",
       "cli": true,
+      "cliVerb": "run retry",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": true,
+      "name": "run_retry"
+    },
+    {
+      "class": "fenced",
+      "cli": true,
       "cliVerb": "run revise-roster",
       "dispatch": true,
       "explicitKey": false,

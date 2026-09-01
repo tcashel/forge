@@ -350,9 +350,11 @@ fn stopped_non_review_refusal_teaches_work_supersession() {
         response["error"]["detail"],
         json!({
             "schema": "forged.remedy/1",
-            "verb": "work supersede",
-            "args": {"id": work, "successor": null},
-            "reason": "create the successor first with work create",
+            "verb": "run retry",
+            "args": {"id": run, "runId": null},
+            "reason": format!(
+                "retry the current spec; use work supersede on {work} when the spec must change"
+            ),
         })
     );
 }

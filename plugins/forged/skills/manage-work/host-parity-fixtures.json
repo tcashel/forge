@@ -152,6 +152,7 @@
     "run_accept_risk",
     "run_adjudicate_settlement",
     "run_advance",
+    "run_retry",
     "run_revise_roster",
     "run_start",
     "run_status",
