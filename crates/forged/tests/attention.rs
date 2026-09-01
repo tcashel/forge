@@ -40,6 +40,98 @@ fn attention(value: &Value, run: &str, condition: &str) -> Option<Value> {
     })
 }
 
+fn start_run(env: &TestEnv, run: &str) {
+    env.seed_work_spec(
+        run,
+        "Exercise the advertised attention recovery verb.",
+        "- the advertised verb executes",
+    );
+    let repository = env.repos.repo.to_string_lossy().into_owned();
+    let (code, started) = env.forged(&[
+        "run",
+        "start",
+        "--work",
+        run,
+        "--repo",
+        &repository,
+        "--base-ref",
+        "main",
+    ]);
+    assert_eq!(code, 0, "start {run}: {started}");
+}
+
+fn exhaust_restart_budget(env: &TestEnv, run: &str) {
+    use forged_ledger::{
+        DesiredReconcileOutcome, DesiredReconcileUpdate, DesiredRestartReservation, DesiredState,
+        DesiredSubjectKind,
+    };
+
+    let ledger = env.ledger();
+    let restart_budget = ledger
+        .get_desired_work(DesiredSubjectKind::Run, run)
+        .expect("desired query")
+        .expect("desired row")
+        .restart_budget;
+    for index in 0..=restart_budget {
+        ledger
+            .record_desired_outcome(
+                DesiredSubjectKind::Run,
+                run,
+                DesiredState::Running,
+                DesiredReconcileOutcome::Authorized,
+                Some("2000-01-01T00:00:00.000000000Z".to_owned()),
+                None,
+            )
+            .expect("make desired row due");
+        let token = format!("attention-restart-{index}");
+        let claimed = ledger
+            .claim_desired_work(
+                DesiredSubjectKind::Run,
+                run,
+                &token,
+                "2099-01-01T00:00:00.000000000Z",
+                "2099-01-01T00:01:00.000000000Z",
+            )
+            .expect("claim desired work")
+            .expect("due desired row");
+        match ledger
+            .reserve_desired_restart(
+                DesiredSubjectKind::Run,
+                run,
+                &token,
+                claimed.controller_generation,
+            )
+            .expect("reserve restart")
+        {
+            DesiredRestartReservation::Reserved(reserved) => {
+                assert!(index < restart_budget);
+                ledger
+                    .finish_desired_reconciliation(
+                        DesiredSubjectKind::Run,
+                        run,
+                        &token,
+                        DesiredReconcileUpdate {
+                            desired_state: None,
+                            outcome: DesiredReconcileOutcome::Backoff,
+                            controller_generation: Some(reserved.controller_generation),
+                            predecessor_generation: reserved.predecessor_generation,
+                            next_wake_at: Some("2000-01-01T00:00:00.000000000Z".to_owned()),
+                            last_progress_at: None,
+                            last_error: Some("fixture controller remained dead".to_owned()),
+                            attention_condition: None,
+                        },
+                    )
+                    .expect("finish desired reconciliation");
+            }
+            DesiredRestartReservation::Exhausted(exhausted) => {
+                assert_eq!(index, restart_budget);
+                assert!(exhausted.exhausted_at.is_some());
+            }
+        }
+    }
+    ledger.close().expect("close ledger");
+}
+
 #[test]
 fn attention_is_identical_across_surfaces_and_controls_are_occurrence_fenced() {
     let env = TestEnv::new("forged-attention-controls");
@@ -64,8 +156,12 @@ fn attention_is_identical_across_surfaces_and_controls_are_occurrence_fenced() {
     assert_eq!(item["state"], json!("open"));
     assert_eq!(
         item["nextActions"],
-        json!([]),
-        "unmapped recommendation codes advertise no verb"
+        json!([{
+            "verb": "attention resolve",
+            "args": {"id": "attention-run", "disposition": null, "note": null},
+            "reason": "bind the adjudicated disposition and note for this exact quarantined occurrence",
+        }]),
+        "ore-070.5 deliberately moves the quarantined action pin"
     );
     let attention_id = item["attentionId"].as_str().expect("attention id");
     let occurrence_id = item["occurrenceId"].as_str().expect("occurrence id");
@@ -105,7 +201,9 @@ fn attention_is_identical_across_surfaces_and_controls_are_occurrence_fenced() {
                 "attentionId": attention_id,
                 "occurrenceId": occurrence_id,
                 "actor": "operator",
-                "disposition": "accepted-risk",
+                "disposition": item["nextActions"][0]["args"]["disposition"]
+                    .as_str()
+                    .unwrap_or("accepted-risk"),
                 "note": "reviewed exact quarantined evidence",
             },
         }),
@@ -222,6 +320,281 @@ fn source_backed_attention_cannot_substitute_for_domain_resolution() {
 }
 
 #[test]
+fn restart_exhaustion_advertises_stop_then_retry_and_clears_on_the_live_successor() {
+    let env = TestEnv::new("forged-attention-restart-actions");
+    env.forged(&["init"]);
+    let run = "attention-restart";
+    start_run(&env, run);
+    env.authorize_run(run);
+    exhaust_restart_budget(&env, run);
+
+    let active = attention(&overview(&env), run, "restart-budget-exhausted")
+        .expect("active exhausted run attention");
+    assert_eq!(
+        active["nextActions"],
+        json!([{
+            "verb": "run stop",
+            "args": {"run": run, "outcome": null, "reason": null},
+            "reason": "stop with an outcome and reason, then retry the terminal run",
+        }]),
+        "an active run must never advertise run retry"
+    );
+    let stop = &active["nextActions"][0];
+    let (code, stopped) = env.forged(&[
+        "run",
+        "stop",
+        "--run",
+        stop["args"]["run"].as_str().expect("advertised run"),
+        "--outcome",
+        "cancelled",
+        "--reason",
+        "bind the exhausted run stop placeholders",
+    ]);
+    assert_eq!(code, 0, "advertised run stop succeeds: {stopped}");
+
+    let terminal = attention(&overview(&env), run, "restart-budget-exhausted")
+        .expect("terminal exhausted run attention");
+    let retry = &terminal["nextActions"][0];
+    assert_eq!(retry["verb"], json!("run retry"));
+    assert_eq!(
+        retry["args"],
+        json!({"id": run, "runId": null}),
+        "retry reuses the shared placeholder shape"
+    );
+    assert!(retry["reason"]
+        .as_str()
+        .is_some_and(|reason| reason.contains("current spec")));
+
+    env.set_work_field(
+        run,
+        "notes",
+        "The restart failure is addressed; retry this revision.",
+    );
+    let (code, retried) = env.forged(&[
+        "run",
+        "retry",
+        "--id",
+        retry["args"]["id"].as_str().expect("advertised run"),
+    ]);
+    assert_eq!(code, 0, "advertised run retry succeeds: {retried}");
+    assert_eq!(retried["result"]["retryOf"], json!(run));
+    assert!(
+        attention(&overview(&env), run, "restart-budget-exhausted").is_none(),
+        "a terminal exhausted source with a live same-work successor clears"
+    );
+}
+
+#[test]
+fn epic_input_attention_advertises_and_executes_epic_resolve() {
+    let env = TestEnv::new("forged-attention-epic-input-action");
+    env.forged(&["init"]);
+    let epic = "attention-epic-input";
+    env.seed_epic(epic, &[("attention-epic-child", &env.spec, true)]);
+    let repository = env.repos.repo.to_string_lossy().into_owned();
+    let spec = env.spec.to_string_lossy().into_owned();
+    let (code, started) = env.forged(&[
+        "epic",
+        "start",
+        "--epic",
+        epic,
+        "--repo",
+        &repository,
+        "--spec",
+        &spec,
+        "--base-ref",
+        "main",
+    ]);
+    assert_eq!(code, 0, "start epic: {started}");
+    env.authorize_epic(epic);
+    append(
+        &env,
+        epic,
+        "forged.epic.input.required",
+        json!({"code": "operator-choice", "detail": "choose the release lane", "childId": null}),
+    );
+
+    let item = attention(&overview(&env), epic, "input-required").expect("epic input attention");
+    assert_eq!(
+        item["nextActions"],
+        json!([{
+            "verb": "epic resolve",
+            "args": {"epic": epic, "child": null, "note": null},
+            "reason": "bind the held child when the input requirement names one and record the resolution note",
+        }])
+    );
+    let action = &item["nextActions"][0];
+    let (code, resolved) = env.forged(&[
+        "epic",
+        "resolve",
+        "--epic",
+        action["args"]["epic"].as_str().expect("advertised epic"),
+        "--note",
+        "ship through the integration lane",
+    ]);
+    assert_eq!(code, 0, "advertised epic resolve succeeds: {resolved}");
+    assert!(
+        attention(&overview(&env), epic, "input-required").is_none(),
+        "the advertised domain transition clears the item"
+    );
+}
+
+#[test]
+fn provider_exhaustion_advertises_and_executes_run_roster_revision() {
+    let env = TestEnv::new("forged-attention-roster-action");
+    env.forged(&["init"]);
+    env.add_uniform_roster("recovery", "codex", "gpt-5.6-sol");
+    let run = "attention-roster";
+    start_run(&env, run);
+    append(
+        &env,
+        run,
+        "run.protocol-terminal",
+        json!({
+            "schemaVersion": 1,
+            "terminal": {"providerUnavailable": {"provider": "fixture"}},
+        }),
+    );
+
+    let item =
+        attention(&overview(&env), run, "retry-exhausted").expect("provider exhaustion attention");
+    assert_eq!(
+        item["nextActions"],
+        json!([{
+            "verb": "run revise-roster",
+            "args": {"run": run, "roster": null, "reason": null},
+            "reason": "bind a configured roster name and the reason for revising provider policy",
+        }])
+    );
+    let action = &item["nextActions"][0];
+    let (code, revised) = env.forged(&[
+        "run",
+        "revise-roster",
+        "--run",
+        action["args"]["run"].as_str().expect("advertised run"),
+        "--roster",
+        "recovery",
+        "--reason",
+        "the original provider is unavailable",
+    ]);
+    assert_eq!(code, 0, "advertised run revise-roster succeeds: {revised}");
+    assert_eq!(revised["result"]["revision"], json!(2));
+    assert_eq!(revised["result"]["roster_ref"]["name"], json!("recovery"));
+}
+
+#[test]
+fn review_disagreement_advertises_accept_risk_only_after_a_persisted_terminal_review() {
+    let env = TestEnv::new("forged-attention-review-actions");
+    env.forged(&["init"]);
+    let gated = "attention-review-gated";
+    let ungated = "attention-review-ungated";
+    start_run(&env, gated);
+    fabricate_run(&env, ungated);
+    for run in [gated, ungated] {
+        let ledger = env.ledger();
+        forged_proto::record(
+            &ledger,
+            run,
+            forged_proto::ProtoEvent::Review {
+                seq: 1,
+                stage: forged_types::Stage::ReviewClaude,
+                verdict: Some(forged_types::Verdict::Approve),
+                available: true,
+            },
+        )
+        .expect("record approving review");
+        forged_proto::record(
+            &ledger,
+            run,
+            forged_proto::ProtoEvent::Review {
+                seq: 1,
+                stage: forged_types::Stage::ReviewCodex,
+                verdict: Some(forged_types::Verdict::RequestChanges),
+                available: true,
+            },
+        )
+        .expect("record requesting review");
+        ledger.close().expect("close ledger");
+    }
+
+    let terminal = json!({
+        "schemaVersion": 1,
+        "terminal": {
+            "reviewBudgetExhausted": {
+                "reviewRounds": 2,
+                "finalVerdict": "requestChanges",
+            }
+        },
+    });
+    append(&env, ungated, "run.protocol-terminal", terminal.clone());
+    append(&env, gated, "run.protocol-terminal", terminal);
+
+    let ungated_item =
+        attention(&overview(&env), ungated, "reviewer-disagreement").expect("ungated disagreement");
+    assert_eq!(
+        ungated_item["nextActions"],
+        json!([{
+            "verb": "attention resolve",
+            "args": {"id": ungated, "disposition": null, "note": null},
+            "reason": "bind the adjudicated disposition and note for this exact review disagreement",
+        }]),
+        "accept-risk must be absent while terminal review evidence is not in the required stopped-blocked state"
+    );
+
+    let ledger = env.ledger();
+    ledger
+        .settle_run(
+            gated,
+            forged_ledger::RunOutcome::Blocked,
+            "review budget exhausted after 2 rounds with verdict requestChanges".to_owned(),
+            None,
+            None,
+            None,
+        )
+        .expect("settle terminal review fixture");
+    ledger.close().expect("close ledger");
+
+    let gated_item =
+        attention(&overview(&env), gated, "reviewer-disagreement").expect("gated disagreement");
+    assert_eq!(
+        gated_item["nextActions"][0]["verb"],
+        json!("attention resolve")
+    );
+    let accept = &gated_item["nextActions"][1];
+    assert_eq!(accept["verb"], json!("run accept-risk"));
+    assert_eq!(
+        accept["args"],
+        json!({"run": gated, "acceptedBy": null, "rationale": null})
+    );
+    let (code, accepted) = env.forged(&[
+        "run",
+        "accept-risk",
+        "--run",
+        accept["args"]["run"].as_str().expect("advertised run"),
+        "--accepted-by",
+        "lead-agent",
+        "--rationale",
+        "the affected path is disabled in this deployment",
+    ]);
+    assert_eq!(code, 0, "advertised run accept-risk succeeds: {accepted}");
+    assert_eq!(accepted["result"]["reviewRounds"], json!(2));
+    assert_eq!(
+        env.ledger()
+            .get_run(gated)
+            .expect("accepted-risk run")
+            .terminal_outcome,
+        Some(forged_ledger::RunOutcome::AcceptedRisk)
+    );
+    let after = attention(&overview(&env), gated, "reviewer-disagreement")
+        .expect("disagreement remains explicitly resolvable");
+    assert_eq!(
+        after["nextActions"].as_array().expect("actions").len(),
+        1,
+        "accepted-risk state must not keep advertising a non-replayable generic acceptance"
+    );
+    assert_eq!(after["nextActions"][0]["verb"], json!("attention resolve"));
+}
+
+#[test]
 fn delivery_requires_the_durably_observed_exact_pr_base() {
     let env = TestEnv::new("forged-attention-pr-base");
     env.forged(&["init"]);
@@ -255,6 +628,11 @@ fn delivery_requires_the_durably_observed_exact_pr_base() {
     let wrong = overview(&env);
     let gap = attention(&wrong, "attention-pr-base", "missing-evidence")
         .expect("wrong-base missing-evidence");
+    assert_eq!(
+        gap["nextActions"],
+        json!([]),
+        "repairable delivery evidence has no honest recording verb"
+    );
     assert!(wrong["queue"]["groups"]
         .as_array()
         .expect("groups")
@@ -304,7 +682,13 @@ fn delivery_requires_the_durably_observed_exact_pr_base() {
         }),
     );
     let exact = overview(&env);
-    assert!(attention(&exact, "attention-pr-base", "merge-approval").is_some());
+    let merge =
+        attention(&exact, "attention-pr-base", "merge-approval").expect("merge approval attention");
+    assert_eq!(
+        merge["nextActions"],
+        json!([]),
+        "merging a pull request has no in-surface domain verb"
+    );
     assert!(attention(&exact, "attention-pr-base", "missing-evidence").is_none());
 }
 
@@ -336,6 +720,15 @@ fn missing_cost_only_accepts_the_explicit_unknown_disposition() {
         .expect("missing-cost attention");
     let attention_id = item["attentionId"].as_str().expect("attention id");
     let occurrence_id = item["occurrenceId"].as_str().expect("occurrence id");
+    let action = &item["nextActions"][0];
+    assert_eq!(action["verb"], json!("attention resolve"));
+    assert_eq!(
+        action["args"],
+        json!({"id": "attention-cost", "disposition": "accepted-unknown", "note": null})
+    );
+    assert!(action["reason"]
+        .as_str()
+        .is_some_and(|reason| reason.contains("config file")));
 
     let (_, refused) = env.forged(&[
         "attention",
@@ -369,7 +762,9 @@ fn missing_cost_only_accepts_the_explicit_unknown_disposition() {
         "--actor",
         "operator",
         "--disposition",
-        "accepted-unknown",
+        action["args"]["disposition"]
+            .as_str()
+            .expect("pre-bound disposition"),
     ]);
     assert_eq!(accepted["ok"], json!(true), "{accepted}");
     assert!(attention(&overview(&env), "attention-cost", "missing-cost").is_none());
@@ -462,6 +857,15 @@ fn missing_evidence_is_adjudicated_per_occurrence_with_its_full_attempt_scope() 
     let item = attention(&overview(&env), "attention-evidence", "missing-evidence")
         .expect("missing-evidence attention");
     assert_eq!(item["state"], json!("open"));
+    assert_eq!(
+        item["nextActions"],
+        json!([{
+            "verb": "attention resolve",
+            "args": {"id": "attention-evidence", "disposition": "evidence-absent", "note": null},
+            "reason": "bind a nonblank note explaining why this attempt-only evidence was never captured",
+        }])
+    );
+    let evidence_action = item["nextActions"][0].clone();
     let attempt_refs: Vec<String> = item["evidenceRefs"]
         .as_array()
         .expect("evidence refs")
@@ -553,7 +957,9 @@ fn missing_evidence_is_adjudicated_per_occurrence_with_its_full_attempt_scope() 
         "--actor",
         "operator",
         "--disposition",
-        "evidence-absent",
+        evidence_action["args"]["disposition"]
+            .as_str()
+            .expect("pre-bound evidence disposition"),
         "--note",
         "attempts predate the artifact manifest",
     ]);

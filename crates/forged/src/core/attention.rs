@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::core::work_types::IssueSummary;
 use forged_ledger::{
     AdmissionReservationState, AttemptState, DesiredReconcileOutcome, DesiredState, EffectClass,
-    EventRow, InventorySnapshot, InventoryUsage, RunOutcome, WorkObservationSnapshot,
+    EventRow, InventorySnapshot, InventoryUsage, RunOutcome, RunState, WorkObservationSnapshot,
 };
 use forged_types::{
     attention_id, attention_occurrence_id, AdmissionOutcome, AdmissionReason,
@@ -232,42 +232,149 @@ pub(crate) fn policy(
 
 /// Closed recommendation-code to domain-verb table. A new code stays
 /// non-executable until its transition has an end-to-end honesty test.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn recommendation_actions(
     recommendation: &AttentionRecommendedActionV1,
+    subject_id: &str,
+    subject_kind: AttentionSubjectKind,
+    run: Option<&forged_ledger::RunRow>,
+    desired_state: Option<DesiredState>,
     work_id: Option<&str>,
+    occurrence_resolution_allowed: bool,
+    risk_acceptance_allowed: bool,
 ) -> Vec<OperationActionV1> {
     use AttentionActionCode as Action;
-    let (verb, args) = match recommendation.code {
+    let action = |verb: &str, args: Value, reason: &str| {
+        let Value::Object(args) = args else {
+            unreachable!("attention action args are objects")
+        };
+        OperationActionV1 {
+            verb: verb.to_owned(),
+            args,
+            reason: reason.to_owned(),
+        }
+    };
+    let attention_resolution = |disposition: Value, reason: &str| {
+        action(
+            "attention resolve",
+            json!({"id": subject_id, "disposition": disposition, "note": Value::Null}),
+            reason,
+        )
+    };
+    let retryable = run.filter(|run| {
+        run.state == RunState::Stopped
+            && !matches!(
+                run.terminal_outcome,
+                Some(RunOutcome::Landed | RunOutcome::Superseded)
+            )
+            && run.superseded_by.is_none()
+    });
+    match recommendation.code {
         Action::ResolveBlocker => {
             let Some(work_id) = work_id else {
                 return Vec::new();
             };
-            ("work reopen", json!({"id": work_id}))
+            vec![action(
+                "work reopen",
+                json!({"id": work_id}),
+                &recommendation.text,
+            )]
         }
-        Action::ProvideInput
-        | Action::ReconcileWork
+        Action::ProvideInput => match subject_kind {
+            AttentionSubjectKind::Epic => vec![action(
+                "epic resolve",
+                json!({"epic": subject_id, "child": Value::Null, "note": Value::Null}),
+                "bind the held child when the input requirement names one and record the resolution note",
+            )],
+            AttentionSubjectKind::Run => retryable.map_or_else(Vec::new, |run| {
+                vec![super::ops::retry_action(
+                    subject_id,
+                    super::ops::retry_reason(run),
+                )]
+            }),
+        },
+        Action::AdjudicateQuarantine => vec![attention_resolution(
+            Value::Null,
+            "bind the adjudicated disposition and note for this exact quarantined occurrence",
+        )],
+        Action::RepairPricing => vec![attention_resolution(
+            json!("accepted-unknown"),
+            "edit the config file to repair pricing, or bind a note accepting this unknown spend",
+        )],
+        Action::ReviseRoster => match subject_kind {
+            AttentionSubjectKind::Run => vec![action(
+                "run revise-roster",
+                json!({"run": subject_id, "roster": Value::Null, "reason": Value::Null}),
+                "bind a configured roster name and the reason for revising provider policy",
+            )],
+            AttentionSubjectKind::Epic => vec![action(
+                "epic revise-roster",
+                json!({"epic": subject_id, "roster": Value::Null, "reason": Value::Null}),
+                "bind a configured roster name and the reason for revising provider policy",
+            )],
+        },
+        Action::AdjudicateReview => {
+            let mut actions = vec![attention_resolution(
+                Value::Null,
+                "bind the adjudicated disposition and note for this exact review disagreement",
+            )];
+            if subject_kind == AttentionSubjectKind::Run && risk_acceptance_allowed {
+                actions.push(action(
+                    "run accept-risk",
+                    json!({"run": subject_id, "acceptedBy": Value::Null, "rationale": Value::Null}),
+                    "bind the accepting operator and rationale after the persisted terminal non-approve review outcome",
+                ));
+            }
+            actions
+        }
+        Action::ReauthorizeWork => match subject_kind {
+            AttentionSubjectKind::Run => {
+                if let Some(run) = retryable {
+                    vec![super::ops::retry_action(
+                        subject_id,
+                        super::ops::retry_reason(run),
+                    )]
+                } else if run.is_some_and(|run| run.state == RunState::Active) {
+                    vec![action(
+                        "run stop",
+                        json!({"run": subject_id, "outcome": Value::Null, "reason": Value::Null}),
+                        "stop with an outcome and reason, then retry the terminal run",
+                    )]
+                } else {
+                    Vec::new()
+                }
+            }
+            AttentionSubjectKind::Epic => {
+                if desired_state == Some(DesiredState::Paused) {
+                    vec![action(
+                        "epic resume",
+                        json!({"epic": subject_id, "reason": Value::Null}),
+                        "bind the reason for resuming the paused epic",
+                    )]
+                } else {
+                    vec![action(
+                        "epic submit",
+                        json!({"epic": subject_id}),
+                        "resubmit the epic to authorize a fresh controller revision",
+                    )]
+                }
+            }
+        },
+        Action::RepairEvidence if occurrence_resolution_allowed => vec![attention_resolution(
+            json!("evidence-absent"),
+            "bind a nonblank note explaining why this attempt-only evidence was never captured",
+        )],
+        // These decision codes have no honesty-tested in-surface domain verb.
+        // RepairEvidence is likewise empty for the repairable, non-attempt
+        // half because no delivery-evidence recording verb exists.
+        Action::MergePullRequest | Action::AdjudicateEffect | Action::RepairEvidence => Vec::new(),
+        Action::ReconcileWork
         | Action::ReclaimAttempt
-        | Action::AdjudicateQuarantine
-        | Action::MergePullRequest
-        | Action::RepairPricing
         | Action::RecoverController
-        | Action::ReauthorizeWork
         | Action::RepairGate
-        | Action::ReviseRoster
         | Action::WaitForProvider
-        | Action::WaitForCapacity
-        | Action::AdjudicateEffect
-        | Action::RepairEvidence
-        | Action::AdjudicateReview => return Vec::new(),
-    };
-    let Value::Object(args) = args else {
-        unreachable!("attention action args are objects")
-    };
-    vec![OperationActionV1 {
-        verb: verb.to_owned(),
-        args,
-        reason: recommendation.text.clone(),
-    }]
+        | Action::WaitForCapacity => Vec::new(),
+    }
 }
 
 fn subject_kind(entry: &Value) -> AttentionSubjectKind {
@@ -393,6 +500,41 @@ fn settlement_cursor(events: &[&EventRow], id: &str) -> i64 {
         .rev()
         .find(|event| event.kind == "run.settled" && event.run_id.as_deref() == Some(id))
         .map_or(0, |event| event.event_id)
+}
+
+fn exhausted_run_has_live_successor(input: &ProjectionInput<'_>, subject_id: &str) -> bool {
+    let Some(subject) = input.runs.iter().find(|run| run.run_id == subject_id) else {
+        return false;
+    };
+    let terminal = subject.state == RunState::Stopped || subject.terminal_outcome.is_some();
+    terminal
+        && input.runs.iter().any(|candidate| {
+            candidate.run_id != subject.run_id
+                && candidate.work_id == subject.work_id
+                && candidate.state == RunState::Active
+                && candidate.terminal_outcome.is_none()
+        })
+}
+
+fn persisted_risk_acceptance_allowed(input: &ProjectionInput<'_>, subject_id: &str) -> bool {
+    let Some(run) = input.runs.iter().find(|run| run.run_id == subject_id) else {
+        return false;
+    };
+    if run.state != RunState::Stopped || run.terminal_outcome != Some(RunOutcome::Blocked) {
+        return false;
+    }
+    let first = events(input, "run.protocol-terminal")
+        .filter(|event| event.run_id.as_deref() == Some(subject_id))
+        .min_by_key(|event| event.event_id);
+    let latest = events(input, "run.protocol-terminal")
+        .filter(|event| event.run_id.as_deref() == Some(subject_id));
+    let latest = latest.max_by_key(|event| event.event_id);
+    let rounds = |event: &EventRow| {
+        super::ops::risk_terminal_review_rounds(&event_value(&event.payload_json))
+    };
+    first
+        .and_then(rounds)
+        .is_some_and(|first_rounds| latest.and_then(rounds) == Some(first_rounds))
 }
 
 fn events<'a>(input: &'a ProjectionInput<'_>, kind: &'a str) -> impl Iterator<Item = &'a EventRow> {
@@ -907,6 +1049,11 @@ fn collect_domain_sources(input: &ProjectionInput<'_>) -> Result<Vec<RawAttentio
         if desired.exhausted_at.is_some()
             || desired.last_outcome == Some(DesiredReconcileOutcome::Exhausted)
         {
+            if desired.subject_kind == forged_ledger::DesiredSubjectKind::Run
+                && exhausted_run_has_live_successor(input, &desired.subject_id)
+            {
+                continue;
+            }
             add_raw(
                 &mut raw,
                 &desired.subject_id,
@@ -1664,13 +1811,19 @@ fn transition_state(
 /// repairable — recording the exact-base PR clears it — so any occurrence
 /// carrying non-attempt evidence refuses explicit resolution.
 pub(crate) fn resolution_allowed(item: &AttentionItemV1) -> bool {
-    match item.condition {
+    resolution_allowed_for(item.condition, &item.evidence_refs)
+}
+
+fn resolution_allowed_for(
+    condition: AttentionCondition,
+    evidence_refs: &[AttentionEvidenceRefV1],
+) -> bool {
+    match condition {
         AttentionCondition::Quarantined
         | AttentionCondition::MissingCost
         | AttentionCondition::RetryExhausted
         | AttentionCondition::ReviewerDisagreement => true,
-        AttentionCondition::MissingEvidence => item
-            .evidence_refs
+        AttentionCondition::MissingEvidence => evidence_refs
             .iter()
             .all(|evidence| evidence.kind == AttentionEvidenceKind::Attempt),
         _ => false,
@@ -1808,9 +1961,34 @@ fn project(input: ProjectionInput<'_>) -> Result<Vec<AttentionItemV1>, Failure> 
             .updated_at
             .unwrap_or_else(|| latest.updated_at.clone());
         let recommended_action = latest.action.clone();
+        let run = input.runs.iter().find(|run| run.run_id == subject_id);
+        let desired_state = input
+            .desired_work
+            .iter()
+            .find(|desired| {
+                desired.subject_id == subject_id
+                    && matches!(
+                        (desired.subject_kind, subject_kind),
+                        (
+                            forged_ledger::DesiredSubjectKind::Run,
+                            AttentionSubjectKind::Run
+                        ) | (
+                            forged_ledger::DesiredSubjectKind::Epic,
+                            AttentionSubjectKind::Epic
+                        )
+                    )
+            })
+            .map(|desired| desired.desired_state);
+        let occurrence_resolution_allowed = resolution_allowed_for(condition, &evidence_refs);
         let next_actions = recommendation_actions(
             &recommended_action,
+            &subject_id,
+            subject_kind,
+            run,
+            desired_state,
             work_by_subject.get(subject_id.as_str()).copied(),
+            occurrence_resolution_allowed,
+            persisted_risk_acceptance_allowed(&input, &subject_id),
         );
         projected.push(Projected {
             source_cursor: latest.source_cursor,
@@ -2055,6 +2233,229 @@ mod tests {
         );
         snapshot.runs.push(run);
         snapshot
+    }
+
+    fn action_verbs(
+        condition: AttentionCondition,
+        subject_kind: AttentionSubjectKind,
+        run: Option<&RunRow>,
+        desired_state: Option<DesiredState>,
+        resolution_allowed: bool,
+        risk_allowed: bool,
+    ) -> Vec<String> {
+        recommendation_actions(
+            &policy(condition).2,
+            "subject-1",
+            subject_kind,
+            run,
+            desired_state,
+            None,
+            resolution_allowed,
+            risk_allowed,
+        )
+        .into_iter()
+        .map(|action| action.verb)
+        .collect()
+    }
+
+    #[test]
+    fn decision_action_table_is_subject_and_state_qualified() {
+        let active = run_row("subject-1", RunState::Active, None);
+        let retryable = run_row(
+            "subject-1",
+            RunState::Stopped,
+            Some(RunOutcome::InputRequired),
+        );
+        let landed = run_row("subject-1", RunState::Stopped, Some(RunOutcome::Landed));
+
+        assert_eq!(
+            action_verbs(
+                AttentionCondition::InputRequired,
+                AttentionSubjectKind::Epic,
+                None,
+                None,
+                false,
+                false,
+            ),
+            ["epic resolve"]
+        );
+        assert!(action_verbs(
+            AttentionCondition::InputRequired,
+            AttentionSubjectKind::Run,
+            Some(&active),
+            None,
+            false,
+            false,
+        )
+        .is_empty());
+        assert_eq!(
+            action_verbs(
+                AttentionCondition::InputRequired,
+                AttentionSubjectKind::Run,
+                Some(&retryable),
+                None,
+                false,
+                false,
+            ),
+            ["run retry"]
+        );
+        assert_eq!(
+            action_verbs(
+                AttentionCondition::Quarantined,
+                AttentionSubjectKind::Run,
+                Some(&active),
+                None,
+                true,
+                false,
+            ),
+            ["attention resolve"]
+        );
+        assert_eq!(
+            action_verbs(
+                AttentionCondition::MissingCost,
+                AttentionSubjectKind::Run,
+                Some(&active),
+                None,
+                true,
+                false,
+            ),
+            ["attention resolve"]
+        );
+        assert_eq!(
+            action_verbs(
+                AttentionCondition::RetryExhausted,
+                AttentionSubjectKind::Run,
+                Some(&active),
+                None,
+                true,
+                false,
+            ),
+            ["run revise-roster"]
+        );
+        assert_eq!(
+            action_verbs(
+                AttentionCondition::RetryExhausted,
+                AttentionSubjectKind::Epic,
+                None,
+                None,
+                true,
+                false,
+            ),
+            ["epic revise-roster"]
+        );
+        assert_eq!(
+            action_verbs(
+                AttentionCondition::ReviewerDisagreement,
+                AttentionSubjectKind::Run,
+                Some(&retryable),
+                None,
+                true,
+                true,
+            ),
+            ["attention resolve", "run accept-risk"]
+        );
+        assert_eq!(
+            action_verbs(
+                AttentionCondition::ReviewerDisagreement,
+                AttentionSubjectKind::Run,
+                Some(&retryable),
+                None,
+                true,
+                false,
+            ),
+            ["attention resolve"]
+        );
+        assert_eq!(
+            action_verbs(
+                AttentionCondition::RestartBudgetExhausted,
+                AttentionSubjectKind::Run,
+                Some(&active),
+                None,
+                false,
+                false,
+            ),
+            ["run stop"]
+        );
+        assert_eq!(
+            action_verbs(
+                AttentionCondition::RestartBudgetExhausted,
+                AttentionSubjectKind::Run,
+                Some(&retryable),
+                None,
+                false,
+                false,
+            ),
+            ["run retry"]
+        );
+        assert!(action_verbs(
+            AttentionCondition::RestartBudgetExhausted,
+            AttentionSubjectKind::Run,
+            Some(&landed),
+            None,
+            false,
+            false,
+        )
+        .is_empty());
+        assert_eq!(
+            action_verbs(
+                AttentionCondition::RestartBudgetExhausted,
+                AttentionSubjectKind::Epic,
+                None,
+                Some(DesiredState::Paused),
+                false,
+                false,
+            ),
+            ["epic resume"]
+        );
+        assert_eq!(
+            action_verbs(
+                AttentionCondition::RestartBudgetExhausted,
+                AttentionSubjectKind::Epic,
+                None,
+                Some(DesiredState::Stopped),
+                false,
+                false,
+            ),
+            ["epic submit"]
+        );
+        assert_eq!(
+            action_verbs(
+                AttentionCondition::MissingEvidence,
+                AttentionSubjectKind::Run,
+                Some(&active),
+                None,
+                true,
+                false,
+            ),
+            ["attention resolve"]
+        );
+        assert!(action_verbs(
+            AttentionCondition::MissingEvidence,
+            AttentionSubjectKind::Run,
+            Some(&active),
+            None,
+            false,
+            false,
+        )
+        .is_empty());
+        assert!(action_verbs(
+            AttentionCondition::MergeApproval,
+            AttentionSubjectKind::Run,
+            Some(&active),
+            None,
+            false,
+            false,
+        )
+        .is_empty());
+        assert!(action_verbs(
+            AttentionCondition::AmbiguousEffect,
+            AttentionSubjectKind::Run,
+            Some(&active),
+            None,
+            false,
+            false,
+        )
+        .is_empty());
     }
 
     fn desired(id: &str) -> DesiredWorkRow {
