@@ -1421,6 +1421,7 @@ CREATE TABLE policy_revisions (
 CREATE UNIQUE INDEX policy_revision_operation
   ON policy_revisions(operation_id) WHERE operation_id IS NOT NULL;
 ALTER TABLE packets ADD COLUMN policy_revision INTEGER;
+";
 
 /// Embedded ordered migrations; `user_version` records the last applied index.
 const MIGRATIONS: &[&str] = &[
