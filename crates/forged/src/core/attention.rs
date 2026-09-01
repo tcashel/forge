@@ -49,10 +49,7 @@ pub(crate) const ATTENTION_EVENT_KINDS: [&str; 13] = [
 
 #[derive(Debug, Clone)]
 struct RawAttention {
-    subject_kind: AttentionSubjectKind,
     subject_id: String,
-    subject_title: Option<forged_types::WorkTitleV1>,
-    repository: Option<String>,
     condition: AttentionCondition,
     severity: AttentionSeverity,
     owner: AttentionOwner,
@@ -78,6 +75,7 @@ enum ProjectionSurface<'a> {
         snapshot: &'a WorkObservationSnapshot,
         review_disagreements: &'a [(String, i64, String, Value)],
         results: &'a BTreeMap<i64, PacketResult>,
+        subject_title: &'a WorkTitleV1,
     },
 }
 
@@ -88,10 +86,24 @@ impl ProjectionSurface<'_> {
 }
 
 struct ProjectionInput<'a> {
-    snapshot: &'a InventorySnapshot,
+    runs: &'a [forged_ledger::RunRow],
+    attempts: &'a [forged_ledger::AttemptRow],
+    attempts_missing_artifacts: Vec<&'a forged_ledger::AttemptRow>,
+    events: Vec<&'a EventRow>,
+    desired_work: &'a [forged_ledger::DesiredWorkRow],
+    inflight_operations: &'a [forged_ledger::OperationRow],
+    admission_decisions: &'a [forged_types::AdmissionDecisionV1],
+    admission_reservations: &'a [forged_ledger::AdmissionReservationRow],
+    usage: ProjectionUsage<'a>,
     entries: &'a [Value],
     work: &'a [IssueSummary],
     surface: ProjectionSurface<'a>,
+}
+
+#[derive(Clone, Copy)]
+enum ProjectionUsage<'a> {
+    Inventory(&'a InventoryUsage),
+    Observation(&'a WorkObservationSnapshot),
 }
 
 pub(crate) fn policy(
@@ -280,6 +292,60 @@ fn repository(entry: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 
+struct SubjectMetadata {
+    kind: AttentionSubjectKind,
+    title: Option<WorkTitleV1>,
+    repository: Option<String>,
+}
+
+fn subject_metadata(input: &ProjectionInput<'_>, id: &str) -> Option<SubjectMetadata> {
+    let ProjectionSurface::Observation {
+        snapshot,
+        subject_title,
+        ..
+    } = &input.surface
+    else {
+        let entry = input
+            .entries
+            .iter()
+            .find(|entry| entry.get("id").and_then(Value::as_str) == Some(id))?;
+        return Some(SubjectMetadata {
+            kind: subject_kind(entry),
+            title: subject_title(entry),
+            repository: repository(entry),
+        });
+    };
+    if let Some(run) = snapshot.runs.iter().find(|run| run.run_id == id) {
+        let title =
+            if snapshot.subject.kind == WorkIdentitySubjectKind::Run && snapshot.subject.id == id {
+                Some((*subject_title).clone())
+            } else {
+                snapshot
+                    .child_identities
+                    .iter()
+                    .find(|identity| identity.subject.id == id)
+                    .map(|identity| forged_types::resolve_work_title(identity, None))
+            };
+        return Some(SubjectMetadata {
+            kind: AttentionSubjectKind::Run,
+            title,
+            repository: Some(run.repo.clone()),
+        });
+    }
+    (snapshot.subject.id == id).then(|| SubjectMetadata {
+        kind: match snapshot.subject.kind {
+            WorkIdentitySubjectKind::Run => AttentionSubjectKind::Run,
+            WorkIdentitySubjectKind::Epic => AttentionSubjectKind::Epic,
+        },
+        title: Some((*subject_title).clone()),
+        repository: snapshot
+            .identity
+            .repository
+            .as_ref()
+            .map(|repository| repository.path.clone()),
+    })
+}
+
 fn event_value(text: &str) -> Value {
     serde_json::from_str(text).unwrap_or(Value::Null)
 }
@@ -290,7 +356,6 @@ fn event_value(text: &str) -> Value {
 #[allow(clippy::too_many_arguments)]
 fn add_raw(
     raw: &mut Vec<RawAttention>,
-    entries: &BTreeMap<String, &Value>,
     subject_id: &str,
     condition: AttentionCondition,
     opened_at: impl Into<String>,
@@ -302,15 +367,9 @@ fn add_raw(
     evidence_kind: AttentionEvidenceKind,
     evidence_id: impl Into<String>,
 ) {
-    let Some(entry) = entries.get(subject_id) else {
-        return;
-    };
     let (severity, owner, action) = policy(condition);
     raw.push(RawAttention {
-        subject_kind: subject_kind(entry),
         subject_id: subject_id.to_owned(),
-        subject_title: subject_title(entry),
-        repository: repository(entry),
         condition,
         severity,
         owner,
@@ -328,29 +387,38 @@ fn add_raw(
     });
 }
 
-fn settlement_cursor(snapshot: &InventorySnapshot, id: &str) -> i64 {
-    snapshot
-        .events("run.settled")
+fn settlement_cursor(events: &[&EventRow], id: &str) -> i64 {
+    events
         .iter()
         .rev()
-        .find(|event| event.run_id.as_deref() == Some(id))
+        .find(|event| event.kind == "run.settled" && event.run_id.as_deref() == Some(id))
         .map_or(0, |event| event.event_id)
 }
 
+fn events<'a>(input: &'a ProjectionInput<'_>, kind: &'a str) -> impl Iterator<Item = &'a EventRow> {
+    input
+        .events
+        .iter()
+        .copied()
+        .filter(move |event| event.kind == kind)
+}
+
+fn observed_reservation_subject<'a>(
+    observation_subject: &'a str,
+    packet_run: Option<&'a str>,
+    kind: forged_types::AdmissionSubjectKind,
+) -> &'a str {
+    if kind == forged_types::AdmissionSubjectKind::Packet {
+        packet_run.unwrap_or(observation_subject)
+    } else {
+        observation_subject
+    }
+}
+
 fn collect_domain_sources(input: &ProjectionInput<'_>) -> Result<Vec<RawAttention>, Failure> {
-    let snapshot = input.snapshot;
     let entries_slice = input.entries;
     let work = input.work;
     let observation = input.surface.is_observation();
-    let InventoryUsage::Included {
-        totals: usage_totals,
-        latest_missing,
-    } = &snapshot.usage
-    else {
-        return Err(Failure::internal(
-            "attention projection requires included inventory usage",
-        ));
-    };
     let entries: BTreeMap<String, &Value> = entries_slice
         .iter()
         .filter_map(|entry| Some((entry.get("id")?.as_str()?.to_owned(), entry)))
@@ -364,7 +432,7 @@ fn collect_domain_sources(input: &ProjectionInput<'_>) -> Result<Vec<RawAttentio
     // Latest input event wins by append order. Resolution self-clears it.
     let mut latest_input: BTreeMap<String, (&str, &forged_ledger::EventRow)> = BTreeMap::new();
     for kind in [epic::INPUT_REQUIRED, epic::INPUT_RESOLVED] {
-        for event in snapshot.events(kind) {
+        for event in events(input, kind) {
             let Some(id) = event.run_id.as_ref() else {
                 continue;
             };
@@ -410,7 +478,6 @@ fn collect_domain_sources(input: &ProjectionInput<'_>) -> Result<Vec<RawAttentio
         };
         add_raw(
             &mut raw,
-            &entries,
             &id,
             AttentionCondition::InputRequired,
             &event.ts,
@@ -434,7 +501,7 @@ fn collect_domain_sources(input: &ProjectionInput<'_>) -> Result<Vec<RawAttentio
         let cursor = if observation {
             0
         } else {
-            settlement_cursor(snapshot, id)
+            settlement_cursor(&input.events, id)
         };
         match outcome {
             Some("blocked") => {
@@ -466,7 +533,6 @@ fn collect_domain_sources(input: &ProjectionInput<'_>) -> Result<Vec<RawAttentio
                 };
                 add_raw(
                     &mut raw,
-                    &entries,
                     id,
                     AttentionCondition::Blocked,
                     updated,
@@ -501,7 +567,6 @@ fn collect_domain_sources(input: &ProjectionInput<'_>) -> Result<Vec<RawAttentio
                 };
                 add_raw(
                     &mut raw,
-                    &entries,
                     id,
                     AttentionCondition::InputRequired,
                     updated,
@@ -541,7 +606,6 @@ fn collect_domain_sources(input: &ProjectionInput<'_>) -> Result<Vec<RawAttentio
                 };
                 add_raw(
                     &mut raw,
-                    &entries,
                     id,
                     condition,
                     updated,
@@ -598,7 +662,6 @@ fn collect_domain_sources(input: &ProjectionInput<'_>) -> Result<Vec<RawAttentio
             );
             add_raw(
                 &mut raw,
-                &entries,
                 id,
                 AttentionCondition::Blocked,
                 updated,
@@ -616,7 +679,7 @@ fn collect_domain_sources(input: &ProjectionInput<'_>) -> Result<Vec<RawAttentio
     // A later success clears the exact pending reconciliation promise.
     let mut work_settlement: BTreeMap<String, (&str, &forged_ledger::EventRow)> = BTreeMap::new();
     for kind in [WORK_SETTLEMENT_PENDING, WORK_SETTLEMENT_SUCCEEDED] {
-        for event in snapshot.events(kind) {
+        for event in events(input, kind) {
             let Some(id) = event.run_id.as_ref() else {
                 continue;
             };
@@ -652,7 +715,6 @@ fn collect_domain_sources(input: &ProjectionInput<'_>) -> Result<Vec<RawAttentio
             });
         add_raw(
             &mut raw,
-            &entries,
             &id,
             AttentionCondition::WorkSettlementPending,
             &event.ts,
@@ -671,8 +733,8 @@ fn collect_domain_sources(input: &ProjectionInput<'_>) -> Result<Vec<RawAttentio
     }
 
     // Revocation and quarantine custody.
-    for attempt in snapshot
-        .live_attempts
+    for attempt in input
+        .attempts
         .iter()
         .filter(|attempt| attempt.state == AttemptState::Revoking)
     {
@@ -681,7 +743,6 @@ fn collect_domain_sources(input: &ProjectionInput<'_>) -> Result<Vec<RawAttentio
         };
         add_raw(
             &mut raw,
-            &entries,
             &id,
             AttentionCondition::Revoking,
             &attempt.updated_at,
@@ -706,7 +767,7 @@ fn collect_domain_sources(input: &ProjectionInput<'_>) -> Result<Vec<RawAttentio
         );
     }
     let mut latest_quarantine: BTreeMap<String, &forged_ledger::EventRow> = BTreeMap::new();
-    for event in snapshot.events("proto.quarantine") {
+    for event in events(input, "proto.quarantine") {
         if let Some(id) = event.run_id.as_ref() {
             latest_quarantine.insert(id.clone(), event);
         }
@@ -724,7 +785,6 @@ fn collect_domain_sources(input: &ProjectionInput<'_>) -> Result<Vec<RawAttentio
         };
         add_raw(
             &mut raw,
-            &entries,
             &id,
             AttentionCondition::Quarantined,
             &event.ts,
@@ -749,10 +809,7 @@ fn collect_domain_sources(input: &ProjectionInput<'_>) -> Result<Vec<RawAttentio
     }
 
     // Partial spend uses the latest unpriced usage row as the occurrence.
-    if let ProjectionSurface::Observation {
-        snapshot: observed, ..
-    } = &input.surface
-    {
+    if let ProjectionUsage::Observation(observed) = input.usage {
         for (id, totals) in &observed.usage_totals {
             if totals.rows_missing_cost == 0 {
                 continue;
@@ -779,7 +836,6 @@ fn collect_domain_sources(input: &ProjectionInput<'_>) -> Result<Vec<RawAttentio
             );
             add_raw(
                 &mut raw,
-                &entries,
                 id,
                 AttentionCondition::MissingCost,
                 &row.ts,
@@ -800,17 +856,18 @@ fn collect_domain_sources(input: &ProjectionInput<'_>) -> Result<Vec<RawAttentio
                 format!("usage:{id}:{offset}"),
             );
         }
-    } else {
+    } else if let ProjectionUsage::Inventory(InventoryUsage::Included {
+        totals,
+        latest_missing,
+    }) = input.usage
+    {
         for (id, (usage_id, observed_at)) in latest_missing {
-            let count = usage_totals
-                .get(id)
-                .map_or(0, |totals| totals.rows_missing_cost);
+            let count = totals.get(id).map_or(0, |totals| totals.rows_missing_cost);
             if count == 0 {
                 continue;
             }
             add_raw(
                 &mut raw,
-                &entries,
                 id,
                 AttentionCondition::MissingCost,
                 observed_at,
@@ -823,6 +880,10 @@ fn collect_domain_sources(input: &ProjectionInput<'_>) -> Result<Vec<RawAttentio
                 usage_id.to_string(),
             );
         }
+    } else {
+        return Err(Failure::internal(
+            "attention projection requires included inventory usage",
+        ));
     }
 
     // Desired-work exhaustion is explicit. Controller-dead is narrower:
@@ -831,7 +892,7 @@ fn collect_domain_sources(input: &ProjectionInput<'_>) -> Result<Vec<RawAttentio
     // also represents input/admission holds and must never be relabelled.
     let as_of = now_iso();
     let mut supervisor_attention: BTreeMap<String, &forged_ledger::EventRow> = BTreeMap::new();
-    for event in snapshot.events("forged.supervisor.attention") {
+    for event in events(input, "forged.supervisor.attention") {
         let Some(id) = event.run_id.as_ref() else {
             continue;
         };
@@ -842,13 +903,12 @@ fn collect_domain_sources(input: &ProjectionInput<'_>) -> Result<Vec<RawAttentio
             supervisor_attention.insert(id.clone(), event);
         }
     }
-    for desired in &snapshot.desired_work {
+    for desired in input.desired_work {
         if desired.exhausted_at.is_some()
             || desired.last_outcome == Some(DesiredReconcileOutcome::Exhausted)
         {
             add_raw(
                 &mut raw,
-                &entries,
                 &desired.subject_id,
                 AttentionCondition::RestartBudgetExhausted,
                 desired
@@ -949,7 +1009,6 @@ fn collect_domain_sources(input: &ProjectionInput<'_>) -> Result<Vec<RawAttentio
             };
         add_raw(
             &mut raw,
-            &entries,
             &desired.subject_id,
             AttentionCondition::ControllerDead,
             opened_at,
@@ -1029,7 +1088,6 @@ fn collect_domain_sources(input: &ProjectionInput<'_>) -> Result<Vec<RawAttentio
                 .unwrap_or(observed.identity.captured_at.as_str());
             add_raw(
                 &mut raw,
-                &entries,
                 &id,
                 AttentionCondition::FailedGate,
                 updated_at,
@@ -1044,7 +1102,7 @@ fn collect_domain_sources(input: &ProjectionInput<'_>) -> Result<Vec<RawAttentio
         }
     } else {
         let mut latest_gate: BTreeMap<String, &forged_ledger::EventRow> = BTreeMap::new();
-        for event in snapshot.events("proto.gate") {
+        for event in events(input, "proto.gate") {
             if let Some(id) = event.run_id.as_ref() {
                 latest_gate.insert(id.clone(), event);
             }
@@ -1054,15 +1112,15 @@ fn collect_domain_sources(input: &ProjectionInput<'_>) -> Result<Vec<RawAttentio
             if payload.get("passed").and_then(Value::as_bool) != Some(false) {
                 continue;
             }
-            let has_live = snapshot.live_attempts.iter().any(|attempt| {
+            let has_live = input.attempts.iter().any(|attempt| {
                 split_packet_key(&attempt.packet_id).is_ok_and(|(run_id, _, _)| run_id == id)
             });
-            let has_scheduled = snapshot.desired_work.iter().any(|desired| {
+            let has_scheduled = input.desired_work.iter().any(|desired| {
                 desired.subject_id == id
                     && desired.desired_state == DesiredState::Running
                     && desired.next_wake_at.is_some()
             });
-            let has_closing_outcome = snapshot.runs.iter().any(|run| {
+            let has_closing_outcome = input.runs.iter().any(|run| {
                 run.run_id == id
                     && matches!(
                         run.terminal_outcome,
@@ -1079,7 +1137,6 @@ fn collect_domain_sources(input: &ProjectionInput<'_>) -> Result<Vec<RawAttentio
             }
             add_raw(
                 &mut raw,
-                &entries,
                 &id,
                 AttentionCondition::FailedGate,
                 &event.ts,
@@ -1096,7 +1153,7 @@ fn collect_domain_sources(input: &ProjectionInput<'_>) -> Result<Vec<RawAttentio
 
     // Terminal provider exhaustion.
     let mut latest_terminal: BTreeMap<String, &forged_ledger::EventRow> = BTreeMap::new();
-    for event in snapshot.events("run.protocol-terminal") {
+    for event in events(input, "run.protocol-terminal") {
         if let Some(id) = event.run_id.as_ref() {
             latest_terminal.insert(id.clone(), event);
         }
@@ -1117,7 +1174,6 @@ fn collect_domain_sources(input: &ProjectionInput<'_>) -> Result<Vec<RawAttentio
         }
         add_raw(
             &mut raw,
-            &entries,
             &id,
             AttentionCondition::RetryExhausted,
             &event.ts,
@@ -1134,7 +1190,7 @@ fn collect_domain_sources(input: &ProjectionInput<'_>) -> Result<Vec<RawAttentio
     // Only typed rate-limit decisions are provider degradation. Routine
     // capacity deferrals remain queued work until a parked controller
     // crosses its wake threshold and appends the durable marker below.
-    for decision in &snapshot.admission_decisions {
+    for decision in input.admission_decisions {
         if decision.outcome != AdmissionOutcome::Deferred
             || !matches!(
                 decision.reason,
@@ -1177,7 +1233,6 @@ fn collect_domain_sources(input: &ProjectionInput<'_>) -> Result<Vec<RawAttentio
         };
         add_raw(
             &mut raw,
-            &entries,
             &subject_id,
             AttentionCondition::ProviderDegraded,
             updated,
@@ -1206,7 +1261,7 @@ fn collect_domain_sources(input: &ProjectionInput<'_>) -> Result<Vec<RawAttentio
     // attention control resolves it. Rate-limit deferrals keep their
     // ProviderDegraded projection above.
     let mut parked: BTreeMap<String, (&forged_ledger::EventRow, Value)> = BTreeMap::new();
-    for event in snapshot.events("forged.admission.attention") {
+    for event in events(input, "forged.admission.attention") {
         let Some(id) = event.run_id.as_ref() else {
             continue;
         };
@@ -1225,7 +1280,7 @@ fn collect_domain_sources(input: &ProjectionInput<'_>) -> Result<Vec<RawAttentio
         let Some(packet_id) = payload.get("packetId").and_then(Value::as_str) else {
             continue;
         };
-        let deferred = snapshot.admission_decisions.iter().find(|decision| {
+        let deferred = input.admission_decisions.iter().find(|decision| {
             decision.subject_kind == forged_types::AdmissionSubjectKind::Packet
                 && decision.subject_id == packet_id
                 && decision.outcome == AdmissionOutcome::Deferred
@@ -1250,7 +1305,6 @@ fn collect_domain_sources(input: &ProjectionInput<'_>) -> Result<Vec<RawAttentio
         };
         add_raw(
             &mut raw,
-            &entries,
             &id,
             AttentionCondition::AdmissionDeferred,
             &event.ts,
@@ -1272,7 +1326,7 @@ fn collect_domain_sources(input: &ProjectionInput<'_>) -> Result<Vec<RawAttentio
     }
 
     // Ambiguous external effects and retained unknown-effect capacity.
-    for operation in &snapshot.inflight_operations {
+    for operation in input.inflight_operations {
         if operation.effect_class != EffectClass::HumanAmbiguous {
             continue;
         }
@@ -1287,7 +1341,6 @@ fn collect_domain_sources(input: &ProjectionInput<'_>) -> Result<Vec<RawAttentio
         };
         add_raw(
             &mut raw,
-            &entries,
             id,
             AttentionCondition::AmbiguousEffect,
             &operation.created_at,
@@ -1303,24 +1356,27 @@ fn collect_domain_sources(input: &ProjectionInput<'_>) -> Result<Vec<RawAttentio
             &operation.operation_id,
         );
     }
-    for reservation in snapshot
+    for reservation in input
         .admission_reservations
         .iter()
         .filter(|row| row.state == AdmissionReservationState::Orphaned)
     {
-        let subject_id = match (&input.surface, reservation.subject_kind) {
-            (
-                ProjectionSurface::Observation {
-                    snapshot: observed, ..
-                },
-                forged_types::AdmissionSubjectKind::Packet,
-            ) => observed
-                .packets
-                .iter()
-                .find(|packet| packet.packet_id == reservation.subject_id)
-                .map(|packet| packet.run_id.clone())
-                .unwrap_or_else(|| observed.subject.id.clone()),
-            (_, forged_types::AdmissionSubjectKind::Packet) => {
+        let subject_id = match &input.surface {
+            ProjectionSurface::Observation {
+                snapshot: observed, ..
+            } => observed_reservation_subject(
+                &observed.subject.id,
+                observed
+                    .packets
+                    .iter()
+                    .find(|packet| packet.packet_id == reservation.subject_id)
+                    .map(|packet| packet.run_id.as_str()),
+                reservation.subject_kind,
+            )
+            .to_owned(),
+            ProjectionSurface::Inventory
+                if reservation.subject_kind == forged_types::AdmissionSubjectKind::Packet =>
+            {
                 let Ok((run_id, _, _)) = split_packet_key(&reservation.subject_id) else {
                     continue;
                 };
@@ -1330,7 +1386,6 @@ fn collect_domain_sources(input: &ProjectionInput<'_>) -> Result<Vec<RawAttentio
         };
         add_raw(
             &mut raw,
-            &entries,
             &subject_id,
             AttentionCondition::AmbiguousEffect,
             &reservation.created_at,
@@ -1346,7 +1401,7 @@ fn collect_domain_sources(input: &ProjectionInput<'_>) -> Result<Vec<RawAttentio
 
     // The snapshot performs the attempt-to-manifest anti-join inside its one
     // transaction. No artifact path is opened by this ordinary projection.
-    for attempt in &snapshot.attempts_missing_artifacts {
+    for attempt in &input.attempts_missing_artifacts {
         let id = match &input.surface {
             ProjectionSurface::Inventory => {
                 let Ok((id, _, _)) = split_packet_key(&attempt.packet_id) else {
@@ -1365,7 +1420,6 @@ fn collect_domain_sources(input: &ProjectionInput<'_>) -> Result<Vec<RawAttentio
         };
         add_raw(
             &mut raw,
-            &entries,
             &id,
             AttentionCondition::MissingEvidence,
             &attempt.updated_at,
@@ -1400,7 +1454,6 @@ fn collect_domain_sources(input: &ProjectionInput<'_>) -> Result<Vec<RawAttentio
                 .unwrap_or(observed.identity.captured_at.as_str());
             add_raw(
                 &mut raw,
-                &entries,
                 id,
                 AttentionCondition::ReviewerDisagreement,
                 updated_at,
@@ -1415,7 +1468,7 @@ fn collect_domain_sources(input: &ProjectionInput<'_>) -> Result<Vec<RawAttentio
         }
     } else {
         let mut reviews: BTreeMap<String, Vec<(&forged_ledger::EventRow, Value)>> = BTreeMap::new();
-        for event in snapshot.events("proto.review") {
+        for event in events(input, "proto.review") {
             let Some(id) = event.run_id.as_ref() else {
                 continue;
             };
@@ -1451,7 +1504,6 @@ fn collect_domain_sources(input: &ProjectionInput<'_>) -> Result<Vec<RawAttentio
             let event_ids: Vec<i64> = selected.iter().map(|(event, _)| event.event_id).collect();
             add_raw(
                 &mut raw,
-                &entries,
                 &id,
                 AttentionCondition::ReviewerDisagreement,
                 &newest.0.ts,
@@ -1482,6 +1534,7 @@ struct TransitionState {
 fn transition_state(
     events: &[&EventRow],
     complete: bool,
+    observation: bool,
     attention: &str,
     occurrence: &str,
 ) -> Result<TransitionState, Failure> {
@@ -1499,13 +1552,27 @@ fn transition_state(
             continue;
         }
         let payload: Value = serde_json::from_str(&event.payload_json).map_err(|error| {
-            Failure::internal(format!("invalid stored attention transition: {error}"))
+            Failure::internal(if observation {
+                format!(
+                    "attention transition event {} has invalid stored JSON: {error}",
+                    event.event_id
+                )
+            } else {
+                format!("invalid stored attention transition: {error}")
+            })
         })?;
         if payload.get("schema").and_then(Value::as_str) != Some("forged.attention-transition/1") {
-            return Err(Failure::internal(format!(
-                "unknown stored attention transition schema in event {}",
-                event.event_id
-            )));
+            return Err(Failure::internal(if observation {
+                format!(
+                    "attention transition event {} has an unsupported schema",
+                    event.event_id
+                )
+            } else {
+                format!(
+                    "unknown stored attention transition schema in event {}",
+                    event.event_id
+                )
+            }));
         }
         if payload.get("attentionId").and_then(Value::as_str) == Some(attention)
             && payload.get("occurrenceId").and_then(Value::as_str) == Some(occurrence)
@@ -1529,6 +1596,9 @@ fn transition_state(
                 // resurrect custody. The writer now refuses it atomically;
                 // retain fail-closed projection for historical/manual rows.
                 if state == AttentionState::Resolved {
+                    if observation {
+                        updated = Some(event.ts.clone());
+                    }
                     continue;
                 }
                 state = AttentionState::Acknowledged;
@@ -1544,7 +1614,11 @@ fn transition_state(
                         || Failure::internal("stored resolution has no disposition"),
                     )?)
                     .map_err(|error| {
-                        Failure::internal(format!("unknown stored resolution disposition: {error}"))
+                        Failure::internal(if observation {
+                            format!("stored resolution has an unknown disposition: {error}")
+                        } else {
+                            format!("unknown stored resolution disposition: {error}")
+                        })
                     })?;
                 state = AttentionState::Resolved;
                 resolution = Some(AttentionResolutionV1 {
@@ -1560,6 +1634,9 @@ fn transition_state(
             }
             REOPENED => {
                 if state != AttentionState::Resolved {
+                    if observation {
+                        updated = Some(event.ts.clone());
+                    }
                     continue;
                 }
                 state = AttentionState::Open;
@@ -1658,22 +1735,19 @@ fn project(input: ProjectionInput<'_>) -> Result<Vec<AttentionItemV1>, Failure> 
             blocked_work.contains(work_id).then_some((subject, work_id))
         })
         .collect();
-    let mut buckets: BTreeMap<
-        (AttentionSubjectKind, String, AttentionCondition),
-        Vec<RawAttention>,
-    > = BTreeMap::new();
+    let mut buckets: BTreeMap<(String, AttentionCondition), Vec<RawAttention>> = BTreeMap::new();
     for source in raw {
         buckets
-            .entry((
-                source.subject_kind,
-                source.subject_id.clone(),
-                source.condition,
-            ))
+            .entry((source.subject_id.clone(), source.condition))
             .or_default()
             .push(source);
     }
     let mut projected = Vec::new();
-    for ((subject_kind, subject_id, condition), mut sources) in buckets {
+    for ((subject_id, condition), mut sources) in buckets {
+        let Some(subject) = subject_metadata(&input, &subject_id) else {
+            continue;
+        };
+        let subject_kind = subject.kind;
         sources.sort_by(|left, right| {
             (left.source_cursor, &left.source_id).cmp(&(right.source_cursor, &right.source_id))
         });
@@ -1685,27 +1759,31 @@ fn project(input: ProjectionInput<'_>) -> Result<Vec<AttentionItemV1>, Failure> 
             .collect::<Vec<_>>()
             .join("\n");
         let occurrence_id = attention_occurrence_id(&stable_id, &causal);
-        let (transition_events, controls_complete): (Vec<&EventRow>, bool) = match &input.surface {
-            ProjectionSurface::Inventory => (
-                [ACKNOWLEDGED, RESOLVED, REOPENED]
-                    .into_iter()
-                    .flat_map(|kind| input.snapshot.events(kind))
-                    .collect(),
-                true,
-            ),
-            ProjectionSurface::Observation {
-                snapshot: observed, ..
-            } => (
-                observed.events.rows.iter().collect(),
-                observed.events.after_event_id == 0
-                    && !observed.events.has_more
-                    && !(observed.subject.kind == WorkIdentitySubjectKind::Epic
-                        && subject_kind == AttentionSubjectKind::Run),
-            ),
-        };
+        let (transition_events, controls_complete, observation): (Vec<&EventRow>, bool, bool) =
+            match &input.surface {
+                ProjectionSurface::Inventory => (
+                    [ACKNOWLEDGED, RESOLVED, REOPENED]
+                        .into_iter()
+                        .flat_map(|kind| events(&input, kind))
+                        .collect(),
+                    true,
+                    false,
+                ),
+                ProjectionSurface::Observation {
+                    snapshot: observed, ..
+                } => (
+                    observed.events.rows.iter().collect(),
+                    observed.events.after_event_id == 0
+                        && !observed.events.has_more
+                        && !(observed.subject.kind == WorkIdentitySubjectKind::Epic
+                            && subject_kind == AttentionSubjectKind::Run),
+                    true,
+                ),
+            };
         let transition = transition_state(
             &transition_events,
             controls_complete,
+            observation,
             &stable_id,
             &occurrence_id,
         )?;
@@ -1748,8 +1826,8 @@ fn project(input: ProjectionInput<'_>) -> Result<Vec<AttentionItemV1>, Failure> 
                 occurrence_id,
                 subject_kind,
                 subject_id,
-                subject_title: latest.subject_title.clone(),
-                repository: latest.repository.clone(),
+                subject_title: subject.title,
+                repository: subject.repository,
                 condition,
                 severity: latest.severity,
                 owner: latest.owner,
@@ -1798,7 +1876,15 @@ pub(crate) fn project_all(
     work: &[IssueSummary],
 ) -> Result<Vec<AttentionItemV1>, Failure> {
     project(ProjectionInput {
-        snapshot,
+        runs: &snapshot.runs,
+        attempts: &snapshot.live_attempts,
+        attempts_missing_artifacts: snapshot.attempts_missing_artifacts.iter().collect(),
+        events: snapshot.events_by_kind.values().flatten().collect(),
+        desired_work: &snapshot.desired_work,
+        inflight_operations: &snapshot.inflight_operations,
+        admission_decisions: &snapshot.admission_decisions,
+        admission_reservations: &snapshot.admission_reservations,
+        usage: ProjectionUsage::Inventory(&snapshot.usage),
         entries,
         work,
         surface: ProjectionSurface::Inventory,
@@ -1822,42 +1908,29 @@ pub(crate) fn project_observation(
         .map(|row| row.attempt_id)
         .collect::<BTreeSet<_>>();
     let events_complete = observed.events.after_event_id == 0 && !observed.events.has_more;
-    let mut events_by_kind = BTreeMap::<String, Vec<EventRow>>::new();
-    if events_complete {
-        for event in &observed.events.rows {
-            events_by_kind
-                .entry(event.kind.clone())
-                .or_default()
-                .push(event.clone());
-        }
-    }
-    let mut work_identities = BTreeMap::new();
-    work_identities.insert(
-        (
-            observed.identity.subject.kind,
-            observed.identity.subject.id.clone(),
-        ),
-        observed.identity.clone(),
-    );
-    for identity in &observed.child_identities {
-        work_identities.insert(
-            (identity.subject.kind, identity.subject.id.clone()),
-            identity.clone(),
-        );
-    }
-    let snapshot = InventorySnapshot {
-        runs: observed.runs.clone(),
-        live_attempts: observed
-            .attempts
-            .iter()
-            .filter(|attempt| {
-                matches!(
-                    attempt.state,
-                    AttemptState::Running | AttemptState::Revoking
-                )
+    let events = if events_complete {
+        observed.events.rows.iter().collect()
+    } else {
+        Vec::new()
+    };
+
+    let entries = observed
+        .runs
+        .iter()
+        .map(|run| {
+            json!({
+                "id": run.run_id,
+                "beadId": run.work_id,
+                "outcome": run.terminal_outcome.map(RunOutcome::as_str),
+                "updatedAt": run.updated_at,
+                "stopReason": run.stop_reason,
             })
-            .cloned()
-            .collect(),
+        })
+        .collect::<Vec<_>>();
+    let work = live_work.into_iter().cloned().collect::<Vec<_>>();
+    Ok(project(ProjectionInput {
+        runs: &observed.runs,
+        attempts: &observed.attempts,
         attempts_missing_artifacts: observed
             .attempts
             .iter()
@@ -1867,75 +1940,20 @@ pub(crate) fn project_observation(
                     AttemptState::Completed | AttemptState::Failed
                 ) && !artifacts.contains(&attempt.attempt_id)
             })
-            .cloned()
             .collect(),
-        usage: InventoryUsage::Included {
-            totals: observed.usage_totals.clone(),
-            latest_missing: BTreeMap::new(),
-        },
-        latest_event: BTreeMap::new(),
-        events_by_kind,
-        desired_work: observed.desired_work.clone(),
-        inflight_operations: observed.inflight_operations.clone(),
-        admission_decisions: observed.admission_decisions.clone(),
-        admission_reservations: observed.admission_reservations.clone(),
-        work_identities,
-    };
-
-    let observed_title = |kind: AttentionSubjectKind, id: &str| -> Option<WorkTitleV1> {
-        let own_kind = match observed.subject.kind {
-            WorkIdentitySubjectKind::Run => AttentionSubjectKind::Run,
-            WorkIdentitySubjectKind::Epic => AttentionSubjectKind::Epic,
-        };
-        if kind == own_kind && id == observed.subject.id {
-            return Some(subject_title.clone());
-        }
-        observed
-            .child_identities
-            .iter()
-            .find(|identity| identity.subject.id == id)
-            .map(|identity| forged_types::resolve_work_title(identity, None))
-    };
-    let mut entries = observed
-        .runs
-        .iter()
-        .map(|run| {
-            json!({
-                "id": run.run_id,
-                "kind": "slice",
-                "titleSource": observed_title(AttentionSubjectKind::Run, &run.run_id),
-                "repo": run.repo,
-                "beadId": run.work_id,
-                "outcome": run.terminal_outcome.map(RunOutcome::as_str),
-                "updatedAt": run.updated_at,
-                "stopReason": run.stop_reason,
-                "baseRef": run.base_ref,
-                "delivery": {
-                    "pr": run.delivery_pr,
-                    "sha": run.delivery_sha,
-                },
-            })
-        })
-        .collect::<Vec<_>>();
-    if observed.subject.kind == WorkIdentitySubjectKind::Epic {
-        entries.push(json!({
-            "id": observed.subject.id,
-            "kind": "epic",
-            "titleSource": observed_title(AttentionSubjectKind::Epic, &observed.subject.id),
-            "repo": observed.identity.repository.as_ref().map(|repository| repository.path.as_str()),
-            "beadId": observed.identity.work.id,
-            "updatedAt": observed.identity.captured_at,
-        }));
-    }
-    let work = live_work.into_iter().cloned().collect::<Vec<_>>();
-    Ok(project(ProjectionInput {
-        snapshot: &snapshot,
+        events,
+        desired_work: &observed.desired_work,
+        inflight_operations: &observed.inflight_operations,
+        admission_decisions: &observed.admission_decisions,
+        admission_reservations: &observed.admission_reservations,
+        usage: ProjectionUsage::Observation(observed),
         entries: &entries,
         work: &work,
         surface: ProjectionSurface::Observation {
             snapshot: observed,
             review_disagreements,
             results,
+            subject_title,
         },
     })?
     .into_iter()
@@ -2361,5 +2379,75 @@ mod tests {
             .expect("project admitted packet")
             .iter()
             .all(|item| item.condition != AttentionCondition::AdmissionDeferred));
+    }
+
+    #[test]
+    fn epic_observation_keeps_run_reservation_identity_on_the_epic() {
+        let subject = observed_reservation_subject(
+            "epic-owner",
+            Some("child-run"),
+            AdmissionSubjectKind::Run,
+        );
+        assert_eq!(subject, "epic-owner");
+        let stable = attention_id(
+            AttentionSubjectKind::Epic,
+            subject,
+            AttentionCondition::AmbiguousEffect,
+        );
+        assert_eq!(
+            stable,
+            "fc9d8fb4d7d601fc67b888c24bfb0facbc91b6634f108b76eb5f4ded2071c1fb"
+        );
+        assert_ne!(
+            stable,
+            attention_id(
+                AttentionSubjectKind::Run,
+                "child-run",
+                AttentionCondition::AmbiguousEffect,
+            )
+        );
+        assert_eq!(
+            attention_occurrence_id(&stable, "reservation:reservation-run"),
+            "17007eceae60891f195f5cde6319106b458fd4fe19ed3194d8ad02117f96b848"
+        );
+    }
+
+    #[test]
+    fn observation_transition_noops_advance_time_and_parse_errors_name_the_event() {
+        let resolved = event(
+            7,
+            "run-transition",
+            RESOLVED,
+            json!({
+                "schema": "forged.attention-transition/1",
+                "attentionId": "attention",
+                "occurrenceId": "occurrence",
+                "actor": "operator",
+                "disposition": "fixed",
+            }),
+        );
+        let stale = event(
+            8,
+            "run-transition",
+            ACKNOWLEDGED,
+            json!({
+                "schema": "forged.attention-transition/1",
+                "attentionId": "attention",
+                "occurrenceId": "occurrence",
+                "actor": "lead",
+            }),
+        );
+        let state = transition_state(&[&resolved, &stale], true, true, "attention", "occurrence")
+            .expect("project observation transitions");
+        assert_eq!(state.state, AttentionState::Resolved);
+        assert_eq!(state.updated_at, Some(stale.ts));
+
+        let mut invalid = event(9, "run-transition", ACKNOWLEDGED, Value::Null);
+        invalid.payload_json = "{".to_owned();
+        let error = match transition_state(&[&invalid], true, true, "attention", "occurrence") {
+            Err(error) => error,
+            Ok(_) => panic!("invalid stored transition was accepted"),
+        };
+        assert!(error.message.contains("transition event 9"), "{error:?}");
     }
 }
