@@ -43,6 +43,7 @@ fn packet_at(run_id: &str, revision: &str, body_sha256: &str) -> NewPacket {
         spec_path: format!("/runs/{run_id}/packets/implement/0/spec.md"),
         spec_sha256: body_sha256.to_owned(),
         spec_revision: Some(revision.to_owned()),
+        policy_revision: None,
         body_json: format!("{{\"schema\":\"forged.packet/1\",\"branch\":\"forged/{run_id}\"}}"),
     }
 }

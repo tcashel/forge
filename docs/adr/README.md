@@ -48,6 +48,7 @@ Each ADR is **self-contained**. Read individual files on demand — **do not loa
 | 0032 | [forged: a provider-neutral Rust orchestrator supersedes both product lines](./0032-forged-provider-neutral-rust-orchestrator.md) | Accepted |
 | 0033 | [Execution packages separate planning, orchestration, and provider cognition](./0033-execution-package-ownership-boundary.md) | Accepted |
 | 0034 | [The ledger owns the work graph; bd becomes the one-shot import source](./0034-ledger-native-work-store.md) | Accepted |
+| 0035 | [Operational policy revisions apply at durable stage boundaries](./0035-operational-policy-revisions-at-durable-stage-boundaries.md) | Accepted |
 
 ## Foundational ADRs
 

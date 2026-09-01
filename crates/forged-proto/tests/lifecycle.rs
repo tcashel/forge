@@ -196,6 +196,7 @@ async fn full_slice_v1_lifecycle_in_process() {
                             spec_path: "spec.md".to_owned(),
                             spec_sha256: "cafe".to_owned(),
                             spec_revision: None,
+                            policy_revision: None,
                             body_json: "{}".to_owned(),
                         })
                         .expect("open packet");

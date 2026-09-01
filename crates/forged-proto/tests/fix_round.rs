@@ -148,6 +148,69 @@ fn a_transport_failure_with_no_grant_yet_counts_from_history_and_waits_on_nothin
 }
 
 #[test]
+fn policy_revision_cutoff_does_not_rescore_pre_revision_failures() {
+    let mut builder = at_fix().budget(1);
+    for _ in 0..4 {
+        builder = builder.failed(Stage::Fix, 1, "transport: old failure");
+    }
+    let mut view = builder.build();
+    let cutoff = "2026-08-12T00:00:01.000000000Z";
+    view.active_policy_revision = Some(forged_ledger::PolicyRevisionRow {
+        run_id: RUN.to_owned(),
+        revision: 2,
+        policy_json: serde_json::to_string(&view.policy).expect("policy JSON"),
+        policy_sha256: "policy-revision-2".to_owned(),
+        reason: "raise transport retry budget".to_owned(),
+        created_at: cutoff.to_owned(),
+        operation_id: Some("policy-operation-2".to_owned()),
+    });
+    assert_eq!(
+        advance(&view),
+        NextAction::AwaitPacket {
+            packet_id: packet_id(RUN, Stage::Fix, 1),
+            not_before: None,
+        },
+        "failures before the revision boundary are outside the new budget epoch"
+    );
+
+    let history = view
+        .terminal_attempts
+        .get_mut(&packet_id(RUN, Stage::Fix, 1))
+        .expect("fix history");
+    history.push(forged_proto::TerminalAttempt {
+        attempt_id: 100,
+        state: forged_ledger::AttemptState::Failed,
+        outcome: None,
+        fail_note: Some("transport: new failure one".to_owned()),
+        started_at: cutoff.to_owned(),
+    });
+    assert!(matches!(
+        advance(&view),
+        NextAction::AwaitPacket {
+            not_before: None,
+            ..
+        }
+    ));
+    view.terminal_attempts
+        .get_mut(&packet_id(RUN, Stage::Fix, 1))
+        .expect("fix history")
+        .push(forged_proto::TerminalAttempt {
+            attempt_id: 101,
+            state: forged_ledger::AttemptState::Failed,
+            outcome: None,
+            fail_note: Some("transport: new failure two".to_owned()),
+            started_at: cutoff.to_owned(),
+        });
+    assert_eq!(
+        advance(&view),
+        NextAction::Stop(Terminal::ProviderUnavailable {
+            stage: Stage::Fix,
+            attempts: 2,
+        })
+    );
+}
+
+#[test]
 fn semantic_failure_consumes_the_round_and_stops_done() {
     let view = at_fix()
         .failed(Stage::Fix, 1, "could not apply findings")

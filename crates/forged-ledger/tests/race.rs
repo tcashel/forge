@@ -25,6 +25,7 @@ fn seed_packet(ledger: &Ledger, run_id: &str) -> String {
             spec_path: "specs/race.md".to_owned(),
             spec_sha256: "feed".to_owned(),
             spec_revision: None,
+            policy_revision: None,
             body_json: "{}".to_owned(),
         })
         .expect("open packet")
@@ -102,7 +103,7 @@ fn eight_concurrent_opens_migrate_once() {
         ledgers.push(handle.join().expect("open thread").expect("open succeeds"));
     }
     for ledger in &ledgers {
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 25);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 26);
     }
     for ledger in ledgers {
         ledger.close().expect("close");

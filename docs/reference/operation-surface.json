@@ -147,6 +147,15 @@
     {
       "class": "fenced",
       "cli": true,
+      "cliVerb": "epic revise-policy",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": true,
+      "name": "epic_revise_policy"
+    },
+    {
+      "class": "fenced",
+      "cli": true,
       "cliVerb": "epic revise-roster",
       "dispatch": true,
       "explicitKey": false,
@@ -350,6 +359,15 @@
       "explicitKey": false,
       "mcp": true,
       "name": "run_retry"
+    },
+    {
+      "class": "fenced",
+      "cli": true,
+      "cliVerb": "run revise-policy",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": true,
+      "name": "run_revise_policy"
     },
     {
       "class": "fenced",

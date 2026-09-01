@@ -24,6 +24,11 @@ owned by Forged.
 - Changing cognition for already-running work uses the typed
   `epic revise-roster` or `run revise-roster` lifecycle operation through
   `../manage-work/SKILL.md`, never an authoring-config edit.
+- Repairing a wrong frozen gate command, stage budget, or transport-retry
+  budget starts with the config edit here, then uses `run revise-policy` or
+  `epic revise-policy` through `../manage-work/SKILL.md`. The verb accepts no
+  field values and applies the config-sourced policy only at the next packet
+  boundary.
 - `forged definition validate` is the acceptance gate.
 - Provider CLIs own routing and authentication. Configure an inference gateway
   in the provider's settings, not here.
@@ -157,7 +162,9 @@ forged doctor
 
 Report resolved defaults, every role's selected candidate with a short reason,
 whether the built-in or a custom rate card applies, and every unpriced model.
-State that new starts pick up the change and already-started work does not.
+State that new starts pick up every change. Already-started work changes only
+through an explicit supported revision: roster revisions for cognition, or
+policy revisions for gate commands, stage budgets, and transport-retry budget.
 
 ## Never
 

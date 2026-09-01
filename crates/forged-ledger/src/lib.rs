@@ -72,11 +72,11 @@ pub use types::{
     OperationOutcome, OperationRow, OperationState, OperationTicket, OwnedHerdrCleanupReason,
     OwnedHerdrCleanupRelease, OwnedHerdrCleanupRetry, OwnedHerdrCleanupState,
     OwnedHerdrLifecycleState, OwnedHerdrOwnerKind, OwnedHerdrSessionRow, PacketRow,
-    PendingWorkSettlementRow, Pragmas, ReviewFindingDeliveryClaim, ReviewFindingDeliveryKey,
-    ReviewFindingDeliveryOutcome, ReviewFindingDeliveryRow, ReviewFindingDeliveryState,
-    ReviewPublicationSource, RevokeScope, RosterRevisionBatch, RosterRevisionRow, RunDefinitionRow,
-    RunOutcome, RunRow, RunSettlement, RunState, SlotOutcome, SpecFence, UsageRecord, UsageTotals,
-    WorkSettlementRetryRow,
+    PendingWorkSettlementRow, PolicyRevisionBatch, PolicyRevisionRow, PolicyRevisionWrite, Pragmas,
+    ReviewFindingDeliveryClaim, ReviewFindingDeliveryKey, ReviewFindingDeliveryOutcome,
+    ReviewFindingDeliveryRow, ReviewFindingDeliveryState, ReviewPublicationSource, RevokeScope,
+    RosterRevisionBatch, RosterRevisionRow, RunDefinitionRow, RunOutcome, RunRow, RunSettlement,
+    RunState, SlotOutcome, SpecFence, UsageRecord, UsageTotals, WorkSettlementRetryRow,
 };
 pub use work::{
     ImportedWorkItem, NewWorkItem, NewWorkNote, WorkDepKind, WorkDepRow, WorkDependencyStatus,

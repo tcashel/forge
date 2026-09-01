@@ -14,7 +14,9 @@ use crate::time::now_iso;
 use crate::types::{stage_as_str, stage_from_db, NewPacket, PacketRow};
 
 pub(crate) const PACKET_COLUMNS: &str = "packet_id, run_id, stage, seq, spec_path, spec_sha256, \
-     spec_revision, body_json, created_at";
+     spec_revision, policy_revision, body_json, created_at";
+
+type PacketReplayFields = (String, String, Option<String>, Option<i64>, String);
 
 pub(crate) fn packet_row(row: &rusqlite::Row<'_>) -> Result<PacketRow, rusqlite::Error> {
     Ok(PacketRow {
@@ -27,8 +29,19 @@ pub(crate) fn packet_row(row: &rusqlite::Row<'_>) -> Result<PacketRow, rusqlite:
         spec_path: row.get(4)?,
         spec_sha256: row.get(5)?,
         spec_revision: row.get(6)?,
-        body_json: row.get(7)?,
-        created_at: row.get(8)?,
+        policy_revision: row
+            .get::<_, Option<i64>>(7)?
+            .map(u32::try_from)
+            .transpose()
+            .map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    7,
+                    rusqlite::types::Type::Integer,
+                    Box::new(error),
+                )
+            })?,
+        body_json: row.get(8)?,
+        created_at: row.get(9)?,
     })
 }
 
@@ -188,16 +201,29 @@ impl Ledger {
         self.submit(move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             require_run(&tx, &new_packet.run_id)?;
-            let existing: Option<(String, String, Option<String>, String)> = tx
+            let existing: Option<PacketReplayFields> = tx
                 .query_row(
-                    "SELECT spec_path, spec_sha256, spec_revision, body_json FROM packets \
+                    "SELECT spec_path, spec_sha256, spec_revision, policy_revision, body_json \
+                     FROM packets \
                      WHERE packet_id = ?1",
                     [&packet_id],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
                 )
                 .optional()?;
-            if let Some((spec_path, spec_sha256, spec_revision, body_json)) = existing {
-                if body_json != new_packet.body_json {
+            if let Some((spec_path, spec_sha256, spec_revision, policy_revision, body_json)) =
+                existing
+            {
+                if body_json != new_packet.body_json
+                    || policy_revision != new_packet.policy_revision.map(i64::from)
+                {
                     return Err(refused(
                         ErrorCode::InvalidRequest,
                         format!(
@@ -244,8 +270,8 @@ impl Ledger {
             }
             tx.execute(
                 "INSERT INTO packets (packet_id, run_id, stage, seq, spec_path, \
-                 spec_sha256, spec_revision, body_json, created_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                 spec_sha256, spec_revision, policy_revision, body_json, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 rusqlite::params![
                     packet_id,
                     new_packet.run_id,
@@ -254,6 +280,7 @@ impl Ledger {
                     new_packet.spec_path,
                     new_packet.spec_sha256,
                     new_packet.spec_revision,
+                    new_packet.policy_revision,
                     new_packet.body_json,
                     now_iso(),
                 ],

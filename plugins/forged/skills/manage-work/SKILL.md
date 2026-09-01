@@ -34,6 +34,7 @@ execution, or an existing-work control become a new submission.
 | Execute one ready epic | Apply the execution gate, then follow `../run-epic/SKILL.md` | One approved start and submit |
 | Express intended priority for an existing item | Guarded notes update and readback | Records intent only; scheduling priority is unchanged |
 | Pause or resume an existing epic | One typed epic control and readback | That already-started epic only |
+| Repair a frozen gate command, stage budget, or transport-retry budget | Edit and validate operator config through `../configure/SKILL.md`, then one `run revise-policy` or `epic revise-policy` and readback | The next packet boundary of that existing run or unmerged epic children only |
 | Cancel an existing slice run | Confirm, then one `run stop` with `cancelled` | That run's terminal transition only |
 | Re-execute an eligible terminal slice after the world changed or its Work spec was amended in place | One `run retry` and readback | One fresh successor run on the same Work |
 | Settle a run whose `run stop` refuses for missing durable driver identity | Confirm the evidence gap, then one `run adjudicate-settlement` | That run's terminal transition only |
@@ -312,6 +313,39 @@ Pause takes effect at its landed durable boundary. Resume is not input
 resolution and does not authorize `epic submit`. An ineligible epic must follow
 its exact domain and attention action. There is no inferred slice pause or
 generic epic stop.
+
+## Repair a frozen operational policy
+
+Use this path only when durable evidence shows a run is doomed by a wrong gate
+command, stage budget, or transport-retry budget. Read the current run or epic,
+its active policy revision, and the packet/attempt boundary first. Edit and
+validate the operator config through `../configure/SKILL.md`; never pass policy
+fields to the revision verb.
+
+For one run:
+
+```bash
+forged run revise-policy --run "$RUN_ID" --reason "$REASON" \
+  --idempotency-key "$OPERATION_KEY"
+forged work detail --subject-kind run --subject-id "$RUN_ID"
+```
+
+For one epic:
+
+```bash
+forged epic revise-policy --epic "$EPIC_ID" --reason "$REASON" \
+  --idempotency-key "$OPERATION_KEY"
+forged work detail --subject-kind epic --subject-id "$EPIC_ID"
+```
+
+The revision splices live `gate_commands`, `stage_budget_s`, and
+`transport_retry_budget` over the standing policy. It retains termination,
+host, and Herdr identity fields, never rewrites the frozen package, never
+changes an open packet or live attempt, and applies when the next packet opens.
+Epic form updates current unmerged children atomically; merged children remain
+untouched. Re-read the active policy revision and packet provenance. A legacy
+definition-less refusal is terminal for this verb; follow its remedy instead
+of fabricating a package or editing `state.db`.
 
 ## Cancel a slice run
 

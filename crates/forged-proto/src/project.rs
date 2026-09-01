@@ -22,6 +22,7 @@ use serde_json::Value;
 
 use crate::engine::{
     machine_idempotency_key, MachineStage, ProfileEscalation, RunView, TerminalAttempt,
+    TimedRetryGrant,
 };
 use crate::error::ProtoError;
 use crate::events::parse_proto_events;
@@ -132,10 +133,12 @@ pub fn project_run_with_policy(
     let events = fetch_all_events(ledger, run_id)?;
     let terminal_attempts = reconstruct_terminal_attempts(ledger, &events)?;
     let proto_events = parse_proto_events(&events)?;
+    let retry_grants = timed_retry_grants(&events)?;
     let profile_escalations = parse_profile_escalations(&events)?;
     let accepted_risk = parse_accepted_risk(&run, &events)?;
     let settled_operations = settled_machine_operations(ledger, run_id, &packets)?;
     let mut active_roster_revision = None;
+    let mut active_policy_revision = None;
     let execution_package = match ledger.get_run_definition(run_id)? {
         Some(definition) => {
             let mut package: ExecutionPackageV1 = serde_json::from_str(&definition.package_json)
@@ -144,6 +147,12 @@ pub fn project_run_with_policy(
                         "stored execution package does not parse: {error}"
                     ))
                 })?;
+            if let Some(error) = package.policy.validate().into_iter().next() {
+                return Err(ProtoError::Projection(format!(
+                    "projected execution policy is invalid at {}: {}",
+                    error.path, error.message
+                )));
+            }
             if let Some(revision) = ledger.latest_roster_revision(run_id)? {
                 let resolved: ResolvedRosterV1 = serde_json::from_str(&revision.roster_json)
                     .map_err(|error| {
@@ -155,6 +164,16 @@ pub fn project_run_with_policy(
                 package.roster_sha256 = revision.roster_sha256.clone();
                 package.roster = resolved;
                 active_roster_revision = Some(revision);
+            }
+            if let Some(revision) = ledger.latest_policy_revision(run_id)? {
+                let policy: ExecutionPolicyV1 = serde_json::from_str(&revision.policy_json)
+                    .map_err(|error| {
+                        ProtoError::Projection(format!(
+                            "stored policy revision does not parse: {error}"
+                        ))
+                    })?;
+                package.policy = policy;
+                active_policy_revision = Some(revision);
             }
             Some(package)
         }
@@ -178,14 +197,42 @@ pub fn project_run_with_policy(
         inflight_operations,
         settled_operations,
         proto_events,
+        retry_grants,
         roster,
         policy,
         now: now.to_owned(),
         execution_package,
         active_roster_revision,
+        active_policy_revision,
         profile_escalations,
         accepted_risk,
     })
+}
+
+fn timed_retry_grants(events: &[EventRow]) -> Result<Vec<TimedRetryGrant>, ProtoError> {
+    let mut grants = Vec::new();
+    for row in events.iter().filter(|row| row.kind == "proto.retry") {
+        let parsed = parse_proto_events(std::slice::from_ref(row))?;
+        let Some(crate::events::ProtoEvent::Retry {
+            packet_id,
+            transport_failures,
+            retry_after,
+            ..
+        }) = parsed.into_iter().next()
+        else {
+            return Err(ProtoError::Projection(format!(
+                "retry event {} did not parse as a retry",
+                row.event_id
+            )));
+        };
+        grants.push(TimedRetryGrant {
+            packet_id,
+            transport_failures,
+            retry_after,
+            created_at: row.ts.clone(),
+        });
+    }
+    Ok(grants)
 }
 
 fn parse_accepted_risk(

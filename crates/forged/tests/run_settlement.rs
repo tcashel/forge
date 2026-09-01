@@ -412,6 +412,7 @@ fn settlement_refreshes_siblings_after_whole_run_deadline_reconciliation() {
                 spec_path: packet.spec.path.clone(),
                 spec_sha256: digest.clone(),
                 spec_revision: None,
+                policy_revision: None,
                 body_json: packet.stored_body().expect("stored packet"),
             })
             .expect("open packet");

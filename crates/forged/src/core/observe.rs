@@ -178,6 +178,29 @@ async fn roster_revisions(ctx: &Ctx, run_id: &str) -> Result<Vec<Value>, Failure
         .collect()
 }
 
+async fn policy_revisions(ctx: &Ctx, run_id: &str) -> Result<Vec<Value>, Failure> {
+    let run_id = run_id.to_owned();
+    let rows = on_ledger(&ctx.ledger, move |ledger| {
+        ledger.list_policy_revisions(&run_id)
+    })
+    .await?;
+    rows.into_iter()
+        .map(|row| {
+            let policy: Value = serde_json::from_str(&row.policy_json)
+                .map_err(|error| Failure::internal(format!("stored policy: {error}")))?;
+            Ok(json!({
+                "runId": row.run_id,
+                "revision": row.revision,
+                "policy": policy,
+                "policySha256": row.policy_sha256,
+                "reason": row.reason,
+                "createdAt": row.created_at,
+                "operationId": row.operation_id,
+            }))
+        })
+        .collect()
+}
+
 async fn run_overview(ctx: &Ctx, run_id: &str, after: i64, limit: u64) -> Result<Value, Failure> {
     let status =
         result(super::ops::run_status(ctx, &request(run_id, json!({"run": run_id}))).await)?;
@@ -210,6 +233,7 @@ async fn run_overview(ctx: &Ctx, run_id: &str, after: i64, limit: u64) -> Result
     };
     let findings = super::drive::latest_review_findings(&view);
     let roster_revisions = roster_revisions(ctx, run_id).await?;
+    let policy_revisions = policy_revisions(ctx, run_id).await?;
     Ok(json!({
         "schema": "forged.overview/1",
         "kind": "slice",
@@ -227,6 +251,7 @@ async fn run_overview(ctx: &Ctx, run_id: &str, after: i64, limit: u64) -> Result
         "artifacts": packet_artifacts(ctx, &view).await?,
         "interventions": event_payloads(&all_events, |kind| kind.starts_with("forged.intervention.")),
         "rosterRevisions": roster_revisions,
+        "policyRevisions": policy_revisions,
         "admission": run_admission,
         "usage": usage,
         "events": event_page,
@@ -840,6 +865,14 @@ async fn explain_run(ctx: &Ctx, id: String) -> Result<Value, Failure> {
         .filter(|attempt| attempt.state == AttemptState::Running)
         .count();
     let retry_of = super::ops::run_retry_of(ctx, &run.run_id).await?;
+    let policy_revision = {
+        let run_id = run.run_id.clone();
+        on_ledger(&ctx.ledger, move |ledger| {
+            ledger.latest_policy_revision(&run_id)
+        })
+        .await?
+        .map(|revision| revision.revision)
+    };
     let next = super::ops::run_projection_actions(run);
     Ok(json!({
         "schema": "forged.explain/1",
@@ -849,6 +882,7 @@ async fn explain_run(ctx: &Ctx, id: String) -> Result<Value, Failure> {
             "identity": observation.identity,
             "workId": run.work_id,
             "retryOf": retry_of,
+            "policyRevision": policy_revision,
             "state": run.state.as_str(),
             "outcome": run.terminal_outcome.map(RunOutcome::as_str),
             "stopReason": run.stop_reason,
@@ -922,6 +956,12 @@ async fn explain_attempt(ctx: &Ctx, resolved: forged_ledger::AttemptRow) -> Resu
         .iter()
         .find(|attempt| attempt.attempt_id == resolved.attempt_id)
         .ok_or_else(|| Failure::internal("attempt observation omitted its requested attempt"))?;
+    let policy_revision = {
+        let packet_id = attempt.packet_id.clone();
+        on_ledger(&ctx.ledger, move |ledger| ledger.get_packet(&packet_id))
+            .await?
+            .policy_revision
+    };
     let inputs = run_observation_inputs(&observation, run);
     let mut how = explain_how(inputs);
     how["attempt"] = json!({"state": attempt.state.as_str(), "stage": stage});
@@ -933,6 +973,7 @@ async fn explain_attempt(ctx: &Ctx, resolved: forged_ledger::AttemptRow) -> Resu
         "what": {
             "runId": run_id,
             "packetId": attempt.packet_id,
+            "policyRevision": policy_revision,
             "state": attempt.state.as_str(),
             "stage": stage,
             "startedAt": attempt.started_at,
@@ -1182,6 +1223,7 @@ fn packet_json(row: &forged_ledger::PacketRow) -> Value {
             "sha256": row.spec_sha256,
             "revision": row.spec_revision,
         },
+        "policyRevision": row.policy_revision,
         "createdAt": row.created_at,
     })
 }

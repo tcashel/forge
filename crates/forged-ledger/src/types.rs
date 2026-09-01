@@ -1406,6 +1406,37 @@ pub struct RosterRevisionBatch {
     pub operation_prefix: String,
 }
 
+/// One append-only `policy_revisions` row.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PolicyRevisionRow {
+    pub run_id: String,
+    pub revision: u32,
+    pub policy_json: String,
+    pub policy_sha256: String,
+    pub reason: String,
+    pub created_at: String,
+    pub operation_id: Option<String>,
+}
+
+/// One child write in an atomic epic policy transition.
+#[derive(Debug, Clone)]
+pub struct PolicyRevisionWrite {
+    pub run_id: String,
+    pub policy: forged_types::ExecutionPolicyV1,
+    pub policy_sha256: String,
+    pub operation_id: String,
+}
+
+/// One atomic epic policy transition: child revisions plus its parent event.
+#[derive(Debug, Clone)]
+pub struct PolicyRevisionBatch {
+    pub epic_id: String,
+    pub event_kind: String,
+    pub event_payload: serde_json::Value,
+    pub writes: Vec<PolicyRevisionWrite>,
+    pub reason: String,
+}
+
 /// One row of `packets`, in DDL column order.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PacketRow {
@@ -1424,6 +1455,10 @@ pub struct PacketRow {
     /// `packets.spec_revision` — the pinned work revision, `None` on a
     /// file-sourced packet.
     pub spec_revision: Option<String>,
+    /// `packets.policy_revision` — the execution policy that built the
+    /// packet's stage contract. `None` only for packets opened before the
+    /// provenance column or for definition-less runs.
+    pub policy_revision: Option<u32>,
     /// `packets.body_json` — stored verbatim, never parsed by the ledger.
     pub body_json: String,
     /// `packets.created_at`.
@@ -1697,6 +1732,8 @@ pub struct NewPacket {
     /// The work revision this packet pins, `None` when the spec came from a
     /// file. A non-`None` value is the packet's drift fence.
     pub spec_revision: Option<String>,
+    /// The execution-policy revision that built the packet's stage contract.
+    pub policy_revision: Option<u32>,
     /// Caller-serialized `WorkPacket` minus the columns above, stored
     /// verbatim.
     pub body_json: String,

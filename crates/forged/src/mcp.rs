@@ -1332,6 +1332,14 @@ impl ForgedServer {
         self.call("run_revise_roster", args.0).await
     }
 
+    #[tool(
+        name = "run_revise_policy",
+        description = "Append a config-sourced operational-policy revision for a run."
+    )]
+    pub async fn run_revise_policy(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
+        self.call("run_revise_policy", args.0).await
+    }
+
     /// Accept the final deduplicated findings after a terminal review failure.
     #[tool(
         name = "run_accept_risk",
@@ -1413,6 +1421,14 @@ impl ForgedServer {
     )]
     pub async fn epic_revise_roster(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
         self.call("epic_revise_roster", args.0).await
+    }
+
+    #[tool(
+        name = "epic_revise_policy",
+        description = "Append config-sourced policy revisions for unmerged epic children."
+    )]
+    pub async fn epic_revise_policy(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
+        self.call("epic_revise_policy", args.0).await
     }
 
     /// Unified reconnect projection, rendered by the optional MCP App.

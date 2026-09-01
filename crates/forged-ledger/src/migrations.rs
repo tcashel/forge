@@ -1215,6 +1215,24 @@ ALTER TABLE work_items ADD COLUMN repository TEXT GENERATED ALWAYS AS
 CREATE INDEX work_items_repository_status ON work_items(repository, status);
 ";
 
+/// Migration 026: append-only execution-policy revisions and the policy
+/// revision that froze each packet's stage contract.
+const MIGRATION_026: &str = "
+CREATE TABLE policy_revisions (
+  run_id        TEXT NOT NULL REFERENCES runs(run_id),
+  revision      INTEGER NOT NULL CHECK (revision > 0),
+  policy_json   TEXT NOT NULL,
+  policy_sha256 TEXT NOT NULL,
+  reason        TEXT NOT NULL CHECK (length(trim(reason)) > 0),
+  created_at    TEXT NOT NULL,
+  operation_id  TEXT,
+  PRIMARY KEY (run_id, revision)
+);
+CREATE UNIQUE INDEX policy_revision_operation
+  ON policy_revisions(operation_id) WHERE operation_id IS NOT NULL;
+ALTER TABLE packets ADD COLUMN policy_revision INTEGER;
+";
+
 /// Embedded ordered migrations; `user_version` records the last applied index.
 const MIGRATIONS: &[&str] = &[
     MIGRATION_001,
@@ -1242,6 +1260,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_023,
     MIGRATION_024,
     MIGRATION_025,
+    MIGRATION_026,
 ];
 
 /// Configure pragmas and apply pending migrations on a fresh connection.
@@ -1465,7 +1484,7 @@ mod tests {
         assert_eq!(pragmas.synchronous, 2);
         assert!(pragmas.foreign_keys);
         assert_eq!(pragmas.busy_timeout_ms, 5000);
-        assert_eq!(pragmas.user_version, 25);
+        assert_eq!(pragmas.user_version, 26);
         ledger.close().expect("close");
 
         // Table names via a separate connection: sqlite_master is data, and
@@ -1482,6 +1501,7 @@ mod tests {
             "run_definitions",
             "run_package_migrations",
             "roster_revisions",
+            "policy_revisions",
             "runtime_migrations",
             "desired_work",
             "attempt_artifacts",
@@ -1518,6 +1538,23 @@ mod tests {
             )
             .expect("partial index missing");
         assert_eq!(index, "one_live_attempt_per_packet");
+        let policy_index: String = conn
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type='index' AND name = ?",
+                ["policy_revision_operation"],
+                |row| row.get(0),
+            )
+            .expect("policy operation index missing");
+        assert_eq!(policy_index, "policy_revision_operation");
+        let packet_policy_revision: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('packets') \
+                 WHERE name = 'policy_revision'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("packet policy revision column");
+        assert_eq!(packet_policy_revision, 1);
         let event_index: String = conn
             .query_row(
                 "SELECT sql FROM sqlite_master WHERE type='index' AND name = ?",
@@ -1576,7 +1613,7 @@ mod tests {
         }
 
         let ledger = Ledger::open(&path).expect("upgrade v23 database");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 25);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 26);
         ledger.close().expect("close");
 
         let conn = rusqlite::Connection::open(&path).expect("raw migrated database");
@@ -1625,7 +1662,7 @@ mod tests {
         }
 
         let ledger = Ledger::open(&path).expect("upgrade v24 database");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 25);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 26);
         ledger.close().expect("close");
 
         let conn = rusqlite::Connection::open(path).expect("raw migrated database");
@@ -1693,7 +1730,7 @@ mod tests {
         }
 
         let ledger = Ledger::open(&path).expect("open migration-013 database");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 25);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 26);
         ledger.close().expect("close");
 
         let conn = rusqlite::Connection::open(&path).expect("open upgraded database");
@@ -1753,7 +1790,7 @@ mod tests {
 
             let ledger = Ledger::open(&path)
                 .unwrap_or_else(|error| panic!("upgrade from v{version} failed: {error}"));
-            assert_eq!(ledger.pragmas().expect("pragmas").user_version, 25);
+            assert_eq!(ledger.pragmas().expect("pragmas").user_version, 26);
             assert_eq!(
                 ledger
                     .list_events_by_kind("legacy.progress")
@@ -1853,7 +1890,7 @@ mod tests {
         }
 
         let ledger = Ledger::open(&path).expect("upgrade owned v20 database");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 25);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 26);
         assert!(ledger
             .get_owned_herdr_session("migration-owned")
             .expect("owned row")
@@ -1897,7 +1934,7 @@ mod tests {
             .close()
             .expect("close");
         let ledger = Ledger::open(&path).expect("second open");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 25);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 26);
         ledger.close().expect("close");
     }
 
@@ -1958,7 +1995,7 @@ mod tests {
                 .expect("mark v0");
         }
         let ledger = Ledger::open(&path).expect("migrate");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 25);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 26);
         let old = ledger.get_run("old-run").expect("old run");
         assert_eq!(old.work_id, "old-bead");
         assert_eq!(old.stop_reason.as_deref(), Some("legacy stop"));
@@ -2001,7 +2038,7 @@ mod tests {
         }
 
         let ledger = Ledger::open(&path).expect("migrate");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 25);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 26);
         let first = ledger.get_attempt(1).expect("attempt 1 survived");
         assert_eq!(first.claim_token, "tok-1");
         assert_eq!(first.state, crate::AttemptState::Reclaimed);

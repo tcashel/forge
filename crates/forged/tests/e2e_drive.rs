@@ -4014,6 +4014,371 @@ fn roster_revision_resets_transport_fallback_to_its_first_candidate() {
 }
 
 #[test]
+fn policy_revision_repairs_the_next_boundary_without_mutating_a_live_packet() {
+    let env = TestEnv::new("forged-policy-revision-boundary");
+    let config_path = env.anvil.join("config.json");
+    let mut config: Value =
+        serde_json::from_str(&std::fs::read_to_string(&config_path).expect("read initial config"))
+            .expect("initial config JSON");
+    config["gate_commands"] = json!(["false"]);
+    config["transport_retry_budget"] = json!(1);
+    std::fs::write(
+        &config_path,
+        serde_json::to_string_pretty(&config).expect("serialize initial policy"),
+    )
+    .expect("write initial policy");
+
+    assert_eq!(env.forged(&["init"]).0, 0);
+    env.seed_frontier("bead-policy-boundary");
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let spec = env.spec.to_string_lossy().into_owned();
+    let (code, started) = env.forged(&[
+        "run",
+        "start",
+        "--work",
+        "bead-policy-boundary",
+        "--repo",
+        &repo,
+        "--spec",
+        &spec,
+        "--base-ref",
+        "main",
+        "--profile",
+        "lean",
+    ]);
+    assert_eq!(code, 0, "start: {started}");
+    env.authorize_run("bead-policy-boundary");
+    let frozen_package_bytes = env
+        .ledger()
+        .get_run_definition("bead-policy-boundary")
+        .expect("definition")
+        .expect("stored definition")
+        .package_json;
+    let frozen_package: forged_types::ExecutionPackageV1 =
+        serde_json::from_str(&frozen_package_bytes).expect("frozen package");
+
+    env.set_scenario("implement", "wait-release", 1);
+    let driver = env
+        .forged_cmd(&["run", "drive", "--run", "bead-policy-boundary"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn driver");
+    for _ in 0..600 {
+        if env
+            .provider_log()
+            .iter()
+            .any(|line| line.starts_with("bead-policy-boundary/implementation/0 start "))
+        {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert!(
+        env.provider_log()
+            .iter()
+            .any(|line| line.starts_with("bead-policy-boundary/implementation/0 start ")),
+        "implementation attempt became live"
+    );
+
+    let ledger = env.ledger();
+    let live_packet = ledger
+        .list_packets("bead-policy-boundary")
+        .expect("packets")
+        .into_iter()
+        .find(|packet| packet.stage == forged_types::Stage::Implement)
+        .expect("live implementation packet");
+    assert_eq!(live_packet.policy_revision, Some(1));
+    let live_contract = forged_proto::stored_packet(&live_packet)
+        .expect("stored live packet")
+        .contract;
+    assert_eq!(live_contract.gate_commands, ["false"]);
+    drop(ledger);
+
+    let mut current: Value =
+        serde_json::from_str(&std::fs::read_to_string(&config_path).expect("read current config"))
+            .expect("current config JSON");
+    current["gate_commands"] = json!(["true"]);
+    current["stage_budget_s"] = json!({
+        "implement": 42,
+        "reviewclaude": 43,
+        "reviewcodex": 44,
+        "fix": 45,
+    });
+    current["transport_retry_budget"] = json!(7);
+    current["host_policy"] = json!("off");
+    current["herdr_sock"] = json!("/tmp/drifted-herdr.sock");
+    std::fs::write(
+        &config_path,
+        serde_json::to_string_pretty(&current).expect("serialize repaired policy"),
+    )
+    .expect("write repaired policy");
+
+    let revise_args = [
+        "run",
+        "revise-policy",
+        "--run",
+        "bead-policy-boundary",
+        "--reason",
+        "repair frozen gate command",
+    ];
+    let (code, revised) = env.forged(&revise_args);
+    assert_eq!(code, 0, "revise policy: {revised}");
+    assert_eq!(revised["result"]["revision"], json!(2));
+    let (code, replayed) = env.forged(&revise_args);
+    assert_eq!(code, 0, "replay policy revision: {replayed}");
+    assert_eq!(replayed["result"]["revision"], json!(2));
+
+    let ledger = env.ledger();
+    assert_eq!(
+        ledger
+            .list_policy_revisions("bead-policy-boundary")
+            .expect("policy revisions")
+            .len(),
+        2,
+        "same-content and same-reason replay does not bump"
+    );
+    let effective_row = ledger
+        .latest_policy_revision("bead-policy-boundary")
+        .expect("policy revision")
+        .expect("active policy revision");
+    let effective: forged_types::ExecutionPolicyV1 =
+        serde_json::from_str(&effective_row.policy_json).expect("effective policy");
+    assert_eq!(effective.gate_commands, ["true"]);
+    assert_eq!(
+        effective.stage_budget_s[&forged_types::Stage::Implement],
+        42
+    );
+    assert_eq!(effective.transport_retry_budget, 7);
+    assert_eq!(
+        effective.termination_grace_s,
+        frozen_package.policy.termination_grace_s
+    );
+    assert_eq!(effective.host_policy, frozen_package.policy.host_policy);
+    assert_eq!(effective.herdr_socket, frozen_package.policy.herdr_socket);
+    assert_eq!(
+        ledger
+            .get_run_definition("bead-policy-boundary")
+            .expect("definition")
+            .expect("stored definition")
+            .package_json,
+        frozen_package_bytes
+    );
+    let still_live = ledger
+        .get_packet(&live_packet.packet_id)
+        .expect("live packet");
+    assert_eq!(still_live.policy_revision, Some(1));
+    assert_eq!(
+        forged_proto::stored_packet(&still_live)
+            .expect("stored live packet")
+            .contract,
+        live_contract,
+        "a revision cannot mutate a packet whose attempt is live"
+    );
+    drop(ledger);
+
+    env.release_stage("implement");
+    let mut next_packet = None;
+    for _ in 0..600 {
+        next_packet = env
+            .ledger()
+            .list_packets("bead-policy-boundary")
+            .expect("packets")
+            .into_iter()
+            .find(|packet| packet.stage == forged_types::Stage::ReviewClaude);
+        if next_packet.is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    let next_packet = next_packet.expect("next packet opened");
+    assert_eq!(next_packet.policy_revision, Some(2));
+    let next_contract = forged_proto::stored_packet(&next_packet)
+        .expect("next packet")
+        .contract;
+    assert_eq!(next_contract.gate_commands, ["true"]);
+    assert_eq!(next_contract.budget_s, 43);
+
+    let driven = driver.wait_with_output().expect("wait for driver");
+    assert!(
+        driven.status.success(),
+        "revised drive failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&driven.stdout),
+        String::from_utf8_lossy(&driven.stderr)
+    );
+    let events = env
+        .ledger()
+        .list_events(Some("bead-policy-boundary"), 0, 1_000)
+        .expect("events");
+    let gates = forged_proto::parse_proto_events(&events)
+        .expect("proto events")
+        .into_iter()
+        .filter_map(|event| match event {
+            forged_proto::ProtoEvent::Gate { rows, .. } => Some(rows),
+            _ => None,
+        })
+        .flatten()
+        .collect::<Vec<_>>();
+    assert!(gates.iter().any(|row| row.command == "true"));
+    assert!(gates.iter().all(|row| row.command != "false"));
+    let (_, status) = env.forged(&["run", "status", "--run", "bead-policy-boundary"]);
+    assert_eq!(
+        status["result"]["run"]["definition"]["policyRevision"],
+        json!(2)
+    );
+    assert!(status["result"]["run"]["packets"]
+        .as_array()
+        .expect("status packets")
+        .iter()
+        .any(|packet| packet["policyRevision"] == json!(2)));
+}
+
+#[test]
+fn epic_policy_revision_batches_unmerged_children_behind_one_event() {
+    let env = TestEnv::new("forged-epic-policy-revision");
+    env.seed_epic(
+        "epic-policy",
+        &[
+            ("policy-child-merged", &env.spec, true),
+            ("policy-child-active", &env.spec, true),
+        ],
+    );
+    assert_eq!(env.forged(&["init"]).0, 0);
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let spec = env.spec.to_string_lossy().into_owned();
+    let (code, started) = env.forged(&[
+        "epic",
+        "start",
+        "--epic",
+        "epic-policy",
+        "--repo",
+        &repo,
+        "--spec",
+        &spec,
+        "--base-ref",
+        "main",
+        "--profile",
+        "lean",
+    ]);
+    assert_eq!(code, 0, "epic start: {started}");
+    env.authorize_epic("epic-policy");
+    for child in ["policy-child-merged", "policy-child-active"] {
+        let (code, child_started) = env.forged(&[
+            "run",
+            "start",
+            "--work",
+            child,
+            "--repo",
+            &repo,
+            "--spec",
+            &spec,
+            "--base-ref",
+            "main",
+            "--profile",
+            "lean",
+        ]);
+        assert_eq!(code, 0, "start {child}: {child_started}");
+    }
+    let ledger = env.ledger();
+    assert!(ledger
+        .get_run_definition("policy-child-merged")
+        .expect("merged child query")
+        .is_some());
+    assert!(ledger
+        .get_run_definition("policy-child-active")
+        .expect("active child query")
+        .is_some());
+    for child in ["policy-child-merged", "policy-child-active"] {
+        ledger
+            .append_event(
+                Some("epic-policy"),
+                "forged.epic.child.started",
+                json!({
+                    "childId": child,
+                    "runId": child,
+                    "wave": 1,
+                    "generation": 1,
+                    "branch": format!("forged/{child}"),
+                    "baseRef": "main",
+                }),
+            )
+            .expect("append child start");
+    }
+    ledger
+        .append_event(
+            Some("epic-policy"),
+            "forged.epic.child.merged",
+            json!({
+                "childId": "policy-child-merged",
+                "runId": "policy-child-merged",
+                "pr": 7,
+                "ready": {},
+                "merge": {},
+                "evidence": {},
+            }),
+        )
+        .expect("mark child merged");
+    drop(ledger);
+
+    let config_path = env.anvil.join("config.json");
+    let mut config: Value =
+        serde_json::from_str(&std::fs::read_to_string(&config_path).expect("read config"))
+            .expect("config JSON");
+    config["gate_commands"] = json!(["echo revised-policy"]);
+    config["transport_retry_budget"] = json!(9);
+    std::fs::write(
+        &config_path,
+        serde_json::to_string_pretty(&config).expect("serialize revised config"),
+    )
+    .expect("write revised config");
+
+    let args = [
+        "epic",
+        "revise-policy",
+        "--epic",
+        "epic-policy",
+        "--reason",
+        "repair child execution policy",
+    ];
+    let (code, revised) = env.forged(&args);
+    assert_eq!(code, 0, "epic policy revision: {revised}");
+    assert_eq!(revised["result"]["revision"], json!(2));
+    let (code, replayed) = env.forged(&args);
+    assert_eq!(code, 0, "epic policy replay: {replayed}");
+    assert_eq!(replayed["result"]["revision"], json!(2));
+
+    let ledger = env.ledger();
+    assert_eq!(
+        ledger
+            .latest_policy_revision("policy-child-merged")
+            .expect("merged revision")
+            .expect("merged initial revision")
+            .revision,
+        1,
+        "a merged child remains untouched"
+    );
+    let active = ledger
+        .latest_policy_revision("policy-child-active")
+        .expect("active revision")
+        .expect("active revised policy");
+    assert_eq!(active.revision, 2);
+    let active_policy: forged_types::ExecutionPolicyV1 =
+        serde_json::from_str(&active.policy_json).expect("active policy");
+    assert_eq!(active_policy.gate_commands, ["echo revised-policy"]);
+    assert_eq!(active_policy.transport_retry_budget, 9);
+    assert_eq!(
+        ledger
+            .list_events(Some("epic-policy"), 0, 1_000)
+            .expect("epic events")
+            .iter()
+            .filter(|event| event.kind == "forged.epic.policy.revised")
+            .count(),
+        1,
+        "the batch has one governing event"
+    );
+}
+
+#[test]
 fn high_profile_runs_three_reviews_and_a_synthesis_seat() {
     let env = TestEnv::new("forged-profile-high");
     env.forged(&["init"]);

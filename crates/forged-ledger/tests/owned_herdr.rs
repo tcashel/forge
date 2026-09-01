@@ -30,6 +30,7 @@ fn seed_attempt(ledger: &Ledger, run: &str, generation: Option<u32>) -> (String,
             spec_path: "spec.md".to_owned(),
             spec_sha256: "body".to_owned(),
             spec_revision: None,
+            policy_revision: None,
             body_json: "{}".to_owned(),
         })
         .expect("packet");

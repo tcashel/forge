@@ -31,7 +31,7 @@ fn ledger_is_send_sync_and_arc_shareable() {
         }));
     }
     for handle in handles {
-        assert_eq!(handle.join().expect("thread"), 25);
+        assert_eq!(handle.join().expect("thread"), 26);
     }
 }
 
@@ -111,6 +111,7 @@ fn every_seam_member_is_consumable() {
             spec_path: "specs/seam.md".to_owned(),
             spec_sha256: "abcd".to_owned(),
             spec_revision: None,
+            policy_revision: None,
             body_json: "{}".to_owned(),
         })
         .expect("open_packet");

@@ -22,6 +22,7 @@ Generated from the dispatch table, clap tree, MCP router, and fenced-call audit.
 | `epic_preflight` | `forged epic preflight` | yes | yes | read_only | no | yes |
 | `epic_resolve` | `forged epic resolve` | yes | yes | fenced | no | yes |
 | `epic_resume` | `forged epic resume` | yes | yes | fenced | no | yes |
+| `epic_revise_policy` | `forged epic revise-policy` | yes | yes | fenced | no | yes |
 | `epic_revise_roster` | `forged epic revise-roster` | yes | yes | fenced | no | yes |
 | `epic_start` | `forged epic start` | yes | yes | fenced | no | yes |
 | `epic_status` | `forged epic status` | yes | yes | read_only | no | yes |
@@ -45,6 +46,7 @@ Generated from the dispatch table, clap tree, MCP router, and fenced-call audit.
 | `run_advance` | `forged run advance` | yes | yes | machine-fenced | no | yes |
 | `run_drive` | `forged run drive` | yes | no | machine-fenced | no | yes |
 | `run_retry` | `forged run retry` | yes | yes | fenced | no | yes |
+| `run_revise_policy` | `forged run revise-policy` | yes | yes | fenced | no | yes |
 | `run_revise_roster` | `forged run revise-roster` | yes | yes | fenced | no | yes |
 | `run_start` | `forged run start` | yes | yes | fenced | no | yes |
 | `run_status` | `forged run status` | yes | yes | read_only | no | yes |

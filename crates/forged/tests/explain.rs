@@ -67,6 +67,7 @@ fn seed_live_attempt(env: &TestEnv, run_id: &str) -> i64 {
             spec_path: packet.spec.path.clone(),
             spec_sha256: packet.spec.sha256.clone(),
             spec_revision: packet.spec.revision.clone(),
+            policy_revision: None,
             body_json: packet.stored_body().expect("stored packet"),
         })
         .expect("open packet");

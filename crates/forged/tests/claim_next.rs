@@ -106,6 +106,7 @@ fn fabricate_resumable(env: &TestEnv, run_id: &str) {
             spec_path: env.spec.to_string_lossy().into_owned(),
             spec_sha256: sha.clone(),
             spec_revision: None,
+            policy_revision: None,
             body_json: json!({
                 "fabricated": true,
                 "providerHints": {

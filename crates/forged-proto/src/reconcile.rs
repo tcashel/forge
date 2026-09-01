@@ -50,11 +50,12 @@ fn reclaim_older_than(stage_budget_s: u64) -> u64 {
 }
 
 /// Caller-supplied reconcile inputs. This crate reads no environment
-/// variables — budgets and gate commands arrive here explicitly.
+/// variables; packet-scoped fields remain present for source compatibility,
+/// while the stored packet contract is the runtime authority.
 #[derive(Debug, Clone)]
 pub struct ReconcileConfig {
-    /// Per-stage limits projected from the run's frozen execution package.
-    /// Definition-less runs receive the explicit legacy policy projection.
+    /// Compatibility projection for callers predating packet-frozen budgets.
+    /// Reconciliation reads the opened packet's `contract.budget_s`.
     ///
     /// AMENDED (operator-adjudicated 2026-08-12): `HashMap` for the same
     /// reason as [`crate::RunView::roster`] — the merged
@@ -63,7 +64,8 @@ pub struct ReconcileConfig {
     pub stage_budget_s: HashMap<Stage, u64>,
     /// Frozen bound for each TERM/close and KILL verification phase.
     pub termination_grace_s: u64,
-    /// Gate commands, in order, for `rerun_gates` during harvest-and-verify.
+    /// Compatibility projection for callers predating packet-frozen gates.
+    /// Harvest replays the claimed packet's `contract.gate_commands`.
     pub gate_commands: Vec<String>,
 }
 
@@ -270,19 +272,17 @@ async fn reconcile_inner(
     };
 
     for attempt in live {
-        let stage = {
+        let packet = {
             let packet_id = attempt.packet_id.clone();
             on_ledger(ledger, move |l| {
                 l.get_packet(&packet_id).map_err(ProtoError::Ledger)
             })
             .await?
-            .stage
         };
-        // Core projects this map from the immutable execution package. Its
-        // explicit definition-less fallback is the sole legacy boundary.
-        let budget = *config.stage_budget_s.get(&stage).ok_or_else(|| {
-            ProtoError::Projection(format!("no frozen stage budget for stage {stage:?}"))
+        let packet = crate::project::stored_packet(&packet).map_err(|error| {
+            ProtoError::Projection(format!("stored packet body does not parse: {error}"))
         })?;
+        let budget = u64::from(packet.contract.budget_s);
 
         match attempt.state {
             // A revoking row skips the liveness ladder entirely: the durable
@@ -451,7 +451,7 @@ async fn reconcile_inner(
         let proto_events = parse_proto_events(&events)?;
 
         settle_operations(ledger, ports, &run, &proto_events, &mut report).await?;
-        harvest_and_verify(ports, run_id, config, &proto_events, &mut report).await?;
+        harvest_and_verify(ledger, ports, run_id, &proto_events, &mut report).await?;
     }
 
     Ok(report)
@@ -514,9 +514,39 @@ async fn deadline_order(
     }
     let packet_id = current.packet_id.clone();
     let since = current.updated_at.clone();
+    let cutoff = {
+        let run_id = run.run_id.clone();
+        on_ledger(ledger, move |ledger| {
+            ledger
+                .latest_policy_revision(&run_id)
+                .map_err(ProtoError::Ledger)
+        })
+        .await?
+        .map(|revision| revision.created_at)
+    };
+    if cutoff
+        .as_ref()
+        .is_some_and(|boundary| current.started_at.as_str() < boundary.as_str())
+    {
+        on_ledger(ledger, move |ledger| {
+            ledger
+                .mark_timed_out(attempt_id)
+                .map_err(ProtoError::Ledger)
+        })
+        .await?;
+        report.timed_out.push(attempt_id);
+        return Ok(());
+    }
     let run_id = run.run_id.clone();
     on_ledger(ledger, move |l| {
-        crate::grant_retry_for_attempt(l, &run_id, &packet_id, attempt_id, &since)
+        crate::grant_retry_for_attempt_since(
+            l,
+            &run_id,
+            &packet_id,
+            attempt_id,
+            &since,
+            cutoff.as_deref(),
+        )
     })
     .await?;
     on_ledger(ledger, move |l| {
@@ -925,9 +955,9 @@ async fn observe(
 /// claims but no closed gate value touches only the commit port. Identical
 /// mismatch lines are reported once.
 async fn harvest_and_verify(
+    ledger: &Ledger,
     ports: &dyn ReconcilePorts,
     run_id: &str,
-    config: &ReconcileConfig,
     proto_events: &[ProtoEvent],
     report: &mut ReconcileReport,
 ) -> Result<(), ProtoError> {
@@ -965,12 +995,22 @@ async fn harvest_and_verify(
         .commits_ahead(run_id)
         .await
         .map_err(|source| port_failure(**first_attempt, "commits_ahead", source))?;
-    let closed_gate_attempt = claims.iter().find_map(|(attempt_id, _, _, gate_state)| {
-        matches!(gate_state, Some("pass" | "fail")).then_some(**attempt_id)
-    });
-    let gates_pass = if let Some(attempt_id) = closed_gate_attempt {
+    let closed_gate_attempt = claims
+        .iter()
+        .find_map(|(attempt_id, packet_id, _, gate_state)| {
+            matches!(gate_state, Some("pass" | "fail"))
+                .then_some((**attempt_id, (*packet_id).clone()))
+        });
+    let gates_pass = if let Some((attempt_id, packet_id)) = closed_gate_attempt {
+        let packet = on_ledger(ledger, move |ledger| {
+            ledger.get_packet(&packet_id).map_err(ProtoError::Ledger)
+        })
+        .await?;
+        let packet = crate::project::stored_packet(&packet).map_err(|error| {
+            ProtoError::Projection(format!("stored packet body does not parse: {error}"))
+        })?;
         let rows = ports
-            .rerun_gates(run_id, &config.gate_commands)
+            .rerun_gates(run_id, &packet.contract.gate_commands)
             .await
             .map_err(|source| port_failure(attempt_id, "rerun_gates", source))?;
         Some(rows.iter().all(|r| r.exit_code == Some(0) && !r.timed_out))

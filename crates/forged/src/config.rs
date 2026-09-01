@@ -1343,7 +1343,7 @@ fn content_sha256(bytes: &[u8]) -> String {
     hex
 }
 
-fn digest_of<T: Serialize>(value: &T) -> Result<String, String> {
+pub(crate) fn digest_of<T: Serialize>(value: &T) -> Result<String, String> {
     let value = serde_json::to_value(value).map_err(|e| e.to_string())?;
     let bytes = canonical_json_bytes(&value).map_err(|e| e.to_string())?;
     let digest = Sha256::digest(bytes);
@@ -2136,6 +2136,16 @@ mod tests {
                 .revision,
             1
         );
+        let policy_revision = ledger
+            .latest_policy_revision("definition-ok")
+            .expect("read policy revision")
+            .expect("policy revision");
+        assert_eq!(policy_revision.revision, 1);
+        assert_eq!(
+            serde_json::from_str::<ExecutionPolicyV1>(&policy_revision.policy_json)
+                .expect("stored policy"),
+            compiled.package.policy
+        );
 
         let error = ledger
             .create_run_with_definition(
@@ -2155,6 +2165,130 @@ mod tests {
                 .code(),
             forged_types::ErrorCode::RunNotFound
         );
+    }
+
+    #[test]
+    fn policy_revision_is_append_only_digest_checked_and_leaves_package_bytes_frozen() {
+        let cfg = config();
+        let compiled = cfg.compile_definition(None, None).expect("compile");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ledger = forged_ledger::Ledger::open(&dir.path().join("state.db")).expect("ledger");
+        ledger
+            .create_run_with_definition(
+                forged_ledger::NewRun {
+                    run_id: forged_types::RunId::new("policy-run").expect("run id"),
+                    work_id: "policy-run".to_owned(),
+                    repo: "/tmp/repo".to_owned(),
+                    base_ref: "main".to_owned(),
+                    branch: "forged/policy-run".to_owned(),
+                },
+                forged_ledger::NewRunDefinition {
+                    package: compiled.package.clone(),
+                    package_sha256: compiled.package_sha256,
+                    compatibility_roster: compiled.compatibility_roster,
+                },
+            )
+            .expect("create run");
+        let frozen = ledger
+            .get_run_definition("policy-run")
+            .expect("definition")
+            .expect("stored definition")
+            .package_json;
+
+        let mut revised = compiled.package.policy;
+        revised.gate_commands = vec!["just ci".to_owned()];
+        revised.stage_budget_s.insert(Stage::Implement, 42);
+        revised.transport_retry_budget = 7;
+        let digest = digest_of(&revised).expect("policy digest");
+        let row = ledger
+            .append_policy_revision(
+                "policy-run",
+                revised.clone(),
+                digest.clone(),
+                "repair gate policy".to_owned(),
+                "policy-operation-2".to_owned(),
+            )
+            .expect("append revision");
+        assert_eq!(row.revision, 2);
+        assert_eq!(
+            ledger
+                .get_run_definition("policy-run")
+                .expect("definition")
+                .expect("stored definition")
+                .package_json,
+            frozen,
+            "a revision never rewrites the frozen package"
+        );
+        assert_eq!(
+            ledger
+                .append_policy_revision(
+                    "policy-run",
+                    revised.clone(),
+                    digest.clone(),
+                    "repair gate policy".to_owned(),
+                    "policy-operation-2".to_owned(),
+                )
+                .expect("exact replay")
+                .revision,
+            2
+        );
+        assert_eq!(
+            ledger
+                .append_policy_revision(
+                    "policy-run",
+                    revised.clone(),
+                    digest,
+                    "repair gate policy".to_owned(),
+                    "policy-operation-alias".to_owned(),
+                )
+                .expect("same content and reason replay")
+                .revision,
+            2
+        );
+        assert_eq!(
+            ledger
+                .list_policy_revisions("policy-run")
+                .expect("policy revisions")
+                .len(),
+            2
+        );
+        assert_eq!(
+            ledger
+                .append_policy_revision(
+                    "policy-run",
+                    revised,
+                    "0".repeat(64),
+                    "corrupt digest".to_owned(),
+                    "policy-operation-bad".to_owned(),
+                )
+                .expect_err("digest mismatch")
+                .code(),
+            forged_types::ErrorCode::InvalidRequest
+        );
+
+        ledger
+            .create_run(forged_ledger::NewRun {
+                run_id: forged_types::RunId::new("legacy-policy-run").expect("run id"),
+                work_id: "legacy-policy-run".to_owned(),
+                repo: "/tmp/repo".to_owned(),
+                base_ref: "main".to_owned(),
+                branch: "forged/legacy-policy-run".to_owned(),
+            })
+            .expect("create legacy run");
+        let legacy_policy = cfg.execution_policy().expect("policy");
+        let legacy_digest = digest_of(&legacy_policy).expect("policy digest");
+        let error = ledger
+            .append_policy_revision(
+                "legacy-policy-run",
+                legacy_policy,
+                legacy_digest,
+                "cannot revise legacy".to_owned(),
+                "legacy-policy-operation".to_owned(),
+            )
+            .expect_err("legacy refusal");
+        assert!(error
+            .to_string()
+            .contains("legacy run has no revisable policy"));
     }
 
     #[test]
