@@ -14,10 +14,21 @@ nextest-version = { required = "0.9.143" }
 
 [test-groups]
 supervise-process-fixtures = { max-threads = 1 }
+# Loop-mode epics execute through real supervisor ticks and detached child
+# controllers, so the epic-driving binaries spawn process trees per test.
+# Unbounded co-scheduling of those trees thrashes small CI runners — locks
+# outlive their retry budgets and wall-clock deadlines blow. Two at a time
+# keeps the runner productive without serializing the whole leg; the
+# supervise group above is a stricter, separate contract and stays alone.
+epic-process-fixtures = { max-threads = 2 }
 
 [[profile.default.overrides]]
 filter = 'package(=forged) & binary(=supervise)'
 test-group = 'supervise-process-fixtures'
+
+[[profile.default.overrides]]
+filter = 'package(=forged) & (binary(=e2e_drive) | binary(=convergence) | binary(=kill_matrix) | binary(=ore_loop) | binary(=ore_loop_failpoint))'
+test-group = 'epic-process-fixtures'
 
 # JUnit XML for the Codecov test-results upload, written to
 # `target/nextest/ci/junit.xml`. CI selects this profile with NEXTEST_PROFILE=ci

@@ -1418,7 +1418,7 @@ impl TestEnv {
         // not state, so the migrator open retries under a wall-clock
         // deadline instead of panicking on the first locked window.
         let db = self.anvil.join("state.db");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
         loop {
             match forged_ledger::Ledger::open(&db) {
                 Ok(ledger) => {
