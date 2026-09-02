@@ -1732,8 +1732,8 @@ async fn run_attempt(
             };
             let note = format!(
                 "readmit: admission {leg} moved: {} -> {}",
-                display(reservation.as_ref()),
-                display(current.as_ref())
+                display(reservation.as_deref()),
+                display(current.as_deref())
             );
             return match fail_pre_spawn_transport(
                 ctx,

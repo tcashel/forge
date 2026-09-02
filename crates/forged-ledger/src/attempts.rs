@@ -959,20 +959,20 @@ impl Ledger {
             let current = desired
                 .as_ref()
                 .map(|(_, revision, _)| {
-                    Ok::<_, LedgerError>(AdmissionFenceFacts {
+                    Ok::<_, LedgerError>(Box::new(AdmissionFenceFacts {
                         repository: packet_facts.repository.clone(),
                         provider: packet_facts.provider.clone(),
                         model: packet_facts.model.clone(),
                         resource_class: packet_facts.resource_class,
                         control_revision: u64::try_from(*revision)
                             .map_err(|_| internal("desired control revision is negative"))?,
-                    })
+                    }))
                 })
                 .transpose()?;
             let reserved = reservation
                 .as_ref()
                 .map(|reservation| {
-                    Ok(AdmissionFenceFacts {
+                    Ok(Box::new(AdmissionFenceFacts {
                         repository: reservation.1.clone(),
                         provider: reservation.2.clone(),
                         model: reservation.3.clone(),
@@ -989,7 +989,7 @@ impl Ledger {
                         },
                         control_revision: u64::try_from(reservation.0)
                             .map_err(|_| internal("reservation control revision is negative"))?,
-                    })
+                    }))
                 })
                 .transpose()?;
             let control_moved = match (desired.as_ref(), reservation.as_ref()) {

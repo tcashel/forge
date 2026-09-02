@@ -69,9 +69,9 @@ pub enum LedgerError {
         /// The exact fence leg that detected the change.
         leg: AdmissionMoveLeg,
         /// Facts transferred into the attempt-owned reservation, if present.
-        reservation: Option<AdmissionFenceFacts>,
+        reservation: Option<Box<AdmissionFenceFacts>>,
         /// Facts currently effective for the packet, if fully available.
-        current: Option<AdmissionFenceFacts>,
+        current: Option<Box<AdmissionFenceFacts>>,
     },
     /// An unexpected internal failure.
     #[error("internal: {message}")]
