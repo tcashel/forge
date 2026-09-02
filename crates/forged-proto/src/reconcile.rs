@@ -514,40 +514,16 @@ async fn deadline_order(
     }
     let packet_id = current.packet_id.clone();
     let since = current.updated_at.clone();
-    let cutoff = {
-        let run_id = run.run_id.clone();
-        on_ledger(ledger, move |ledger| {
-            ledger
-                .latest_policy_revision(&run_id)
-                .map_err(ProtoError::Ledger)
-        })
-        .await?
-        .map(|revision| revision.created_at)
-    };
-    // ADR-0035:50-52: a failure that started before the active policy cutoff
-    // is not rescored and earns no retry grant.
-    if cutoff
-        .as_ref()
-        .is_some_and(|boundary| current.started_at.as_str() < boundary.as_str())
-    {
-        on_ledger(ledger, move |ledger| {
-            ledger
-                .mark_timed_out(attempt_id)
-                .map_err(ProtoError::Ledger)
-        })
-        .await?;
-        report.timed_out.push(attempt_id);
-        return Ok(());
-    }
+    let started_at = current.started_at;
     let run_id = run.run_id.clone();
     on_ledger(ledger, move |l| {
-        crate::grant_retry_for_attempt_since(
+        crate::grant_retry_for_attempt_under_active_policy(
             l,
             &run_id,
             &packet_id,
             attempt_id,
             &since,
-            cutoff.as_deref(),
+            &started_at,
         )
     })
     .await?;

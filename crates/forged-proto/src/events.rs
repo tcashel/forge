@@ -449,6 +449,51 @@ pub fn grant_retry_since(
         .ok_or_else(|| ProtoError::Projection("granted retry carries no count".to_owned()))
 }
 
+/// Charge one pre-claim transport failure under the policy revision that is
+/// active at the append boundary.
+///
+/// Revision lookup, cutoff evaluation, standing-count derivation, and append
+/// share one ledger transaction. `None` means the failure began before the
+/// active revision's cutoff and therefore earned no grant.
+pub fn grant_retry_under_active_policy(
+    ledger: &Ledger,
+    run_id: &str,
+    packet_id: &str,
+    since: &str,
+    failure_started_at: &str,
+) -> Result<Option<u32>, ProtoError> {
+    let owned_packet = packet_id.to_owned();
+    let since = since.to_owned();
+    let failure_started_at = failure_started_at.to_owned();
+    let payload = ledger.append_event_derived_with_policy_revision(
+        run_id,
+        RETRY_KIND,
+        move |standing, active_policy_revision| {
+            let cutoff = active_policy_revision.map(|revision| revision.created_at.as_str());
+            if cutoff.is_some_and(|boundary| failure_started_at.as_str() < boundary) {
+                return Ok((Value::Null, false));
+            }
+            let standing =
+                transport_failures_of_since(standing, &owned_packet, cutoff).map_err(internal)?;
+            let count = standing.saturating_add(1);
+            let retry_after =
+                backoff_deadline(&since, count.saturating_sub(1)).map_err(internal)?;
+            let payload = ProtoEvent::Retry {
+                packet_id: owned_packet.clone(),
+                attempt_id: None,
+                policy_revision: active_policy_revision
+                    .map(|revision| u64::from(revision.revision)),
+                transport_failures: count,
+                retry_after,
+            }
+            .payload()
+            .map_err(internal)?;
+            Ok((payload, true))
+        },
+    )?;
+    retry_count_or_skipped(&payload)
+}
+
 /// Grant the one retry earned by a kill-confirmed timed-out attempt.
 ///
 /// `attemptId` makes crash replay idempotent: if settlement resumes after
@@ -515,6 +560,82 @@ pub fn grant_retry_for_attempt_since(
     payload["transportFailures"]
         .as_u64()
         .and_then(|count| u32::try_from(count).ok())
+        .ok_or_else(|| ProtoError::Projection("granted retry carries no count".to_owned()))
+}
+
+/// Grant a timed-out attempt's retry under the policy revision active at the
+/// append boundary.
+///
+/// The attempt replay check, revision lookup, cutoff decision, standing count,
+/// and append are one transaction. `None` means an uncharged pre-cutoff
+/// failure; an already-recorded attempt grant is replayed even if a later
+/// revision has since become active.
+pub fn grant_retry_for_attempt_under_active_policy(
+    ledger: &Ledger,
+    run_id: &str,
+    packet_id: &str,
+    attempt_id: i64,
+    since: &str,
+    failure_started_at: &str,
+) -> Result<Option<u32>, ProtoError> {
+    let owned_packet = packet_id.to_owned();
+    let since = since.to_owned();
+    let failure_started_at = failure_started_at.to_owned();
+    let payload = ledger.append_event_derived_with_policy_revision(
+        run_id,
+        RETRY_KIND,
+        move |standing, active_policy_revision| {
+            let parsed = parse_proto_events(standing).map_err(internal)?;
+            if let Some(existing) = parsed.iter().find_map(|event| match event {
+                ProtoEvent::Retry {
+                    attempt_id: Some(charged),
+                    transport_failures,
+                    retry_after,
+                    packet_id,
+                    ..
+                } if *charged == attempt_id => Some(json!({
+                    "schemaVersion": 1,
+                    "packetId": packet_id,
+                    "attemptId": attempt_id,
+                    "transportFailures": transport_failures,
+                    "retryAfter": retry_after,
+                })),
+                _ => None,
+            }) {
+                return Ok((existing, false));
+            }
+            let cutoff = active_policy_revision.map(|revision| revision.created_at.as_str());
+            if cutoff.is_some_and(|boundary| failure_started_at.as_str() < boundary) {
+                return Ok((Value::Null, false));
+            }
+            let standing =
+                transport_failures_of_since(standing, &owned_packet, cutoff).map_err(internal)?;
+            let count = standing.saturating_add(1);
+            let retry_after =
+                backoff_deadline(&since, count.saturating_sub(1)).map_err(internal)?;
+            let payload = ProtoEvent::Retry {
+                packet_id: owned_packet.clone(),
+                attempt_id: Some(attempt_id),
+                policy_revision: None,
+                transport_failures: count,
+                retry_after,
+            }
+            .payload()
+            .map_err(internal)?;
+            Ok((payload, true))
+        },
+    )?;
+    retry_count_or_skipped(&payload)
+}
+
+fn retry_count_or_skipped(payload: &Value) -> Result<Option<u32>, ProtoError> {
+    if payload.is_null() {
+        return Ok(None);
+    }
+    payload["transportFailures"]
+        .as_u64()
+        .and_then(|count| u32::try_from(count).ok())
+        .map(Some)
         .ok_or_else(|| ProtoError::Projection("granted retry carries no count".to_owned()))
 }
 

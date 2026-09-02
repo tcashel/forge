@@ -7,8 +7,9 @@ use rusqlite::{Connection, TransactionBehavior};
 
 use crate::error::LedgerError;
 use crate::ledger::Ledger;
+use crate::runs::latest_policy_revision_tx;
 use crate::time::now_iso;
-use crate::types::EventRow;
+use crate::types::{EventRow, PolicyRevisionRow};
 
 /// Insert one event row inside the caller's transaction. The payload is a
 /// [`serde_json::Value`], so it is well-formed by construction; the ledger
@@ -71,6 +72,19 @@ pub(crate) fn list_events_by_kind_tx(
          WHERE kind = ?1 ORDER BY event_id ASC",
     )?;
     let rows = statement.query_map([kind], event_row)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+fn run_events_by_kind_tx(
+    conn: &Connection,
+    run_id: &str,
+    kind: &str,
+) -> Result<Vec<EventRow>, LedgerError> {
+    let mut statement = conn.prepare(
+        "SELECT event_id, ts, run_id, kind, payload_json FROM events \
+         WHERE run_id = ?1 AND kind = ?2 ORDER BY event_id ASC",
+    )?;
+    let rows = statement.query_map(rusqlite::params![run_id, kind], event_row)?;
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
 
@@ -197,27 +211,45 @@ impl Ledger {
         let kind = kind.to_owned();
         self.submit(move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let standing = {
-                let mut statement = tx.prepare(
-                    "SELECT event_id, ts, run_id, kind, payload_json FROM events \
-                     WHERE run_id = ?1 AND kind = ?2 ORDER BY event_id ASC",
-                )?;
-                let rows = statement.query_map(rusqlite::params![run_id, kind], |row| {
-                    Ok(EventRow {
-                        event_id: row.get(0)?,
-                        ts: row.get(1)?,
-                        run_id: row.get(2)?,
-                        kind: row.get(3)?,
-                        payload_json: row.get(4)?,
-                    })
-                })?;
-                let mut out = Vec::new();
-                for row in rows {
-                    out.push(row?);
-                }
-                out
-            };
+            let standing = run_events_by_kind_tx(&tx, &run_id, &kind)?;
             let (payload, append) = derive(&standing)?;
+            if append {
+                append_event_tx(&tx, Some(&run_id), &kind, &payload)?;
+            }
+            tx.commit()?;
+            Ok(payload)
+        })
+    }
+
+    /// Append one derived event while observing the run's latest execution
+    /// policy revision under the same write transaction.
+    ///
+    /// This is the retry-policy counterpart to [`Ledger::append_event_derived`]:
+    /// a policy revision cannot land between the revision snapshot used for a
+    /// cutoff decision and the event append. The ledger still interprets
+    /// neither input; it supplies stored rows to `derive` and persists the
+    /// returned payload only when the paired boolean is true.
+    pub fn append_event_derived_with_policy_revision<F>(
+        &self,
+        run_id: &str,
+        kind: &str,
+        derive: F,
+    ) -> Result<serde_json::Value, LedgerError>
+    where
+        F: FnOnce(
+                &[EventRow],
+                Option<&PolicyRevisionRow>,
+            ) -> Result<(serde_json::Value, bool), LedgerError>
+            + Send
+            + 'static,
+    {
+        let run_id = run_id.to_owned();
+        let kind = kind.to_owned();
+        self.submit(move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let policy_revision = latest_policy_revision_tx(&tx, &run_id)?;
+            let standing = run_events_by_kind_tx(&tx, &run_id, &kind)?;
+            let (payload, append) = derive(&standing, policy_revision.as_ref())?;
             if append {
                 append_event_tx(&tx, Some(&run_id), &kind, &payload)?;
             }
@@ -286,7 +318,136 @@ impl Ledger {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
     use super::*;
+
+    static POLICY_WRITER_BLOCKED: AtomicBool = AtomicBool::new(false);
+
+    fn observe_blocked_policy_writer(_attempts: i32) -> bool {
+        POLICY_WRITER_BLOCKED.store(true, Ordering::SeqCst);
+        true
+    }
+
+    #[test]
+    fn policy_revision_cannot_land_between_derived_snapshot_and_retry_append() {
+        const RUN: &str = "run-policy-retry-race";
+        const RETRY_KIND: &str = "proto.retry";
+
+        POLICY_WRITER_BLOCKED.store(false, Ordering::SeqCst);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.db");
+        let bootstrap = Ledger::open(&path).expect("open bootstrap ledger");
+        bootstrap
+            .create_run(crate::NewRun {
+                run_id: forged_types::RunId::new(RUN).expect("run id"),
+                work_id: RUN.to_owned(),
+                repo: dir.path().to_string_lossy().into_owned(),
+                base_ref: "main".to_owned(),
+                branch: format!("forged/{RUN}"),
+            })
+            .expect("create run");
+        bootstrap.close().expect("close bootstrap ledger");
+
+        let connection = Connection::open(&path).expect("open policy fixture");
+        connection
+            .execute(
+                "INSERT INTO policy_revisions \
+                 (run_id, revision, policy_json, policy_sha256, reason, created_at) \
+                 VALUES (?1, 1, '{}', 'rev1', 'initial', \
+                         '2026-09-02T00:00:00.000000000Z')",
+                [RUN],
+            )
+            .expect("insert revision 1");
+        drop(connection);
+
+        let retry_ledger = Ledger::open(&path).expect("open retry ledger");
+        let observer = Ledger::open(&path).expect("open observer ledger");
+        let (snapshot_tx, snapshot_rx) = mpsc::sync_channel(0);
+        let (release_tx, release_rx) = mpsc::sync_channel(0);
+        let retry = std::thread::spawn(move || {
+            let payload = retry_ledger
+                .append_event_derived_with_policy_revision(
+                    RUN,
+                    RETRY_KIND,
+                    move |_standing, revision| {
+                        let revision = revision.expect("revision snapshot");
+                        assert_eq!(revision.revision, 1);
+                        snapshot_tx.send(()).expect("announce snapshot");
+                        release_rx.recv().expect("release retry append");
+                        Ok((
+                            serde_json::json!({
+                                "schemaVersion": 1,
+                                "packetId": "run-policy-retry-race/implement/1",
+                                "policyRevision": revision.revision,
+                                "transportFailures": 1,
+                                "retryAfter": "2026-09-02T00:00:30.000000000Z",
+                            }),
+                            true,
+                        ))
+                    },
+                )
+                .expect("append retry");
+            retry_ledger.close().expect("close retry ledger");
+            payload
+        });
+        snapshot_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("retry transaction reached revision snapshot");
+
+        let revision_path = path.clone();
+        let revision = std::thread::spawn(move || {
+            let mut connection = Connection::open(revision_path).expect("open revision writer");
+            connection
+                .busy_handler(Some(observe_blocked_policy_writer))
+                .expect("install busy observer");
+            let tx = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .expect("begin policy revision");
+            let created_at = now_iso();
+            tx.execute(
+                "INSERT INTO policy_revisions \
+                 (run_id, revision, policy_json, policy_sha256, reason, created_at) \
+                 VALUES (?1, 2, '{}', 'rev2', 'concurrent revision', ?2)",
+                rusqlite::params![RUN, created_at],
+            )
+            .expect("insert revision 2");
+            tx.commit().expect("commit revision 2");
+        });
+
+        let wait_started = Instant::now();
+        while !POLICY_WRITER_BLOCKED.load(Ordering::SeqCst)
+            && wait_started.elapsed() < Duration::from_secs(2)
+        {
+            std::thread::yield_now();
+        }
+        let was_blocked = POLICY_WRITER_BLOCKED.load(Ordering::SeqCst);
+        release_tx.send(()).expect("release retry transaction");
+        let payload = retry.join().expect("retry writer");
+        revision.join().expect("revision writer");
+        assert!(
+            was_blocked,
+            "the competing revision must reach the retry transaction's write lock"
+        );
+        assert_eq!(payload["policyRevision"], serde_json::json!(1));
+        let latest_revision = observer
+            .latest_policy_revision(RUN)
+            .expect("latest policy")
+            .expect("revision 2");
+        assert_eq!(latest_revision.revision, 2);
+        let rows = observer
+            .list_events(Some(RUN), 0, 16)
+            .expect("retry events");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, RETRY_KIND);
+        assert!(
+            rows[0].ts < latest_revision.created_at,
+            "the retry must commit before the competing policy cutoff"
+        );
+        observer.close().expect("close observer ledger");
+    }
 
     #[test]
     fn latest_event_plan_uses_the_partial_run_major_index_without_temp_grouping() {

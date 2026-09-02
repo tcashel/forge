@@ -146,33 +146,16 @@ async fn settle_deadline_retry(
     }
     let since = current.updated_at;
     let started_at = current.started_at;
-    let cutoff = {
-        let run_id = run_id.to_owned();
-        on_ledger(&ctx.ledger, move |ledger| {
-            ledger.latest_policy_revision(&run_id)
-        })
-        .await?
-        .map(|revision| revision.created_at)
-    };
-    // ADR-0035:50-52: a failure that started before the active policy cutoff
-    // is not rescored and earns no retry grant.
-    if cutoff
-        .as_ref()
-        .is_some_and(|boundary| started_at.as_str() < boundary.as_str())
-    {
-        on_ledger(&ctx.ledger, move |ledger| ledger.mark_timed_out(attempt_id)).await?;
-        return Ok(PacketOutcome::Transport(note));
-    }
     let run_id = run_id.to_owned();
     let packet_id = packet_id.to_owned();
     on_ledger(&ctx.ledger, move |ledger| {
-        forged_proto::grant_retry_for_attempt_since(
+        forged_proto::grant_retry_for_attempt_under_active_policy(
             ledger,
             &run_id,
             &packet_id,
             attempt_id,
             &since,
-            cutoff.as_deref(),
+            &started_at,
         )
         .map_err(|error| forged_ledger::LedgerError::Internal {
             message: error.to_string(),
@@ -1244,35 +1227,15 @@ async fn charge_retry(
     since: String,
     failure_started_at: String,
 ) -> Result<(), Failure> {
-    let active_policy_revision = {
-        let run_id = run_id.to_owned();
-        on_ledger(&ctx.ledger, move |ledger| {
-            ledger.latest_policy_revision(&run_id)
-        })
-        .await?
-    };
-    let cutoff = active_policy_revision
-        .as_ref()
-        .map(|revision| revision.created_at.clone());
-    let policy_revision = active_policy_revision.map(|revision| u64::from(revision.revision));
-    // ADR-0035:50-52: a failure that started before the active policy cutoff
-    // is not rescored and earns no retry grant.
-    if cutoff
-        .as_ref()
-        .is_some_and(|boundary| failure_started_at.as_str() < boundary.as_str())
-    {
-        return Ok(());
-    }
     let run_id = run_id.to_owned();
     let packet_id = packet_id.to_owned();
     on_ledger(&ctx.ledger, move |l| {
-        forged_proto::grant_retry_since(
+        forged_proto::grant_retry_under_active_policy(
             l,
             &run_id,
             &packet_id,
             &since,
-            cutoff.as_deref(),
-            policy_revision,
+            &failure_started_at,
         )
         .map_err(|e| match e {
             forged_proto::ProtoError::Ledger(inner) => inner,
