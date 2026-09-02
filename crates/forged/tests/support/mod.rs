@@ -1900,10 +1900,14 @@ impl TestEnv {
         )
     }
 
-    /// Reconcile an epic until its pass reports a durable stop.
+    /// Reconcile an epic until its pass reports a durable stop. Loop-mode
+    /// epics settle through real supervisor cadences and detached child
+    /// controllers, so the bound is a wall-clock deadline sized for a loaded
+    /// CI runner, never an iteration count.
     pub fn drive_epic_to_stop(&self, epic_id: &str) -> (i32, Value) {
         let mut last = Value::Null;
-        for _ in 0..1_200 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(240);
+        while std::time::Instant::now() < deadline {
             let (code, value) = self.reconcile_epic(epic_id);
             if code != 0 || value["result"]["stopped"].is_object() {
                 return (code, value);
