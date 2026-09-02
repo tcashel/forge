@@ -47,9 +47,24 @@ Verified on `main` c530743e and the operator store on 2026-09-02:
   ore-070 lead wrote critiques and adjudications into `notes` prose via
   scripts, not through the typed note surface.
 - `repository_write_active` defaults to 1 (`config.rs:110`).
-- Two v0.7.0 CI findings await slices: the orphaned-reservation
-  self-capacity deadlock and the identity-less controller boot-grace
-  gap (dogfood log 2026-09-02).
+- Two v0.7.0 retro findings await slices: the orphaned-reservation
+  self-capacity deadlock and the first-launch restart charge
+  (`restartUsed 1` on launch). The boot-grace finding was retracted on
+  2026-09-02 with evidence: the supervisor already adopts an
+  identity-less spawn through `controller-<gen>.pid/.lstart`
+  (`handoff.rs` `recover_reserved_record`); the real cause was the
+  pre-spawn fence dead state fixed in #245.
+- Two findings from the v0.7.1 work (2026-09-02) are "one next"
+  defects: an exhausted run (restart budget gone) answers `explain` with
+  `next: null`; and `run retry` mints its successor on a fresh branch,
+  discarding an implementation branch that already carries commits
+  (three, on ore-071), leaving the lead-finish door as the only recovery.
+- v0.7.1 (tag expected 2026-09-03) changes `handoff.rs`
+  `recover_abandoned`, `attempts.rs` (`LedgerError::AdmissionMoved`,
+  code stays `StaleClaimToken`), `forged-proto` `events.rs`/`engine.rs`
+  (retry logical keys, `FailureKind::Readmit`), `execute.rs`
+  `charge_retry`, nextest config, and the test tree. Wave 1 bases on
+  the tagged SHA and touches none of those.
 
 ## Waves and slices
 
@@ -94,8 +109,12 @@ relevance test class beside the honesty test: for every advertised
 `should`, the subject is non-terminal and the verb's precondition
 holds. Fix the observed wrong advertisements (`work reopen` on closed,
 `work supersede` on landed, `not-started` on closed epics: `explain`
-gains `landed`, `closed`, `parked` verdicts). *Deletes:* the "check
-`status` before believing `nextActions`" rule.
+gains `landed`, `closed`, `parked` verdicts). Coverage rule, the mirror
+of relevance: every non-terminal subject parked on a decision has
+exactly one `should` — an exhausted run (restart budget gone) answers
+`next: null` today and must advertise `run retry --because
+world-changed`. *Deletes:* the "check `status` before believing
+`nextActions`" rule.
 
 **.3 Bounded by construction.** Every list verb returns summary rows by
 default with `coverage {shown, total, truncated, nextCursor}`; spec
@@ -130,11 +149,12 @@ lead's list; raw envelopes on every read.
 **.6 Pile-1 core fixes from the v0.7.0 retro.** (a) the supervisor
 releases an orphaned reservation whose subject has no live attempt and
 no controller record (evidence-based, custody untouched), so a subject
-cannot deadlock on its own stranded capacity; (b) a boot grace before an
-identity-less spawn is judged dead (defer while the spawn is younger
-than a boot budget) plus a pre-identity pid marker the supervisor can
-kill-confirm; (c) the first-launch restart charge asymmetry
-(`restartUsed 1` on launch) corrected so the budget means what it says.
+cannot deadlock on its own stranded capacity; (b) the first-launch
+restart charge asymmetry (`restartUsed 1` on launch) corrected so the
+budget means what it says. Both base on post-#245 `main`
+(`recover_abandoned` now reconciles when live attempts exist;
+`assert_admitted_attempt_live` refuses with `AdmissionMoved`). The
+boot-grace item is deliberately absent: retracted, see ground facts.
 *Deletes:* two dogfood findings and one class of budget burn.
 
 ### Wave 2 — the lifecycle in the ledger
@@ -169,8 +189,13 @@ already use. Defaults: repository from `metadata.repository`, base from
 the repository default branch, profile and roster from config
 defaults. `run start` and `run submit` move to the machine audience.
 `run retry` gains `--because spec-amended | world-changed | rebase`
-recorded as a decision. *Deletes:* the two-verb dance and the unfenced
-approval note; the "mutate nothing between start and submit" rule.
+recorded as a decision, and never discards committed work: when the
+terminal run's branch is ahead of its base, the successor starts from
+that branch (recorded as provenance) instead of a fresh cut, so the
+ore-071 case (three commits stranded, lead finish the only door) cannot
+recur; `--fresh` is the explicit opt-out. *Deletes:* the two-verb dance
+and the unfenced approval note; the "mutate nothing between start and
+submit" rule; the stranded-branch recovery by hand.
 
 **.10 `wait`.** `forged wait --id <id> [--until decision | stage |
 terminal] --timeout <s>` (default 240) blocks on the ledger event
@@ -260,6 +285,9 @@ rebase`). *Deletes:* the direct lane's reason to exist.
   [`ore-081-factory-loop.md`](ore-081-factory-loop.md).
 - No Apps redesign; the HTML views consume the same projections and
   shrink with them.
+- No Herdr work. The protocol mismatch (forged 0.7.0 expects 19, current
+  Herdr speaks 20, every seat falls back to the process host) is the
+  Herdr-polish item the operator ordered last; it stays out of ore-080.
 
 ## Open questions for adjudication
 
