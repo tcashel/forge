@@ -160,22 +160,6 @@ fn start_epic(env: &TestEnv, epic: &str, children: &[(&str, &Path, bool)]) {
     assert_eq!(code, 0, "epic start {epic}: {started}");
 }
 
-fn park_direct_epic(env: &TestEnv, epic: &str) {
-    env.authorize_epic(epic);
-    let ledger = env.ledger();
-    ledger
-        .record_desired_outcome(
-            DesiredSubjectKind::Epic,
-            epic,
-            DesiredState::Running,
-            DesiredReconcileOutcome::Adopted,
-            None,
-            None,
-        )
-        .expect("park directly-driven epic outside supervisor scope");
-    ledger.close().expect("close ledger");
-}
-
 fn provider_starts(env: &TestEnv, stage: &str) -> Vec<String> {
     let needle = format!("/{stage}/0 start ");
     env.provider_log()
@@ -760,7 +744,7 @@ fn submit_preflight_refuses_every_non_capacity_shape_family_with_a_remedy() {
 }
 
 #[test]
-fn epic_submit_uses_the_same_priority_preflight() {
+fn epic_submit_queues_without_controller_admission_preflight() {
     let env = TestEnv::new("adm-epic-preflight");
     let child_spec = env.spec.clone();
     start_epic(
@@ -769,17 +753,10 @@ fn epic_submit_uses_the_same_priority_preflight() {
         &[("adm-epic-preflight-child", child_spec.as_path(), true)],
     );
     env.set_work_field("adm-epic-preflight", "priority", "");
-    let (code, refusal) = env.forged(&["epic", "submit", "--epic", "adm-epic-preflight"]);
-    assert_ne!(code, 0, "priority-less epic submit must refuse: {refusal}");
-    assert!(
-        refusal["error"]["message"]
-            .as_str()
-            .is_some_and(
-                |message| message.contains("bead-malformed") && message.contains("priority")
-            ),
-        "epic field-naming refusal: {refusal}"
-    );
-    assert_eq!(refusal["error"]["detail"]["verb"], json!("work update"));
+    let (code, queued) = env.forged(&["epic", "submit", "--epic", "adm-epic-preflight"]);
+    assert_eq!(code, 0, "group authorization must queue: {queued}");
+    assert_eq!(queued["result"]["phase"], json!("queued"));
+    assert!(queued["result"]["controller"].is_null());
 }
 
 #[test]
@@ -1414,14 +1391,19 @@ fn convergence_authorization_admission_and_fanout() {
         "dependencies",
         r#"[{"id":"conv-fanout-blocker","dependency_type":"blocks","status":"open"}]"#,
     );
-    park_direct_epic(&fanout, "conv-fanout");
+    fanout.authorize_epic("conv-fanout");
     fanout.set_scenario("implement", "hang", 3);
-    let driver = fanout
-        .forged_cmd(&["epic", "drive", "--epic", "conv-fanout"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("fanout driver");
+    assert_eq!(fanout.reconcile_epic("conv-fanout").0, 0);
+    let (code, dispatched) = fanout.reconcile_epic("conv-fanout");
+    assert_eq!(code, 0, "fanout dispatch: {dispatched}");
+    assert_eq!(
+        dispatched["result"]["progress"]["launched"]
+            .as_array()
+            .map(Vec::len),
+        Some(3),
+        "the pass queues every independent child before admission: {dispatched}"
+    );
+    assert_eq!(fanout.reconcile_epic("conv-fanout").0, 0);
     wait_until("two admitted child attempts", || {
         provider_starts(&fanout, "implementation").len() == 2
     });
@@ -1487,25 +1469,16 @@ fn convergence_authorization_admission_and_fanout() {
     let epic_events = ledger
         .list_events(Some("conv-fanout"), 0, 65_536)
         .expect("epic events");
-    let wave_position = epic_events
+    assert!(epic_events
         .iter()
-        .position(|event| event.kind == "forged.epic.wave.started")
-        .expect("wave start event");
-    let first_child_position = epic_events
-        .iter()
-        .position(|event| event.kind == "forged.epic.child.started")
-        .expect("child start event");
-    assert!(
-        wave_position < first_child_position,
-        "wave commits before children"
-    );
+        .all(|event| event.kind != "forged.epic.wave.started"));
     ledger.close().expect("close ledger");
 
     let first = first_two[0].split('/').next().expect("child id").to_owned();
     stop_run(&fanout, &first);
     std::thread::sleep(Duration::from_millis(1_100));
     wait_until("deferred child durable wake", || {
-        let _ = fanout.forged(&["supervise", "--once"]);
+        let _ = fanout.reconcile_epic("conv-fanout");
         provider_starts(&fanout, "implementation").len() == 3
     });
     let starts = provider_starts(&fanout, "implementation");
@@ -1524,13 +1497,6 @@ fn convergence_authorization_admission_and_fanout() {
             stop_run(&fanout, child);
         }
     }
-    let output = driver.wait_with_output().expect("fanout driver exits");
-    assert!(
-        output.status.success(),
-        "fanout driver: stdout={} stderr={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
     no_live_reservations(&fanout);
 
     // A one-slot epic proves integration and GitHub effects are serialized.
@@ -1545,8 +1511,8 @@ fn convergence_authorization_admission_and_fanout() {
             ("conv-serial-b", &serial_spec, true),
         ],
     );
-    park_direct_epic(&serial, "conv-serial");
-    let (code, driven) = serial.forged(&["epic", "drive", "--epic", "conv-serial"]);
+    serial.authorize_epic("conv-serial");
+    let (code, driven) = serial.drive_epic_to_stop("conv-serial");
     assert_eq!(code, 0, "serialized epic: {driven}");
     assert!(driven["result"]["stopped"]["finalPr"].is_object());
     let calls = serial.gh_calls();
@@ -2070,21 +2036,30 @@ fn convergence_crash_matrix_is_effect_exact() {
         no_live_reservations(&env);
     }
 
-    // GitHub accepted the child merge, then the controller died. Resume
-    // probes the durable external state and never repeats the merge.
+    // GitHub accepted the child merge, then the pass died. A later pass probes
+    // the durable external state and never repeats the merge.
     let gh = TestEnv::new("convergence-gh-effect");
     let gh_spec = gh.spec.clone();
     start_epic(&gh, "conv-gh-effect", &[("conv-gh-child", &gh_spec, true)]);
-    park_direct_epic(&gh, "conv-gh-effect");
-    let status = gh
-        .forged_cmd(&["epic", "drive", "--epic", "conv-gh-effect"])
-        .env("FORGED_FAILPOINT", "epic.child.merge.after")
-        .env("FORGED_FAILPOINT_MODE", "crash")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .expect("crashing epic driver");
-    assert!(!status.success());
+    gh.authorize_epic("conv-gh-effect");
+    assert_eq!(gh.reconcile_epic("conv-gh-effect").0, 0);
+    assert_eq!(gh.reconcile_epic("conv-gh-effect").0, 0);
+    // Every tick in the window runs with the failpoint armed: pre-merge
+    // progress is untouched (the failpoint sits after the merge effect), and
+    // whichever tick first attempts the merge crashes — deterministically,
+    // regardless of whether cleanliness and the merge land in one tick.
+    wait_until("the merging pass crashes at the failpoint", || {
+        gh.wake_epic("conv-gh-effect");
+        let status = gh
+            .forged_cmd(&["supervise", "--once"])
+            .env("FORGED_FAILPOINT", "epic.child.merge.after")
+            .env("FORGED_FAILPOINT_MODE", "crash")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("armed epic pass");
+        !status.success()
+    });
     let merge_count = |env: &TestEnv| {
         env.gh_calls()
             .iter()
@@ -2095,7 +2070,7 @@ fn convergence_crash_matrix_is_effect_exact() {
             .count()
     };
     assert_eq!(merge_count(&gh), 1);
-    let (code, resumed) = gh.forged(&["epic", "drive", "--epic", "conv-gh-effect"]);
+    let (code, resumed) = gh.drive_epic_to_stop("conv-gh-effect");
     assert_eq!(code, 0, "resume epic merge: {resumed}");
     assert_eq!(merge_count(&gh), 1, "merge is observed, never repeated");
     no_live_reservations(&gh);

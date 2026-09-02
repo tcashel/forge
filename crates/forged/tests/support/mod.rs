@@ -1418,7 +1418,7 @@ impl TestEnv {
         // not state, so the migrator open retries under a wall-clock
         // deadline instead of panicking on the first locked window.
         let db = self.anvil.join("state.db");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
         loop {
             match forged_ledger::Ledger::open(&db) {
                 Ok(ledger) => {
@@ -1821,14 +1821,141 @@ impl TestEnv {
         ledger.close().expect("close test ledger");
     }
 
-    /// Authorize a directly-driven epic fixture without starting a detached
-    /// controller. Child packet admission delegates to this parent epoch.
+    /// Authorize an epic fixture without exercising the public submit wrapper.
+    /// Child packet admission delegates to this parent epoch.
     pub fn authorize_epic(&self, epic_id: &str) {
         let ledger = self.ledger();
         ledger
             .authorize_desired_work(forged_ledger::DesiredSubjectKind::Epic, epic_id, 0)
             .expect("authorize test epic");
         ledger.close().expect("close test ledger");
+    }
+
+    /// Make one authorized epic due for a process-level supervisor tick.
+    /// Expiring a retained token models the lease boundary after a crashed
+    /// pass; a live test process never calls this concurrently with the pass.
+    pub fn wake_epic(&self, epic_id: &str) {
+        assert!(
+            self.wake_epic_if_running(epic_id),
+            "epic {epic_id} has no running desired row"
+        );
+    }
+
+    /// Make a running epic due, returning false after it reaches a stop.
+    pub fn wake_epic_if_running(&self, epic_id: &str) -> bool {
+        let connection = rusqlite::Connection::open(self.anvil.join("state.db"))
+            .expect("open desired-work clock");
+        let affected = connection
+            .execute(
+                "UPDATE desired_work SET next_wake_at = ?1, \
+                 reconcile_lease_until = CASE WHEN reconcile_token IS NULL THEN NULL ELSE ?1 END \
+                 WHERE subject_kind = 'epic' AND subject_id = ?2 AND desired_state = 'running'",
+                rusqlite::params!["2000-01-01T00:00:00.000000000Z", epic_id],
+            )
+            .expect("wake desired epic");
+        affected == 1
+    }
+
+    /// Drive one bounded epic frontier iteration through `supervise --once`.
+    /// The returned shape preserves concise assertions while the exercised
+    /// production surface is exclusively the supervisor ore pass.
+    pub fn reconcile_epic(&self, epic_id: &str) -> (i32, Value) {
+        self.wake_epic(epic_id);
+        let (code, tick) = self.forged(&["supervise", "--once"]);
+        if code != 0 {
+            return (code, tick);
+        }
+        let subject = tick["result"]["orePass"]["subjects"]
+            .as_array()
+            .and_then(|subjects| {
+                subjects
+                    .iter()
+                    .find(|subject| subject["epicId"] == json!(epic_id))
+            });
+        let Some(subject) = subject else {
+            return (code, tick);
+        };
+        let result = subject["result"].clone();
+        let projected = match subject["action"].as_str() {
+            Some("progress") => json!({"progress": result}),
+            Some("waiting") => json!({"waiting": result}),
+            Some("stopped") => json!({
+                "stopped": result
+                    .get("inputRequired")
+                    .cloned()
+                    .unwrap_or(result),
+            }),
+            Some("backoff") => json!({"backoff": subject["error"].clone()}),
+            _ => json!({"pass": subject}),
+        };
+        (
+            code,
+            json!({
+                "ok": true,
+                "reused": false,
+                "operationId": Value::Null,
+                "result": projected,
+                "error": Value::Null,
+            }),
+        )
+    }
+
+    /// Reconcile an epic until its pass reports a durable stop. Loop-mode
+    /// epics settle through real supervisor cadences and detached child
+    /// controllers, so the bound is a wall-clock deadline sized for a loaded
+    /// CI runner, never an iteration count.
+    pub fn drive_epic_to_stop(&self, epic_id: &str) -> (i32, Value) {
+        let mut last = Value::Null;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(240);
+        while std::time::Instant::now() < deadline {
+            let (code, value) = self.reconcile_epic(epic_id);
+            if code != 0 || value["result"]["stopped"].is_object() {
+                return (code, value);
+            }
+            last = value;
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        // Timeout forensics: the epic report alone cannot say WHY children
+        // never settle, so dump the scheduler-facts tables verbatim.
+        let mut forensics = String::new();
+        if let Ok(conn) = rusqlite::Connection::open(self.anvil.join("state.db")) {
+            for (label, sql) in [
+                (
+                    "desired_work",
+                    "SELECT subject_kind, subject_id, desired_state, restart_used, \
+                     exhausted_at, next_wake_at, last_outcome, last_error \
+                     FROM desired_work",
+                ),
+                (
+                    "runs",
+                    "SELECT run_id, state, terminal_outcome, stop_reason FROM runs",
+                ),
+                (
+                    "admission_decisions",
+                    "SELECT subject_id, outcome, reason, next_eligible_wake_at \
+                     FROM admission_decisions ORDER BY rowid DESC LIMIT 12",
+                ),
+            ] {
+                forensics.push_str(&format!("\n[{label}]\n"));
+                if let Ok(mut stmt) = conn.prepare(sql) {
+                    let cols = stmt.column_count();
+                    if let Ok(mut rows) = stmt.query([]) {
+                        while let Ok(Some(row)) = rows.next() {
+                            let mut line = Vec::new();
+                            for i in 0..cols {
+                                line.push(
+                                    row.get_ref(i)
+                                        .map(|v| format!("{v:?}"))
+                                        .unwrap_or_else(|e| format!("<{e}>")),
+                                );
+                            }
+                            forensics.push_str(&format!("  {}\n", line.join(" | ")));
+                        }
+                    }
+                }
+            }
+        }
+        panic!("epic {epic_id} did not reach a durable stop: {last}\n{forensics}")
     }
 
     /// The run's worktree path.

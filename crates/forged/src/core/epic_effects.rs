@@ -1,4 +1,4 @@
-//! Shared epic effects used by controller and loop schedulers.
+//! Epic effects used by the supervisor ore pass.
 
 use super::*;
 
@@ -42,7 +42,7 @@ pub(super) async fn apply_planning_result(
     child: &FrozenChild,
     state: &PlanningState,
     candidate: crate::adapters::execute::PlanCandidate,
-) -> Result<Step, Failure> {
+) -> Result<ReconcileAction, Failure> {
     apply_planning_result_impl(ctx, view, child, state, candidate).await
 }
 
@@ -52,11 +52,11 @@ pub(super) async fn merge_child(
     child: &FrozenChild,
     run: &forged_proto::RunView,
     evidence: Value,
-) -> Result<Step, Failure> {
+) -> Result<ReconcileAction, Failure> {
     merge_child_impl(ctx, config, child, run, evidence).await
 }
 
-pub(super) async fn final_pr(ctx: &Ctx, view: &EpicView) -> Result<Step, Failure> {
+pub(super) async fn final_pr(ctx: &Ctx, view: &EpicView) -> Result<ReconcileAction, Failure> {
     final_pr_impl(ctx, view).await
 }
 
@@ -76,19 +76,11 @@ pub(super) async fn dispatch_assurance_run(
     ensure_assurance_run_impl(ctx, config, state, true).await
 }
 
-pub(super) async fn start_assurance(
-    ctx: &Ctx,
-    view: &EpicView,
-    pr: &Value,
-) -> Result<Step, Failure> {
-    start_assurance_impl(ctx, view, pr, false).await
-}
-
 pub(super) async fn dispatch_assurance(
     ctx: &Ctx,
     view: &EpicView,
     pr: &Value,
-) -> Result<Step, Failure> {
+) -> Result<ReconcileAction, Failure> {
     start_assurance_impl(ctx, view, pr, true).await
 }
 
@@ -97,7 +89,7 @@ pub(super) async fn complete_assurance(
     view: &EpicView,
     state: &AssuranceState,
     run: &forged_proto::RunView,
-) -> Result<Step, Failure> {
+) -> Result<ReconcileAction, Failure> {
     complete_assurance_impl(ctx, view, state, run).await
 }
 
@@ -407,7 +399,7 @@ async fn apply_planning_result_impl(
     child: &FrozenChild,
     state: &PlanningState,
     candidate: crate::adapters::execute::PlanCandidate,
-) -> Result<Step, Failure> {
+) -> Result<ReconcileAction, Failure> {
     let config = &view.config;
     let post_fields = candidate.spec;
     let traceability = candidate.traceability;
@@ -428,7 +420,7 @@ async fn apply_planning_result_impl(
             ),
         )
         .await?;
-        return Ok(Step::Stop(input));
+        return Ok(ReconcileAction::Stop(input));
     }
     if state.integration_sha.is_some() {
         let checkpoint = match capture_planning_checkpoint(ctx, view, child).await {
@@ -448,7 +440,7 @@ async fn apply_planning_result_impl(
                     Some(json!({"error": error.message})),
                 )
                 .await?;
-                return Ok(Step::Stop(input));
+                return Ok(ReconcileAction::Stop(input));
             }
         };
         if let Err(detail) = checkpoint_drift(state, &checkpoint, &post_digest) {
@@ -478,7 +470,7 @@ async fn apply_planning_result_impl(
                 })),
             )
             .await?;
-            return Ok(Step::Stop(input));
+            return Ok(ReconcileAction::Stop(input));
         }
     }
     let issue = crate::core::workstore::show_issue(&ctx.ledger, &child.id).await?;
@@ -499,7 +491,7 @@ async fn apply_planning_result_impl(
             ),
         )
         .await?;
-        return Ok(Step::Stop(input));
+        return Ok(ReconcileAction::Stop(input));
     }
     if let Err(error) =
         forged_git::verify_worktree_clean(&ctx.config.runs_root, &state.run_id).await
@@ -520,7 +512,7 @@ async fn apply_planning_result_impl(
                 ),
             )
             .await?;
-            return Ok(Step::Stop(input));
+            return Ok(ReconcileAction::Stop(input));
         }
         return Err(error.into());
     }
@@ -537,7 +529,7 @@ async fn apply_planning_result_impl(
             ),
         )
         .await?;
-        return Ok(Step::Stop(input));
+        return Ok(ReconcileAction::Stop(input));
     }
     let key = derive_key(
         "epic_plan_apply",
@@ -634,7 +626,7 @@ async fn apply_planning_result_impl(
                     })),
                 )
                 .await?;
-                return Ok(Step::Stop(input));
+                return Ok(ReconcileAction::Stop(input));
             }
             json!({
                 "id": current.id,
@@ -680,7 +672,7 @@ async fn apply_planning_result_impl(
         "apply": applied,
     });
     append(ctx, &config.epic_id, PLAN_APPLIED, event.clone()).await?;
-    Ok(Step::Progress(event))
+    Ok(ReconcileAction::Progress(event))
 }
 
 async fn merge_child_impl(
@@ -689,7 +681,7 @@ async fn merge_child_impl(
     child: &FrozenChild,
     run: &forged_proto::RunView,
     evidence: Value,
-) -> Result<Step, Failure> {
+) -> Result<ReconcileAction, Failure> {
     let Some(pr_number) = crate::core::drive::pr_number_of(run) else {
         let input = require_input(
             ctx,
@@ -699,7 +691,7 @@ async fn merge_child_impl(
             "clean terminal slice has no durable draft PR identity",
         )
         .await?;
-        return Ok(Step::Stop(input));
+        return Ok(ReconcileAction::Stop(input));
     };
     let remote = github_remote(Path::new(&config.repo))
         .await
@@ -787,10 +779,10 @@ async fn merge_child_impl(
         "evidence": evidence,
     });
     append(ctx, &config.epic_id, CHILD_MERGED, event.clone()).await?;
-    Ok(Step::Progress(event))
+    Ok(ReconcileAction::Progress(event))
 }
 
-async fn final_pr_impl(ctx: &Ctx, view: &EpicView) -> Result<Step, Failure> {
+async fn final_pr_impl(ctx: &Ctx, view: &EpicView) -> Result<ReconcileAction, Failure> {
     let remote = github_remote(Path::new(&view.config.repo))
         .await
         .map_err(Failure::from)?;
@@ -870,9 +862,11 @@ async fn final_pr_impl(ctx: &Ctx, view: &EpicView) -> Result<Step, Failure> {
     )
     .await?;
     if view.config.assurance_package.is_some() {
-        Ok(Step::Progress(json!({"draftPr": value, "terminal": false})))
+        Ok(ReconcileAction::Progress(
+            json!({"draftPr": value, "terminal": false}),
+        ))
     } else {
-        Ok(Step::Stop(json!({"finalPr": value})))
+        Ok(ReconcileAction::Stop(json!({"finalPr": value})))
     }
 }
 
@@ -991,7 +985,7 @@ async fn start_assurance_impl(
     view: &EpicView,
     pr: &Value,
     authorize: bool,
-) -> Result<Step, Failure> {
+) -> Result<ReconcileAction, Failure> {
     let config = &view.config;
     let inspected: Result<(String, forged_git::PrMeta, String), Failure> = async {
         let integration_sha =
@@ -1022,7 +1016,7 @@ async fn start_assurance_impl(
                 })),
             )
             .await?;
-            return Ok(Step::Stop(stopped));
+            return Ok(ReconcileAction::Stop(stopped));
         }
     };
     let pr_sha = pr
@@ -1056,7 +1050,7 @@ async fn start_assurance_impl(
             })),
         )
         .await?;
-        return Ok(Step::Stop(stopped));
+        return Ok(ReconcileAction::Stop(stopped));
     }
     let run_id = assurance_run_id(&config.epic_id);
     let input_body = format!(
@@ -1108,7 +1102,7 @@ async fn start_assurance_impl(
     } else {
         ensure_assurance_run(ctx, config, &state).await?
     };
-    Ok(Step::Progress(
+    Ok(ReconcileAction::Progress(
         json!({"assurance": event, "started": started}),
     ))
 }
@@ -1118,7 +1112,7 @@ async fn complete_assurance_impl(
     view: &EpicView,
     state: &AssuranceState,
     run: &forged_proto::RunView,
-) -> Result<Step, Failure> {
+) -> Result<ReconcileAction, Failure> {
     let config = &view.config;
     let prepared: Result<_, Failure> = async {
         let gate = latest_gate_evidence(run)?;
@@ -1187,7 +1181,7 @@ async fn complete_assurance_impl(
                 })),
             )
             .await?;
-            return Ok(Step::Stop(stopped));
+            return Ok(ReconcileAction::Stop(stopped));
         }
     };
     let inspected: Result<AssuranceFinalInspection, Failure> = async {
@@ -1236,7 +1230,7 @@ async fn complete_assurance_impl(
                 })),
             )
             .await?;
-            return Ok(Step::Stop(stopped));
+            return Ok(ReconcileAction::Stop(stopped));
         }
     };
     let findings = crate::core::drive::latest_review_findings(run);
@@ -1302,7 +1296,7 @@ async fn complete_assurance_impl(
             Some(mismatch_evidence),
         )
         .await?;
-        return Ok(Step::Stop(stopped));
+        return Ok(ReconcileAction::Stop(stopped));
     }
     let reviewers = run
         .packets
@@ -1499,7 +1493,7 @@ async fn complete_assurance_impl(
     .await;
     let value = match finalized {
         Ok(value) if value.get("inputRequired").is_some() => {
-            return Ok(Step::Stop(value));
+            return Ok(ReconcileAction::Stop(value));
         }
         Ok(value) => value,
         Err(error) => {
@@ -1518,7 +1512,7 @@ async fn complete_assurance_impl(
                 })),
             )
             .await?;
-            return Ok(Step::Stop(stopped));
+            return Ok(ReconcileAction::Stop(stopped));
         }
     };
     // The replayable external effect is sealed before its cleanup checkpoint.
@@ -1527,7 +1521,9 @@ async fn complete_assurance_impl(
     append(ctx, &config.epic_id, ASSURANCE_FINALIZED, value.clone()).await?;
     crate::failpoint::hit("epic.assurance.finalized.after");
     if let Some(input) = complete_assurance_cleanup(ctx, view, &value).await? {
-        return Ok(Step::Stop(json!({"inputRequired": input})));
+        return Ok(ReconcileAction::Stop(json!({"inputRequired": input})));
     }
-    Ok(Step::Stop(json!({"finalPr": state.pr, "assurance": value})))
+    Ok(ReconcileAction::Stop(
+        json!({"finalPr": state.pr, "assurance": value}),
+    ))
 }

@@ -1,10 +1,10 @@
-//! The work-store consumer types — the nouns every projection, scheduler,
+//! The work-store consumer types — the nouns every projection and pass,
 //! and driver speaks. They originated as the bd wire shapes and keep their
 //! field-level contracts verbatim; the store behind them is the ledger.
 
 use std::collections::BTreeMap;
 
-/// The work fields forged consumes — the epic scheduler's inventory plus
+/// The work fields forged consumes — the epic group's inventory plus
 /// the spec body a run is built from.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]

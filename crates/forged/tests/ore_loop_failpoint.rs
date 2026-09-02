@@ -7,21 +7,8 @@ mod support;
 use std::process::Stdio;
 
 use forged_ledger::{DesiredSubjectKind, OperationState};
-use serde_json::{json, Value};
+use serde_json::Value;
 use support::TestEnv;
-
-fn set_loop_scheduler(env: &TestEnv) {
-    let path = env.anvil.join("config.json");
-    let mut config: Value =
-        serde_json::from_str(&std::fs::read_to_string(&path).expect("read forged test config"))
-            .expect("forged test config JSON");
-    config["epicScheduler"] = json!("loop");
-    std::fs::write(
-        path,
-        serde_json::to_string_pretty(&config).expect("serialize scheduler config"),
-    )
-    .expect("write scheduler config");
-}
 
 #[test]
 fn frontier_dispatch_recovers_run_operation_and_authorization_as_one_effect() {
@@ -29,7 +16,6 @@ fn frontier_dispatch_recovers_run_operation_and_authorization_as_one_effect() {
     env.enable_dynamic_gh();
     env.seed_epic("epic-loop-crash", &[("child-loop-crash", &env.spec, true)]);
     assert_eq!(env.forged(&["init"]).0, 0);
-    set_loop_scheduler(&env);
     let repo = env.repos.repo.to_string_lossy().into_owned();
     let spec = env.spec.to_string_lossy().into_owned();
     let (code, started) = env.forged(&[

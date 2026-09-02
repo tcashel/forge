@@ -16,8 +16,6 @@ Generated from the dispatch table, clap tree, MCP router, and fenced-call audit.
 | `definition_validate` | `forged definition validate` | yes | yes | read_only | no | yes |
 | `doctor` | `forged doctor` | yes | yes | read_only | no | yes |
 | `epic_abandon` | `forged epic abandon` | yes | yes | fenced | no | yes |
-| `epic_advance` | `forged epic advance` | yes | yes | machine-fenced | no | yes |
-| `epic_drive` | `forged epic drive` | yes | yes | machine-fenced | no | yes |
 | `epic_pause` | `forged epic pause` | yes | yes | fenced | no | yes |
 | `epic_preflight` | `forged epic preflight` | yes | yes | read_only | no | yes |
 | `epic_resolve` | `forged epic resolve` | yes | yes | fenced | no | yes |

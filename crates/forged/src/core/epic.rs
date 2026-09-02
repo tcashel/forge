@@ -1,23 +1,21 @@
-//! `epic/v1`: an event-sourced scheduler over work readiness and slice/v1.
+//! `epic/v1`: an event-sourced group over work readiness and slice/v1.
 
 #[path = "epic_effects.rs"]
 mod effects;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
-use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::Path;
-use std::time::Duration;
 
 use forged_ledger::{
     DesiredReconcileOutcome, DesiredState, DesiredSubjectKind, EffectClass,
-    InventoryUsageSelection, Ledger, OperationState, RunOutcome, RunState, SlotOutcome,
+    InventoryUsageSelection, Ledger, OperationState, RunOutcome, RunState,
 };
 use forged_proto::{machine_idempotency_key, MachineStage, NextAction, ProtoEvent, Terminal};
 use forged_types::{
     AdmissionDecisionV1, AdmissionOutcome, AdmissionSubjectKind, ErrorCode, ExecutionPackageV1,
-    ExecutionPolicyV1, NativeWorkSpecV1, OperationActionV1, OperationRequest, OperationResponse,
-    PolicyRevisionV1, RosterRevisionV1, SeatPurpose, Severity, Verdict, WorkIdentityContextV1,
+    ExecutionPolicyV1, NativeWorkSpecV1, OperationRequest, OperationResponse, PolicyRevisionV1,
+    RosterRevisionV1, SeatPurpose, Severity, Verdict, WorkIdentityContextV1,
     WorkIdentitySubjectKind,
 };
 use serde_json::{json, Map, Value};
@@ -33,7 +31,7 @@ use crate::core::{
 // inventory (`super::ops::work_list`) derives an epic's entry from exactly
 // these, and the input pair because the portfolio's attention rail folds an
 // epic's hold out of exactly those two; every other kind stays private to
-// the scheduler.
+// the epic projection.
 pub(super) const STARTED: &str = "forged.epic.started";
 pub(super) const ABANDONED: &str = "forged.epic.abandoned";
 const INTEGRATION_READY: &str = "forged.epic.integration.ready";
@@ -55,10 +53,6 @@ const PACKAGE_MIGRATED: &str = "forged.epic.execution-package.migrated";
 const PACKAGE_MIGRATION: &str = "forged.epic.execution-package/1";
 const PLAN_STARTED: &str = "forged.epic.plan.started";
 const PLAN_APPLIED: &str = "forged.epic.plan.applied";
-const EPIC_POLL: Duration = Duration::from_millis(250);
-/// Consecutive identical `Step::Progress` payloads that demote the drive
-/// loop to the poll cadence. Real progress changes the payload every tick.
-const PROGRESS_REPEAT_LIMIT: usize = 8;
 
 #[derive(Debug, Clone)]
 struct FrozenChild {
@@ -771,8 +765,8 @@ pub(super) async fn epic_submission_stop(ctx: &Ctx, epic: &str) -> Result<Option
     })
 }
 
-/// Poll the durable epic stream until initial setup resolves: the first
-/// wave started (`complete`), an unresolved input requirement or a
+/// Poll the durable epic stream until initial setup resolves: integration is
+/// prepared (`complete`), an unresolved input requirement or a
 /// halted/exhausted supervisor row (`failed`, with the evidence), or the
 /// bounded wait elapsed (`pending`). Read-only; the submit wrapper attaches
 /// the verdict as an advisory readback that is never stored.
@@ -800,10 +794,10 @@ pub(super) async fn await_setup(ctx: &Ctx, epic: &str) -> Value {
 async fn setup_probe(ctx: &Ctx, epic: &str) -> Result<Option<Value>, Failure> {
     let events = epoch_events(ctx, epic).await?;
     let mut latest_input: Option<&forged_ledger::EventRow> = None;
-    let mut wave_started = false;
+    let mut setup_complete = false;
     for row in &events {
         match row.kind.as_str() {
-            WAVE_STARTED => wave_started = true,
+            INTEGRATION_READY | WAVE_STARTED => setup_complete = true,
             INPUT_REQUIRED => latest_input = Some(row),
             INPUT_RESOLVED => latest_input = None,
             _ => {}
@@ -813,7 +807,7 @@ async fn setup_probe(ctx: &Ctx, epic: &str) -> Result<Option<Value>, Failure> {
         let evidence = serde_json::from_str::<Value>(&row.payload_json).unwrap_or(Value::Null);
         return Ok(Some(json!({"state": "failed", "inputRequired": evidence})));
     }
-    if wave_started {
+    if setup_complete {
         return Ok(Some(json!({"state": "complete"})));
     }
     let id = epic.to_owned();
@@ -883,7 +877,7 @@ async fn complete_assurance_cleanup(
             "assurance-cleanup-failed",
             None,
             format!(
-                "assurance worktree {:?} is {kind}; clean or resolve it, then explicitly advance the epic to retry cleanup",
+                "assurance worktree {:?} is {kind}; clean it, then run `forged epic resolve` so the pass retries cleanup",
                 worktree
             ),
             Some(json!({
@@ -1133,27 +1127,13 @@ fn response(resp: OperationResponse) -> Result<Value, Failure> {
     })
 }
 
-/// An epic controller is singular. Its slot holder is a real PID; a later
-/// process may reap only a confirmed-dead holder before resuming.
-struct DriverGuard {
-    ledger: Ledger,
-    slot: String,
-    holder: String,
-}
-
-impl Drop for DriverGuard {
-    fn drop(&mut self) {
-        let _ = self.ledger.release_merge_slot(&self.slot, &self.holder);
-    }
-}
-
-struct DesiredControlGuard {
+struct DesiredWorkGuard {
     ledger: Ledger,
     epic: String,
     token: String,
 }
 
-impl Drop for DesiredControlGuard {
+impl Drop for DesiredWorkGuard {
     fn drop(&mut self) {
         let _ =
             self.ledger
@@ -1161,97 +1141,10 @@ impl Drop for DesiredControlGuard {
     }
 }
 
-fn pid_alive(pid: i32) -> bool {
-    matches!(
-        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
-        Ok(()) | Err(nix::errno::Errno::EPERM)
-    )
-}
-
-fn lstart_hash(value: &str) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    value.hash(&mut hasher);
-    hasher.finish()
-}
-
-fn holder_identity(holder: &str) -> Option<(i32, Option<u64>)> {
-    let mut fields = holder.strip_prefix("forged-epic:")?.split(':');
-    let pid = fields.next()?.parse().ok()?;
-    let identity = fields.next().and_then(|value| value.parse().ok());
-    Some((pid, identity))
-}
-
-async fn acquire_driver(ctx: &Ctx, epic: &str) -> Result<DriverGuard, Failure> {
-    let slot = format!("epic:{epic}");
-    let pid = std::process::id() as i32;
-    let identity = crate::adapters::ports::lstart_of(pid)
-        .await
-        .map(|value| lstart_hash(&value));
-    let holder = format!(
-        "forged-epic:{}:{}:{}",
-        pid,
-        identity
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "unknown".to_owned()),
-        uuid::Uuid::new_v4()
-    );
-    let first = {
-        let slot = slot.clone();
-        let holder = holder.clone();
-        on_ledger(&ctx.ledger, move |ledger| {
-            ledger.acquire_merge_slot(&slot, &holder)
-        })
-        .await?
-    };
-    match first {
-        SlotOutcome::Acquired(_) => {}
-        SlotOutcome::Held(row) => match holder_identity(&row.holder) {
-            Some((held_pid, held_identity))
-                if !pid_alive(held_pid)
-                    || matches!(
-                        (held_identity, crate::adapters::ports::lstart_of(held_pid).await),
-                        (Some(recorded), Some(current)) if recorded != lstart_hash(&current)
-                    ) =>
-            {
-                let slot_for_release = slot.clone();
-                on_ledger(&ctx.ledger, move |ledger| {
-                    ledger.force_release_merge_slot(&slot_for_release)
-                })
-                .await?;
-                let slot_for_acquire = slot.clone();
-                let holder_for_acquire = holder.clone();
-                let acquired = on_ledger(&ctx.ledger, move |ledger| {
-                    ledger.acquire_merge_slot(&slot_for_acquire, &holder_for_acquire)
-                })
-                .await?;
-                if !matches!(acquired, SlotOutcome::Acquired(_)) {
-                    return Err(Failure::invalid(format!(
-                        "epic {epic} controller changed while reclaiming"
-                    )));
-                }
-            }
-            _ => {
-                return Err(Failure::refused(
-                    forged_types::ErrorCode::WorkContention,
-                    format!("epic {epic} is already driven by {}", row.holder),
-                ))
-            }
-        },
-    }
-    Ok(DriverGuard {
-        ledger: ctx.ledger.clone(),
-        slot,
-        holder,
-    })
-}
-
-async fn acquire_loop_control(
-    ctx: &Ctx,
-    epic: &str,
-) -> Result<Option<DesiredControlGuard>, Failure> {
-    if ctx.config.epic_scheduler != crate::config::EpicScheduler::Loop {
-        return Ok(None);
-    }
+/// Claim an existing epic desired row for one control operation. The ore pass
+/// owns the same token column, so a live reconciliation iteration wins with a
+/// recoverable contention refusal instead of observing a partial control.
+async fn acquire_desired_work(ctx: &Ctx, epic: &str) -> Result<Option<DesiredWorkGuard>, Failure> {
     let desired_id = epic.to_owned();
     let desired = on_ledger(&ctx.ledger, move |ledger| {
         ledger.get_desired_work(DesiredSubjectKind::Epic, &desired_id)
@@ -1275,16 +1168,16 @@ async fn acquire_loop_control(
             format!("epic {epic} is being reconciled by the supervisor ore pass; retry the control verb"),
         ));
     }
-    Ok(Some(DesiredControlGuard {
+    Ok(Some(DesiredWorkGuard {
         ledger: ctx.ledger.clone(),
         epic: epic.to_owned(),
         token,
     }))
 }
 
-/// With the singular controller lock held, an in-progress SafeRetry action
-/// belongs to a dead predecessor (or this process after a caught error). All
-/// epic effects below are probe-before-mutate, so releasing permits recovery.
+/// With the desired-work fence held, an in-progress SafeRetry action belongs
+/// to a dead predecessor (or this process after a caught error). All epic
+/// effects below are probe-before-mutate, so releasing permits recovery.
 async fn prepare_retry(ctx: &Ctx, name: &str, key: &str) -> Result<(), Failure> {
     let name_owned = name.to_owned();
     let key_owned = key.to_owned();
@@ -1530,7 +1423,9 @@ async fn validate_requested_base_ref(
     Ok(bare.to_owned())
 }
 
-/// Freeze the work inventory and child execution defaults.
+/// Freeze the work inventory and child execution defaults. Any existing
+/// desired row is claimed briefly so the ore pass cannot reconcile a prior
+/// epoch while the replacement inventory is frozen.
 pub async fn epic_start(ctx: &Ctx, req: &mut OperationRequest) -> OperationResponse {
     let epic = match param_str(&req.params, "epic") {
         Ok(value) => value.to_owned(),
@@ -1575,7 +1470,7 @@ pub async fn epic_start(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespo
     if req.run_id.is_none() {
         req.run_id = Some(epic.clone());
     }
-    let _guard = match acquire_driver(ctx, &epic).await {
+    let _desired_guard = match acquire_desired_work(ctx, &epic).await {
         Ok(guard) => guard,
         Err(error) => return err_response(&req.idempotency_key, &error),
     };
@@ -1913,14 +1808,9 @@ fn active_compiled_definition(
 
 async fn status_json(ctx: &Ctx, view: EpicView) -> Result<Value, Failure> {
     let active_definition = active_compiled_definition(&view)?;
-    let render_frontier = ctx.config.epic_scheduler == crate::config::EpicScheduler::Loop
-        || has_loop_dispatch(ctx, &view.config.epic_id).await?;
-    let controller = super::handoff::controller_status(ctx, &view.config.epic_id).await?;
     // One durable snapshot supplies every child run, identity, desired state,
     // admission decision, in-flight operation, and latest PR/controller
-    // record. Child status never fans out into process-table or filesystem
-    // probes; the epic controller's existing top-level projection remains a
-    // single backwards-compatible liveness probe.
+    // record. Status never fans out into process-table or filesystem probes.
     let snapshot = on_ledger(&ctx.ledger, |ledger| {
         ledger.inventory_snapshot(
             &[
@@ -1980,7 +1870,7 @@ async fn status_json(ctx: &Ctx, view: EpicView) -> Result<Value, Failure> {
             .cloned()
             .collect::<Vec<_>>()
     };
-    let (mut frontier, frontier_error) = if render_frontier && live_error.is_none() {
+    let (mut frontier, frontier_error) = if live_error.is_none() {
         match super::workstore::ready_frozen_epic_children(
             &ctx.ledger,
             &view.config.epic_id,
@@ -2085,20 +1975,6 @@ async fn status_json(ctx: &Ctx, view: EpicView) -> Result<Value, Failure> {
     let epic_desired = snapshot.desired_work.iter().find(|row| {
         row.subject_kind == DesiredSubjectKind::Epic && row.subject_id == view.config.epic_id
     });
-    let epic_admission_deferred = snapshot
-        .admission_decisions
-        .iter()
-        .find(|decision| {
-            decision.subject_kind == AdmissionSubjectKind::Epic
-                && decision.subject_id == view.config.epic_id
-        })
-        .is_some_and(|decision| decision.outcome == AdmissionOutcome::Deferred);
-    let slot_name = format!("epic:{}", view.config.epic_id);
-    let integration_owner = on_ledger(&ctx.ledger, {
-        let slot_name = slot_name.clone();
-        move |ledger| ledger.read_merge_slot(&slot_name)
-    })
-    .await?;
     let integration_operation = snapshot.inflight_operations.iter().rev().find(|row| {
         row.run_id.as_deref() == Some(view.config.epic_id.as_str())
             && matches!(
@@ -2115,7 +1991,7 @@ async fn status_json(ctx: &Ctx, view: EpicView) -> Result<Value, Failure> {
         ("merged", 0),
     ]);
     // Deferral reasons across non-terminal children, so expected
-    // serialization (`repository-write-capacity: 1`) reads as a wave-level
+    // serialization (`repository-write-capacity: 1`) reads as a frontier-level
     // fact instead of a stall diffed out of two children's admission blobs.
     let mut deferred_reasons: BTreeMap<String, u64> = BTreeMap::new();
     let mut next_wakes = Vec::new();
@@ -2271,24 +2147,23 @@ async fn status_json(ctx: &Ctx, view: EpicView) -> Result<Value, Failure> {
             }),
         })
     });
+    let active_children = counts.get("active").copied().unwrap_or(0)
+        + counts.get("queuedDeferred").copied().unwrap_or(0);
+    let pass_or_children_live =
+        epic_desired.is_some_and(|row| row.reconcile_token.is_some()) || active_children > 0;
     let epic_health = super::health::execution_health(super::health::HealthInputs::epic_status(
         final_pr.is_some(),
         view.paused.is_some(),
         view.input.is_some(),
-        epic_admission_deferred,
+        false,
         epic_desired,
-        match controller.get("state").and_then(Value::as_str) {
-            Some("running") => Some(true),
-            Some("exited" | "vanished" | "dead") => Some(false),
-            _ => None,
-        },
+        Some(pass_or_children_live),
     ));
     let mut status = json!({
         "schema": "forged.epic.status/1",
         "epicId": view.config.epic_id,
         "executionHealth": epic_health,
         "desired": desired_json(epic_desired),
-        "lastControllerFailure": terminal_failures.get(view.config.epic_id.as_str()),
         "deferred": deferred_reasons,
         "identity": identity,
         "herdrLayout": herdr_layout,
@@ -2300,11 +2175,6 @@ async fn status_json(ctx: &Ctx, view: EpicView) -> Result<Value, Failure> {
         "maxActiveChildren": view.config.max_active_children,
         "counts": counts,
         "nextCoordinatorWakeAt": next_wakes.first(),
-        "integrationOwner": integration_owner.map(|row| json!({
-            "slot": row.slot,
-            "holder": row.holder,
-            "acquiredAt": row.acquired_at,
-        })),
         "integrationOperation": integration_operation.map(|row| json!({
             "operationId": row.operation_id,
             "name": row.name,
@@ -2321,24 +2191,21 @@ async fn status_json(ctx: &Ctx, view: EpicView) -> Result<Value, Failure> {
         "policyRevisions": view.policy_revisions,
         "cursor": view.cursor,
         "integration": view.integration,
-        "waves": view.waves,
         "children": children,
         "inputRequired": view.input,
         "paused": view.paused,
         "draftPr": draft_pr,
         "finalPr": final_pr,
         "assurance": assurance,
-        "controller": controller,
         "beadsInventory": {
             "available": live_error.is_none() && frontier_error.is_none(),
             "detail": live_error.or(frontier_error),
         },
     });
-    if render_frontier {
-        status
-            .as_object_mut()
-            .expect("epic status is an object")
-            .insert("frontier".to_owned(), Value::Array(frontier));
+    let object = status.as_object_mut().expect("epic status is an object");
+    object.insert("frontier".to_owned(), Value::Array(frontier));
+    if !view.waves.is_empty() {
+        object.insert("waves".to_owned(), Value::Array(view.waves));
     }
     Ok(status)
 }
@@ -2703,9 +2570,9 @@ pub async fn epic_status(ctx: &Ctx, req: &OperationRequest) -> OperationResponse
     .await
 }
 
-/// Append one explicit roster revision to an epic. The epic controller lock
-/// makes the active-child set stable while every unmerged child receives the
-/// same resolved snapshot; future children inherit it from the epic stream.
+/// Append one explicit roster revision to an epic. A short-lived desired-row
+/// claim makes the active-child set stable while every unmerged child receives
+/// the same resolved snapshot; future children inherit it from the epic stream.
 pub async fn epic_revise_roster(ctx: &Ctx, req: &mut OperationRequest) -> OperationResponse {
     let epic = match param_str(&req.params, "epic") {
         Ok(value) => value.to_owned(),
@@ -2749,7 +2616,7 @@ pub async fn epic_revise_roster(ctx: &Ctx, req: &mut OperationRequest) -> Operat
             )
         }
     };
-    let _guard = match acquire_driver(ctx, &epic).await {
+    let _desired_guard = match acquire_desired_work(ctx, &epic).await {
         Ok(guard) => guard,
         Err(error) => {
             return err_response(
@@ -2874,7 +2741,8 @@ pub async fn epic_revise_roster(ctx: &Ctx, req: &mut OperationRequest) -> Operat
 }
 
 /// Append a config-sourced policy revision to every unmerged child and to
-/// the epic template used by future children.
+/// the epic template used by future children. A short-lived desired-row claim
+/// keeps that child set stable against the ore pass.
 pub async fn epic_revise_policy(ctx: &Ctx, req: &mut OperationRequest) -> OperationResponse {
     let epic = match param_str(&req.params, "epic") {
         Ok(value) => value.to_owned(),
@@ -2915,7 +2783,7 @@ pub async fn epic_revise_policy(ctx: &Ctx, req: &mut OperationRequest) -> Operat
             );
         }
     }
-    let _guard = match acquire_driver(ctx, &epic).await {
+    let _desired_guard = match acquire_desired_work(ctx, &epic).await {
         Ok(guard) => guard,
         Err(error) => {
             return err_response(
@@ -3216,49 +3084,10 @@ fn clean_slice(view: &forged_proto::RunView) -> (bool, Value) {
     )
 }
 
-pub(super) enum Step {
+pub(super) enum ReconcileAction {
     Progress(Value),
     Wait(Value),
     Stop(Value),
-}
-
-/// The drive loop's spin brake.
-///
-/// `Step::Progress` is the only step that loops without sleeping, so a step
-/// that repeats without moving the projection forward burns a core and floods
-/// the epic's stream with one operation-request event per iteration. An
-/// IDENTICAL payload is that signature; ordinary dispatch changes it, so
-/// distinct values reset the run.
-///
-/// It is a brake, never a stop: the planning and assurance relays hand
-/// `run_advance`'s response back verbatim, and a child awaiting a live
-/// provider yields the same `awaitPacket` payload on every tick for as long
-/// as that provider runs. An identical run is therefore a WAIT and must be
-/// polled at the wait cadence, never parked as input-required.
-#[derive(Default)]
-struct ProgressRepeat {
-    last: Option<Value>,
-    run: usize,
-}
-
-impl ProgressRepeat {
-    /// Record one progress payload; `true` once the identical run reaches
-    /// `PROGRESS_REPEAT_LIMIT`.
-    fn stalled(&mut self, value: &Value) -> bool {
-        if self.last.as_ref() == Some(value) {
-            self.run += 1;
-        } else {
-            self.last = Some(value.clone());
-            self.run = 1;
-        }
-        self.run >= PROGRESS_REPEAT_LIMIT
-    }
-}
-
-struct PendingWave {
-    number: u32,
-    members: BTreeSet<String>,
-    launch_order: BTreeMap<String, usize>,
 }
 
 /// The INTEGRATION_READY payload for ONE epoch.
@@ -3272,50 +3101,6 @@ struct PendingWave {
 /// only be a same-epoch retry, which is legitimately idempotent.
 fn integration_ready_event(branch: &str, base: &str, cut_sha: &str, epoch: usize) -> Value {
     json!({"branch": branch, "baseRef": base, "cutSha": cut_sha, "epoch": epoch})
-}
-
-async fn start_child(
-    ctx: &Ctx,
-    config: &EpicConfig,
-    child: &FrozenChild,
-    wave: u32,
-    generation: u32,
-    compiled: crate::config::CompiledDefinition,
-) -> Result<Value, Failure> {
-    let run_id = if generation == 1 {
-        child.id.clone()
-    } else {
-        format!("{}-g{generation}", child.id)
-    };
-    let mut request = OperationRequest {
-        schema_version: 1,
-        idempotency_key: derive_key("run_start", Some(&run_id), None, None),
-        run_id: Some(run_id.clone()),
-        params: match json!({
-            "bead": child.id,
-            "run": run_id,
-            "repo": config.repo,
-            "spec": child.spec_path,
-            "baseRef": config.integration_branch,
-            "epicId": config.epic_id,
-            "epicTitle": config.title,
-        }) {
-            Value::Object(map) => map,
-            _ => Map::new(),
-        },
-    };
-    let started =
-        response(super::ops::run_start_with_definition(ctx, &mut request, compiled).await)?;
-    let event = json!({
-        "childId": child.id,
-        "runId": run_id,
-        "wave": wave,
-        "generation": generation,
-        "branch": started.get("branch"),
-        "baseRef": config.integration_branch,
-    });
-    append(ctx, &config.epic_id, CHILD_STARTED, event.clone()).await?;
-    Ok(event)
 }
 
 async fn dispatch_loop_child(
@@ -3424,7 +3209,7 @@ async fn start_planning(
     generation: u32,
     guidance: Option<&str>,
     authorize: bool,
-) -> Result<Step, Failure> {
+) -> Result<ReconcileAction, Failure> {
     let config = &view.config;
     let frozen_fields = child.frozen_fields.as_ref().ok_or_else(|| {
         Failure::internal(format!("planning stub {:?} has no frozen fields", child.id))
@@ -3445,7 +3230,7 @@ async fn start_planning(
                 Some(json!({"error": detail})),
             )
             .await?;
-            return Ok(Step::Stop(input));
+            return Ok(ReconcileAction::Stop(input));
         }
         Err(error) => return Err(error),
     };
@@ -3521,10 +3306,10 @@ async fn start_planning(
         effects::ensure_planning_run(ctx, config, child, &state).await?
     };
     match ensured {
-        PlanningRunEnsure::Started(started) => Ok(Step::Progress(
+        PlanningRunEnsure::Started(started) => Ok(ReconcileAction::Progress(
             json!({"planning": event, "started": started}),
         )),
-        PlanningRunEnsure::Stop(stopped) => Ok(Step::Stop(stopped)),
+        PlanningRunEnsure::Stop(stopped) => Ok(ReconcileAction::Stop(stopped)),
     }
 }
 
@@ -3629,45 +3414,6 @@ fn checkpoint_drift(
 /// lead session uses. The epic never calls a provider or a run driver: an
 /// admitted controller owns the child from this point forward, while a
 /// deferred response leaves durable desired work for the supervisor.
-async fn submit_child(
-    ctx: &Ctx,
-    epic: &str,
-    child: &FrozenChild,
-    run_id: &str,
-) -> Result<Value, Failure> {
-    // Parent before child is the lock order used by packet launch too.
-    // Pause/stop either wins before this bounded submit (and no child is
-    // authorized) or waits until its controller identity/queued decision is
-    // durable. Detached children are deliberately not killed by a later
-    // parent pause.
-    let _parent_guard =
-        super::handoff::acquire_submit(ctx, epic, super::handoff::Scope::Epic).await?;
-    let parent = project(ctx, epic).await?;
-    if parent.paused.is_some() || parent.input.is_some() || parent.pr.is_some() {
-        return Ok(json!({
-            "childId": child.id,
-            "runId": run_id,
-            "submitted": false,
-            "parentStopped": true,
-        }));
-    }
-    let mut request = OperationRequest {
-        schema_version: 1,
-        idempotency_key: String::new(),
-        run_id: Some(run_id.to_owned()),
-        params: match json!({"run": run_id}) {
-            Value::Object(map) => map,
-            _ => Map::new(),
-        },
-    };
-    let submitted = response(super::handoff::run_submit(ctx, &mut request).await)?;
-    Ok(json!({
-        "childId": child.id,
-        "runId": run_id,
-        "submission": submitted,
-    }))
-}
-
 fn assurance_run_id(epic: &str) -> String {
     format!("{epic}-epic-assurance")
 }
@@ -3752,101 +3498,6 @@ fn latest_gate_evidence(view: &forged_proto::RunView) -> Result<Value, Failure> 
     }))
 }
 
-async fn advance_assurance(ctx: &Ctx, view: &EpicView) -> Result<Step, Failure> {
-    let pr = view
-        .pr
-        .as_ref()
-        .ok_or_else(|| Failure::internal("assurance advance has no draft PR"))?;
-    let Some(state) = view.assurance.as_ref() else {
-        return effects::start_assurance(ctx, view, pr).await;
-    };
-    let started = match effects::ensure_assurance_run(ctx, &view.config, state).await {
-        Ok(started) => started,
-        Err(error) => {
-            let stopped = require_input_with_evidence(
-                ctx,
-                &view.config.epic_id,
-                "assurance-recovery-unsafe",
-                None,
-                error.message,
-                Some(json!({"runId": state.run_id, "integrationSha": state.integration_sha})),
-            )
-            .await?;
-            return Ok(Step::Stop(stopped));
-        }
-    };
-    let run = super::drive::project(ctx, &state.run_id).await?;
-    if run.run.state == RunState::Stopped {
-        if run.run.terminal_outcome == Some(RunOutcome::Clean) {
-            return effects::complete_assurance(ctx, view, state, &run).await;
-        }
-        let terminal = planning_protocol_terminal(ctx, &state.run_id).await?;
-        let stopped = require_input_with_evidence(
-            ctx,
-            &view.config.epic_id,
-            "assurance-run-stopped",
-            None,
-            format!(
-                "integrated assurance run {} stopped with outcome {:?}: {}",
-                state.run_id,
-                run.run.terminal_outcome,
-                run.run.stop_reason.as_deref().unwrap_or("no reason")
-            ),
-            Some(json!({
-                "runId": state.run_id,
-                "integrationSha": state.integration_sha,
-                "outcome": run.run.terminal_outcome.map(RunOutcome::as_str),
-                "protocolTerminal": terminal,
-                "draftPr": state.pr,
-            })),
-        )
-        .await?;
-        return Ok(Step::Stop(stopped));
-    }
-    let request = OperationRequest {
-        schema_version: 1,
-        idempotency_key: String::new(),
-        run_id: Some(state.run_id.clone()),
-        params: match json!({"run": state.run_id}) {
-            Value::Object(map) => map,
-            _ => Map::new(),
-        },
-    };
-    let advanced = super::drive::run_advance(ctx, &request).await;
-    if !advanced.ok {
-        if advanced
-            .error
-            .as_ref()
-            .is_some_and(|error| error.recoverable && error.code == ErrorCode::OperationInProgress)
-        {
-            return Ok(Step::Wait(json!({
-                "assuranceDeferred": advanced,
-                "runId": state.run_id,
-                "started": started,
-            })));
-        }
-        let stopped = require_input_with_evidence(
-            ctx,
-            &view.config.epic_id,
-            "assurance-advance-failed",
-            None,
-            advanced
-                .error
-                .as_ref()
-                .map(|error| error.message.clone())
-                .unwrap_or_else(|| "assurance advance failed without typed detail".to_owned()),
-            Some(json!({"runId": state.run_id, "response": advanced})),
-        )
-        .await?;
-        return Ok(Step::Stop(stopped));
-    }
-    Ok(Step::Progress(json!({
-        "assuranceAdvanced": advanced,
-        "runId": state.run_id,
-        "started": started,
-    })))
-}
-
 fn child_accounted(view: &EpicView, statuses: &BTreeMap<&str, &str>, child: &FrozenChild) -> bool {
     child.initially_closed
         || statuses
@@ -3858,137 +3509,11 @@ fn child_accounted(view: &EpicView, statuses: &BTreeMap<&str, &str>, child: &Fro
             .is_some_and(|state| state.merged.is_some())
 }
 
-async fn planning_after_completed_wave(
-    ctx: &Ctx,
-    view: &EpicView,
-    statuses: &BTreeMap<&str, &str>,
-) -> Result<Option<Step>, Failure> {
-    if view.config.planning_package.is_none() || view.waves.is_empty() {
-        return Ok(None);
-    }
-    let events = epoch_events(ctx, &view.config.epic_id).await?;
-    let latest_wave_event = events
-        .iter()
-        .rev()
-        .find(|event| event.kind == WAVE_STARTED)
-        .map(|event| event.event_id)
-        .unwrap_or(0);
-    let already_attempted = events
-        .iter()
-        .any(|event| event.event_id > latest_wave_event && event.kind == PLAN_STARTED);
-    let retry_child = view.planning_guidance.keys().next().map(String::as_str);
-    if already_attempted && retry_child.is_none() {
-        return Ok(None);
-    }
-
-    let candidates = view
-        .config
-        .children
-        .iter()
-        .filter(|child| child.planning_stub)
-        .filter(|child| !child_accounted(view, statuses, child))
-        .filter(|child| !view.planning.contains_key(&child.id))
-        .filter(|child| retry_child.is_none_or(|retry| child.id == retry))
-        .collect::<Vec<_>>();
-    let candidate_ids = candidates
-        .iter()
-        .map(|child| child.id.clone())
-        .collect::<Vec<_>>();
-    let plan_rows = super::workstore::plan_issues(&ctx.ledger, &candidate_ids)
-        .await?
-        .into_iter()
-        .map(|row| (row.issue.id.clone(), row))
-        .collect::<BTreeMap<_, _>>();
-    let mut eligible = Vec::new();
-    for child in candidates {
-        let Some(row) = plan_rows.get(&child.id) else {
-            let input = require_input(
-                ctx,
-                &view.config.epic_id,
-                "planning-stub-missing",
-                Some(&child.id),
-                "frozen planning stub is absent from the work store",
-            )
-            .await?;
-            return Ok(Some(Step::Stop(input)));
-        };
-        let live_blockers = row
-            .dependencies
-            .iter()
-            .filter(|dependency| dependency.dependency_type.blocks_readiness())
-            .map(|dependency| dependency.id.clone())
-            .collect::<BTreeSet<_>>();
-        let frozen_blockers = child.blockers.iter().cloned().collect::<BTreeSet<_>>();
-        if live_blockers != frozen_blockers {
-            let input = require_input(
-                ctx,
-                &view.config.epic_id,
-                "planning-graph-drift",
-                Some(&child.id),
-                format!(
-                    "blocking dependencies changed: frozen {frozen_blockers:?}, live {live_blockers:?}"
-                ),
-            )
-            .await?;
-            return Ok(Some(Step::Stop(input)));
-        }
-        let digest = fields_digest(&native_fields(&row.issue))?;
-        if child.frozen_fields_sha256.as_deref() != Some(digest.as_str())
-            || row.issue.status != "blocked"
-            || row.issue.assignee.is_some()
-        {
-            let input = require_input(
-                ctx,
-                &view.config.epic_id,
-                "planning-stub-drift",
-                Some(&child.id),
-                format!(
-                    "stub changed before planning: status {:?}, assignee {:?}, digest {}",
-                    row.issue.status, row.issue.assignee, digest
-                ),
-            )
-            .await?;
-            return Ok(Some(Step::Stop(input)));
-        }
-        let blockers_closed = row
-            .dependencies
-            .iter()
-            .filter(|dependency| dependency.dependency_type.blocks_readiness())
-            .all(|dependency| dependency.status.is_some_and(|status| status.is_closed()));
-        if blockers_closed {
-            eligible.push((row.issue.priority.unwrap_or(i64::MAX), child));
-        }
-    }
-    eligible.sort_by(|(left_priority, left), (right_priority, right)| {
-        left_priority
-            .cmp(right_priority)
-            .then_with(|| left.id.cmp(&right.id))
-    });
-    let Some((_, child)) = eligible.first() else {
-        return Ok(None);
-    };
-    Ok(Some(
-        start_planning(
-            ctx,
-            view,
-            child,
-            view.planning_generations
-                .get(&child.id)
-                .copied()
-                .unwrap_or(0)
-                .saturating_add(1),
-            view.planning_guidance.get(&child.id).map(String::as_str),
-            false,
-        )
-        .await?,
-    ))
-}
-
 async fn planning_in_loop_round(
     ctx: &Ctx,
     view: &EpicView,
     statuses: &BTreeMap<&str, &str>,
-) -> Result<Option<Step>, Failure> {
+) -> Result<Option<ReconcileAction>, Failure> {
     if view.config.planning_package.is_none() {
         return Ok(None);
     }
@@ -3999,11 +3524,17 @@ async fn planning_in_loop_round(
         .find(|event| matches!(event.kind.as_str(), PLAN_APPLIED | CHILD_MERGED))
         .map(|event| event.event_id)
         .unwrap_or(0);
-    if events
+    // INPUT_RESOLVED removes a rejected cycle from the projection while its
+    // historical start remains. Only a still-projected cycle blocks a retry.
+    for event in events
         .iter()
-        .any(|event| event.event_id > round_cursor && event.kind == PLAN_STARTED)
+        .filter(|event| event.event_id > round_cursor && event.kind == PLAN_STARTED)
     {
-        return Ok(None);
+        let started = payload(event)?;
+        let child = string(&started, "childId")?;
+        if view.planning.contains_key(&child) {
+            return Ok(None);
+        }
     }
     let candidates = view
         .config
@@ -4033,7 +3564,7 @@ async fn planning_in_loop_round(
                 "frozen planning stub is absent from the work store",
             )
             .await?;
-            return Ok(Some(Step::Stop(input)));
+            return Ok(Some(ReconcileAction::Stop(input)));
         };
         let live_blockers = row
             .dependencies
@@ -4053,7 +3584,7 @@ async fn planning_in_loop_round(
                 ),
             )
             .await?;
-            return Ok(Some(Step::Stop(input)));
+            return Ok(Some(ReconcileAction::Stop(input)));
         }
         let digest = fields_digest(&native_fields(&row.issue))?;
         if child.frozen_fields_sha256.as_deref() != Some(digest.as_str())
@@ -4071,7 +3602,7 @@ async fn planning_in_loop_round(
                 ),
             )
             .await?;
-            return Ok(Some(Step::Stop(input)));
+            return Ok(Some(ReconcileAction::Stop(input)));
         }
         let blockers_closed = row
             .dependencies
@@ -4107,7 +3638,10 @@ async fn planning_in_loop_round(
     ))
 }
 
-async fn reconcile_loop_planning(ctx: &Ctx, view: &EpicView) -> Result<Option<Step>, Failure> {
+async fn reconcile_loop_planning(
+    ctx: &Ctx,
+    view: &EpicView,
+) -> Result<Option<ReconcileAction>, Failure> {
     for child in &view.config.children {
         let Some(planning) = view
             .planning
@@ -4118,11 +3652,11 @@ async fn reconcile_loop_planning(ctx: &Ctx, view: &EpicView) -> Result<Option<St
         };
         match effects::dispatch_planning_run(ctx, &view.config, child, planning).await? {
             PlanningRunEnsure::Started(_) => {}
-            PlanningRunEnsure::Stop(stopped) => return Ok(Some(Step::Stop(stopped))),
+            PlanningRunEnsure::Stop(stopped) => return Ok(Some(ReconcileAction::Stop(stopped))),
         }
         let run = super::drive::project(ctx, &planning.run_id).await?;
         if run.run.state != RunState::Stopped {
-            return Ok(Some(Step::Wait(json!({
+            return Ok(Some(ReconcileAction::Wait(json!({
                 "reason": "planning-running-or-deferred",
                 "childId": child.id,
                 "runId": planning.run_id,
@@ -4138,7 +3672,7 @@ async fn reconcile_loop_planning(ctx: &Ctx, view: &EpicView) -> Result<Option<St
                     "clean epic-plan run has no complete durable plan candidate",
                 )
                 .await?;
-                return Ok(Some(Step::Stop(input)));
+                return Ok(Some(ReconcileAction::Stop(input)));
             };
             return effects::apply_planning_result(ctx, view, child, planning, candidate)
                 .await
@@ -4179,12 +3713,12 @@ async fn reconcile_loop_planning(ctx: &Ctx, view: &EpicView) -> Result<Option<St
             })),
         )
         .await?;
-        return Ok(Some(Step::Stop(input)));
+        return Ok(Some(ReconcileAction::Stop(input)));
     }
     Ok(None)
 }
 
-async fn advance_loop_assurance(ctx: &Ctx, view: &EpicView) -> Result<Step, Failure> {
+async fn advance_loop_assurance(ctx: &Ctx, view: &EpicView) -> Result<ReconcileAction, Failure> {
     let pr = view
         .pr
         .as_ref()
@@ -4204,12 +3738,12 @@ async fn advance_loop_assurance(ctx: &Ctx, view: &EpicView) -> Result<Step, Fail
                 Some(json!({"runId": state.run_id, "integrationSha": state.integration_sha})),
             )
             .await?;
-            return Ok(Step::Stop(stopped));
+            return Ok(ReconcileAction::Stop(stopped));
         }
     };
     let run = super::drive::project(ctx, &state.run_id).await?;
     if run.run.state != RunState::Stopped {
-        return Ok(Step::Wait(json!({
+        return Ok(ReconcileAction::Wait(json!({
             "reason": "assurance-running-or-deferred",
             "runId": state.run_id,
             "started": started,
@@ -4239,94 +3773,41 @@ async fn advance_loop_assurance(ctx: &Ctx, view: &EpicView) -> Result<Step, Fail
         })),
     )
     .await?;
-    Ok(Step::Stop(stopped))
-}
-
-/// Whether a live controller owns the epic driver slot. This is a read-only
-/// probe: only the controller acquisition path may reap a confirmed-dead row.
-pub(super) async fn loop_driver_live(ctx: &Ctx, epic: &str) -> Result<bool, Failure> {
-    let slot = format!("epic:{epic}");
-    let row = on_ledger(&ctx.ledger, move |ledger| ledger.read_merge_slot(&slot)).await?;
-    let Some(row) = row else { return Ok(false) };
-    let confirmed_dead = match holder_identity(&row.holder) {
-        Some((pid, identity)) => {
-            !pid_alive(pid)
-                || matches!(
-                    (identity, crate::adapters::ports::lstart_of(pid).await),
-                    (Some(recorded), Some(current)) if recorded != lstart_hash(&current)
-                )
-        }
-        None => false,
-    };
-    Ok(!confirmed_dead)
-}
-
-/// A null wave is the irreversible marker that the waveless scheduler has
-/// dispatched this epic.
-pub(super) async fn has_loop_dispatch(ctx: &Ctx, epic: &str) -> Result<bool, Failure> {
-    Ok(epic_events(ctx, epic).await?.iter().any(|row| {
-        row.kind == CHILD_STARTED
-            && payload(row)
-                .ok()
-                .and_then(|event| event.get("wave").cloned())
-                .is_some_and(|wave| wave.is_null())
-    }))
-}
-
-async fn refuse_loop_controller(ctx: &Ctx, epic: &str, key: &str) -> Option<OperationResponse> {
-    match has_loop_dispatch(ctx, epic).await {
-        Ok(false) => None,
-        Ok(true) => {
-            let failure = Failure::invalid(format!(
-                "epic {epic} contains a loop-dispatched child and cannot be driven by a controller; set epicScheduler: loop and run supervise"
-            ));
-            Some(remedy_response(
-                key,
-                &failure,
-                forged_types::RemedyV1::from(OperationActionV1 {
-                    verb: "supervise".to_owned(),
-                    args: Map::new(),
-                    reason: "set epicScheduler: loop; the controller-to-loop flip is irreversible for this epic"
-                        .to_owned(),
-                }),
-            ))
-        }
-        Err(error) => Some(err_response(key, &error)),
-    }
+    Ok(ReconcileAction::Stop(stopped))
 }
 
 /// One bounded, waveless frontier iteration. Run cognition stays owned by the
 /// ordinary supervisor subjects minted here; this function performs at most
 /// one child merge and never advances a child, planning, or assurance run.
-pub(super) async fn advance_loop_once(ctx: &Ctx, epic: &str) -> Result<Step, Failure> {
+pub(super) async fn reconcile_once(ctx: &Ctx, epic: &str) -> Result<ReconcileAction, Failure> {
     let view = project(ctx, epic).await?;
     if let Some(completed) = view.assurance_completed.as_ref() {
-        return Ok(Step::Stop(
+        return Ok(ReconcileAction::Stop(
             json!({"finalPr": view.pr, "assurance": completed}),
-        ));
-    }
-    if let Some(finalized) = view.assurance_finalized.as_ref() {
-        if let Some(input) = complete_assurance_cleanup(ctx, &view, finalized).await? {
-            return Ok(Step::Stop(json!({"inputRequired": input})));
-        }
-        return Ok(Step::Stop(
-            json!({"finalPr": view.pr, "assurance": finalized}),
         ));
     }
     if view.config.assurance_package.is_none() {
         if let Some(pr) = view.pr.as_ref() {
-            return Ok(Step::Stop(json!({"finalPr": pr})));
+            return Ok(ReconcileAction::Stop(json!({"finalPr": pr})));
         }
     }
     if let Some(paused) = view.paused.as_ref() {
-        return Ok(Step::Stop(json!({"paused": paused})));
+        return Ok(ReconcileAction::Stop(json!({"paused": paused})));
     }
     if let Some(input) = view.input.as_ref() {
-        return Ok(Step::Stop(json!({"inputRequired": input})));
+        return Ok(ReconcileAction::Stop(json!({"inputRequired": input})));
+    }
+    if let Some(finalized) = view.assurance_finalized.as_ref() {
+        if let Some(input) = complete_assurance_cleanup(ctx, &view, finalized).await? {
+            return Ok(ReconcileAction::Stop(json!({"inputRequired": input})));
+        }
+        return Ok(ReconcileAction::Stop(
+            json!({"finalPr": view.pr, "assurance": finalized}),
+        ));
     }
     if view.integration.is_none() {
         return match effects::ensure_integration(ctx, &view.config, view.start_epoch).await {
-            Ok(ready) => Ok(Step::Progress(ready)),
+            Ok(ready) => Ok(ReconcileAction::Progress(ready)),
             Err(failure) if failure.recoverable => Err(failure),
             Err(failure) => {
                 let stopped = require_input_with_evidence(
@@ -4346,7 +3827,7 @@ pub(super) async fn advance_loop_once(ctx: &Ctx, epic: &str) -> Result<Step, Fai
                     })),
                 )
                 .await?;
-                Ok(Step::Stop(stopped))
+                Ok(ReconcileAction::Stop(stopped))
             }
         };
     }
@@ -4503,11 +3984,11 @@ pub(super) async fn advance_loop_once(ctx: &Ctx, epic: &str) -> Result<Step, Fai
             );
         }
         if !launched.is_empty() {
-            return Ok(Step::Progress(json!({"launched": launched})));
+            return Ok(ReconcileAction::Progress(json!({"launched": launched})));
         }
     }
     if nonterminal > 0 {
-        return Ok(Step::Wait(json!({
+        return Ok(ReconcileAction::Wait(json!({
             "reason": "children-running-or-deferred",
             "activeOrQueued": nonterminal,
         })));
@@ -4515,7 +3996,7 @@ pub(super) async fn advance_loop_once(ctx: &Ctx, epic: &str) -> Result<Step, Fai
     held.sort_by(|left, right| left.0.cmp(&right.0));
     if let Some((child, code, detail)) = held.into_iter().next() {
         let input = require_input(ctx, epic, code, Some(&child), detail).await?;
-        return Ok(Step::Stop(input));
+        return Ok(ReconcileAction::Stop(input));
     }
     let unresolved = view
         .config
@@ -4532,717 +4013,7 @@ pub(super) async fn advance_loop_once(ctx: &Ctx, epic: &str) -> Result<Step, Fai
         format!("Work frontier contains none of the unresolved children: {unresolved:?}"),
     )
     .await?;
-    Ok(Step::Stop(input))
-}
-
-async fn advance_once(ctx: &Ctx, epic: &str) -> Result<Step, Failure> {
-    let view = project(ctx, epic).await?;
-    if let Some(completed) = view.assurance_completed.as_ref() {
-        return Ok(Step::Stop(json!({
-            "finalPr": view.pr,
-            "assurance": completed,
-        })));
-    }
-    if let Some(finalized) = view.assurance_finalized.as_ref() {
-        if let Some(input) = view.input.as_ref() {
-            let cleanup_input = view
-                .assurance
-                .as_ref()
-                .is_some_and(|state| is_assurance_cleanup_input(input, &state.run_id));
-            if !cleanup_input {
-                return Ok(Step::Stop(json!({"inputRequired": input})));
-            }
-        }
-        if let Some(input) = complete_assurance_cleanup(ctx, &view, finalized).await? {
-            return Ok(Step::Stop(json!({"inputRequired": input})));
-        }
-        return Ok(Step::Stop(json!({
-            "finalPr": view.pr,
-            "assurance": finalized,
-        })));
-    }
-    if view.config.assurance_package.is_none() {
-        if let Some(pr) = view.pr.as_ref() {
-            return Ok(Step::Stop(json!({"finalPr": pr})));
-        }
-    }
-    if let Some(paused) = view.paused.as_ref() {
-        return Ok(Step::Stop(json!({"paused": paused})));
-    }
-    if let Some(input) = view.input.as_ref() {
-        return Ok(Step::Stop(json!({"inputRequired": input})));
-    }
-    if view.integration.is_none() {
-        // A deterministic setup refusal (hook rejection, missing base, auth)
-        // repeats identically under restart; it parks as explicit input with
-        // the full git diagnostic instead of consuming controller restarts.
-        return match effects::ensure_integration(ctx, &view.config, view.start_epoch).await {
-            Ok(ready) => Ok(Step::Progress(ready)),
-            Err(failure) if failure.recoverable => Err(failure),
-            Err(failure) => {
-                let stopped = require_input_with_evidence(
-                    ctx,
-                    epic,
-                    "integration-setup-failed",
-                    None,
-                    format!("integration branch setup failed: {}", failure.message),
-                    Some(json!({
-                        "integrationBranch": view.config.integration_branch,
-                        "baseRef": view.config.base_ref,
-                        "error": {
-                            "code": failure.code,
-                            "message": failure.message,
-                            "recoverable": failure.recoverable,
-                        },
-                    })),
-                )
-                .await?;
-                Ok(Step::Stop(stopped))
-            }
-        };
-    }
-    if view.pr.is_some() {
-        return advance_assurance(ctx, &view).await;
-    }
-
-    let (live, live_legacy_non_parent) =
-        super::workstore::epic_children_with_legacy(&ctx.ledger, epic).await?;
-    let issues = live
-        .into_iter()
-        .map(|issue| (issue.id.clone(), issue))
-        .collect::<BTreeMap<_, _>>();
-    let statuses = issues
-        .iter()
-        .map(|(id, issue)| (id.as_str(), issue.status.as_str()))
-        .collect::<BTreeMap<_, _>>();
-
-    let accounted = |child: &FrozenChild| child_accounted(&view, &statuses, child);
-
-    // A planning run is internal cognition owned by the epic controller.
-    // Reconcile it before opening another wave; a clean reviewed candidate
-    // crosses the separate guarded work apply seam, while every failure
-    // names its stub. No second controller or manual child dispatch exists.
-    for child in &view.config.children {
-        let Some(planning) = view
-            .planning
-            .get(&child.id)
-            .filter(|state| state.applied.is_none())
-        else {
-            continue;
-        };
-        if planning.integration_sha.is_some() {
-            match effects::ensure_planning_run(ctx, &view.config, child, planning).await? {
-                PlanningRunEnsure::Started(_) => {}
-                PlanningRunEnsure::Stop(stopped) => return Ok(Step::Stop(stopped)),
-            }
-        }
-        let run = super::drive::project(ctx, &planning.run_id).await?;
-        if run.run.state == RunState::Stopped {
-            if run.run.terminal_outcome == Some(RunOutcome::Clean) {
-                let Some(candidate) = super::drive::latest_plan_candidate(&run) else {
-                    let input = require_input(
-                        ctx,
-                        epic,
-                        "planning-result-missing",
-                        Some(&child.id),
-                        "clean epic-plan run has no complete durable plan candidate",
-                    )
-                    .await?;
-                    return Ok(Step::Stop(input));
-                };
-                return effects::apply_planning_result(ctx, &view, child, planning, candidate)
-                    .await;
-            }
-            let terminal = planning_protocol_terminal(ctx, &planning.run_id).await?;
-            let amendment = terminal
-                .as_ref()
-                .and_then(|value| value.get("specAmendmentProposed"));
-            let code = if amendment.is_some() {
-                "planning-spec-amendment"
-            } else {
-                "planning-run-stopped"
-            };
-            let detail = amendment
-                .and_then(|value| value.get("amendment"))
-                .and_then(|value| value.get("summary"))
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-                .unwrap_or_else(|| {
-                    format!(
-                        "epic-plan run {} stopped with outcome {:?}: {}",
-                        planning.run_id,
-                        run.run.terminal_outcome,
-                        run.run.stop_reason.as_deref().unwrap_or("no reason")
-                    )
-                });
-            let input = require_input_with_evidence(
-                ctx,
-                epic,
-                code,
-                Some(&child.id),
-                detail,
-                Some(json!({
-                    "runId": planning.run_id,
-                    "outcome": run.run.terminal_outcome.map(RunOutcome::as_str),
-                    "protocolTerminal": terminal,
-                })),
-            )
-            .await?;
-            return Ok(Step::Stop(input));
-        }
-        let request = OperationRequest {
-            schema_version: 1,
-            idempotency_key: String::new(),
-            run_id: Some(planning.run_id.clone()),
-            params: match json!({"run": planning.run_id}) {
-                Value::Object(map) => map,
-                _ => Map::new(),
-            },
-        };
-        return Ok(Step::Progress(json!({
-            "planningAdvanced": response(super::drive::run_advance(ctx, &request).await)?,
-            "childId": child.id,
-            "runId": planning.run_id,
-        })));
-    }
-    if view.config.children.iter().all(accounted) {
-        return effects::final_pr(ctx, &view).await;
-    }
-
-    let desired = on_ledger(&ctx.ledger, |ledger| ledger.list_desired_work())
-        .await?
-        .into_iter()
-        .filter(|row| row.subject_kind == DesiredSubjectKind::Run)
-        .map(|row| (row.subject_id.clone(), row))
-        .collect::<BTreeMap<_, _>>();
-    let admissions = on_ledger(&ctx.ledger, |ledger| {
-        ledger.latest_admission_decisions(Some(AdmissionSubjectKind::Run), None)
-    })
-    .await?
-    .into_iter()
-    .map(|decision| (decision.subject_id.clone(), decision))
-    .collect::<BTreeMap<_, _>>();
-
-    let mut clean_children = Vec::new();
-    let mut held = Vec::<(String, &'static str, String)>::new();
-    let mut missing_submission = Vec::new();
-    let mut nonterminal = 0usize;
-    let mut safe_nonterminal = false;
-    let mut next_wakes = Vec::new();
-
-    // Reconcile every started child from durable run state. No child is ever
-    // advanced inline: its independent run controller owns protocol work.
-    for child in &view.config.children {
-        let Some(state) = view.children.get(&child.id) else {
-            continue;
-        };
-        if state.merged.is_some() {
-            continue;
-        }
-        let run = super::drive::project(ctx, &state.run_id).await?;
-        if matches!(forged_proto::advance(&run), NextAction::Stop(_)) {
-            let (is_clean, evidence) = clean_slice(&run);
-            if is_clean {
-                clean_children.push((state.wave, child.id.clone(), run, evidence));
-            } else {
-                held.push((
-                    child.id.clone(),
-                    "child-not-clean",
-                    format!("slice requires adjudication: {evidence}"),
-                ));
-            }
-            continue;
-        }
-
-        nonterminal = nonterminal.saturating_add(1);
-        let desired_row = desired.get(&state.run_id);
-        let decision = admissions.get(&state.run_id);
-        if let Some(wake) = desired_row
-            .and_then(|row| row.next_wake_at.as_ref())
-            .or_else(|| decision.and_then(|row| row.next_eligible_wake_at.as_ref()))
-        {
-            next_wakes.push(wake.clone());
-        }
-        if desired_row.is_none() {
-            missing_submission.push(child.id.clone());
-            continue;
-        }
-        let durable_hold = decision
-            .is_some_and(|decision| decision.outcome == AdmissionOutcome::Ineligible)
-            || desired_row.is_some_and(|row| {
-                row.desired_state != DesiredState::Running
-                    || matches!(
-                        row.last_outcome,
-                        Some(
-                            DesiredReconcileOutcome::Attention | DesiredReconcileOutcome::Exhausted
-                        )
-                    )
-            });
-        if durable_hold {
-            held.push((
-                child.id.clone(),
-                "child-controller-held",
-                format!(
-                    "detached child cannot progress: desired={:?}, admission={}",
-                    desired_row.and_then(|row| row.last_outcome),
-                    decision.map_or_else(
-                        || "none".to_owned(),
-                        |row| format!(
-                            "{:?}/{}",
-                            row.outcome,
-                            super::admission::decision_reason(row)
-                        )
-                    )
-                ),
-            ));
-        } else {
-            safe_nonterminal = true;
-        }
-    }
-
-    // The existing epic slot plus the child-specific SafeRetry operation
-    // serializes this complete ready/merge/close chain. Choose exactly one
-    // clean child per tick in deterministic wave/id order.
-    clean_children.sort_by(|left, right| (left.0, &left.1).cmp(&(right.0, &right.1)));
-    if let Some((_, child_id, run, evidence)) = clean_children.into_iter().next() {
-        let child = view
-            .config
-            .children
-            .iter()
-            .find(|child| child.id == child_id)
-            .ok_or_else(|| Failure::internal(format!("frozen child {child_id:?} vanished")))?;
-        return effects::merge_child(ctx, &view.config, child, &run, evidence).await;
-    }
-
-    // Crash recovery: CHILD_STARTED is durable before submit. Re-enter the
-    // shared submit operation for one such child before opening another
-    // slot. The deterministic run id and submit key make this idempotent.
-    missing_submission.sort();
-    if let Some(child_id) = missing_submission.first() {
-        let current = project(ctx, epic).await?;
-        if let Some(paused) = current.paused {
-            return Ok(Step::Stop(json!({"paused": paused})));
-        }
-        let child = view
-            .config
-            .children
-            .iter()
-            .find(|child| child.id == *child_id)
-            .ok_or_else(|| Failure::internal(format!("frozen child {child_id:?} vanished")))?;
-        let state = view
-            .children
-            .get(child_id)
-            .ok_or_else(|| Failure::internal(format!("started child {child_id:?} vanished")))?;
-        return Ok(Step::Progress(
-            submit_child(ctx, epic, child, &state.run_id).await?,
-        ));
-    }
-
-    // A wave is immutable once recorded. Only after every member joins may
-    // the coordinator read and freeze a later global frontier.
-    let pending_wave = view
-        .waves
-        .last()
-        .map(|wave| -> Result<Option<PendingWave>, Failure> {
-            let number = wave
-                .get("wave")
-                .and_then(Value::as_u64)
-                .and_then(|value| u32::try_from(value).ok())
-                .ok_or_else(|| Failure::internal("epic wave event has no valid wave"))?;
-            let member_order = wave
-                .get("children")
-                .and_then(Value::as_array)
-                .ok_or_else(|| Failure::internal("epic wave event has no children"))?
-                .iter()
-                .map(|value| {
-                    value
-                        .as_str()
-                        .map(str::to_owned)
-                        .ok_or_else(|| Failure::internal("epic wave child is not a string"))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let members = member_order.iter().cloned().collect::<BTreeSet<_>>();
-            let frozen_order = match wave.get("priorityOrder") {
-                Some(value) => value
-                    .as_array()
-                    .ok_or_else(|| Failure::internal("epic wave priority order is not an array"))?
-                    .iter()
-                    .map(|entry| {
-                        entry
-                            .get("childId")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned)
-                            .ok_or_else(|| {
-                                Failure::internal("epic wave priority entry has no child id")
-                            })
-                    })
-                    .collect::<Result<Vec<_>, _>>()?,
-                None => member_order,
-            };
-            if frozen_order.iter().cloned().collect::<BTreeSet<_>>() != members
-                || frozen_order.len() != members.len()
-            {
-                return Err(Failure::internal(
-                    "epic wave priority order does not match its frozen membership",
-                ));
-            }
-            let launch_order = frozen_order
-                .into_iter()
-                .enumerate()
-                .map(|(rank, child)| (child, rank))
-                .collect::<BTreeMap<_, _>>();
-            let joined = view
-                .config
-                .children
-                .iter()
-                .filter(|child| members.contains(&child.id))
-                .all(&accounted);
-            Ok((!joined).then_some(PendingWave {
-                number,
-                members,
-                launch_order,
-            }))
-        })
-        .transpose()?
-        .flatten();
-
-    let (wave, members, launch_order) = match pending_wave {
-        Some(value) => (value.number, value.members, value.launch_order),
-        None => {
-            if let Some(step) = planning_after_completed_wave(ctx, &view, &statuses).await? {
-                return Ok(step);
-            }
-            let frozen_ids = view
-                .config
-                .children
-                .iter()
-                .map(|child| child.id.clone())
-                .collect::<BTreeSet<_>>();
-            let legacy_non_parent = if view.config.legacy_membership_recorded {
-                view.config
-                    .children
-                    .iter()
-                    .filter(|child| child.legacy_non_parent)
-                    .map(|child| child.id.clone())
-                    .filter(|id| live_legacy_non_parent.contains(id))
-                    .collect::<Vec<_>>()
-            } else {
-                live_legacy_non_parent
-                    .iter()
-                    .filter(|id| frozen_ids.contains(*id))
-                    .cloned()
-                    .collect::<Vec<_>>()
-            };
-            let ready =
-                super::workstore::ready_frozen_epic_children(&ctx.ledger, epic, &legacy_non_parent)
-                    .await?
-                    .into_iter()
-                    .map(|issue| (issue.id.clone(), issue))
-                    .collect::<BTreeMap<_, _>>();
-            let mut frontier = view
-                .config
-                .children
-                .iter()
-                .filter(|child| !accounted(child))
-                .filter(|child| !view.children.contains_key(&child.id))
-                .filter(|child| ready.contains_key(&child.id))
-                .collect::<Vec<_>>();
-            frontier.sort_by(|left, right| {
-                ready
-                    .get(&left.id)
-                    .and_then(|issue| issue.priority)
-                    .unwrap_or(i64::MAX)
-                    .cmp(
-                        &ready
-                            .get(&right.id)
-                            .and_then(|issue| issue.priority)
-                            .unwrap_or(i64::MAX),
-                    )
-                    .then_with(|| left.id.cmp(&right.id))
-            });
-            if frontier.is_empty() {
-                let unresolved = view
-                    .config
-                    .children
-                    .iter()
-                    .filter(|child| !accounted(child))
-                    .map(|child| child.id.clone())
-                    .collect::<Vec<_>>();
-                let child = unresolved.first().map(String::as_str);
-                let input = require_input(
-                    ctx,
-                    epic,
-                    "no-ready-children",
-                    child,
-                    format!(
-                        "Work frontier contains none of the unresolved children: {unresolved:?}"
-                    ),
-                )
-                .await?;
-                return Ok(Step::Stop(input));
-            }
-            let wave = u32::try_from(view.waves.len())
-                .unwrap_or(u32::MAX)
-                .saturating_add(1);
-            let order = frontier
-                .iter()
-                .map(|child| {
-                    json!({
-                        "childId": child.id,
-                        "priority": ready.get(&child.id).and_then(|issue| issue.priority),
-                    })
-                })
-                .collect::<Vec<_>>();
-            let member_order = frontier
-                .iter()
-                .map(|child| child.id.clone())
-                .collect::<Vec<_>>();
-            // This commit is intentionally a distinct scheduler action. A
-            // crash cannot leave the first child visible without the whole
-            // deterministic frontier already durable.
-            let wave_event = json!({
-                "wave": wave,
-                "children": member_order,
-                "priorityOrder": order,
-            });
-            append(ctx, epic, WAVE_STARTED, wave_event.clone()).await?;
-            return Ok(Step::Progress(wave_event));
-        }
-    };
-
-    let mut pending = view
-        .config
-        .children
-        .iter()
-        .filter(|child| members.contains(&child.id))
-        .filter(|child| !accounted(child))
-        .filter(|child| !view.children.contains_key(&child.id))
-        .collect::<Vec<_>>();
-    pending.sort_by(|left, right| {
-        launch_order
-            .get(&left.id)
-            .unwrap_or(&usize::MAX)
-            .cmp(launch_order.get(&right.id).unwrap_or(&usize::MAX))
-            .then_with(|| left.id.cmp(&right.id))
-    });
-
-    for child in pending.iter().filter(|child| is_no_diff(&child.issue_type)) {
-        held.push((
-            child.id.clone(),
-            "non-code-child",
-            format!(
-                "{} is a no-diff {} work item; complete it directly in the work store, then resolve this hold",
-                child.id, child.issue_type
-            ),
-        ));
-    }
-
-    let available = usize::try_from(view.config.max_active_children)
-        .unwrap_or(usize::MAX)
-        .saturating_sub(nonterminal);
-    let launchable = pending
-        .iter()
-        .copied()
-        .filter(|child| !is_no_diff(&child.issue_type))
-        .take(available)
-        .collect::<Vec<_>>();
-    if !launchable.is_empty() {
-        let compiled = active_compiled_definition(&view)?;
-        let mut launched = Vec::new();
-        for child in launchable {
-            // Pause is out-of-band. Observe it before each new child so at
-            // most the current start/submit effect crosses the boundary.
-            let current = project(ctx, epic).await?;
-            if current.paused.is_some() || current.input.is_some() || current.pr.is_some() {
-                break;
-            }
-            let generation = view
-                .child_generations
-                .get(&child.id)
-                .copied()
-                .unwrap_or(0)
-                .saturating_add(1);
-            let started =
-                start_child(ctx, &view.config, child, wave, generation, compiled.clone()).await?;
-            let run_id = string(&started, "runId")?;
-            let current = project(ctx, epic).await?;
-            let submission = if current.paused.is_some() {
-                Value::Null
-            } else {
-                submit_child(ctx, epic, child, &run_id).await?
-            };
-            launched.push(json!({"started": started, "submitted": submission}));
-        }
-        if !launched.is_empty() {
-            return Ok(Step::Progress(json!({"launched": launched})));
-        }
-        let current = project(ctx, epic).await?;
-        if let Some(paused) = current.paused {
-            return Ok(Step::Stop(json!({"paused": paused})));
-        }
-    }
-
-    // Terminal failures and direct-action children wait until independent
-    // controllers have finished or reached their durable wake. Only then is
-    // the lowest child id promoted into the singular resolution rail.
-    if safe_nonterminal {
-        next_wakes.sort();
-        return Ok(Step::Wait(json!({
-            "reason": "children-running-or-deferred",
-            "nextWakeAt": next_wakes.first(),
-            "activeOrQueued": nonterminal,
-        })));
-    }
-    held.sort_by(|left, right| left.0.cmp(&right.0));
-    if let Some((child, code, detail)) = held.into_iter().next() {
-        let input = require_input(ctx, epic, code, Some(&child), detail).await?;
-        return Ok(Step::Stop(input));
-    }
-
-    if nonterminal > 0 {
-        return Ok(Step::Wait(json!({
-            "reason": "children-awaiting-reconciliation",
-            "activeOrQueued": nonterminal,
-        })));
-    }
-
-    let stalled_child = view
-        .config
-        .children
-        .iter()
-        .filter(|child| !accounted(child))
-        .map(|child| child.id.as_str())
-        .min();
-    let input = require_input(
-        ctx,
-        epic,
-        "wave-stalled",
-        stalled_child,
-        format!("wave {wave} has no safe launch, integration, or resolution candidate"),
-    )
-    .await?;
-    Ok(Step::Stop(input))
-}
-
-async fn record_desired_stop(ctx: &Ctx, epic: &str, stop: &Value) -> Result<(), Failure> {
-    // Share the controller-submit singleton through the durable stop write.
-    // A supervisor that already owns the fence linearizes its spawn first;
-    // otherwise this transition clears its claim before it can reserve or
-    // spawn a generation.
-    let _submit_guard =
-        super::handoff::acquire_submit(ctx, epic, super::handoff::Scope::Epic).await?;
-    let (state, outcome, detail) = if stop.get("finalPr").is_some() {
-        (
-            DesiredState::Stopped,
-            DesiredReconcileOutcome::Terminal,
-            None,
-        )
-    } else if stop.get("paused").is_some() {
-        (DesiredState::Paused, DesiredReconcileOutcome::Paused, None)
-    } else {
-        // Input-required remains a separate explicit resolution rail. Keep
-        // authorization, but park it with no wake until resume/resolve makes
-        // the subject due again.
-        (
-            DesiredState::Running,
-            DesiredReconcileOutcome::Attention,
-            Some(format!("epic {epic} requires explicit input resolution")),
-        )
-    };
-    let epic = epic.to_owned();
-    on_ledger(&ctx.ledger, move |ledger| {
-        ledger.record_desired_outcome(
-            DesiredSubjectKind::Epic,
-            &epic,
-            state,
-            outcome,
-            None,
-            detail,
-        )
-    })
-    .await
-}
-
-/// One epic scheduler action.
-pub async fn epic_advance(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
-    let epic = match param_str(&req.params, "epic") {
-        Ok(value) => value.to_owned(),
-        Err(error) => return err_response(&derive_key("epic_advance", None, None, None), &error),
-    };
-    let key = derive_key("epic_advance", Some(&epic), None, None);
-    if let Some(response) = refuse_loop_controller(ctx, &epic, &key).await {
-        return response;
-    }
-    let _guard = match acquire_driver(ctx, &epic).await {
-        Ok(guard) => guard,
-        Err(error) => return err_response(&key, &error),
-    };
-    match advance_once(ctx, &epic).await {
-        Ok(Step::Progress(value)) => ok_response(&key, false, json!({"progress": value})),
-        Ok(Step::Wait(value)) => ok_response(&key, false, json!({"waiting": value})),
-        Ok(Step::Stop(value)) => match record_desired_stop(ctx, &epic, &value).await {
-            Ok(()) => ok_response(&key, false, json!({"stopped": value})),
-            Err(error) => err_response(&key, &error),
-        },
-        Err(error) => err_response(&key, &error),
-    }
-}
-
-/// Drive an epic through child slices and waves until a durable human stop.
-pub async fn epic_drive(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
-    let response = epic_drive_loop(ctx, req).await;
-    // Every terminal error exit of the loop records durable evidence: the
-    // supervisor reads it instead of the controller's process-local log.
-    if let (Some(error), Ok(epic)) = (response.error.as_ref(), param_str(&req.params, "epic")) {
-        super::handoff::record_controller_terminal(ctx, epic, error).await;
-    }
-    response
-}
-
-async fn epic_drive_loop(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
-    let epic = match param_str(&req.params, "epic") {
-        Ok(value) => value.to_owned(),
-        Err(error) => return err_response(&derive_key("epic_drive", None, None, None), &error),
-    };
-    let key = derive_key("epic_drive", Some(&epic), None, None);
-    if let Some(response) = refuse_loop_controller(ctx, &epic, &key).await {
-        return response;
-    }
-    let mut repeat = ProgressRepeat::default();
-    loop {
-        // Ownership covers one bounded reconciliation tick only. In
-        // particular, no merge slot or SQLite transaction survives the
-        // poll below, so manual/replacement ticks and pause can linearize.
-        let step = {
-            let _guard = match acquire_driver(ctx, &epic).await {
-                Ok(guard) => guard,
-                Err(error) => return err_response(&key, &error),
-            };
-            advance_once(ctx, &epic).await
-        };
-        match step {
-            // Defense in depth: a step that keeps repeating itself has moved
-            // nothing, so it earns the wait cadence rather than a hot loop.
-            Ok(Step::Progress(value)) => {
-                if repeat.stalled(&value) {
-                    tracing::warn!(
-                        epic,
-                        repeats = PROGRESS_REPEAT_LIMIT,
-                        "identical epic progress step repeated; polling instead of spinning"
-                    );
-                    tokio::time::sleep(EPIC_POLL).await;
-                }
-            }
-            Ok(Step::Wait(_)) => tokio::time::sleep(EPIC_POLL).await,
-            Ok(Step::Stop(value)) => {
-                if let Err(error) = record_desired_stop(ctx, &epic, &value).await {
-                    return err_response(&key, &error);
-                }
-                return ok_response(&key, false, json!({"stopped": value}));
-            }
-            Err(error) => return err_response(&key, &error),
-        }
-    }
+    Ok(ReconcileAction::Stop(input))
 }
 
 async fn control_event(
@@ -5250,7 +4021,7 @@ async fn control_event(
     req: &mut OperationRequest,
     name: &str,
     kind: &str,
-    require_idle_driver: bool,
+    fence_reconciliation: bool,
 ) -> OperationResponse {
     // `safe_effect` rebuilds its envelope at schemaVersion 1, so the
     // caller's version must be gated HERE or the begin-operation check the
@@ -5289,29 +4060,16 @@ async fn control_event(
         derive_key(name, Some(&epic), None, Some(control_epoch)),
     );
     let key = req.idempotency_key.clone();
-    // Pause is an out-of-band control signal specifically so a lead session
-    // can stop a detached controller at its next durable boundary. Resume is
-    // accepted only after that controller has observed the pause and released
-    // its singular driver slot.
-    let _driver_guard = match require_idle_driver
-        && ctx.config.epic_scheduler == crate::config::EpicScheduler::Controller
-    {
-        true => match acquire_driver(ctx, &epic).await {
-            Ok(guard) => Some(guard),
-            Err(error) => return err_response(&key, &error),
-        },
-        false => None,
-    };
-    let _loop_guard = match require_idle_driver {
-        true => match acquire_loop_control(ctx, &epic).await {
+    // Pause is an out-of-band durable signal. Resume claims the desired row
+    // briefly so it cannot race a live ore-pass iteration.
+    let _desired_guard = match fence_reconciliation {
+        true => match acquire_desired_work(ctx, &epic).await {
             Ok(guard) => guard,
             Err(error) => return err_response(&key, &error),
         },
         false => None,
     };
-    // Serialize the desired-state transition with manual submit and
-    // supervisor restart. Pause remains out-of-band with respect to the
-    // long-lived epic driver, but it cannot race a new controller spawn.
+    // Serialize the desired-state transition with submit authorization.
     let _submit_guard =
         match super::handoff::acquire_submit(ctx, &epic, super::handoff::Scope::Epic).await {
             Ok(guard) => guard,
@@ -5439,17 +4197,10 @@ pub async fn epic_abandon(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
             forged_types::RemedyV1::from(forged_types::OperationActionV1 {
                 verb: "epic pause".to_owned(),
                 args,
-                reason: "pause the live controller before abandoning the epic".to_owned(),
+                reason: "pause scheduling before abandoning the epic".to_owned(),
             }),
         );
     }
-    // Pause is durable; the driver slot closes the final boundary race while
-    // the detached controller observes it and releases custody. A dead holder
-    // is force-released by acquisition itself.
-    let _guard = match acquire_driver(ctx, &epic).await {
-        Ok(guard) => guard,
-        Err(error) => return err_response(&key, &error),
-    };
     let _submit_guard =
         match super::handoff::acquire_submit(ctx, &epic, super::handoff::Scope::Epic).await {
             Ok(guard) => guard,
@@ -5499,6 +4250,7 @@ pub async fn epic_pause(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespo
 }
 
 /// Resume a paused epic (input-required remains until explicitly resolved).
+/// A short-lived desired-row claim refuses while the ore pass owns the epic.
 pub async fn epic_resume(ctx: &Ctx, req: &mut OperationRequest) -> OperationResponse {
     control_event(ctx, req, "epic_resume", RESUMED, true).await
 }
@@ -5550,18 +4302,6 @@ pub async fn epic_resolve(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
         ),
     );
     let key = req.idempotency_key.clone();
-    let _driver_guard = if ctx.config.epic_scheduler == crate::config::EpicScheduler::Controller {
-        match acquire_driver(ctx, &epic).await {
-            Ok(guard) => Some(guard),
-            Err(error) => return err_response(&key, &error),
-        }
-    } else {
-        None
-    };
-    let _loop_guard = match acquire_loop_control(ctx, &epic).await {
-        Ok(guard) => guard,
-        Err(error) => return err_response(&key, &error),
-    };
     match recover_applied_epic_resolution(ctx, &key, &epic, child.as_deref(), &note).await {
         Ok(Some(response)) => return response,
         Ok(None) => {}
@@ -5839,29 +4579,6 @@ mod tests {
         assert!(state.root_snapshot.is_none());
         assert!(state.target_snapshot.is_none());
         assert!(state.input_body.is_none());
-    }
-
-    #[test]
-    fn the_spin_brake_engages_only_on_an_identical_repeated_step() {
-        let repeated = json!({"branch": "forged/epic-x", "epoch": 1});
-        let mut repeat = ProgressRepeat::default();
-        for tick in 1..PROGRESS_REPEAT_LIMIT {
-            assert!(!repeat.stalled(&repeated), "engaged early at tick {tick}");
-        }
-        assert!(repeat.stalled(&repeated), "the stall signature must engage");
-
-        // Ordinary dispatch alternates payloads; it must never engage, and one
-        // distinct step must clear an almost-engaged run.
-        let mut repeat = ProgressRepeat::default();
-        for tick in 0..PROGRESS_REPEAT_LIMIT * 4 {
-            assert!(!repeat.stalled(&json!({"child": tick % 2})), "tick {tick}");
-        }
-        let mut repeat = ProgressRepeat::default();
-        for _ in 1..PROGRESS_REPEAT_LIMIT {
-            assert!(!repeat.stalled(&repeated));
-        }
-        assert!(!repeat.stalled(&json!({"child": "other"})));
-        assert!(!repeat.stalled(&repeated), "a distinct step resets the run");
     }
 
     #[test]

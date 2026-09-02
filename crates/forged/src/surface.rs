@@ -45,8 +45,6 @@ const OPERATION_CLASSES: &[(&str, OperationClass)] = &[
     ("definition_validate", OperationClass::ReadOnly),
     ("doctor", OperationClass::ReadOnly),
     ("epic_abandon", OperationClass::Fenced),
-    ("epic_advance", OperationClass::MachineFenced),
-    ("epic_drive", OperationClass::MachineFenced),
     ("epic_pause", OperationClass::Fenced),
     ("epic_preflight", OperationClass::ReadOnly),
     ("epic_resolve", OperationClass::Fenced),

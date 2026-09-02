@@ -1364,34 +1364,16 @@ impl ForgedServer {
         self.call("epic_start", args.0).await
     }
 
-    /// Perform one epic scheduler action.
-    #[tool(
-        name = "epic_advance",
-        description = "Advance an epic by one action. Refuses with BEADS_CONTENTION while a live detached controller drives the epic; observe with epic_status or operations_overview instead."
-    )]
-    pub async fn epic_advance(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
-        self.call("epic_advance", args.0).await
-    }
-
-    /// Drive an epic to a durable stop.
-    #[tool(
-        name = "epic_drive",
-        description = "Drive an epic to input or final PR."
-    )]
-    pub async fn epic_drive(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
-        self.call("epic_drive", args.0).await
-    }
-
-    /// Hand an epic to a detached durable controller.
+    /// Authorize an epic for the supervisor's ore pass.
     #[tool(
         name = "epic_submit",
-        description = "Submit an epic for detached driving."
+        description = "Submit an epic for supervisor-owned frontier reconciliation."
     )]
     pub async fn epic_submit(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
         self.call("epic_submit", args.0).await
     }
 
-    /// Project epic waves, child runs, blockers, and PR state.
+    /// Project an epic frontier, child runs, blockers, and PR state.
     #[tool(name = "epic_status", description = "Project durable epic state.")]
     pub async fn epic_status(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
         self.call("epic_status", args.0).await

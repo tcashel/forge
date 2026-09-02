@@ -564,8 +564,8 @@ impl Ledger {
     }
 
     /// Claim a desired row for an operator control transition. Unlike a
-    /// scheduler claim, a paused or parked row is eligible; the shared token
-    /// lease serializes loop-mode resume and resolution with ore reconciliation.
+    /// pass claim, a paused or parked row is eligible; the shared token lease
+    /// serializes epic start, revision, and resume with ore reconciliation.
     pub fn claim_desired_control(
         &self,
         kind: DesiredSubjectKind,

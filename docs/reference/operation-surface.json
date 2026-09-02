@@ -91,24 +91,6 @@
       "name": "epic_abandon"
     },
     {
-      "class": "machine-fenced",
-      "cli": true,
-      "cliVerb": "epic advance",
-      "dispatch": true,
-      "explicitKey": false,
-      "mcp": true,
-      "name": "epic_advance"
-    },
-    {
-      "class": "machine-fenced",
-      "cli": true,
-      "cliVerb": "epic drive",
-      "dispatch": true,
-      "explicitKey": false,
-      "mcp": true,
-      "name": "epic_drive"
-    },
-    {
       "class": "fenced",
       "cli": true,
       "cliVerb": "epic pause",

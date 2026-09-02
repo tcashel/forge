@@ -173,7 +173,7 @@ pub async fn epic_children(ledger: &Ledger, epic: &str) -> Result<Vec<IssueSumma
 /// An epic's inventory: native parent-linked children unioned with the
 /// legacy epic-depends-on-children encoding (the epic's own outgoing edges),
 /// plus the set of ids present ONLY through the legacy encoding — the same
-/// contract the bd read gave the epic driver.
+/// contract the bd read gave the epic pass.
 pub async fn epic_children_with_legacy(
     ledger: &Ledger,
     epic: &str,

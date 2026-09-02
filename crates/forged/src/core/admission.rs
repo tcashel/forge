@@ -146,9 +146,9 @@ fn epic_facts(
         repository,
         candidate.provider.clone(),
         candidate.model.clone(),
-        // The epic controller reconciles durable child state and serializes
+        // The epic pass reconciles durable child state and serializes
         // integration; it never runs a provider in the repository. Charging
-        // it as the package's first workspace-write seat makes the default
+        // the group as the package's first workspace-write seat makes the default
         // repositoryWriteActive=1 deadlock fan-out recovery while a detached
         // child attempt is live. Child controller/packet admission carries
         // the actual provider resource class.

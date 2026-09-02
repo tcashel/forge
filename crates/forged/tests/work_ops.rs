@@ -1569,6 +1569,29 @@ fn abandoning_a_started_epic_opens_a_clean_epoch() {
     ]);
     assert_eq!(code, 0, "first start: {started}");
 
+    let ledger = env.ledger();
+    ledger
+        .append_event(
+            Some("epic-doomed"),
+            "forged.epic.input.required",
+            json!({"code": "fixture", "childId": "doomed-child", "detail": "epoch zero"}),
+        )
+        .expect("append epoch-zero input");
+    ledger.close().expect("close ledger");
+    let first_resolution = result(
+        &env,
+        &[
+            "epic",
+            "resolve",
+            "--epic",
+            "epic-doomed",
+            "--child",
+            "doomed-child",
+            "--note",
+            "resolve epoch zero",
+        ],
+    );
+
     // Abandoning an unstarted epic refuses.
     let (code, nothing) = env.forged(&[
         "epic",
@@ -1599,8 +1622,20 @@ fn abandoning_a_started_epic_opens_a_clean_epoch() {
                 "epic": "epic-doomed",
                 "reason": "pause before abandoning this epic",
             },
-            "reason": "pause the live controller before abandoning the epic",
+            "reason": "pause scheduling before abandoning the epic",
         })
+    );
+    pause_epic(&env, "epic-doomed");
+    result(
+        &env,
+        &[
+            "epic",
+            "resume",
+            "--epic",
+            "epic-doomed",
+            "--reason",
+            "exercise epoch-zero resume key",
+        ],
     );
     pause_epic(&env, "epic-doomed");
     let abandoned = result(&env, &abandon);
@@ -1642,6 +1677,33 @@ fn abandoning_a_started_epic_opens_a_clean_epoch() {
         "main",
     ]);
     assert_eq!(code, 0, "fresh epoch start: {restarted}");
+
+    let ledger = env.ledger();
+    ledger
+        .append_event(
+            Some("epic-doomed"),
+            "forged.epic.input.required",
+            json!({"code": "fixture", "childId": "doomed-child", "detail": "epoch one"}),
+        )
+        .expect("append epoch-one input");
+    ledger.close().expect("close ledger");
+    let second_resolution = result(
+        &env,
+        &[
+            "epic",
+            "resolve",
+            "--epic",
+            "epic-doomed",
+            "--child",
+            "doomed-child",
+            "--note",
+            "resolve epoch one",
+        ],
+    );
+    assert_ne!(
+        first_resolution["resolutionId"], second_resolution["resolutionId"],
+        "resolution epochs count the full stream"
+    );
     let (code, status) = env.forged(&["epic", "status", "--epic", "epic-doomed"]);
     assert_eq!(code, 0, "the new epoch projects: {status}");
 
@@ -1660,6 +1722,18 @@ fn abandoning_a_started_epic_opens_a_clean_epoch() {
     // A second abandon derives a fresh key (the epoch counter), so it ends
     // the SECOND epoch rather than replaying the first abandon's response.
     pause_epic(&env, "epic-doomed");
+    result(
+        &env,
+        &[
+            "epic",
+            "resume",
+            "--epic",
+            "epic-doomed",
+            "--reason",
+            "exercise epoch-one resume key",
+        ],
+    );
+    pause_epic(&env, "epic-doomed");
     let again = result(
         &env,
         &[
@@ -1672,6 +1746,27 @@ fn abandoning_a_started_epic_opens_a_clean_epoch() {
         ],
     );
     assert_eq!(again["abandoned"], json!(true));
+    let events = epic_events(&env, "epic-doomed");
+    let control_ids = events
+        .iter()
+        .filter(|(kind, _)| {
+            matches!(
+                kind.as_str(),
+                "forged.epic.paused" | "forged.epic.resumed" | "forged.epic.abandoned"
+            )
+        })
+        .map(|(_, payload)| {
+            payload["controlId"]
+                .as_str()
+                .expect("control id")
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        control_ids.iter().collect::<BTreeSet<_>>().len(),
+        control_ids.len(),
+        "control keys stay monotonic across the abandon boundary"
+    );
     let (code, _) = env.forged(&["epic", "status", "--epic", "epic-doomed"]);
     assert_ne!(code, 0, "the second epoch ended as well");
 }
@@ -1699,7 +1794,8 @@ fn a_fresh_epoch_records_its_own_integration_event_with_the_base_unmoved() {
 
     let (code, first) = env.forged(&start);
     assert_eq!(code, 0, "epoch 0 start: {first}");
-    let advanced = result(&env, &["epic", "advance", "--epic", "epic-unmoved"]);
+    env.authorize_epic("epic-unmoved");
+    let advanced = env.reconcile_epic("epic-unmoved").1["result"].clone();
     assert_eq!(advanced["progress"]["epoch"], json!(0), "{advanced}");
 
     pause_epic(&env, "epic-unmoved");
@@ -1719,7 +1815,8 @@ fn a_fresh_epoch_records_its_own_integration_event_with_the_base_unmoved() {
     // fresh epoch re-cuts the identical branch/base/sha triple.
     let (code, second) = env.forged(&start);
     assert_eq!(code, 0, "epoch 1 start: {second}");
-    let advanced = result(&env, &["epic", "advance", "--epic", "epic-unmoved"]);
+    env.authorize_epic("epic-unmoved");
+    let advanced = env.reconcile_epic("epic-unmoved").1["result"].clone();
     assert_eq!(advanced["progress"]["epoch"], json!(1), "{advanced}");
 
     let events = epic_events(&env, "epic-unmoved");
@@ -1744,7 +1841,7 @@ fn a_fresh_epoch_records_its_own_integration_event_with_the_base_unmoved() {
     );
     assert!(
         events.len() < 100,
-        "the controller never flooded the stream: {} events",
+        "the pass never flooded the stream: {} events",
         events.len()
     );
 }
@@ -1771,7 +1868,8 @@ fn a_replayed_setup_heals_an_epoch_whose_integration_event_was_swallowed() {
     ];
 
     assert_eq!(env.forged(&start).0, 0, "epoch 0 start");
-    result(&env, &["epic", "advance", "--epic", "epic-poisoned"]);
+    env.authorize_epic("epic-poisoned");
+    let _ = env.reconcile_epic("epic-poisoned");
     pause_epic(&env, "epic-poisoned");
     result(
         &env,
@@ -1785,6 +1883,7 @@ fn a_replayed_setup_heals_an_epoch_whose_integration_event_was_swallowed() {
         ],
     );
     assert_eq!(env.forged(&start).0, 0, "epoch 1 start");
+    env.authorize_epic("epic-poisoned");
 
     // Reproduce the state a shipped binary left behind: epoch 1's setup is
     // stored terminal-OK carrying a payload that predates the epoch tag, and
@@ -1849,7 +1948,7 @@ fn a_replayed_setup_heals_an_epoch_whose_integration_event_was_swallowed() {
         "the wedge starts with nothing the epoch can project: {status}"
     );
 
-    let advanced = result(&env, &["epic", "advance", "--epic", "epic-poisoned"]);
+    let advanced = env.reconcile_epic("epic-poisoned").1["result"].clone();
     assert_eq!(
         advanced["progress"]["epoch"],
         json!(1),

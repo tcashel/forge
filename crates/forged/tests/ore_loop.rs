@@ -7,19 +7,6 @@ use forged_types::AdmissionSubjectKind;
 use serde_json::{json, Value};
 use support::TestEnv;
 
-fn set_scheduler(env: &TestEnv, scheduler: &str) {
-    let path = env.anvil.join("config.json");
-    let mut config: Value =
-        serde_json::from_str(&std::fs::read_to_string(&path).expect("read forged test config"))
-            .expect("forged test config JSON");
-    config["epicScheduler"] = json!(scheduler);
-    std::fs::write(
-        path,
-        serde_json::to_string_pretty(&config).expect("serialize scheduler config"),
-    )
-    .expect("write scheduler config");
-}
-
 fn epic_events(env: &TestEnv, epic: &str) -> Vec<forged_ledger::EventRow> {
     let ledger = env.ledger();
     let events = ledger
@@ -63,12 +50,11 @@ fn wait_for_clean_run(env: &TestEnv, run: &str) -> Value {
 }
 
 #[test]
-fn loop_submit_claims_its_own_epic_and_dispatches_a_wave_free_child_atomically() {
+fn submit_is_idempotently_queued_and_the_pass_dispatches_a_wave_free_child_atomically() {
     let env = TestEnv::new("forged-ore-loop-dispatch");
     env.enable_dynamic_gh();
     env.seed_epic("epic-loop", &[("child-loop", &env.spec, true)]);
     assert_eq!(env.forged(&["init"]).0, 0);
-    set_scheduler(&env, "loop");
     let repo = env.repos.repo.to_string_lossy().into_owned();
     let spec = env.spec.to_string_lossy().into_owned();
     let (code, started) = env.forged(&[
@@ -85,11 +71,23 @@ fn loop_submit_claims_its_own_epic_and_dispatches_a_wave_free_child_atomically()
     ]);
     assert_eq!(code, 0, "epic start: {started}");
 
-    let (code, submitted) = env.forged(&["epic", "submit", "--epic", "epic-loop"]);
+    let submit_args = [
+        "epic",
+        "submit",
+        "--epic",
+        "epic-loop",
+        "--idempotency-key",
+        "epic-loop-submit",
+    ];
+    let (code, submitted) = env.forged(&submit_args);
     assert_eq!(code, 0, "loop submit: {submitted}");
     assert_eq!(submitted["result"]["phase"], json!("queued"));
     assert_eq!(submitted["result"]["controller"], Value::Null);
     assert_eq!(submitted["result"]["queued"], json!(true));
+    let (code, resubmitted) = env.forged(&submit_args);
+    assert_eq!(code, 0, "queued resubmit: {resubmitted}");
+    assert_eq!(resubmitted["reused"], json!(true));
+    assert_eq!(resubmitted["result"], submitted["result"]);
 
     let ledger = env.ledger();
     let desired = ledger
@@ -98,30 +96,6 @@ fn loop_submit_claims_its_own_epic_and_dispatches_a_wave_free_child_atomically()
         .expect("epic authorized");
     assert_eq!(desired.desired_state, DesiredState::Running);
     assert_eq!(desired.restart_used, 0);
-    let holder = format!("forged-epic:{}:unknown:test", std::process::id());
-    assert!(matches!(
-        ledger
-            .acquire_merge_slot("epic:epic-loop", &holder)
-            .expect("hold live driver slot"),
-        forged_ledger::SlotOutcome::Acquired(_)
-    ));
-    ledger.close().expect("close ledger");
-
-    let (code, deferred) = env.forged(&["supervise", "--once"]);
-    assert_eq!(code, 0, "driver exclusion tick: {deferred}");
-    assert_eq!(
-        deferred["result"]["orePass"]["subjects"][0]["action"],
-        json!("driver-active")
-    );
-    assert_eq!(
-        event_count(&env, "epic-loop", "forged.epic.integration.ready"),
-        0,
-        "the pass must not overlap a live controller"
-    );
-    let ledger = env.ledger();
-    ledger
-        .release_merge_slot("epic:epic-loop", &holder)
-        .expect("release test driver slot");
     ledger.close().expect("close ledger");
 
     let (code, paused) = env.forged(&[
@@ -169,8 +143,8 @@ fn loop_submit_claims_its_own_epic_and_dispatches_a_wave_free_child_atomically()
     assert_eq!(code, 0, "frontier pause: {paused}");
     let (code, status) = env.forged(&["epic", "status", "--epic", "epic-loop"]);
     assert_eq!(code, 0, "loop status: {status}");
-    assert_eq!(status["result"]["waves"], json!([]));
-    assert_eq!(status["result"]["controller"], Value::Null);
+    assert!(status["result"].get("waves").is_none());
+    assert!(status["result"].get("controller").is_none());
     assert_eq!(
         status["result"]["frontier"],
         json!([{"childId": "child-loop", "priority": 2}])
@@ -232,23 +206,9 @@ fn loop_submit_claims_its_own_epic_and_dispatches_a_wave_free_child_atomically()
 
     let (code, status) = env.forged(&["epic", "status", "--epic", "epic-loop"]);
     assert_eq!(code, 0, "dispatched status: {status}");
-    assert_eq!(status["result"]["waves"], json!([]));
-    assert_eq!(status["result"]["controller"], Value::Null);
+    assert!(status["result"].get("waves").is_none());
+    assert!(status["result"].get("controller").is_none());
     assert_eq!(status["result"]["frontier"], json!([]));
-
-    let (code, refused) = env.forged(&["epic", "advance", "--epic", "epic-loop"]);
-    assert_ne!(code, 0, "controller advance must refuse: {refused}");
-    assert!(refused["error"]["message"]
-        .as_str()
-        .is_some_and(|message| message.contains("epicScheduler: loop")));
-    assert_eq!(refused["error"]["detail"]["verb"], json!("supervise"));
-
-    set_scheduler(&env, "controller");
-    let (code, refused) = env.forged(&["epic", "submit", "--epic", "epic-loop"]);
-    assert_ne!(code, 0, "reverse flip must refuse: {refused}");
-    assert!(refused["error"]["message"]
-        .as_str()
-        .is_some_and(|message| message.contains("epicScheduler: loop")));
 }
 
 #[test]
@@ -268,7 +228,6 @@ fn loop_scheduler_recomputes_the_frontier_after_each_single_child_merge() {
         r#"[{"id":"child-loop-first","dependency_type":"blocks","status":"open"}]"#,
     );
     assert_eq!(env.forged(&["init"]).0, 0);
-    set_scheduler(&env, "loop");
     let repo = env.repos.repo.to_string_lossy().into_owned();
     let spec = env.spec.to_string_lossy().into_owned();
     let (code, started) = env.forged(&[
@@ -355,10 +314,70 @@ fn loop_scheduler_recomputes_the_frontier_after_each_single_child_merge() {
     let (code, status) = env.forged(&["epic", "status", "--epic", "epic-loop-rolling"]);
     assert_eq!(code, 0, "terminal status: {status}");
     assert!(status["result"]["finalPr"].is_object());
-    assert_eq!(status["result"]["waves"], json!([]));
-    assert_eq!(status["result"]["controller"], Value::Null);
+    assert!(status["result"].get("waves").is_none());
+    assert!(status["result"].get("controller").is_none());
     assert_eq!(status["result"]["frontier"], json!([]));
     assert!(epic_events(&env, "epic-loop-rolling")
         .iter()
         .all(|event| event.kind != "forged.epic.wave.started"));
+}
+
+#[test]
+fn historical_wave_stream_projects_and_resumes_under_the_waveless_pass() {
+    let env = TestEnv::new("forged-ore-loop-historical-resume");
+    env.seed_epic("epic-historical", &[("child-historical", &env.spec, true)]);
+    assert_eq!(env.forged(&["init"]).0, 0);
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let spec = env.spec.to_string_lossy().into_owned();
+    let (code, started) = env.forged(&[
+        "epic",
+        "start",
+        "--epic",
+        "epic-historical",
+        "--repo",
+        &repo,
+        "--spec",
+        &spec,
+        "--base-ref",
+        "main",
+    ]);
+    assert_eq!(code, 0, "historical epic start: {started}");
+    let (code, submitted) = env.forged(&["epic", "submit", "--epic", "epic-historical"]);
+    assert_eq!(code, 0, "historical epic submit: {submitted}");
+    supervise_once(&env);
+
+    let ledger = env.ledger();
+    ledger
+        .append_event(
+            Some("epic-historical"),
+            "forged.epic.wave.started",
+            json!({"wave": 7, "children": ["child-historical"]}),
+        )
+        .expect("append historical wave");
+    ledger.close().expect("close ledger");
+    let (code, projected) = env.forged(&["epic", "status", "--epic", "epic-historical"]);
+    assert_eq!(code, 0, "historical projection: {projected}");
+    assert_eq!(projected["result"]["waves"][0]["wave"], json!(7));
+    assert_eq!(
+        projected["result"]["frontier"][0]["childId"],
+        json!("child-historical")
+    );
+
+    wake_ore(&env, "epic-historical", "migrate historical stream");
+    supervise_once(&env);
+    let events = epic_events(&env, "epic-historical");
+    let child = events
+        .iter()
+        .find(|event| event.kind == "forged.epic.child.started")
+        .expect("historical epic continues under pass");
+    let payload: Value = serde_json::from_str(&child.payload_json).expect("child payload");
+    assert!(payload["wave"].is_null());
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == "forged.epic.wave.started")
+            .count(),
+        1,
+        "the pass preserves history without appending a new wave"
+    );
 }

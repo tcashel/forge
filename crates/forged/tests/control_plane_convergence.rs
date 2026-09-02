@@ -539,7 +539,7 @@ fn modern_projections_and_all_five_apps_converge_on_real_envelopes() {
     tools.sort();
     assert_eq!(
         tools.len(),
-        67,
+        65,
         "the integrated public tool inventory moved"
     );
     assert!(tools.contains(&"epic_revise_policy".to_owned()));

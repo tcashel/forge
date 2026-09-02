@@ -1477,7 +1477,7 @@ impl Ledger {
     /// transaction: refuses unless the item is `Blocked` with EMPTY custody,
     /// mints the next spec revision with cause `PlanningApply`, and promotes
     /// the stub to `Open`. No revision token is taken — atomicity is the
-    /// fence the bd path faked with a read-back, and the epic driver's own
+    /// fence the bd path faked with a read-back, and the epic scheduler's own
     /// digest pre/post-image checks stand unchanged around it.
     pub fn apply_work_planning_spec(
         &self,

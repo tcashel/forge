@@ -27,7 +27,7 @@
 //! attempt row is `running` and nothing has been written to the packet
 //! directory yet, so a test paused there can make the materialization fail
 //! for real.
-//! `epic.child.merge.after` is the scheduler's applied-but-response-lost
+//! `epic.child.merge.after` is the pass's applied-but-response-lost
 //! boundary: GitHub accepted the integration merge, but the operation and
 //! epic journal have not yet been completed.
 //! `epic.plan.apply.after-beads` is the rolling planner's corresponding
@@ -36,10 +36,10 @@
 //! `controller.record.after` is the handoff equivalent: the detached
 //! controller identity is on disk, but its event and operation response are
 //! not yet durable in the ledger.
-//! `supervisor.stop-check.after` is the gap after landed-stop projection and
-//! before the controller-submit singleton. `epic.stop.guarded.before-commit`
-//! holds that same singleton immediately before an input/final event and its
-//! desired-state transition commit atomically.
+//! `supervisor.stop-check.after` is the run handoff gap after landed-stop
+//! projection and before controller submission. `epic.stop.guarded.before-commit`
+//! pauses the ore pass with its desired-row claim held immediately before an
+//! input/final event and desired-state transition commit atomically.
 //! `epic.resolve.desired.after` is the inverse seam: the identified
 //! INPUT_RESOLVED event and due wake are committed, but the safe-effect
 //! operation has not yet been settled.

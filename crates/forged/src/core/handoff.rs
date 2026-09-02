@@ -1,6 +1,6 @@
 //! Durable handoff from an interactive lead session to a detached controller.
 //!
-//! The controller is only a host for `run drive` or `epic drive`; the ledger
+//! The controller is only a host for `run drive`; the ledger
 //! remains execution truth. Herdr supplies a durable pane when available.
 
 use std::collections::HashMap;
@@ -18,7 +18,7 @@ use forged_types::{
 };
 use serde_json::{json, Value};
 
-use crate::config::{now_iso, EpicScheduler, HostPolicy};
+use crate::config::{now_iso, HostPolicy};
 use crate::core::{
     default_key, derive_key, err_response, fenced_authorizing_desired, key_absent, ok_response,
     on_ledger, param_str, remedy_response, Ctx, DesiredAuthorization, Failure,
@@ -1304,7 +1304,6 @@ pub(super) async fn spawn(
     ctx: &Ctx,
     id: &str,
     repo: &str,
-    scope: Scope,
     generation: u32,
     host_policy: HostPolicy,
     herdr_socket: Option<PathBuf>,
@@ -1329,10 +1328,8 @@ pub(super) async fn spawn(
         ))
     })?;
     let command = format!(
-        "{} {} drive --{} {}",
+        "{} run drive --run {}",
         shell_quote(&exe.to_string_lossy()),
-        scope.noun(),
-        scope.noun(),
         shell_quote(id),
     );
     let mut env = HashMap::new();
@@ -1359,7 +1356,7 @@ pub(super) async fn spawn(
         DRIVER_LSTART_ENV.to_owned(),
         lstart_path.to_string_lossy().into_owned(),
     );
-    env.insert(CONTROLLER_SCOPE_ENV.to_owned(), scope.noun().to_owned());
+    env.insert(CONTROLLER_SCOPE_ENV.to_owned(), "run".to_owned());
     env.insert(CONTROLLER_ID_ENV.to_owned(), id.to_owned());
     env.insert(CONTROLLER_GENERATION_ENV.to_owned(), generation.to_string());
     #[cfg(feature = "failpoints")]
@@ -1374,10 +1371,7 @@ pub(super) async fn spawn(
     }
 
     let layout_subject = forged_types::HerdrLayoutSubjectV1 {
-        kind: match scope {
-            Scope::Run => forged_types::HerdrLayoutSubjectKind::Run,
-            Scope::Epic => forged_types::HerdrLayoutSubjectKind::Epic,
-        },
+        kind: forged_types::HerdrLayoutSubjectKind::Run,
         id: id.to_owned(),
     };
     let (host, host_kind, socket_path, layout_mutation): (
@@ -1400,8 +1394,14 @@ pub(super) async fn spawn(
                 ));
             }
             None => {
-                record_fallback(ctx, id, scope, generation, "no Herdr socket is configured")
-                    .await?;
+                record_fallback(
+                    ctx,
+                    id,
+                    Scope::Run,
+                    generation,
+                    "no Herdr socket is configured",
+                )
+                .await?;
                 (
                     Box::new(ProcessHost::new(&status_base)),
                     "process",
@@ -1435,7 +1435,7 @@ pub(super) async fn spawn(
                     )
                 }
                 Err(error) if host_policy == HostPolicy::Preferred => {
-                    record_fallback(ctx, id, scope, generation, &error.to_string()).await?;
+                    record_fallback(ctx, id, Scope::Run, generation, &error.to_string()).await?;
                     (
                         Box::new(ProcessHost::new(&status_base)),
                         "process",
@@ -1469,7 +1469,8 @@ pub(super) async fn spawn(
         }
     };
     let status_path = prepared.sentinel_path().to_path_buf();
-    let ownership = super::herdr_ownership::controller_identity(&prepared, scope, id, generation)?;
+    let ownership =
+        super::herdr_ownership::controller_identity(&prepared, Scope::Run, id, generation)?;
     if let Some(identity) = ownership.as_ref() {
         if let Err(error) = super::herdr_ownership::register(ctx, identity.clone()).await {
             super::herdr_layout::finish_mutation(
@@ -1532,7 +1533,7 @@ pub(super) async fn spawn(
     )?;
     let record = json!({
         "schemaVersion": 2,
-        "scope": scope.noun(),
+        "scope": "run",
         "id": id,
         "generation": generation,
         "host": host_kind,
@@ -1599,32 +1600,6 @@ async fn submit(ctx: &Ctx, req: &mut OperationRequest, scope: Scope) -> Operatio
             }
         },
     };
-    if matches!(scope, Scope::Epic) && ctx.config.epic_scheduler == EpicScheduler::Controller {
-        match super::epic::has_loop_dispatch(ctx, &id).await {
-            Ok(true) => {
-                let failure = Failure::invalid(format!(
-                    "epic {id} contains a loop-dispatched child and cannot spawn a controller; set epicScheduler: loop and run supervise"
-                ));
-                return remedy_response(
-                    &derive_key(scope.operation(), Some(&id), None, None),
-                    &failure,
-                    forged_types::RemedyV1::from(forged_types::OperationActionV1 {
-                        verb: "supervise".to_owned(),
-                        args: serde_json::Map::new(),
-                        reason: "set epicScheduler: loop; the controller-to-loop flip is irreversible for this epic"
-                            .to_owned(),
-                    }),
-                );
-            }
-            Ok(false) => {}
-            Err(error) => {
-                return err_response(
-                    &derive_key(scope.operation(), Some(&id), None, None),
-                    &error,
-                )
-            }
-        }
-    }
     if req.run_id.is_none() {
         req.run_id = Some(id.clone());
     }
@@ -1946,7 +1921,7 @@ async fn submit(ctx: &Ctx, req: &mut OperationRequest, scope: Scope) -> Operatio
     };
     max_generation = max_generation.max(owned_generation.unwrap_or(0));
 
-    if !(matches!(scope, Scope::Epic) && ctx.config.epic_scheduler == EpicScheduler::Loop) {
+    if matches!(scope, Scope::Run) {
         let preflight = match super::admission::preflight_shape(
             ctx,
             (scope.desired_kind(), id.clone()),
@@ -2089,7 +2064,7 @@ async fn submit(ctx: &Ctx, req: &mut OperationRequest, scope: Scope) -> Operatio
             Err(error) => return err_response(&key, &error),
         }
     }
-    if matches!(scope, Scope::Epic) && ctx.config.epic_scheduler == EpicScheduler::Loop {
+    if matches!(scope, Scope::Epic) {
         default_key(
             req,
             derive_key(
@@ -2370,16 +2345,8 @@ async fn submit(ctx: &Ctx, req: &mut OperationRequest, scope: Scope) -> Operatio
                         "controller": controller,
                     }));
                 }
-                let controller = spawn(
-                    ctx,
-                    &id,
-                    &repo,
-                    scope,
-                    spawn_generation,
-                    host_policy,
-                    herdr_socket,
-                )
-                .await?;
+                let controller =
+                    spawn(ctx, &id, &repo, spawn_generation, host_policy, herdr_socket).await?;
                 Ok(json!({
                     "submitted": true,
                     "phase": "spawned",
@@ -2494,7 +2461,7 @@ pub(crate) async fn authorize_frontier_run(
     })
 }
 
-/// Detach an epic driver and return its durable controller identity.
+/// Authorize an epic for supervisor-owned frontier reconciliation.
 pub async fn epic_submit(ctx: &Ctx, req: &mut OperationRequest) -> OperationResponse {
     // `waitSetup` is a read-only wrapper directive: it is stripped before
     // the fenced request so it never perturbs operation identity, and its
@@ -2517,7 +2484,7 @@ pub async fn epic_submit(ctx: &Ctx, req: &mut OperationRequest) -> OperationResp
             .as_ref()
             .and_then(|result| result.get("phase"))
             .and_then(Value::as_str);
-        if matches!(phase, Some("spawned" | "recovered" | "already-running")) {
+        if phase == Some("queued") {
             if let Ok(epic) = param_str(&req.params, "epic") {
                 let setup = super::epic::await_setup(ctx, epic).await;
                 if let Some(object) = response.result.as_mut().and_then(Value::as_object_mut) {

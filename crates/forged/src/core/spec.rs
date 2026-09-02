@@ -14,7 +14,7 @@
 //!
 //! BD READ BUDGET: exactly one work read per packet open and one per claim,
 //! never one per seat — the bd gate lock is shared with live runs, and a
-//! read storm during a wave would contend with an epic scheduler's own bd
+//! read storm during a frontier pass would contend with its own bd
 //! traffic.
 
 use std::path::Path;

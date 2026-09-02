@@ -155,7 +155,7 @@ fn preflight_names_a_child_assigned_to_another_repository() {
     assert_nothing_durable(&env, "epic-pfr");
 }
 
-/// A no-diff child never launches a run — the scheduler raises the
+/// A no-diff child never launches a run — the pass raises the
 /// `non-code-child` hold instead — so its identity row advertises no run,
 /// branch, or worktree.
 #[test]

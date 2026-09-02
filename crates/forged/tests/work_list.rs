@@ -17,20 +17,6 @@ use std::collections::BTreeSet;
 use serde_json::{json, Value};
 use support::{fabricate_epic, fabricate_run, TestEnv};
 
-/// Poll a forged command until it answers `ready`, or fail loudly.
-fn wait_for(env: &TestEnv, args: &[&str], ready: impl Fn(&Value) -> bool) -> Value {
-    let mut last = Value::Null;
-    for _ in 0..600 {
-        let (code, value) = env.forged(args);
-        if code == 0 && ready(&value) {
-            return value;
-        }
-        last = value;
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-    panic!("timed out waiting for forged {args:?}: {last}")
-}
-
 /// Open the operator ledger directly. Only the two tests that must forge a
 /// condition no API can produce — a timestamp tie, an unreadable payload —
 /// use this.
@@ -710,14 +696,16 @@ fn an_epic_reports_the_state_its_events_describe() {
     assert_eq!(epic["state"], json!("active"), "resume reactivates: {epic}");
     assert_eq!(epic["stopReason"], Value::Null);
 
-    // Drive the epic the whole way: the final PR is written by the
-    // scheduler, not by the test.
+    // Reconcile the epic the whole way: the final PR is written by the
+    // supervisor's pass, not by the test.
     let (code, submitted) = env.forged(&["epic", "submit", "--epic", "epic-state"]);
     assert_eq!(code, 0, "epic submit: {submitted}");
-    let driven = wait_for(&env, &["epic", "status", "--epic", "epic-state"], |value| {
-        value["result"]["finalPr"]["number"].is_number()
-    });
-    assert_eq!(driven["result"]["finalPr"]["isDraft"], json!(true));
+    let (code, driven) = env.drive_epic_to_stop("epic-state");
+    assert_eq!(code, 0, "epic pass: {driven}");
+    assert_eq!(
+        driven["result"]["stopped"]["finalPr"]["isDraft"],
+        json!(true)
+    );
     let epic = epic_entry(&env, "epic-state");
     assert_eq!(epic["state"], json!("submitted"), "final PR: {epic}");
     assert_eq!(epic["stopReason"], Value::Null);
