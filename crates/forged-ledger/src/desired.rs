@@ -563,6 +563,62 @@ impl Ledger {
         })
     }
 
+    /// Claim a desired row for an operator control transition. Unlike a
+    /// scheduler claim, a paused or parked row is eligible; the shared token
+    /// lease serializes loop-mode resume and resolution with ore reconciliation.
+    pub fn claim_desired_control(
+        &self,
+        kind: DesiredSubjectKind,
+        id: &str,
+        token: &str,
+        now: &str,
+        lease_until: &str,
+    ) -> Result<Option<DesiredWorkRow>, LedgerError> {
+        let id = id.to_owned();
+        let token = token.to_owned();
+        let now = now.to_owned();
+        let lease_until = lease_until.to_owned();
+        self.submit(move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let affected = tx.execute(
+                "UPDATE desired_work SET reconcile_token = ?1, reconcile_lease_until = ?2,
+                   updated_at = ?3
+                 WHERE subject_kind = ?4 AND subject_id = ?5
+                   AND (reconcile_token IS NULL OR reconcile_lease_until IS NULL
+                        OR reconcile_lease_until <= ?3)",
+                rusqlite::params![token, lease_until, now, kind.as_str(), id],
+            )?;
+            let row = if affected == 1 {
+                get_tx(&tx, kind, &id)?
+            } else {
+                None
+            };
+            tx.commit()?;
+            Ok(row)
+        })
+    }
+
+    /// Release an operator control claim that did not land its transition.
+    /// A transition or rival epoch that already replaced the token wins.
+    pub fn release_desired_claim(
+        &self,
+        kind: DesiredSubjectKind,
+        id: &str,
+        token: &str,
+    ) -> Result<(), LedgerError> {
+        let id = id.to_owned();
+        let token = token.to_owned();
+        self.submit(move |conn| {
+            conn.execute(
+                "UPDATE desired_work SET reconcile_token = NULL, reconcile_lease_until = NULL,
+                   updated_at = ?1
+                 WHERE subject_kind = ?2 AND subject_id = ?3 AND reconcile_token = ?4",
+                rusqlite::params![now_iso(), kind.as_str(), id, token],
+            )?;
+            Ok(())
+        })
+    }
+
     /// Charge the finite budget and reserve the only generation this tick
     /// may spawn. Exhaustion is durable and emits one attention event.
     pub fn reserve_desired_restart(
@@ -1155,6 +1211,73 @@ mod tests {
             .filter(|event| event.kind == "forged.epic.input.resolved")
             .count();
         assert_eq!(resolution_events, 2);
+    }
+
+    #[test]
+    fn operator_control_claims_serialize_with_epic_reconciliation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ledger = Ledger::open(&dir.path().join("state.db")).expect("ledger");
+        ledger
+            .authorize_desired_work(DesiredSubjectKind::Epic, "epic-serialized", 0)
+            .expect("authorize");
+        assert!(ledger
+            .claim_desired_work(
+                DesiredSubjectKind::Epic,
+                "epic-serialized",
+                "ore-pass",
+                "9999-01-01T00:00:00.000000000Z",
+                "9999-01-01T00:01:00.000000000Z",
+            )
+            .expect("ore claim")
+            .is_some());
+        assert!(ledger
+            .claim_desired_control(
+                DesiredSubjectKind::Epic,
+                "epic-serialized",
+                "resume-control",
+                "9999-01-01T00:00:00.000000000Z",
+                "9999-01-01T00:01:00.000000000Z",
+            )
+            .expect("contended control claim")
+            .is_none());
+        ledger
+            .release_desired_claim(DesiredSubjectKind::Epic, "epic-serialized", "ore-pass")
+            .expect("release ore claim");
+        assert!(ledger
+            .claim_desired_control(
+                DesiredSubjectKind::Epic,
+                "epic-serialized",
+                "resume-control",
+                "9999-01-01T00:00:00.000000000Z",
+                "9999-01-01T00:01:00.000000000Z",
+            )
+            .expect("control claim")
+            .is_some());
+        assert!(ledger
+            .claim_desired_work(
+                DesiredSubjectKind::Epic,
+                "epic-serialized",
+                "rival-ore-pass",
+                "9999-01-01T00:00:30.000000000Z",
+                "9999-01-01T00:02:00.000000000Z",
+            )
+            .expect("contended ore claim")
+            .is_none());
+        ledger
+            .append_event_controlling_desired(
+                DesiredSubjectKind::Epic,
+                "epic-serialized",
+                "forged.epic.resumed",
+                json!({"reason": "continue", "controlId": "resume-1"}),
+                DesiredState::Running,
+            )
+            .expect("land control transition");
+        assert!(ledger
+            .get_desired_work(DesiredSubjectKind::Epic, "epic-serialized")
+            .expect("desired lookup")
+            .expect("desired row")
+            .reconcile_token
+            .is_none());
     }
 
     #[test]

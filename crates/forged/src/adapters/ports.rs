@@ -1000,6 +1000,7 @@ mod tests {
             herdr_sock: None,
             pricing: crate::pricing::default_rate_card(),
             admission: crate::config::AdmissionPolicy::default(),
+            epic_scheduler: crate::config::EpicScheduler::Controller,
         };
         (config, ledger, attempt)
     }

@@ -18,6 +18,7 @@ pub(crate) mod herdr_projection;
 mod history;
 mod observe;
 mod ops;
+mod ore;
 mod review;
 mod session_inventory;
 pub(crate) mod sessions;

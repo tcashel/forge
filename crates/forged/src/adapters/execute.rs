@@ -3523,6 +3523,7 @@ mod settle_tests {
             herdr_sock: Some(socket.to_path_buf()),
             pricing: crate::pricing::default_rate_card(),
             admission: crate::config::AdmissionPolicy::default(),
+            epic_scheduler: crate::config::EpicScheduler::Controller,
         }
     }
 
