@@ -169,7 +169,9 @@ critique or adjudicate a work item, identify what needs attention, explain one r
 blocker or spend, reprioritize a work item, or safely pause, resume, or cancel exact
 existing work. It can also prepare one ready subject for explicit execution
 approval. The shared `manage-work` skill routes that intent without requiring a
-command name or machine id.
+command name or machine id. The lifecycle the skills walk is stated once in
+[`docs/LIFECYCLE.md`](../../docs/LIFECYCLE.md), and the way an agent drives
+Forge from responses alone is [`docs/DRIVING.md`](../../docs/DRIVING.md).
 
 Portfolio answers come from headless Operations Overview and exact Work Detail
 projections. Their Apps are optional views over the same data. Every mutation

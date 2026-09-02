@@ -4,6 +4,23 @@ The Rust binary is the execution path. There is no preliminary “first contact�
 experiment and no token-accounting-only milestone: finish planning with the
 user, lock the work, submit it, then inspect durable state.
 
+## Read this first
+
+This file is the operational guide and the roadmap. The system itself is
+described as a tower in three short documents that outrank this one when
+they disagree:
+
+- [`SYSTEM.md`](SYSTEM.md) — the layers, nouns, ids, invariants, and where
+  each truth lives.
+- [`LIFECYCLE.md`](LIFECYCLE.md) — the one lifecycle every work item moves
+  through, the evidence for each stage, and the verb that records it.
+- [`DRIVING.md`](DRIVING.md) — the runbook for an agent driving Forge from
+  operation responses alone.
+
+The decision behind them is
+[ADR-0036](adr/0036-agent-is-the-operator-one-id-one-lifecycle-one-next.md);
+the delivery plan is in [Roadmap](#roadmap) at the end of this file.
+
 ## Ownership
 
 - The user talks to one lead agent.
@@ -12,7 +29,8 @@ user, lock the work, submit it, then inspect durable state.
 - The Forged ledger owns work items, dependencies, readiness, and
   leases (ADR-0034).
 - Forged owns cognitive-stage contracts, topology, provider dispatch, gates,
-  review/remediation, epic waves, and results.
+  review/remediation, frontier scheduling and epic integration (the ore
+  pass), and results.
 - Provider adapters perform cognition.
 - Herdr owns panes/process transport; the Forged ledger remains truth.
 - Git/GitHub own code, branches, PRs, and merge truth.
@@ -248,31 +266,49 @@ work store, close the child, then `epic resolve`. Forged never manufactures an
 empty commit or PR for them, and a child closed after epic start counts as
 accounted work.
 
+Since v0.7.0 there is no epic controller process and no wave. `epic submit`
+authorizes the epic's desired row; the supervisor's **ore pass** claims that
+row on each tick through the same lease the due loop uses and runs one
+bounded iteration: ensure the integration branch, merge at most one clean
+landed child, roll planning forward when the frontier is empty and children
+remain unaccounted, dispatch ready frontier children into free slots through
+the exact `run_start` operation identity (run row, operation row, and
+generation-0 authorization in one transaction), and open the final draft PR
+(with assurance when the profile enables it) once every child is accounted.
+Dispatched children are ordinary runs with their own detached controllers,
+admission, and restart budgets; the epic itself never reserves capacity or
+charges a restart. A merge recomputes the frontier, so a child blocked on a
+sibling dispatches as soon as the sibling merges — rolling execution without
+waves. `epic advance` and `epic drive` no longer exist; historical
+wave-bearing streams resume under the pass unchanged.
+
 Resolving a child-specific stop retires that terminal child binding from the
-epic projection. The next wave starts a fresh child run generation (for
-example, `<child>-g2`) from the adjudicated spec; it never reuses or silently
-accepts the unclean terminal run.
+epic projection; the pass then dispatches a fresh child run from the
+adjudicated spec. It never reuses or silently accepts the unclean terminal
+run. Forged squash-merges only mechanically clean slices into
+`forged/epic-<epic-id>` and never merges that branch to the default branch.
+A completed epic ends at one draft PR; ambiguity, no ready children, or
+non-clean work becomes durable `inputRequired`, not a hidden cognitive
+replan.
 
-Forged freezes the work store inventory, drives ready children in waves, and
-squash-merges only mechanically clean slices into
-`forged/epic-<epic-id>`. It never merges that branch to the default branch. A
-completed epic ends at one draft PR; ambiguity/no-ready/non-clean work becomes
-durable `inputRequired`, not a hidden cognitive replan.
-
-After the lead agent or user adjudicates a held child:
+After the lead agent or user adjudicates a held child, resolving the hold
+wakes the existing desired row; no resubmit is needed:
 
 ```sh
 forged epic resolve --epic <epic-id> --child <child-id> --note '<resolution>'
-forged epic submit --epic <epic-id>
 ```
 
-Pause is an out-of-band signal observed at the next durable boundary:
+Pause is observed at the pass's next iteration; resume wakes the row:
 
 ```sh
 forged epic pause --epic <epic-id> --reason '<reason>'
 forged epic resume --epic <epic-id> --reason '<reason>'
-forged epic submit --epic <epic-id>
 ```
+
+Control verbs (`pause`, `resume`, `abandon`, `revise-roster`,
+`revise-policy`) fence through the pass's own desired-work claim and refuse
+with `BEADS_CONTENTION` while a pass iteration holds the epic; back off,
+observe `epic status`, and retry only the refused control verb.
 
 ## Reconnect from any agent harness
 
@@ -533,3 +569,33 @@ operational action after merge and release is to install the first Forge
 version containing this marketplace and use `/forged:plan` →
 `/forged:critique` → `/forged:adjudicate` → typed submission on real work. No
 alternate execution path remains to reconcile.
+
+## Roadmap
+
+Shipped, in order: v0.6.0 the ledger-native work store (ADR-0034); v0.6.2
+the pile-1 core fixes; v0.6.3 affordances and the generated surface
+manifest; v0.7.0 the Ore Loop — one scheduler, retry, policy revisions,
+submit-time preflight, typed decisions (ADR-0035).
+
+Next, decided in
+[ADR-0036](adr/0036-agent-is-the-operator-one-id-one-lifecycle-one-next.md)
+and sequenced as two epic briefs that go through the lifecycle they
+describe (plan, critique, adjudicate, then dispatch):
+
+1. [The driver surface](plans/ore-080-driver-surface.md) — `forged next`,
+   `next` with `should | can | repair` classes on every projection, bounded
+   reads, one id on every verb, lead-audience MCP with envelope-free reads,
+   the lifecycle in the ledger with `work adjudicate` and `run dispatch`,
+   `wait`, thin skills, finish-as-a-decision, a seat progress and question
+   channel, and parallel implementation slots. Wave 1 is projection-only
+   (v0.7.x); wave 2 changes the plugin (v0.8.0); wave 3 changes the
+   protocol tail (v0.9.0).
+2. [The factory loop](plans/ore-081-factory-loop.md) — complexity class on
+   the item, roster policy by class, telemetry with a denominator, cost on
+   every `next` verb, PR narrative from evidence, retros on the record, and
+   adjudicated advice (v1.0 candidate).
+
+Deferred behind those, unchanged from the ore-070 adjudication: the
+machine-wide session archive ([plan](plans/forged-history-mvp.md)), a
+`session_message` sequence key, read-connection pooling, retention policy,
+and the worker-typed landing ADR.

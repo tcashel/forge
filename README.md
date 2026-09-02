@@ -145,11 +145,15 @@ then file, sized by lines and colored by coverage.
 
 ## Documentation
 
+- [The system as a tower](docs/SYSTEM.md) — start here
+- [The one lifecycle](docs/LIFECYCLE.md)
+- [Driving Forge — the agent's runbook](docs/DRIVING.md)
 - [Lead-agent plugin and host setup](plugins/forged/README.md)
-- [CLI and operations guide](docs/NEXT.md)
+- [CLI and operations guide, and roadmap](docs/NEXT.md)
 - [Provider-neutral orchestration](docs/adr/0032-forged-provider-neutral-rust-orchestrator.md)
 - [Planning and execution boundaries](docs/adr/0033-execution-package-ownership-boundary.md)
 - [Operational policy revisions](docs/adr/0035-operational-policy-revisions-at-durable-stage-boundaries.md)
+- [The agent is the operator](docs/adr/0036-agent-is-the-operator-one-id-one-lifecycle-one-next.md)
 - [Changelog](CHANGELOG.md)
 - [Release process](RELEASE.md)
 - [Contributing](CONTRIBUTING.md)
