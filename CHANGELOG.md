@@ -4,6 +4,67 @@ This file records user-visible changes to Forge.
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-09-02
+
+The Ore Loop release (epic ore-070, PRs #229-#239): epic execution
+collapses from a driven wave machine to one scheduler — a decoupled
+supervisor pass that dispatches the ready frontier, rolls planning
+forward, and merges landed children with no driver process, no wave
+barriers, and no second code path. Runs gain typed recovery and
+stage-boundary policy revisions; admission charges truthful facts and
+refuses at submit time instead of deferring after.
+
+### Added
+
+- The ore pass: a supervisor-owned reconciliation pass that claims a
+  loop-mode epic's desired row and drives it end-to-end — frontier
+  children dispatch through the `run_start` operation identity (atomic
+  run row + operation row + generation-0 authorization), planning
+  rolls forward on a durable cursor instead of wave barriers, and one
+  child merges per iteration. Controller-era epics flip one-way onto
+  the loop; historical wave-bearing streams resume under the pass
+  unchanged.
+- `run retry`: one verb to redispatch any terminal run — mints the
+  successor, links supersedes, and reuses the stored spec revision
+  under the same fenced start identity; the old cancel-and-hand-mint
+  choreography is gone.
+- Stage-boundary policy revisions (`run revise-policy` /
+  `epic revise-policy`, migration 027, ADR-0035): admission-policy
+  edits append provenance-carrying revision rows and take effect at
+  durable stage boundaries — never mid-stage, never by rewriting
+  history.
+- Submit-time admission preflight: submission refuses impossible
+  admissions up front — with the exact failing fields — instead of
+  accepting work that can only defer forever.
+- Typed decision verbs on attention items: exhaustion and settlement
+  conditions advertise their exact recovery verb with placeholders
+  bound and honesty-tested; exhaustion clears itself once a durable
+  successor exists.
+
+### Changed
+
+- `epic advance` and `epic drive` are deleted; the dispatch surface
+  is 70 operations (epic 12 → 10). Control verbs (`pause`, `resume`,
+  `abandon`, `revise-roster`, `revise-policy`) fence through the
+  pass's own desired-work claim and refuse with a recoverable
+  contention shape while a pass holds the epic.
+- Admission charges capacity from effective facts — live attempts and
+  held reservations as they are, not as the launch-time snapshot said
+  they would be — and reads them through a trigger-backed staleness
+  token (migration 026) that batches the per-decision reads.
+- Attention projections fold through one shared projection, so every
+  surface renders identical condition state.
+
+### Fixed
+
+- A queued generation-0 authorization launches through the due loop's
+  restart path exactly like a retry successor — the contract is now
+  pinned by test rather than assumed by the dispatcher.
+- Epic process-fixture tests serialize on small CI runners; the
+  identity-less controller boot-grace gap and the orphaned-reservation
+  self-capacity deadlock it exposed are recorded findings with
+  operator adjudication as the interim door.
+
 ## [0.6.3] - 2026-08-29
 
 The affordance and query release (epic ore-063, PRs #213-#226): the
