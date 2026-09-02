@@ -502,6 +502,115 @@ pub(crate) async fn run_start_with_definition(
     .await
 }
 
+/// Mint and authorize one epic frontier run without spawning it. The
+/// operation identity is exactly `run_start`; its successful response and
+/// generation-zero desired authorization commit through one dynamic fence.
+pub(crate) async fn dispatch_frontier_run(
+    ctx: &Ctx,
+    req: &mut OperationRequest,
+    compiled: crate::config::CompiledDefinition,
+) -> OperationResponse {
+    let work = match param_str(&req.params, "bead") {
+        Ok(value) => value.to_owned(),
+        Err(error) => return err_response(&derive_key("run_start", None, None, None), &error),
+    };
+    let run_name = param_opt_str(&req.params, "run").unwrap_or(&work);
+    let run_id = match RunId::new(run_name.to_owned()) {
+        Ok(run_id) => run_id,
+        Err(error) => {
+            return err_response(
+                &derive_key("run_start", None, None, None),
+                &Failure::invalid(format!("work id does not mint a valid run id: {error}")),
+            )
+        }
+    };
+    let epoch = match super::released_retry_seq(ctx, run_id.as_str(), "run_start").await {
+        Ok(epoch) => epoch,
+        Err(error) => {
+            return err_response(
+                &derive_key("run_start", Some(run_id.as_str()), None, None),
+                &error,
+            )
+        }
+    };
+    default_key(
+        req,
+        derive_key("run_start", Some(run_id.as_str()), None, epoch),
+    );
+    if req.run_id.is_none() {
+        req.run_id = Some(run_id.as_str().to_owned());
+    }
+    req.params.insert(
+        "packageSha256".to_owned(),
+        Value::String(compiled.package_sha256.clone()),
+    );
+    let submit_guard = match super::handoff::acquire_run_submit(ctx, run_id.as_str()).await {
+        Ok(guard) => guard,
+        Err(error) => return err_response(&req.idempotency_key, &error),
+    };
+    match recover_applied_frontier_dispatch(ctx, req, &run_id).await {
+        Ok(Some(response)) => return response,
+        Ok(None) => {}
+        Err(error) => return err_response(&req.idempotency_key, &error),
+    }
+    let params = req.params.clone();
+    let run_for_effect = run_id.clone();
+    let response = fenced_dynamic_authorizing_desired(
+        ctx,
+        "run_start",
+        EffectClass::SafeRetry,
+        req,
+        move |operation_id| async move {
+            let started = create_run_from_definition(
+                ctx,
+                &params,
+                work,
+                run_for_effect.clone(),
+                compiled,
+                operation_id,
+                None,
+            )
+            .await?;
+            let authorization =
+                super::handoff::authorize_frontier_run(ctx, run_for_effect.as_str(), &submit_guard)
+                    .await?;
+            Ok((started, authorization))
+        },
+    )
+    .await;
+    if response.ok {
+        // A controller-era `run_start` may replay here without the desired
+        // authorization that loop dispatch now seals atomically. Bridge only
+        // that already-terminal compatibility case; fresh loop dispatches
+        // commit the operation response and desired row together above.
+        let desired_id = run_id.as_str().to_owned();
+        let desired = on_ledger(&ctx.ledger, {
+            let desired_id = desired_id.clone();
+            move |ledger| {
+                ledger.get_desired_work(forged_ledger::DesiredSubjectKind::Run, &desired_id)
+            }
+        })
+        .await;
+        if matches!(desired, Ok(None)) {
+            if let Err(error) = on_ledger(&ctx.ledger, move |ledger| {
+                ledger.authorize_desired_work(
+                    forged_ledger::DesiredSubjectKind::Run,
+                    &desired_id,
+                    0,
+                )?;
+                Ok(())
+            })
+            .await
+            {
+                return err_response(&req.idempotency_key, &error);
+            }
+        } else if let Err(error) = desired {
+            return err_response(&req.idempotency_key, &error);
+        }
+    }
+    response
+}
+
 async fn create_run_from_definition(
     ctx: &Ctx,
     params: &serde_json::Map<String, Value>,
@@ -1110,6 +1219,50 @@ async fn recover_applied_run_start(
     let stored = response.clone();
     on_ledger(&ctx.ledger, move |ledger| {
         ledger.resolve_interrupted_operation(&operation_id, &stored)
+    })
+    .await?;
+    let mut replayed = response;
+    replayed.reused = true;
+    Ok(Some(replayed))
+}
+
+async fn recover_applied_frontier_dispatch(
+    ctx: &Ctx,
+    request: &OperationRequest,
+    run_id: &RunId,
+) -> Result<Option<OperationResponse>, Failure> {
+    let name = "run_start".to_owned();
+    let key = request.idempotency_key.clone();
+    let row = on_ledger(&ctx.ledger, move |ledger| {
+        ledger.find_operation(&name, &key)
+    })
+    .await?;
+    let Some(row) = row.filter(|row| row.state == OperationState::InProgress) else {
+        return Ok(None);
+    };
+    let hash = request_sha256(request)
+        .map_err(|error| Failure::invalid(format!("params cannot be canonicalized: {error}")))?;
+    if row.request_sha256 != hash {
+        return Err(Failure::refused(
+            ErrorCode::IdempotencyConflict,
+            "frontier run start key was stored with a different request",
+        ));
+    }
+    let Some(result) = replay_atomic_run_start(ctx, run_id, &row.operation_id).await? else {
+        return Ok(None);
+    };
+    let response = ok_response(&row.operation_id, false, result);
+    let operation_id = row.operation_id;
+    let stored = response.clone();
+    let desired_id = run_id.as_str().to_owned();
+    on_ledger(&ctx.ledger, move |ledger| {
+        ledger.resolve_interrupted_operation_authorizing_desired(
+            &operation_id,
+            &stored,
+            forged_ledger::DesiredSubjectKind::Run,
+            &desired_id,
+            0,
+        )
     })
     .await?;
     let mut replayed = response;

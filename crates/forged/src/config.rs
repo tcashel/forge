@@ -72,6 +72,20 @@ pub struct ForgedConfig {
     pub pricing: RateCard,
     /// Resolved, finite scheduler capacity and optional usage ceilings.
     pub admission: AdmissionPolicy,
+    /// Epic scheduling is operational daemon policy. Long-running supervision
+    /// refreshes it per iteration; `supervise --once` uses its startup snapshot.
+    pub epic_scheduler: EpicScheduler,
+}
+
+/// The owner of epic frontier reconciliation.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum EpicScheduler {
+    /// Preserve the detached `epic drive` controller.
+    #[default]
+    Controller,
+    /// Let the supervisor's decoupled ore pass walk the frontier.
+    Loop,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -199,6 +213,12 @@ struct ConfigFile {
     pricing: Option<RateCard>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     admission: Option<AdmissionPolicy>,
+    #[serde(
+        rename = "epicScheduler",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    epic_scheduler: Option<EpicScheduler>,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -586,6 +606,7 @@ impl ForgedConfig {
                 .pricing
                 .unwrap_or_else(crate::pricing::default_rate_card),
             admission,
+            epic_scheduler: file.epic_scheduler.unwrap_or_default(),
             anvil_home,
         })
     }
@@ -913,6 +934,7 @@ impl ForgedConfig {
                 .map(|path| path.to_string_lossy().into_owned()),
             pricing: Some(self.pricing.clone()),
             admission: Some(self.admission.clone()),
+            epic_scheduler: Some(self.epic_scheduler),
         };
         if self
             .config_path
@@ -1411,6 +1433,7 @@ pub(crate) fn scratch_config(anvil_home: &std::path::Path) -> ForgedConfig {
         herdr_sock: None,
         pricing: crate::pricing::default_rate_card(),
         admission: AdmissionPolicy::default(),
+        epic_scheduler: EpicScheduler::Controller,
     }
 }
 
@@ -1444,6 +1467,7 @@ mod tests {
             herdr_sock: None,
             pricing: crate::pricing::default_rate_card(),
             admission: AdmissionPolicy::default(),
+            epic_scheduler: EpicScheduler::Controller,
         }
     }
 
@@ -1461,6 +1485,27 @@ mod tests {
         let compiled = cfg.compile_definition(None, None).expect("compile");
         assert_eq!(compiled.package.profile_ref.name, "standard");
         assert_eq!(compiled.compatibility_roster.len(), 4);
+    }
+
+    #[test]
+    fn epic_scheduler_defaults_to_controller_and_accepts_the_top_level_loop_knob() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("config.yaml");
+        std::fs::write(&path, "futureTopLevelKey: tolerated\n").expect("default config");
+        let defaulted = ForgedConfig::load_at(
+            directory.path().to_path_buf(),
+            path.clone(),
+            Some(path.clone()),
+        )
+        .expect("unknown top-level key remains tolerated");
+        assert_eq!(defaulted.epic_scheduler, EpicScheduler::Controller);
+
+        std::fs::write(&path, "epicScheduler: loop\nfutureTopLevelKey: tolerated\n")
+            .expect("loop config");
+        let loop_config =
+            ForgedConfig::load_at(directory.path().to_path_buf(), path.clone(), Some(path))
+                .expect("loop scheduler config");
+        assert_eq!(loop_config.epic_scheduler, EpicScheduler::Loop);
     }
 
     #[test]

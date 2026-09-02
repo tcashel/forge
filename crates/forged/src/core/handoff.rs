@@ -18,7 +18,7 @@ use forged_types::{
 };
 use serde_json::{json, Value};
 
-use crate::config::{now_iso, HostPolicy};
+use crate::config::{now_iso, EpicScheduler, HostPolicy};
 use crate::core::{
     default_key, derive_key, err_response, fenced_authorizing_desired, key_absent, ok_response,
     on_ledger, param_str, remedy_response, Ctx, DesiredAuthorization, Failure,
@@ -1599,6 +1599,32 @@ async fn submit(ctx: &Ctx, req: &mut OperationRequest, scope: Scope) -> Operatio
             }
         },
     };
+    if matches!(scope, Scope::Epic) && ctx.config.epic_scheduler == EpicScheduler::Controller {
+        match super::epic::has_loop_dispatch(ctx, &id).await {
+            Ok(true) => {
+                let failure = Failure::invalid(format!(
+                    "epic {id} contains a loop-dispatched child and cannot spawn a controller; set epicScheduler: loop and run supervise"
+                ));
+                return remedy_response(
+                    &derive_key(scope.operation(), Some(&id), None, None),
+                    &failure,
+                    forged_types::RemedyV1::from(forged_types::OperationActionV1 {
+                        verb: "supervise".to_owned(),
+                        args: serde_json::Map::new(),
+                        reason: "set epicScheduler: loop; the controller-to-loop flip is irreversible for this epic"
+                            .to_owned(),
+                    }),
+                );
+            }
+            Ok(false) => {}
+            Err(error) => {
+                return err_response(
+                    &derive_key(scope.operation(), Some(&id), None, None),
+                    &error,
+                )
+            }
+        }
+    }
     if req.run_id.is_none() {
         req.run_id = Some(id.clone());
     }
@@ -1920,8 +1946,13 @@ async fn submit(ctx: &Ctx, req: &mut OperationRequest, scope: Scope) -> Operatio
     };
     max_generation = max_generation.max(owned_generation.unwrap_or(0));
 
-    let preflight =
-        match super::admission::preflight_shape(ctx, (scope.desired_kind(), id.clone())).await {
+    if !(matches!(scope, Scope::Epic) && ctx.config.epic_scheduler == EpicScheduler::Loop) {
+        let preflight = match super::admission::preflight_shape(
+            ctx,
+            (scope.desired_kind(), id.clone()),
+        )
+        .await
+        {
             Ok(preflight) => preflight,
             Err(error) => {
                 return err_response(
@@ -1930,15 +1961,16 @@ async fn submit(ctx: &Ctx, req: &mut OperationRequest, scope: Scope) -> Operatio
                 )
             }
         };
-    if let Some(refusal) = preflight {
-        let key = derive_key(
-            scope.operation(),
-            Some(&id),
-            Some("admission-preflight"),
-            None,
-        );
-        let (failure, remedy) = admission_preflight_refusal(scope, &id, &refusal);
-        return remedy_response(&key, &failure, remedy);
+        if let Some(refusal) = preflight {
+            let key = derive_key(
+                scope.operation(),
+                Some(&id),
+                Some("admission-preflight"),
+                None,
+            );
+            let (failure, remedy) = admission_preflight_refusal(scope, &id, &refusal);
+            return remedy_response(&key, &failure, remedy);
+        }
     }
 
     let stopped = match scope {
@@ -2056,6 +2088,41 @@ async fn submit(ctx: &Ctx, req: &mut OperationRequest, scope: Scope) -> Operatio
             Ok(_) => {}
             Err(error) => return err_response(&key, &error),
         }
+    }
+    if matches!(scope, Scope::Epic) && ctx.config.epic_scheduler == EpicScheduler::Loop {
+        default_key(
+            req,
+            derive_key(
+                scope.operation(),
+                Some(&id),
+                None,
+                Some(i64::from(next_generation)),
+            ),
+        );
+        return fenced_authorizing_desired(
+            ctx,
+            scope.operation(),
+            EffectClass::SafeRetry,
+            req,
+            DesiredAuthorization {
+                kind: DesiredSubjectKind::Epic,
+                id: id.clone(),
+                generation: max_generation,
+                queued_until: Some(now_iso()),
+                admission_reason: Some("loop-mode epic awaits the supervisor ore pass".to_owned()),
+            },
+            move |_operation| async move {
+                Ok(json!({
+                    "submitted": true,
+                    "phase": "queued",
+                    "controlRevision": next_control_revision,
+                    "queued": true,
+                    "alreadyRunning": false,
+                    "controller": Value::Null,
+                }))
+            },
+        )
+        .await;
     }
     let (host_policy, herdr_socket) = match scope {
         Scope::Run => match super::drive::project(ctx, &id).await {
@@ -2388,6 +2455,43 @@ pub(crate) async fn authorize_retry_successor(
             ),
         },
     ))
+}
+
+/// Prepare a newly minted epic frontier run for ordinary supervisor
+/// admission. The caller's operation fence seals this authorization with the
+/// run-start response; no controller is spawned on this path.
+pub(crate) async fn authorize_frontier_run(
+    ctx: &Ctx,
+    run_id: &str,
+    _guard: &SubmitGuard,
+) -> Result<DesiredAuthorization, Failure> {
+    let id = run_id.to_owned();
+    let (run, desired) = on_ledger(&ctx.ledger, move |ledger| {
+        Ok((
+            ledger.get_run(&id)?,
+            ledger.get_desired_work(DesiredSubjectKind::Run, &id)?,
+        ))
+    })
+    .await?;
+    if run.state != forged_ledger::RunState::Active {
+        return Err(Failure::refused(
+            ErrorCode::InvalidRequest,
+            format!("frontier run {run_id} is already terminal"),
+        ));
+    }
+    if desired.is_some() {
+        return Err(Failure::refused(
+            ErrorCode::InvalidRequest,
+            format!("frontier run {run_id} is already authorized"),
+        ));
+    }
+    Ok(DesiredAuthorization {
+        kind: DesiredSubjectKind::Run,
+        id: run_id.to_owned(),
+        generation: 0,
+        queued_until: None,
+        admission_reason: Some("frontier child awaits ordinary supervisor admission".to_owned()),
+    })
 }
 
 /// Detach an epic driver and return its durable controller identity.

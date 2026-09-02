@@ -28,6 +28,7 @@ const POLL_SECONDS: u64 = 5;
 const CLAIM_LEASE_SECONDS: u64 = 60;
 const MAX_BACKOFF_SECONDS: u64 = 300;
 const PROJECTION_PASS_BUDGET: Duration = Duration::from_secs(5);
+const ORE_PASS_BUDGET: Duration = Duration::from_secs(30);
 const DEFERRED_ATTENTION_SURFACE_WAKES: u32 = 3;
 
 /// Consecutive supervisor deferrals are process-local by design. A service
@@ -219,6 +220,83 @@ impl WorkSettlementPass {
 }
 
 impl Drop for WorkSettlementPass {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
+}
+
+/// The ore pass is detached from due-work admission. A wedged repository or
+/// GitHub effect consumes only this bounded task; the current and following
+/// ticks continue admitting independent run subjects without awaiting it.
+struct OrePass {
+    handle: Option<tokio::task::JoinHandle<Value>>,
+    last_report: Value,
+}
+
+impl OrePass {
+    fn new() -> Self {
+        Self {
+            handle: None,
+            last_report: Value::Null,
+        }
+    }
+
+    async fn poll(&mut self, ctx: &Ctx) {
+        if self
+            .handle
+            .as_ref()
+            .is_some_and(tokio::task::JoinHandle::is_finished)
+        {
+            self.harvest().await;
+        }
+        if self.handle.is_none() {
+            let pass_ctx = Ctx {
+                config: ctx.config.clone(),
+                ledger: ctx.ledger.clone(),
+            };
+            self.handle = Some(tokio::spawn(async move {
+                match tokio::time::timeout(ORE_PASS_BUDGET, super::ore::reconcile(&pass_ctx)).await
+                {
+                    Ok(Ok(report)) => report,
+                    Ok(Err(error)) => json!({
+                        "schema": "forged.ore-pass.report/1",
+                        "error": error.to_string(),
+                    }),
+                    Err(_) => json!({
+                        "schema": "forged.ore-pass.report/1",
+                        "timedOut": true,
+                        "budgetSeconds": ORE_PASS_BUDGET.as_secs(),
+                    }),
+                }
+            }));
+        }
+    }
+
+    async fn join(&mut self) {
+        self.harvest().await;
+    }
+
+    async fn harvest(&mut self) {
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        self.last_report = match handle.await {
+            Ok(report) => report,
+            Err(error) => json!({
+                "schema": "forged.ore-pass.report/1",
+                "error": format!("ore pass task failed: {error}"),
+            }),
+        };
+    }
+
+    fn report(&self) -> Value {
+        self.last_report.clone()
+    }
+}
+
+impl Drop for OrePass {
     fn drop(&mut self) {
         if let Some(handle) = self.handle.take() {
             handle.abort();
@@ -1174,8 +1252,9 @@ async fn finish_spawn_failure(
 async fn tick_with_deferrals(
     ctx: &Ctx,
     settlement: &mut WorkSettlementPass,
+    ore: &mut OrePass,
     deferrals: &mut ConsecutiveDeferrals,
-    join_settlement: bool,
+    join_passes: bool,
 ) -> Result<Value, Failure> {
     let started_at = now_iso();
     // Give terminal custom-source release an opportunity to race independent
@@ -1209,10 +1288,17 @@ async fn tick_with_deferrals(
         })
         .await?
     };
+    // Snapshot ordinary due work before starting the ore pass. Runs it mints
+    // therefore enter the next ordinary tick, while this tick's admission is
+    // already independent of any repository or GitHub latency in the pass.
+    ore.poll(ctx).await;
     let tick_id = uuid::Uuid::now_v7().to_string();
     let mut claimed_rows = Vec::new();
     let mut contended = 0u64;
-    for candidate in due {
+    for candidate in due.into_iter().filter(|candidate| {
+        !(ctx.config.epic_scheduler == crate::config::EpicScheduler::Loop
+            && candidate.subject_kind == DesiredSubjectKind::Epic)
+    }) {
         let token = format!("supervise:{tick_id}:{}", uuid::Uuid::now_v7());
         let now = now_iso();
         let lease = deadline_after(&now, CLAIM_LEASE_SECONDS)?;
@@ -1231,6 +1317,25 @@ async fn tick_with_deferrals(
     let mut subjects = Vec::new();
     let mut admission_rows = Vec::new();
     for (candidate, token) in claimed_rows {
+        if candidate.subject_kind == DesiredSubjectKind::Epic
+            && super::epic::has_loop_dispatch(ctx, &candidate.subject_id).await?
+        {
+            deferrals.reset(candidate.subject_kind, &candidate.subject_id);
+            subjects.push(
+                finish_attention_condition(
+                    ctx,
+                    &candidate,
+                    &token,
+                    "epic-scheduler-mode",
+                    format!(
+                        "epic {} has loop-dispatched children; set epicScheduler: loop and run supervise",
+                        candidate.subject_id
+                    ),
+                )
+                .await?,
+            );
+            continue;
+        }
         match reconcile_live_before_admission(ctx, &candidate, &token).await {
             Ok(Some(report)) => {
                 deferrals.reset(candidate.subject_kind, &candidate.subject_id);
@@ -1399,10 +1504,12 @@ async fn tick_with_deferrals(
         }
     }
     let projection = projection_task.finish().await;
-    if join_settlement {
+    if join_passes {
         settlement.join().await;
+        ore.join().await;
     }
     let work_settlement = settlement.report();
+    let ore_pass = ore.report();
     let wake_now = now_iso();
     let desired_now = wake_now.clone();
     let desired_wake_at = on_ledger(&ctx.ledger, move |ledger| {
@@ -1433,6 +1540,7 @@ async fn tick_with_deferrals(
         "cleanup": cleanup,
         "layoutCleanup": layout_cleanup,
         "beadSettlement": work_settlement,
+        "orePass": ore_pass,
         "herdrProjection": projection,
         "nextWakeAt": next_wake_at,
     }))
@@ -1441,10 +1549,11 @@ async fn tick_with_deferrals(
 pub(super) async fn tick(
     ctx: &Ctx,
     settlement: &mut WorkSettlementPass,
-    join_settlement: bool,
+    join_passes: bool,
 ) -> Result<Value, Failure> {
     let mut deferrals = ConsecutiveDeferrals::default();
-    tick_with_deferrals(ctx, settlement, &mut deferrals, join_settlement).await
+    let mut ore = OrePass::new();
+    tick_with_deferrals(ctx, settlement, &mut ore, &mut deferrals, join_passes).await
 }
 
 fn sleep_until(next_wake: Option<&str>) -> Duration {
@@ -1625,6 +1734,7 @@ pub async fn supervise(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
     let mut ticks = 0u64;
     let mut last_report = Value::Null;
     let mut settlement = WorkSettlementPass::new();
+    let mut ore = OrePass::new();
     let mut deferrals = ConsecutiveDeferrals::default();
     // The daemon's config is decided fresh per tick, so a live edit to
     // rosters, admission, or pricing is served without a service restart. A
@@ -1656,7 +1766,7 @@ pub async fn supervise(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
         // its durable marker lands, and the daily snapshot fires when the
         // day rolls over — not only on the start-up day.
         bootstrap_pass(&live).await;
-        match tick_with_deferrals(&live, &mut settlement, &mut deferrals, false).await {
+        match tick_with_deferrals(&live, &mut settlement, &mut ore, &mut deferrals, false).await {
             Ok(report) => {
                 ticks = ticks.saturating_add(1);
                 if let Some(observer) = observer.as_mut() {
