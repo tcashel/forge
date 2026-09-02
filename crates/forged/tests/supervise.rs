@@ -36,6 +36,17 @@ impl Drop for PausedProcessGroup {
 }
 
 #[test]
+fn serialized_runner_contract_rejects_a_wrong_nextest_group() {
+    let panic = std::panic::catch_unwind(|| {
+        serialized_runner_contract(true, Some("wrong-group"), None);
+    });
+    assert!(
+        panic.is_err(),
+        "nextest outside the supervise fixture group must fail closed"
+    );
+}
+
+#[test]
 fn recovered_live_attempt_persists_a_wake_no_later_than_its_deadline() {
     if !require_serialized_runner() {
         return;

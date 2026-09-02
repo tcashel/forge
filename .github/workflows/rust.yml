@@ -149,6 +149,13 @@ jobs:
     # `success()` is not implied once a custom `if` is present (see `changes`).
     if: success() && needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      # Stable hashes keep each test in one explicit partition. Four partitions
+      # balance this process-fixture-heavy leg on the 4-vCPU runners; remeasure
+      # membership and durations before changing the count.
+      matrix:
+        partition: [1, 2, 3, 4]
     # Job-level, never workflow-level: the workflow env block above must stay
     # byte-identical to release.yml's or rust-cache's key diverges. NEXTEST_* is
     # not among the CARGO*/RUST* prefixes rust-cache hashes, so the caches these
@@ -178,7 +185,9 @@ jobs:
         run: cargo build --workspace --locked
 
       - name: test
-        run: cargo nextest run --workspace
+        run: >-
+          cargo nextest run --workspace
+          --partition hash:${{ matrix.partition }}/4
 
       # Uploads on failure too — a red run is exactly when the per-test detail
       # is worth having. Observational only: nothing here gates ci-ok.
@@ -188,13 +197,19 @@ jobs:
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: target/nextest/ci/junit.xml
-          flags: workspace
+          flags: workspace,workspace-partition-${{ matrix.partition }}-of-4
 
   failpoints:
     needs: changes
     # `success()` is not implied once a custom `if` is present (see `changes`).
     if: success() && needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      # This leg uses the same stable hash contract with its independently
+      # measured count. Every failpoint test still runs in exactly one shard.
+      matrix:
+        partition: [1, 2, 3]
     env:
       NEXTEST_PROFILE: ci
     steps:
@@ -235,6 +250,7 @@ jobs:
       - name: failpoints
         run: >-
           cargo nextest run -p forged --features failpoints
+          --partition hash:${{ matrix.partition }}/3
           -E 'binary(=forged) | binary(/_failpoint$/) | binary(=kill_matrix)'
 
       # Distinct flag: this run is the same crate under a different feature set,
@@ -245,7 +261,7 @@ jobs:
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: target/nextest/ci/junit.xml
-          flags: failpoints
+          flags: failpoints,failpoints-partition-${{ matrix.partition }}-of-3
 
   # Line coverage for the default feature set, reported to Codecov but not
   # gated on. This measures the workspace as it ships. The failpoint kill-matrix is

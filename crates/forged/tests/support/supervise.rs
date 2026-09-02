@@ -27,16 +27,32 @@ pub(crate) const WAIT: Duration = Duration::from_secs(30);
 /// serializes the binary); `RUST_TEST_THREADS=1` marks a deliberately serial
 /// libtest run. The `--test-threads=1` flag leaves no environment trace and
 /// cannot be honored here — use the environment variable instead.
-pub(crate) fn require_serialized_runner() -> bool {
-    if std::env::var_os("NEXTEST").is_some() {
+pub(crate) fn serialized_runner_contract(
+    nextest: bool,
+    nextest_test_group: Option<&str>,
+    rust_test_threads: Option<&str>,
+) -> bool {
+    if nextest {
         assert_eq!(
-            std::env::var("NEXTEST_TEST_GROUP").ok().as_deref(),
+            nextest_test_group,
             Some("supervise-process-fixtures"),
             "supervise test is outside `supervise-process-fixtures`; add this binary to the filter in .config/nextest.toml"
         );
         return true;
     }
-    if std::env::var("RUST_TEST_THREADS").is_ok_and(|threads| threads == "1") {
+
+    rust_test_threads == Some("1")
+}
+
+pub(crate) fn require_serialized_runner() -> bool {
+    let nextest = std::env::var_os("NEXTEST").is_some();
+    let nextest_test_group = std::env::var("NEXTEST_TEST_GROUP").ok();
+    let rust_test_threads = std::env::var("RUST_TEST_THREADS").ok();
+    if serialized_runner_contract(
+        nextest,
+        nextest_test_group.as_deref(),
+        rust_test_threads.as_deref(),
+    ) {
         return true;
     }
     eprintln!(
