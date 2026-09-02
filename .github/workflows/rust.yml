@@ -171,6 +171,9 @@ jobs:
         with:
           tool: cargo-nextest@0.9.143
 
+      - name: runner facts
+        run: nproc; free -g | sed -n 2p
+
       - name: build
         run: cargo build --workspace --locked
 
@@ -212,8 +215,33 @@ jobs:
 
       # The failpoint kill-matrix. Lease semantics are ledger-native
       # (ADR-0034): no bd binary is involved here.
+      - name: runner facts
+        run: nproc; free -g | sed -n 2p
+
+      # Only the binaries that carry `cfg(feature = "failpoints")` tests run
+      # here; every other forged test already ran unchanged in `test`. The
+      # guard below fails the leg if a gated test appears in a binary this
+      # list does not name, so the filter can never silently skip one.
+      - name: failpoint binaries are all listed
+        shell: bash
+        run: |
+          set -euo pipefail
+          listed='forged herdr_orphan_failpoint ore_loop_failpoint kill_matrix run_status_failpoint work_identity_failpoint work_settlement_failpoint convergence supervise e2e_drive mcp_lazy_init review_publish'
+          missing=0
+          for file in $(grep -l 'cfg(feature = "failpoints")' crates/forged/tests/*.rs); do
+            bin="$(basename "$file" .rs)"
+            case " $listed " in
+              *" $bin "*) ;;
+              *) echo "test binary '$bin' has failpoint-gated tests but is not in the failpoints leg filter" >&2; missing=1 ;;
+            esac
+          done
+          exit "$missing"
+
       - name: failpoints
-        run: cargo nextest run -p forged --features failpoints
+        run: >-
+          cargo nextest run -p forged --features failpoints
+          -E 'binary(=forged) | binary(/_failpoint$/) | binary(=kill_matrix) | binary(=convergence)
+          | binary(=supervise) | binary(=e2e_drive) | binary(=mcp_lazy_init) | binary(=review_publish)'
 
       # Distinct flag: this run is the same crate under a different feature set,
       # so Codecov must not fold it into the workspace suite.
@@ -229,14 +257,18 @@ jobs:
   # gated on. This measures the workspace as it ships. The failpoint kill-matrix is
   # cfg'd out here — `failpoints` is off by default, so that code is not
   # compiled into this build and is neither covered nor counted against it.
-  # Runs on PRs as well as main so Codecov can compare head against base and
-  # post the PR coverage comment. Never part of ci-ok: coverage informs, it
-  # does not gate — but it is change-gated like the others, so a docs push does
-  # not burn a twelve-minute instrumented run to reproduce the same number.
+  # Runs once per merge to main, never on pull requests: coverage informs, it
+  # does not gate (it is not part of ci-ok), and an instrumented run of the
+  # whole workspace is fifteen runner-minutes a PR would otherwise spend on a
+  # number nothing acts on. The Codecov PR comment is the accepted cost; the
+  # post-merge upload still moves the main-branch baseline. Change-gated like
+  # the others, so a docs push does not burn the run either.
   coverage:
     needs: changes
     # `success()` is not implied once a custom `if` is present (see `changes`).
-    if: success() && needs.changes.outputs.code == 'true'
+    if: >-
+      success() && needs.changes.outputs.code == 'true'
+      && github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -255,6 +287,9 @@ jobs:
       - uses: taiki-e/install-action@37f7c5781271959fb65b6b35224e28652ff2b63d # v2.87.0
         with:
           tool: cargo-llvm-cov@0.9.0,cargo-nextest@0.9.143
+
+      - name: runner facts
+        run: nproc; free -g | sed -n 2p
 
       - name: coverage
         run: cargo llvm-cov nextest --workspace --lcov --output-path lcov.info
