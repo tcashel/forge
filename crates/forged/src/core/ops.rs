@@ -709,6 +709,14 @@ pub(crate) fn retry_action(
     }
 }
 
+pub(crate) fn retry_reason(run: &forged_ledger::RunRow) -> &'static str {
+    if run.terminal_outcome == Some(forged_ledger::RunOutcome::InputRequired) {
+        "apply the requested decision or amendment, then retry"
+    } else {
+        "re-run the current spec after the world changed"
+    }
+}
+
 fn action(verb: &str, args: Value, reason: impl Into<String>) -> forged_types::OperationActionV1 {
     let Value::Object(args) = args else {
         unreachable!("operation action args are an object")
@@ -1298,16 +1306,11 @@ pub(crate) fn run_projection_actions(
             format!("inspect successor run {successor}"),
         )];
     }
-    let retry_reason = if run.terminal_outcome == Some(forged_ledger::RunOutcome::InputRequired) {
-        "apply the requested decision or amendment, then retry"
-    } else {
-        "re-run the current spec after the world changed"
-    };
     let mut supersede = work_supersede_action(&run.work_id);
     supersede.reason =
         "use work supersede when the spec must change; create the successor first with work create"
             .to_owned();
-    vec![retry_action(&run.run_id, retry_reason), supersede]
+    vec![retry_action(&run.run_id, retry_reason(run)), supersede]
 }
 
 pub(crate) async fn run_retry_of(ctx: &Ctx, run_id: &str) -> Result<Option<String>, Failure> {
@@ -2194,7 +2197,7 @@ pub async fn run_accept_risk(ctx: &Ctx, req: &mut OperationRequest) -> Operation
     .await
 }
 
-fn risk_terminal_review_rounds(payload: &Value) -> Option<u8> {
+pub(crate) fn risk_terminal_review_rounds(payload: &Value) -> Option<u8> {
     let terminal = payload.get("terminal")?;
     if let Some(value) = terminal.get("reviewBudgetExhausted") {
         if !is_non_approve_terminal_verdict(value) {
