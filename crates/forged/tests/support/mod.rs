@@ -1915,7 +1915,47 @@ impl TestEnv {
             last = value;
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
-        panic!("epic {epic_id} did not reach a durable stop: {last}")
+        // Timeout forensics: the epic report alone cannot say WHY children
+        // never settle, so dump the scheduler-facts tables verbatim.
+        let mut forensics = String::new();
+        if let Ok(conn) = rusqlite::Connection::open(self.anvil.join("state.db")) {
+            for (label, sql) in [
+                (
+                    "desired_work",
+                    "SELECT subject_kind, subject_id, desired_state, restart_used, \
+                     exhausted_at, next_wake_at, last_outcome, last_error \
+                     FROM desired_work",
+                ),
+                (
+                    "runs",
+                    "SELECT run_id, state, terminal_outcome, stop_reason FROM runs",
+                ),
+                (
+                    "admission_decisions",
+                    "SELECT subject_id, outcome, reason, next_eligible_wake_at \
+                     FROM admission_decisions ORDER BY rowid DESC LIMIT 12",
+                ),
+            ] {
+                forensics.push_str(&format!("\n[{label}]\n"));
+                if let Ok(mut stmt) = conn.prepare(sql) {
+                    let cols = stmt.column_count();
+                    if let Ok(mut rows) = stmt.query([]) {
+                        while let Ok(Some(row)) = rows.next() {
+                            let mut line = Vec::new();
+                            for i in 0..cols {
+                                line.push(
+                                    row.get_ref(i)
+                                        .map(|v| format!("{v:?}"))
+                                        .unwrap_or_else(|e| format!("<{e}>")),
+                                );
+                            }
+                            forensics.push_str(&format!("  {}\n", line.join(" | ")));
+                        }
+                    }
+                }
+            }
+        }
+        panic!("epic {epic_id} did not reach a durable stop: {last}\n{forensics}")
     }
 
     /// The run's worktree path.
