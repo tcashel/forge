@@ -16,11 +16,14 @@ nextest-version = { required = "0.9.143" }
 supervise-process-fixtures = { max-threads = 1 }
 # Loop-mode epics execute through real supervisor ticks and detached child
 # controllers, so the epic-driving binaries spawn process trees per test.
-# Unbounded co-scheduling of those trees thrashes small CI runners — locks
-# outlive their retry budgets and wall-clock deadlines blow. Two at a time
-# keeps the runner productive without serializing the whole leg; the
-# supervise group above is a stricter, separate contract and stays alone.
-epic-process-fixtures = { max-threads = 2 }
+# Co-scheduling two such trees on a two-core CI runner stretches controller
+# boot past the supervisor's first observation wake; the booting controller
+# has no recorded identity yet, so the supervisor respawns over it and every
+# zombie's StaleClaimToken death charges the restart budget to exhaustion.
+# One at a time keeps controller boot inside the observation cadence; the
+# other runner slot still serves in-process tests, and the supervise group
+# above is a stricter, separate contract and stays alone.
+epic-process-fixtures = { max-threads = 1 }
 
 [[profile.default.overrides]]
 filter = 'package(=forged) & binary(=supervise)'
