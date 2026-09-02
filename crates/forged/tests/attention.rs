@@ -327,7 +327,7 @@ fn source_backed_attention_cannot_substitute_for_domain_resolution() {
 }
 
 #[test]
-fn restart_exhaustion_advertises_stop_then_retry_and_clears_on_the_live_successor() {
+fn restart_exhaustion_advertises_stop_then_retry_and_clears_durably() {
     let env = TestEnv::new("forged-attention-restart-actions");
     env.forged(&["init"]);
     let run = "attention-restart";
@@ -394,6 +394,30 @@ fn restart_exhaustion_advertises_stop_then_retry_and_clears_on_the_live_successo
     assert!(
         attention(&detail["result"], run, "restart-budget-exhausted").is_none(),
         "exact Work Detail must not retain a retry action after a live same-work successor: {detail}"
+    );
+
+    // Successor existence, not successor liveness, is the clearing fact:
+    // the item must stay cleared after the successor itself settles.
+    let (code, stopped_successor) = env.forged(&[
+        "run",
+        "stop",
+        "--run",
+        retried["result"]["runId"].as_str().expect("successor run"),
+        "--outcome",
+        "cancelled",
+        "--reason",
+        "settle the successor to prove durable clearance",
+    ]);
+    assert_eq!(code, 0, "successor stop succeeds: {stopped_successor}");
+    assert!(
+        attention(&overview(&env), run, "restart-budget-exhausted").is_none(),
+        "clearance survives the successor's own settlement"
+    );
+    let (code, detail) = env.forged(&["work", "detail", "--id", run]);
+    assert_eq!(code, 0, "post-settlement Work Detail: {detail}");
+    assert!(
+        attention(&detail["result"], run, "restart-budget-exhausted").is_none(),
+        "exact Work Detail clearance survives the successor's settlement: {detail}"
     );
 }
 

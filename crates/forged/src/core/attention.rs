@@ -511,7 +511,7 @@ fn settlement_cursor(events: &[&EventRow], id: &str) -> i64 {
         .map_or(0, |event| event.event_id)
 }
 
-fn exhausted_run_has_live_successor(input: &ProjectionInput<'_>, subject_id: &str) -> bool {
+fn exhausted_run_has_successor(input: &ProjectionInput<'_>, subject_id: &str) -> bool {
     let Some(subject) = input.runs.iter().find(|run| run.run_id == subject_id) else {
         return false;
     };
@@ -521,11 +521,10 @@ fn exhausted_run_has_live_successor(input: &ProjectionInput<'_>, subject_id: &st
             ProjectionSurface::Inventory => input.runs.iter().any(|candidate| {
                 candidate.run_id != subject.run_id
                     && candidate.work_id == subject.work_id
-                    && candidate.state == RunState::Active
-                    && candidate.terminal_outcome.is_none()
+                    && candidate.created_at >= subject.created_at
             }),
             ProjectionSurface::Observation { snapshot, .. } => snapshot
-                .runs_with_live_same_work_successors
+                .runs_with_same_work_successors
                 .contains(subject_id),
         }
 }
@@ -1064,7 +1063,7 @@ fn collect_domain_sources(input: &ProjectionInput<'_>) -> Result<Vec<RawAttentio
             || desired.last_outcome == Some(DesiredReconcileOutcome::Exhausted)
         {
             if desired.subject_kind == forged_ledger::DesiredSubjectKind::Run
-                && exhausted_run_has_live_successor(input, &desired.subject_id)
+                && exhausted_run_has_successor(input, &desired.subject_id)
             {
                 continue;
             }
