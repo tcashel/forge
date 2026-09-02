@@ -322,6 +322,10 @@ pub enum FailureKind {
     /// stands on the same bounded budget a transport failure uses, which is
     /// what keeps a permanent one from re-claiming forever.
     Unspawned,
+    /// Admission authority moved after claim but before spawn. The attempt is
+    /// retired for immediate re-admission under current facts, without a
+    /// retry grant, budget charge, or backoff.
+    Readmit,
     /// The provider tried; the failure consumes what the stage's failure
     /// consumes.
     Semantic,
@@ -336,6 +340,8 @@ pub fn classify_failure(fail_note: &str) -> FailureKind {
         FailureKind::Transport
     } else if fail_note.starts_with("unspawned:") {
         FailureKind::Unspawned
+    } else if fail_note.starts_with("readmit:") {
+        FailureKind::Readmit
     } else {
         FailureKind::Semantic
     }
@@ -1431,6 +1437,10 @@ fn packet_state<'v>(view: &'v RunView, packet: &'v PacketRow) -> LegState<'v> {
             FailureKind::Transport | FailureKind::Unspawned => {
                 transport_leg(view, packet_id, history)
             }
+            FailureKind::Readmit => LegState::Pending {
+                packet_id,
+                not_before: None,
+            },
             FailureKind::Semantic => LegState::FailedSemantic,
         },
         // A reclaimed or stopped attempt leaves the packet open for a
@@ -1635,6 +1645,27 @@ mod tests {
         assert_eq!(classify_failure("unspawned:"), FailureKind::Unspawned);
         assert_eq!(classify_failure("Unspawned: x"), FailureKind::Semantic);
         assert_eq!(classify_failure(" unspawned: x"), FailureKind::Semantic);
+        assert_eq!(
+            classify_failure("readmit: admission facts moved"),
+            FailureKind::Readmit
+        );
+        assert_eq!(classify_failure("readmit:"), FailureKind::Readmit);
+        assert_eq!(classify_failure("Readmit: x"), FailureKind::Semantic);
+        assert_eq!(classify_failure(" readmit: x"), FailureKind::Semantic);
+    }
+
+    #[test]
+    fn readmit_failures_never_enter_transport_retry_state() {
+        let history = (0..32)
+            .map(|attempt_id| TerminalAttempt {
+                attempt_id,
+                state: AttemptState::Failed,
+                outcome: None,
+                fail_note: Some("readmit: admission facts moved".to_owned()),
+                started_at: "2026-09-02T00:00:00.000000000Z".to_owned(),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(transport_failures(&history, None), 0);
     }
 
     #[test]

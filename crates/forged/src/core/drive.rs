@@ -855,6 +855,7 @@ fn after_outcome(outcome: PacketOutcome) {
         PacketOutcome::Unspawned(note) => {
             tracing::warn!(note, "attempt retired before any provider ran")
         }
+        PacketOutcome::Readmit(note) => tracing::info!(note, "packet re-admitted before spawn"),
         PacketOutcome::Semantic(note) => tracing::warn!(note, "semantic failure recorded"),
         PacketOutcome::Revoked => tracing::warn!("attempt revoked mid-flight"),
     }

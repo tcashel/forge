@@ -1243,7 +1243,19 @@ pub(super) async fn recover_abandoned(
         ledger.list_inflight_operations(Some(&id_for_rows))
     })
     .await?;
-    if inflight.is_empty() {
+    let has_live_attempts = match scope {
+        Scope::Run => {
+            let id_for_attempts = id.to_owned();
+            on_ledger(&ctx.ledger, move |ledger| {
+                Ok(!ledger
+                    .list_live_attempts(Some(&id_for_attempts))?
+                    .is_empty())
+            })
+            .await?
+        }
+        Scope::Epic => false,
+    };
+    if inflight.is_empty() && !has_live_attempts {
         return Ok(());
     }
     let result = match scope {

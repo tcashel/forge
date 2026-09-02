@@ -24,7 +24,9 @@ use forged_types::{new_claim_token, ErrorCode, PacketResult};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use serde_json::json;
 
-use crate::error::{column_decode_error, internal, refused, LedgerError};
+use crate::error::{
+    column_decode_error, internal, refused, AdmissionFenceFacts, AdmissionMoveLeg, LedgerError,
+};
 use crate::events::append_event_tx;
 use crate::ledger::Ledger;
 use crate::time::now_iso;
@@ -954,24 +956,83 @@ impl Ledger {
             };
             let packet_facts =
                 crate::admission::packet_effective_facts_tx(conn, &attempt.packet_id)?;
-            let authorized = desired.as_ref().zip(reservation.as_ref()).is_some_and(
-                |((state, revision, exhausted), reservation)| {
-                    state == "running"
-                        && *revision == reservation.0
-                        && exhausted.is_none()
-                        && packet_facts.repository == reservation.1
-                        && packet_facts.provider == reservation.2
-                        && packet_facts.model == reservation.3
-                        && match packet_facts.resource_class {
-                            forged_types::AdmissionResourceClass::Read => "read",
-                            forged_types::AdmissionResourceClass::RepositoryWrite => {
-                                "repository-write"
+            let current = desired
+                .as_ref()
+                .map(|(_, revision, _)| {
+                    Ok::<_, LedgerError>(AdmissionFenceFacts {
+                        repository: packet_facts.repository.clone(),
+                        provider: packet_facts.provider.clone(),
+                        model: packet_facts.model.clone(),
+                        resource_class: packet_facts.resource_class,
+                        control_revision: u64::try_from(*revision)
+                            .map_err(|_| internal("desired control revision is negative"))?,
+                    })
+                })
+                .transpose()?;
+            let reserved = reservation
+                .as_ref()
+                .map(|reservation| {
+                    Ok(AdmissionFenceFacts {
+                        repository: reservation.1.clone(),
+                        provider: reservation.2.clone(),
+                        model: reservation.3.clone(),
+                        resource_class: match reservation.4.as_str() {
+                            "read" => forged_types::AdmissionResourceClass::Read,
+                            "repository-write" => {
+                                forged_types::AdmissionResourceClass::RepositoryWrite
                             }
-                        } == reservation.4
-                },
-            );
-            if !authorized {
-                return Err(stale_token());
+                            other => {
+                                return Err(internal(format!(
+                                    "unknown admission reservation resource class: {other:?}"
+                                )))
+                            }
+                        },
+                        control_revision: u64::try_from(reservation.0)
+                            .map_err(|_| internal("reservation control revision is negative"))?,
+                    })
+                })
+                .transpose()?;
+            let control_moved = match (desired.as_ref(), reservation.as_ref()) {
+                (Some((state, _, exhausted)), _) if state != "running" || exhausted.is_some() => {
+                    true
+                }
+                (Some((_, revision, _)), Some(reservation)) => *revision != reservation.0,
+                (None, _) => true,
+                _ => false,
+            };
+            if control_moved {
+                return Err(LedgerError::AdmissionMoved {
+                    leg: AdmissionMoveLeg::Control,
+                    reservation: reserved,
+                    current,
+                });
+            }
+            let Some(reservation) = reservation else {
+                return Err(LedgerError::AdmissionMoved {
+                    leg: AdmissionMoveLeg::Reservation,
+                    reservation: None,
+                    current,
+                });
+            };
+            let resource_class = match reservation.4.as_str() {
+                "read" => forged_types::AdmissionResourceClass::Read,
+                "repository-write" => forged_types::AdmissionResourceClass::RepositoryWrite,
+                other => {
+                    return Err(internal(format!(
+                        "unknown admission reservation resource class: {other:?}"
+                    )))
+                }
+            };
+            if packet_facts.repository != reservation.1
+                || packet_facts.provider != reservation.2
+                || packet_facts.model != reservation.3
+                || packet_facts.resource_class != resource_class
+            {
+                return Err(LedgerError::AdmissionMoved {
+                    leg: AdmissionMoveLeg::Facts,
+                    reservation: reserved,
+                    current,
+                });
             }
             Ok(())
         })

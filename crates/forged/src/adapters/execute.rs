@@ -94,6 +94,9 @@ pub enum PacketOutcome {
     /// the same bounded budget. Distinct from `Transport` because nothing
     /// was transported: no seat spoke, so there is no stage result to read.
     Unspawned(String),
+    /// Admission authority moved before spawn; retry immediately under the
+    /// current facts without charging transport recovery.
+    Readmit(String),
     /// A semantic failure was recorded.
     Semantic(String),
     /// Our own attempt was revoked mid-flight; the provider was stopped.
@@ -1698,12 +1701,57 @@ async fn run_attempt(
     // admission stale before workspace/tab creation can occur.
     let submit_guard =
         crate::core::handoff::acquire_packet_submit(ctx, &packet_id, &run_id).await?;
-    {
+    let fence = {
         let claim_token = claim_token.clone();
         on_ledger(&ctx.ledger, move |ledger| {
-            ledger.assert_admitted_attempt_live(&claim_token)
+            Ok(ledger.assert_admitted_attempt_live(&claim_token))
         })
-        .await?;
+        .await?
+    };
+    match fence {
+        Ok(()) => {}
+        Err(forged_ledger::LedgerError::AdmissionMoved {
+            leg,
+            reservation,
+            current,
+        }) => {
+            let display = |facts: Option<&forged_ledger::AdmissionFenceFacts>| match facts {
+                Some(facts) => format!(
+                    "{}/{}/{}@rev{}",
+                    facts.provider,
+                    facts.model,
+                    match facts.resource_class {
+                        forged_types::AdmissionResourceClass::Read => "read",
+                        forged_types::AdmissionResourceClass::RepositoryWrite => {
+                            "repository-write"
+                        }
+                    },
+                    facts.control_revision
+                ),
+                None => "?".to_owned(),
+            };
+            let note = format!(
+                "readmit: admission {leg} moved: {} -> {}",
+                display(reservation.as_ref()),
+                display(current.as_ref())
+            );
+            return match fail_pre_spawn_transport(
+                ctx,
+                &packet,
+                attempt_id,
+                &claim_token,
+                note,
+                "admission-fence",
+            )
+            .await
+            {
+                Err(failure) if failure.code == forged_types::ErrorCode::StaleClaimToken => {
+                    Ok(PacketOutcome::Revoked)
+                }
+                outcome => outcome,
+            };
+        }
+        Err(error) => return Err(error.into()),
     }
     let as_of = now_iso();
     if let Some(note) = deadline_reason(exec, &packet, attempt_id, &attempt_started_at, &as_of)? {
@@ -2893,8 +2941,9 @@ pub async fn land_result(
 /// and the backoff deadline computed from the failed attempt's `ended_at` —
 /// what lets kill-matrix case 7 assert the fix round is untouched.
 ///
-/// The note's own prefix is what classifies the failure (`transport:` or
-/// `unspawned:`); both stand on this one budget.
+/// The note's own prefix is what classifies the failure. `transport:` and
+/// `unspawned:` stand on the bounded retry budget; `readmit:` is immediately
+/// claimable under current admission facts and receives no retry grant.
 pub(crate) async fn fail_and_grant_retry(
     ctx: &Ctx,
     packet_id: &str,
@@ -2920,12 +2969,16 @@ pub(crate) async fn fail_and_grant_retry(
         })
         .await?
     };
-    charge_retry(ctx, &run_id, packet_id, failed_at, started_at).await?;
+    let kind = forged_proto::classify_failure(&note);
+    if kind != forged_proto::FailureKind::Readmit {
+        charge_retry(ctx, &run_id, packet_id, failed_at, started_at).await?;
+    }
     // The note's prefix classified the failure for the ledger; report the
     // same distinction to the caller rather than calling an unspawned seat
     // a transport failure.
-    Ok(match forged_proto::classify_failure(&note) {
+    Ok(match kind {
         forged_proto::FailureKind::Unspawned => PacketOutcome::Unspawned(note),
+        forged_proto::FailureKind::Readmit => PacketOutcome::Readmit(note),
         _ => PacketOutcome::Transport(note),
     })
 }
