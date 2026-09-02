@@ -312,5 +312,10 @@ historical TypeScript `v0.4.0` product has been replaced and is unsupported.
 - Refuses non-normalized or root-equivalent install prefixes before touching a
   live path.
 
-[Unreleased]: https://github.com/tcashel/forge/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/tcashel/forge/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/tcashel/forge/compare/v0.6.3...v0.7.0
+[0.6.3]: https://github.com/tcashel/forge/compare/v0.6.2...v0.6.3
+[0.6.2]: https://github.com/tcashel/forge/compare/v0.6.1...v0.6.2
+[0.6.1]: https://github.com/tcashel/forge/compare/v0.6.0...v0.6.1
+[0.6.0]: https://github.com/tcashel/forge/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/tcashel/forge/compare/v0.4.0...v0.5.0
