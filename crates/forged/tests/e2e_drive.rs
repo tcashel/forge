@@ -5056,6 +5056,23 @@ fn run_uses_its_frozen_roster_after_the_authoring_config_changes() {
 fn epic_roster_revision_updates_current_and_future_children() {
     let env = TestEnv::new("forged-epic-roster-revision");
     env.enable_dynamic_gh();
+    // This test's subject is roster propagation, not capacity
+    // serialization. At the default write capacity of 1, a child whose
+    // controller dies identity-less on a slow runner blocks its OWN
+    // relaunch behind its stranded reservation (the orphan-holds-capacity
+    // contract) and the epic wedges until an operator adjudicates.
+    // Headroom of one write slot keeps the scenario out of this test;
+    // the self-capacity deadlock itself is tracked as its own finding.
+    set_admission(
+        &env,
+        json!({
+            "totalActive": 8,
+            "providerActive": 8,
+            "repositoryWriteActive": 2,
+            "epicFanout": 2,
+            "deferSeconds": 1,
+        }),
+    );
     env.add_uniform_roster("all-codex", "codex", "gpt-5.6-sol");
     env.seed_epic(
         "epic-roster",
