@@ -192,6 +192,67 @@ fn bounded_input_error(error: impl std::fmt::Display) -> String {
     text
 }
 
+#[derive(Debug, Clone, Copy)]
+struct DesiredAdmissionShape {
+    desired_state: DesiredState,
+    control_revision: u64,
+    exhausted: bool,
+    explicit: bool,
+    requires_authorization: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WorkAdmissionShape<'a> {
+    item: Option<&'a crate::core::work_types::IssueSummary>,
+    input_error: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LaunchAdmissionFacts<'a> {
+    available: bool,
+    provider: Option<&'a str>,
+    model: Option<&'a str>,
+}
+
+/// The complete non-capacity admission predicate. Submit rehearses this
+/// shape explicitly; admission uses the same result before applying mutable
+/// capacity, spend, and rate policy.
+fn invalid_reason(
+    desired: DesiredAdmissionShape,
+    work: WorkAdmissionShape<'_>,
+    facts: LaunchAdmissionFacts<'_>,
+    repository: &str,
+) -> Option<AdmissionReason> {
+    let work_repository = work.item.and_then(|item| item.metadata.get("repository"));
+    if desired.requires_authorization && desired.control_revision == 0 {
+        Some(AdmissionReason::Unauthorized)
+    } else if !desired.explicit
+        && desired.control_revision > 0
+        && desired.desired_state != DesiredState::Running
+    {
+        Some(AdmissionReason::DesiredNotRunning)
+    } else if desired.exhausted && !desired.explicit {
+        Some(AdmissionReason::Exhausted)
+    } else if work.input_error.is_some() || work.item.is_none() {
+        Some(AdmissionReason::WorkUnavailable)
+    } else if work.item.is_some_and(|item| {
+        item.priority.is_none() || item.revision.is_none() || work_repository.is_none()
+    }) {
+        Some(AdmissionReason::WorkMalformed)
+    } else if work.item.is_some_and(|item| !runnable(&item.status)) {
+        Some(AdmissionReason::WorkNotRunnable)
+    } else if !facts.available
+        || facts.provider.is_none_or(str::is_empty)
+        || facts.model.is_none_or(str::is_empty)
+    {
+        Some(AdmissionReason::WorkMalformed)
+    } else if work_repository.map(String::as_str) != Some(repository) {
+        Some(AdmissionReason::RepositoryMismatch)
+    } else {
+        None
+    }
+}
+
 fn project_candidates(
     snapshot: &AdmissionLedgerSnapshot,
     issues: &[crate::core::work_types::IssueSummary],
@@ -256,28 +317,25 @@ fn project_candidates(
         let is_explicit = explicit_submit.is_some_and(|target| {
             target.0 == durable.subject_kind && target.1 == durable.subject_id
         });
-        let invalid = if !is_explicit
-            && durable.control_revision > 0
-            && durable.desired_state != DesiredState::Running
-        {
-            Some(AdmissionReason::DesiredNotRunning)
-        } else if durable.exhausted && !is_explicit {
-            Some(AdmissionReason::Exhausted)
-        } else if input_error.is_some() || issue.is_none() {
-            Some(AdmissionReason::WorkUnavailable)
-        } else if issue.is_some_and(|issue| {
-            issue.priority.is_none() || issue.revision.is_none() || work_repository.is_none()
-        }) {
-            Some(AdmissionReason::WorkMalformed)
-        } else if issue.is_some_and(|issue| !runnable(&issue.status)) {
-            Some(AdmissionReason::WorkNotRunnable)
-        } else if facts.is_none() || candidate.provider.is_none() || candidate.model.is_none() {
-            Some(AdmissionReason::WorkMalformed)
-        } else if work_repository.as_deref() != Some(repository.as_str()) {
-            Some(AdmissionReason::RepositoryMismatch)
-        } else {
-            None
-        };
+        let invalid = invalid_reason(
+            DesiredAdmissionShape {
+                desired_state: durable.desired_state,
+                control_revision: durable.control_revision,
+                exhausted: durable.exhausted,
+                explicit: is_explicit,
+                requires_authorization: false,
+            },
+            WorkAdmissionShape {
+                item: issue,
+                input_error,
+            },
+            LaunchAdmissionFacts {
+                available: facts.is_some(),
+                provider: candidate.provider.as_deref(),
+                model: candidate.model.as_deref(),
+            },
+            &repository,
+        );
         out.push((candidate, invalid));
     }
     out.sort_by(|(left, _), (right, _)| {
@@ -389,6 +447,71 @@ pub(crate) fn decision_reason(decision: &AdmissionDecisionV1) -> String {
         .reason_detail
         .as_ref()
         .map_or(reason.clone(), |detail| format!("{reason}: {detail}"))
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct AdmissionShapeRefusal {
+    pub(crate) candidate: AdmissionCandidateV1,
+    pub(crate) reason: AdmissionReason,
+    pub(crate) reason_detail: Option<String>,
+}
+
+impl AdmissionShapeRefusal {
+    pub(crate) fn detail(&self) -> String {
+        let reason = serde_json::to_value(self.reason)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .unwrap_or_else(|| "admission-refused".to_owned());
+        self.reason_detail
+            .as_ref()
+            .map_or(reason.clone(), |detail| format!("{reason}: {detail}"))
+    }
+}
+
+/// Rehearse only the durable non-capacity predicate for one explicit submit.
+/// The snapshot and bounded work hydration are read-only; mutable capacity,
+/// spend, rate policy, reservations, and decision persistence stay in
+/// [`admit`].
+pub(crate) async fn preflight_shape(
+    ctx: &Ctx,
+    target: (DesiredSubjectKind, String),
+) -> Result<Option<AdmissionShapeRefusal>, Failure> {
+    let snapshot = on_ledger(&ctx.ledger, {
+        let target = target.clone();
+        move |ledger| ledger.admission_snapshot(Some(target))
+    })
+    .await?;
+    let targets = BTreeSet::from([target.clone()]);
+    let work_ids = snapshot
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.subject_kind == target.0 && candidate.subject_id == target.1)
+        .filter_map(|candidate| candidate.work_id.clone())
+        .collect::<Vec<_>>();
+    let (issues, input_error) =
+        match crate::core::workstore::list_issues(&ctx.ledger, &work_ids).await {
+            Ok(issues) => (issues, None),
+            Err(error) => (Vec::new(), Some(bounded_input_error(error))),
+        };
+    let mut projected = project_candidates(
+        &snapshot,
+        &issues,
+        &targets,
+        Some(&target),
+        input_error.as_deref(),
+    );
+    if projected.len() != 1 {
+        return Err(Failure::internal(format!(
+            "submit admission preflight projected {} candidates, expected one",
+            projected.len()
+        )));
+    }
+    let (candidate, reason) = projected.remove(0);
+    Ok(reason.map(|reason| AdmissionShapeRefusal {
+        reason_detail: reason_detail(&candidate, reason),
+        candidate,
+        reason,
+    }))
 }
 
 pub(crate) fn evaluate(
@@ -814,27 +937,25 @@ async fn admit_packet_facts_once(
         resource_class: packet_facts.resource_class,
         authorized_at: durable.authorized_at.clone(),
     };
-    let invalid = if durable.control_revision == 0 {
-        Some(AdmissionReason::Unauthorized)
-    } else if durable.desired_state != DesiredState::Running {
-        Some(AdmissionReason::DesiredNotRunning)
-    } else if durable.exhausted {
-        Some(AdmissionReason::Exhausted)
-    } else if input_error.is_some() || issue.is_none() {
-        Some(AdmissionReason::WorkUnavailable)
-    } else if issue.is_some_and(|issue| {
-        issue.priority.is_none() || issue.revision.is_none() || work_repository.is_none()
-    }) {
-        Some(AdmissionReason::WorkMalformed)
-    } else if issue.is_some_and(|issue| !runnable(&issue.status)) {
-        Some(AdmissionReason::WorkNotRunnable)
-    } else if candidate.provider.is_none() || candidate.model.is_none() {
-        Some(AdmissionReason::WorkMalformed)
-    } else if work_repository.as_deref() != Some(repository.as_str()) {
-        Some(AdmissionReason::RepositoryMismatch)
-    } else {
-        None
-    };
+    let invalid = invalid_reason(
+        DesiredAdmissionShape {
+            desired_state: durable.desired_state,
+            control_revision: durable.control_revision,
+            exhausted: durable.exhausted,
+            explicit: false,
+            requires_authorization: true,
+        },
+        WorkAdmissionShape {
+            item: issue,
+            input_error: input_error.as_deref(),
+        },
+        LaunchAdmissionFacts {
+            available: true,
+            provider: candidate.provider.as_deref(),
+            model: candidate.model.as_deref(),
+        },
+        &repository,
+    );
     let policy_revision = digest(&ctx.config.admission)?;
     let inputs = AdmissionInputsV1 {
         schema: ADMISSION_INPUTS_SCHEMA_V1.to_owned(),
@@ -903,6 +1024,81 @@ mod tests {
     #[test]
     fn protocol_names_never_make_a_blocked_work_runnable() {
         assert!(!runnable("blocked"));
+    }
+
+    #[test]
+    fn explicit_shape_bypasses_only_desired_state_and_exhaustion() {
+        let mut metadata = BTreeMap::new();
+        metadata.insert("repository".to_owned(), "/repo".to_owned());
+        let mut item = crate::core::work_types::IssueSummary {
+            id: "work-shape".to_owned(),
+            title: "Work shape".to_owned(),
+            description: String::new(),
+            status: "open".to_owned(),
+            priority: Some(2),
+            assignee: None,
+            issue_type: "task".to_owned(),
+            acceptance_criteria: String::new(),
+            design: String::new(),
+            notes: String::new(),
+            spec_id: None,
+            metadata,
+            revision: Some("1".to_owned()),
+            updated_at: None,
+        };
+        let facts = LaunchAdmissionFacts {
+            available: true,
+            provider: Some("codex"),
+            model: Some("gpt"),
+        };
+        let desired = DesiredAdmissionShape {
+            desired_state: DesiredState::Stopped,
+            control_revision: 1,
+            exhausted: true,
+            explicit: true,
+            requires_authorization: false,
+        };
+        assert_eq!(
+            invalid_reason(
+                desired,
+                WorkAdmissionShape {
+                    item: Some(&item),
+                    input_error: None,
+                },
+                facts,
+                "/repo",
+            ),
+            None
+        );
+        item.priority = None;
+        assert_eq!(
+            invalid_reason(
+                desired,
+                WorkAdmissionShape {
+                    item: Some(&item),
+                    input_error: None,
+                },
+                facts,
+                "/repo",
+            ),
+            Some(AdmissionReason::WorkMalformed)
+        );
+        item.priority = Some(2);
+        assert_eq!(
+            invalid_reason(
+                DesiredAdmissionShape {
+                    explicit: false,
+                    ..desired
+                },
+                WorkAdmissionShape {
+                    item: Some(&item),
+                    input_error: None,
+                },
+                facts,
+                "/repo",
+            ),
+            Some(AdmissionReason::DesiredNotRunning)
+        );
     }
 
     #[test]
