@@ -125,6 +125,7 @@ fn fabricate_live_attempt(env: &TestEnv, run: &str) {
             spec_path: packet.spec.path.clone(),
             spec_sha256: sha.clone(),
             spec_revision: None,
+            policy_revision: None,
             body_json: packet.stored_body().expect("stored packet"),
         })
         .expect("open fabricated packet");
