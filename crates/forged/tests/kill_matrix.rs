@@ -126,20 +126,6 @@ fn start_epic(env: &TestEnv, epic: &str) {
     env.authorize_epic(epic);
 }
 
-fn wait_for_clean_run(env: &TestEnv, run: &str) {
-    let mut last = Value::Null;
-    for _ in 0..600 {
-        let _ = env.forged(&["supervise", "--once"]);
-        let (code, status) = env.forged(&["run", "status", "--run", run]);
-        if code == 0 && status["result"]["run"]["outcome"] == json!("clean") {
-            return;
-        }
-        last = status;
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    panic!("run {run} did not stop cleanly: {last}")
-}
-
 fn spawn_epic_pass(env: &TestEnv, epic: &str, failpoint: (&str, &str, &Path)) -> Child {
     env.wake_epic(epic);
     let mut cmd = env.forged_cmd(&["supervise", "--once"]);
