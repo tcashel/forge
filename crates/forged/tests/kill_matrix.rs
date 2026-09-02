@@ -2226,6 +2226,155 @@ fn a_materialization_failure_leaves_no_running_attempt_behind() {
     assert_attempts_serialized(&env, "bead-k9", "bead-k9/implementation/0");
 }
 
+#[test]
+fn controller_death_reconciles_a_running_unspawned_attempt_without_operations() {
+    let env = TestEnv::new("km-unspawned-controller-death");
+    env.write_config(None);
+    let config_path = env.anvil.join("config.json");
+    let mut config: Value = serde_json::from_slice(
+        &std::fs::read(&config_path).expect("read config for admission headroom"),
+    )
+    .expect("config json");
+    config["admission"] = json!({
+        "totalActive": 8,
+        "providerActive": 8,
+        "repositoryWriteActive": 2,
+        "epicFanout": 2,
+        "deferSeconds": 1,
+    });
+    std::fs::write(
+        &config_path,
+        serde_json::to_vec_pretty(&config).expect("serialize config"),
+    )
+    .expect("write admission headroom");
+    start_run(&env, "bead-k-unspawned");
+    env.set_scenario("implement", "wait-release", 1);
+    let fp = env.root.join("fp-unspawned-controller-death");
+    std::fs::create_dir_all(&fp).expect("failpoint dir");
+
+    let output = env
+        .forged_cmd(&["run", "submit", "--run", "bead-k-unspawned"])
+        .env("FORGED_FAILPOINT", "packet.materialize.before")
+        .env("FORGED_FAILPOINT_MODE", "crash")
+        .env("FORGED_FAILPOINT_DIR", &fp)
+        .output()
+        .expect("submitter runs");
+    assert!(
+        output.status.success(),
+        "submit failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let submitted: Value = serde_json::from_slice(&output.stdout).expect("submit envelope");
+    let crashed_controller = controller_pid(&submitted);
+
+    wait_until("running unspawned attempt", || {
+        attempt_states(&env, "bead-k-unspawned")
+            .iter()
+            .any(|(_, state)| state == "running")
+    });
+    wait_until("crashed controller death", || {
+        !process_group_alive(crashed_controller)
+    });
+    assert!(
+        env.provider_log().is_empty(),
+        "the crashed controller must not spawn a provider"
+    );
+
+    let resolve_before = {
+        let ledger = env.ledger();
+        let row = ledger
+            .find_operation("resolve", "bead-k-unspawned/resolve/0")
+            .expect("resolve lookup")
+            .expect("resolve operation");
+        assert!(
+            ledger
+                .list_inflight_operations(Some("bead-k-unspawned"))
+                .expect("in-flight operations")
+                .is_empty(),
+            "the crash happened without an in-flight operation"
+        );
+        ledger.close().expect("close");
+        row
+    };
+
+    let connection =
+        rusqlite::Connection::open(env.anvil.join("state.db")).expect("open desired clock");
+    connection
+        .execute(
+            "UPDATE desired_work SET next_wake_at = ?1, reconcile_lease_until = ?1 \
+             WHERE subject_kind = 'run' AND subject_id = ?2",
+            rusqlite::params!["2000-01-01T00:00:00.000000000Z", "bead-k-unspawned"],
+        )
+        .expect("wake crashed run");
+    drop(connection);
+
+    let (code, recovered) = env.forged(&["supervise", "--once"]);
+    assert_eq!(code, 0, "recovery tick: {recovered}");
+    wait_until("fresh successor attempt", || {
+        let states = attempt_states(&env, "bead-k-unspawned");
+        states.iter().any(|(_, state)| state == "reclaimed")
+            && states
+                .iter()
+                .filter(|(_, state)| state == "running")
+                .count()
+                == 1
+            && states.len() >= 2
+    });
+
+    let ledger = env.ledger();
+    let packet_id = "bead-k-unspawned/implementation/0";
+    let states = ledger
+        .list_events(Some("bead-k-unspawned"), 0, 65_536)
+        .expect("events")
+        .into_iter()
+        .filter(|event| event.kind == "attempt.state")
+        .filter_map(|event| serde_json::from_str::<Value>(&event.payload_json).ok())
+        .filter(|payload| payload["packetId"] == json!(packet_id))
+        .filter_map(|payload| payload["new"].as_str().map(str::to_owned))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        states,
+        ["running", "revoking", "reclaimed", "running"],
+        "one recovery tick must reclaim before the successor claim"
+    );
+    assert_eq!(
+        ledger
+            .list_events(Some("bead-k-unspawned"), 0, 65_536)
+            .expect("events")
+            .into_iter()
+            .filter(|event| event.kind == "forged.controller.recovered")
+            .count(),
+        1
+    );
+    assert_eq!(
+        ledger
+            .find_operation("resolve", "bead-k-unspawned/resolve/0")
+            .expect("resolve after recovery"),
+        Some(resolve_before),
+        "recovery must not touch the crashed controller's settled operation"
+    );
+    for (name, key) in [
+        ("push", "bead-k-unspawned/push/0"),
+        ("draftpr", "bead-k-unspawned/draftpr/0"),
+    ] {
+        assert!(
+            ledger
+                .find_operation(name, key)
+                .expect("operation lookup")
+                .is_none(),
+            "recovery must not open observe-only {name}"
+        );
+    }
+    ledger.close().expect("close");
+
+    env.release_stage("implement");
+    wait_until("successor controller completes", || {
+        let (_, status) = env.forged(&["run", "status", "--run", "bead-k-unspawned"]);
+        status["result"]["run"]["nextAction"]["stop"]["done"].is_object()
+    });
+}
+
 // ------------------------------------------- schedule 9, the other doors
 
 /// Start a WORK-SOURCED run: `materialize` is a no-op for a file spec (there
