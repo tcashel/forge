@@ -187,6 +187,43 @@ jobs:
           files: target/nextest/ci/junit.xml
           flags: workspace
 
+  # TEMPORARY flake harness (never merges): repeats the roster-revision
+  # epic test on a 2-core runner to capture the boot-grace failure with
+  # full forensics.
+  roster-flake:
+    needs: changes
+    if: success() && needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    env:
+      NEXTEST_PROFILE: ci
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          cache-save-if: 'false'
+
+      - uses: taiki-e/install-action@37f7c5781271959fb65b6b35224e28652ff2b63d # v2.87.0
+        with:
+          tool: cargo-nextest@0.9.143
+
+      - name: repeat the roster-revision test
+        shell: bash
+        run: |
+          set +e
+          fails=0
+          for i in $(seq 1 12); do
+            echo "===== attempt $i"
+            cargo nextest run -p forged --no-fail-fast \
+              -E 'test(epic_roster_revision_updates_current_and_future_children)'
+            rc=$?
+            if [ "$rc" -ne 0 ]; then fails=$((fails+1)); echo "===== attempt $i FAILED"; fi
+          done
+          echo "===== failures: $fails / 12"
+          exit 0
+
   failpoints:
     needs: changes
     # `success()` is not implied once a custom `if` is present (see `changes`).

@@ -1916,24 +1916,36 @@ impl TestEnv {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
         // Timeout forensics: the epic report alone cannot say WHY children
-        // never settle, so dump the scheduler-facts tables verbatim.
+        // never settle, so dump the scheduler facts, the attempt rows, the
+        // tail of the event stream, and the on-disk controller records.
         let mut forensics = String::new();
         if let Ok(conn) = rusqlite::Connection::open(self.anvil.join("state.db")) {
             for (label, sql) in [
                 (
                     "desired_work",
                     "SELECT subject_kind, subject_id, desired_state, restart_used, \
-                     exhausted_at, next_wake_at, last_outcome, last_error \
-                     FROM desired_work",
+                     controller_generation, exhausted_at, next_wake_at, last_outcome, \
+                     last_error FROM desired_work",
                 ),
                 (
                     "runs",
                     "SELECT run_id, state, terminal_outcome, stop_reason FROM runs",
                 ),
                 (
+                    "attempts",
+                    "SELECT attempt_id, packet_id, claimant, state, revoke_reason, \
+                     fail_note, started_at, last_heartbeat_at, ended_at FROM attempts",
+                ),
+                (
                     "admission_decisions",
                     "SELECT subject_id, outcome, reason, next_eligible_wake_at \
                      FROM admission_decisions ORDER BY rowid DESC LIMIT 12",
+                ),
+                (
+                    "events (last 120, oldest first)",
+                    "SELECT event_id, ts, run_id, kind, payload_json FROM \
+                     (SELECT * FROM events ORDER BY event_id DESC LIMIT 120) \
+                     ORDER BY event_id ASC",
                 ),
             ] {
                 forensics.push_str(&format!("\n[{label}]\n"));
@@ -1943,15 +1955,36 @@ impl TestEnv {
                         while let Ok(Some(row)) = rows.next() {
                             let mut line = Vec::new();
                             for i in 0..cols {
-                                line.push(
-                                    row.get_ref(i)
-                                        .map(|v| format!("{v:?}"))
-                                        .unwrap_or_else(|e| format!("<{e}>")),
-                                );
+                                line.push(match row.get_ref(i) {
+                                    Ok(rusqlite::types::ValueRef::Text(t)) => {
+                                        String::from_utf8_lossy(t).into_owned()
+                                    }
+                                    Ok(rusqlite::types::ValueRef::Null) => "∅".to_owned(),
+                                    Ok(v) => format!("{v:?}"),
+                                    Err(e) => format!("<{e}>"),
+                                });
                             }
                             forensics.push_str(&format!("  {}\n", line.join(" | ")));
                         }
                     }
+                }
+            }
+        }
+        if let Ok(runs) = std::fs::read_dir(self.anvil.join("runs")) {
+            for run in runs.flatten() {
+                let controller = run.path().join("controller");
+                let Ok(files) = std::fs::read_dir(&controller) else {
+                    continue;
+                };
+                forensics.push_str(&format!("\n[{}]\n", controller.display()));
+                for file in files.flatten() {
+                    let body = std::fs::read_to_string(file.path()).unwrap_or_default();
+                    let body: String = body.chars().take(400).collect();
+                    forensics.push_str(&format!(
+                        "  {}: {}\n",
+                        file.file_name().to_string_lossy(),
+                        body.trim().replace('\n', " ⏎ ")
+                    ));
                 }
             }
         }
