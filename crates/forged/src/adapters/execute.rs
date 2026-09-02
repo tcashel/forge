@@ -77,8 +77,6 @@ pub struct ExecutionContext {
     pub host_policy: HostPolicy,
     /// Frozen Herdr endpoint for this run.
     pub herdr_socket: Option<std::path::PathBuf>,
-    /// Per-stage wall-clock limits from the frozen execution package policy.
-    pub stage_budget_s: HashMap<Stage, u64>,
     /// Frozen upper bound for each provider termination phase.
     pub termination_grace_s: u64,
 }
@@ -103,17 +101,13 @@ pub enum PacketOutcome {
 }
 
 fn deadline_reason(
-    exec: &ExecutionContext,
+    _exec: &ExecutionContext,
     packet: &WorkPacket,
     attempt_id: i64,
     started_at: &str,
     as_of: &str,
 ) -> Result<Option<String>, Failure> {
-    let budget_s = exec
-        .stage_budget_s
-        .get(&packet.stage)
-        .copied()
-        .ok_or_else(|| Failure::internal("frozen policy has no stage budget"))?;
+    let budget_s = u64::from(packet.contract.budget_s);
     let deadline = forged_proto::stage_deadline_at(started_at, budget_s)
         .map_err(|error| Failure::internal(error.to_string()))?;
     if !forged_proto::stage_deadline_reached(started_at, budget_s, as_of)
@@ -148,13 +142,36 @@ async fn settle_deadline_retry(
         return Ok(PacketOutcome::Revoked);
     }
     let since = current.updated_at;
+    let started_at = current.started_at;
+    let cutoff = {
+        let run_id = run_id.to_owned();
+        on_ledger(&ctx.ledger, move |ledger| {
+            ledger.latest_policy_revision(&run_id)
+        })
+        .await?
+        .map(|revision| revision.created_at)
+    };
+    if cutoff
+        .as_ref()
+        .is_some_and(|boundary| started_at.as_str() < boundary.as_str())
+    {
+        on_ledger(&ctx.ledger, move |ledger| ledger.mark_timed_out(attempt_id)).await?;
+        return Ok(PacketOutcome::Transport(note));
+    }
     let run_id = run_id.to_owned();
     let packet_id = packet_id.to_owned();
     on_ledger(&ctx.ledger, move |ledger| {
-        forged_proto::grant_retry_for_attempt(ledger, &run_id, &packet_id, attempt_id, &since)
-            .map_err(|error| forged_ledger::LedgerError::Internal {
-                message: error.to_string(),
-            })
+        forged_proto::grant_retry_for_attempt_since(
+            ledger,
+            &run_id,
+            &packet_id,
+            attempt_id,
+            &since,
+            cutoff.as_deref(),
+        )
+        .map_err(|error| forged_ledger::LedgerError::Internal {
+            message: error.to_string(),
+        })
     })
     .await?;
     on_ledger(&ctx.ledger, move |ledger| ledger.mark_timed_out(attempt_id)).await?;
@@ -503,12 +520,16 @@ pub fn build_packet(
 ///
 /// So the key is (run, stage, seq) — the packet's identity, and nothing
 /// about its spec.
-pub async fn open_packet_op(ctx: &Ctx, packet: &WorkPacket) -> Result<(), Failure> {
+pub async fn open_packet_op(
+    ctx: &Ctx,
+    packet: &WorkPacket,
+    policy_revision: Option<u32>,
+) -> Result<(), Failure> {
     let body_json = packet
         .stored_body()
         .map_err(|e| Failure::internal(format!("cannot serialize packet: {e}")))?;
     let run_id = packet.run_id.clone();
-    let target = open_target(packet, body_json)?;
+    let target = open_target(packet, body_json, policy_revision)?;
     let key = crate::core::derive_key(
         "packet_open",
         Some(&run_id),
@@ -574,7 +595,11 @@ struct OpenTarget {
     semantic_id: Option<String>,
 }
 
-fn open_target(packet: &WorkPacket, body_json: String) -> Result<OpenTarget, Failure> {
+fn open_target(
+    packet: &WorkPacket,
+    body_json: String,
+    policy_revision: Option<u32>,
+) -> Result<OpenTarget, Failure> {
     let (stage_key, logical_seq, lane_seq) = match &packet.execution {
         Some(execution) => (
             execution.stage_id.clone(),
@@ -598,6 +623,7 @@ fn open_target(packet: &WorkPacket, body_json: String) -> Result<OpenTarget, Fai
             spec_path: packet.spec.path.clone(),
             spec_sha256: packet.spec.sha256.clone(),
             spec_revision: packet.spec.revision.clone(),
+            policy_revision,
             body_json,
         },
         semantic_id: packet.execution.as_ref().map(|_| packet.packet_id.clone()),
@@ -906,11 +932,7 @@ async fn await_pid(
     attempt_id: i64,
     started_at: &str,
 ) -> Result<PidObservation, Failure> {
-    let budget_s = exec
-        .stage_budget_s
-        .get(&packet.stage)
-        .copied()
-        .ok_or_else(|| Failure::internal("frozen policy has no stage budget"))?;
+    let budget_s = u64::from(packet.contract.budget_s);
     let deadline: jiff::Timestamp = forged_proto::stage_deadline_at(started_at, budget_s)
         .map_err(|error| Failure::internal(error.to_string()))?
         .parse()
@@ -967,11 +989,7 @@ where
     let Ok(pid) = i32::try_from(pid) else {
         return Ok(ProviderIdentityObservation::Missing);
     };
-    let budget_s = exec
-        .stage_budget_s
-        .get(&packet.stage)
-        .copied()
-        .ok_or_else(|| Failure::internal("frozen policy has no stage budget"))?;
+    let budget_s = u64::from(packet.contract.budget_s);
     let deadline: jiff::Timestamp = forged_proto::stage_deadline_at(started_at, budget_s)
         .map_err(|error| Failure::internal(error.to_string()))?
         .parse()
@@ -1207,7 +1225,8 @@ pub(crate) async fn grant_pre_claim_retry(
     note: String,
 ) -> Result<PacketOutcome, Failure> {
     let (run_id, _, _) = crate::core::split_packet_key(packet_id)?;
-    charge_retry(ctx, &run_id, packet_id, now_iso()).await?;
+    let now = now_iso();
+    charge_retry(ctx, &run_id, packet_id, now.clone(), now).await?;
     Ok(PacketOutcome::Transport(note))
 }
 
@@ -1218,16 +1237,33 @@ async fn charge_retry(
     run_id: &str,
     packet_id: &str,
     since: String,
+    failure_started_at: String,
 ) -> Result<(), Failure> {
+    let cutoff = {
+        let run_id = run_id.to_owned();
+        on_ledger(&ctx.ledger, move |ledger| {
+            ledger.latest_policy_revision(&run_id)
+        })
+        .await?
+        .map(|revision| revision.created_at)
+    };
+    if cutoff
+        .as_ref()
+        .is_some_and(|boundary| failure_started_at.as_str() < boundary.as_str())
+    {
+        return Ok(());
+    }
     let run_id = run_id.to_owned();
     let packet_id = packet_id.to_owned();
     on_ledger(&ctx.ledger, move |l| {
-        forged_proto::grant_retry(l, &run_id, &packet_id, &since).map_err(|e| match e {
-            forged_proto::ProtoError::Ledger(inner) => inner,
-            other => forged_ledger::LedgerError::Internal {
-                message: other.to_string(),
+        forged_proto::grant_retry_since(l, &run_id, &packet_id, &since, cutoff.as_deref()).map_err(
+            |e| match e {
+                forged_proto::ProtoError::Ledger(inner) => inner,
+                other => forged_ledger::LedgerError::Internal {
+                    message: other.to_string(),
+                },
             },
-        })
+        )
     })
     .await?;
     Ok(())
@@ -2866,7 +2902,7 @@ pub(crate) async fn fail_and_grant_retry(
     note: String,
 ) -> Result<PacketOutcome, Failure> {
     let (run_id, _, _) = crate::core::split_packet_key(packet_id)?;
-    let failed_at = {
+    let (failed_at, started_at) = {
         let packet_id = packet_id.to_owned();
         let token = claim_token.to_owned();
         let note = note.clone();
@@ -2877,11 +2913,14 @@ pub(crate) async fn fail_and_grant_retry(
                     .ok_or(forged_ledger::LedgerError::Internal {
                         message: "failed attempt not found by token".to_owned(),
                     })?;
-            Ok(attempt.ended_at.clone().unwrap_or(attempt.updated_at))
+            Ok((
+                attempt.ended_at.clone().unwrap_or(attempt.updated_at),
+                attempt.started_at,
+            ))
         })
         .await?
     };
-    charge_retry(ctx, &run_id, packet_id, failed_at).await?;
+    charge_retry(ctx, &run_id, packet_id, failed_at, started_at).await?;
     // The note's prefix classified the failure for the ledger; report the
     // same distinction to the caller rather than calling an unspawned seat
     // a transport failure.
@@ -2893,8 +2932,6 @@ pub(crate) async fn fail_and_grant_retry(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
     use forged_types::{
         Deliverable, Finding, HostPolicyV1, ProtocolRef, ProviderHints, RoleId, Sandbox,
         SeatExecutionV1, SeatId, SeatPurpose, Severity, SpecRef, Stage, StageContract, WorkPacket,
@@ -2980,7 +3017,6 @@ mod tests {
             push_url: "https://example.invalid/repo.git".to_owned(),
             host_policy: HostPolicyV1::Off,
             herdr_socket: None,
-            stage_budget_s: HashMap::new(),
             termination_grace_s: 5,
         }
     }
@@ -3101,7 +3137,6 @@ mod tests {
             push_url: String::new(),
             host_policy: HostPolicyV1::Off,
             herdr_socket: None,
-            stage_budget_s: HashMap::new(),
             termination_grace_s: 5,
         };
 
@@ -3576,7 +3611,6 @@ mod settle_tests {
             push_url: String::new(),
             host_policy: HostPolicy::Required,
             herdr_socket: Some(socket.to_path_buf()),
-            stage_budget_s: HashMap::from([(Stage::Implement, budget_s)]),
             termination_grace_s: 5,
         };
         let intent = PacketIntent {
@@ -3609,6 +3643,7 @@ mod settle_tests {
                 spec_path: packet.spec.path.clone(),
                 spec_sha256: spec_sha.clone(),
                 spec_revision: None,
+                policy_revision: None,
                 body_json: packet.stored_body().expect("packet json"),
             })
             .expect("open packet");
@@ -3655,8 +3690,7 @@ mod settle_tests {
     async fn overdue_adoption_settles_before_any_provider_effect() {
         let root = tempfile::tempdir().expect("tempdir");
         let socket = root.path().join("herdr.sock");
-        let mut fixture = claimed_fixture(root.path(), &socket).await;
-        fixture.exec.stage_budget_s.insert(Stage::Implement, 1);
+        let fixture = claimed_fixture_with_budget(root.path(), &socket, 1).await;
         tokio::time::sleep(Duration::from_millis(1_100)).await;
 
         let outcome = execute_adopted(
@@ -3876,8 +3910,7 @@ mod settle_tests {
     async fn execution_deadline_uses_the_exact_nanosecond_boundary() {
         let root = tempfile::tempdir().expect("tempdir");
         let socket = root.path().join("herdr.sock");
-        let mut fixture = claimed_fixture(root.path(), &socket).await;
-        fixture.exec.stage_budget_s.insert(Stage::Implement, 2);
+        let fixture = claimed_fixture_with_budget(root.path(), &socket, 2).await;
 
         let started = "2026-08-25T00:00:00.000000123Z";
         assert!(deadline_reason(
@@ -3905,8 +3938,7 @@ mod settle_tests {
         let root = tempfile::tempdir().expect("tempdir");
         let socket = root.path().join("herdr.sock");
         let seen = start_mock_herdr(&socket, MockBehavior::Normal);
-        let mut fixture = claimed_fixture(root.path(), &socket).await;
-        fixture.exec.stage_budget_s.insert(Stage::Implement, 1);
+        let fixture = claimed_fixture_with_budget(root.path(), &socket, 1).await;
         let attempt_dirs = PacketDirs::new(&fixture.packet_dir, fixture.attempt_id);
         tokio::spawn(play_provider_after(
             attempt_dirs.attempt_path(),
@@ -3967,8 +3999,7 @@ mod settle_tests {
     async fn an_operator_marker_winning_the_deadline_race_never_charges_retry() {
         let root = tempfile::tempdir().expect("tempdir");
         let socket = root.path().join("herdr.sock");
-        let mut fixture = claimed_fixture(root.path(), &socket).await;
-        fixture.exec.stage_budget_s.insert(Stage::Implement, 1);
+        let fixture = claimed_fixture_with_budget(root.path(), &socket, 1).await;
         fixture
             .ledger
             .revoke_attempt_scoped(

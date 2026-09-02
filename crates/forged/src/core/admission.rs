@@ -1317,6 +1317,7 @@ mod tests {
                 spec_path: format!("specs/capacity-{suffix}.md"),
                 spec_sha256: "feed".to_owned(),
                 spec_revision: None,
+                policy_revision: None,
                 body_json: serde_json::json!({
                     "providerHints": {
                         "provider": "codex",

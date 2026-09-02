@@ -141,6 +141,7 @@ fn complete(
         spec_path: "planning-input.md".to_owned(),
         spec_sha256: "spec".to_owned(),
         spec_revision: None,
+        policy_revision: None,
         body_json: packet.stored_body().expect("stored packet"),
         created_at: T0.to_owned(),
     });

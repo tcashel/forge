@@ -254,7 +254,8 @@ async fn a_released_safe_retry_step_still_has_to_run() {
             spec_path: "spec.md".to_owned(),
             spec_sha256: "cafe".to_owned(),
             spec_revision: None,
-            body_json: "{}".to_owned(),
+            policy_revision: None,
+            body_json: packet_body(1800),
         })
         .expect("open packet");
     let claim = ledger
@@ -629,9 +630,8 @@ async fn frozen_deadline_ignores_heartbeat_and_grants_one_retry_after_verified_k
     let dir = tempfile::tempdir().expect("tempdir");
     let ledger = Ledger::open(&dir.path().join("state.db")).expect("open");
     seed_run(&ledger);
-    // Reconciliation receives the frozen package policy projected by core;
-    // the packet contract is not a second timeout authority.
-    let body = packet_body(3_600);
+    // Reconciliation reads the contract frozen when this packet opened.
+    let body = packet_body(2);
     let packet_id = ledger
         .open_packet(NewPacket {
             run_id: RUN.to_owned(),
@@ -640,6 +640,7 @@ async fn frozen_deadline_ignores_heartbeat_and_grants_one_retry_after_verified_k
             spec_path: "spec.md".to_owned(),
             spec_sha256: "cafe".to_owned(),
             spec_revision: None,
+            policy_revision: None,
             body_json: body,
         })
         .expect("open packet");
@@ -787,6 +788,7 @@ async fn deadline_marker_retains_custody_until_kill_can_be_verified_then_replays
             spec_path: "spec.md".to_owned(),
             spec_sha256: "cafe".to_owned(),
             spec_revision: None,
+            policy_revision: None,
             body_json: packet_body(1),
         })
         .expect("open packet");
@@ -864,7 +866,8 @@ async fn human_ambiguous_is_quarantined_and_left_in_progress() {
             spec_path: "spec.md".to_owned(),
             spec_sha256: "cafe".to_owned(),
             spec_revision: None,
-            body_json: "{}".to_owned(),
+            policy_revision: None,
+            body_json: packet_body(1800),
         })
         .expect("open packet");
     let claim = ledger

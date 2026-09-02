@@ -221,6 +221,8 @@ pub enum RunCmd {
     AdjudicateSettlement(RunAdjudicateSettlementArgs),
     /// Append an explicit roster revision at a durable boundary.
     ReviseRoster(RunReviseRosterArgs),
+    /// Re-resolve revisable execution policy from current config.
+    RevisePolicy(RunRevisePolicyArgs),
     /// Accept the final deduplicated findings after a terminal review failure.
     AcceptRisk(RunAcceptRiskArgs),
 }
@@ -365,6 +367,8 @@ pub enum EpicCmd {
     Abandon(EpicAbandonArgs),
     /// Append a roster revision for current and future child runs.
     ReviseRoster(EpicReviseRosterArgs),
+    /// Re-resolve revisable execution policy for unmerged children.
+    RevisePolicy(EpicRevisePolicyArgs),
 }
 
 /// `epic preflight` flags — the same geometry `epic start` takes.
@@ -513,6 +517,20 @@ pub struct EpicReviseRosterArgs {
     pub idempotency_key: Option<String>,
 }
 
+/// `epic revise-policy` flags.
+#[derive(Debug, Args)]
+pub struct EpicRevisePolicyArgs {
+    /// Durable epic id.
+    #[arg(long)]
+    pub epic: String,
+    /// Human-readable reason recorded with the revision.
+    #[arg(long)]
+    pub reason: String,
+    /// Override the derived idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
 /// `run revise-roster` flags.
 #[derive(Debug, Args)]
 pub struct RunReviseRosterArgs {
@@ -522,6 +540,20 @@ pub struct RunReviseRosterArgs {
     /// Named roster from the once-read config.
     #[arg(long)]
     pub roster: String,
+    /// Human-readable reason recorded with the revision.
+    #[arg(long)]
+    pub reason: String,
+    /// Override the derived idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+/// `run revise-policy` flags.
+#[derive(Debug, Args)]
+pub struct RunRevisePolicyArgs {
+    /// Run id.
+    #[arg(long)]
+    pub run: String,
     /// Human-readable reason recorded with the revision.
     #[arg(long)]
     pub reason: String,
@@ -1847,6 +1879,7 @@ pub fn command_name(command: &Command) -> &'static str {
             RunCmd::Stop(_) => "run_stop",
             RunCmd::AdjudicateSettlement(_) => "run_adjudicate_settlement",
             RunCmd::ReviseRoster(_) => "run_revise_roster",
+            RunCmd::RevisePolicy(_) => "run_revise_policy",
             RunCmd::AcceptRisk(_) => "run_accept_risk",
         },
         Command::Epic { command } => match command {
@@ -1861,6 +1894,7 @@ pub fn command_name(command: &Command) -> &'static str {
             EpicCmd::Resolve(_) => "epic_resolve",
             EpicCmd::Abandon(_) => "epic_abandon",
             EpicCmd::ReviseRoster(_) => "epic_revise_roster",
+            EpicCmd::RevisePolicy(_) => "epic_revise_policy",
         },
         Command::Packet { command } => match command {
             PacketCmd::Show(_) => "packet_show",
@@ -2056,6 +2090,14 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
                     json!({"run": a.run, "roster": a.roster, "reason": a.reason}),
                 ),
             ),
+            RunCmd::RevisePolicy(a) => (
+                "run_revise_policy",
+                request(
+                    a.idempotency_key,
+                    Some(a.run.clone()),
+                    json!({"run": a.run, "reason": a.reason}),
+                ),
+            ),
             RunCmd::AcceptRisk(a) => (
                 "run_accept_risk",
                 request(
@@ -2177,6 +2219,14 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
                     a.idempotency_key,
                     Some(a.epic.clone()),
                     json!({"epic": a.epic, "roster": a.roster, "reason": a.reason}),
+                ),
+            ),
+            EpicCmd::RevisePolicy(a) => (
+                "epic_revise_policy",
+                request(
+                    a.idempotency_key,
+                    Some(a.epic.clone()),
+                    json!({"epic": a.epic, "reason": a.reason}),
                 ),
             ),
         },

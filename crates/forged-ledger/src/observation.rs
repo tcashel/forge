@@ -101,6 +101,10 @@ pub struct WorkObservationSnapshot {
     pub child_identities: Vec<WorkIdentityV1>,
     /// The requested run, or every distinct run ever started by the epic.
     pub runs: Vec<RunRow>,
+    /// Selected run ids whose work minted another run at or after them.
+    /// Successor existence is the durable clearing fact: an exhausted
+    /// subject stays cleared even after that successor itself settles.
+    pub runs_with_same_work_successors: BTreeSet<String>,
     /// Requested-subject and child-run supervisor rows.
     pub desired_work: Vec<DesiredWorkRow>,
     /// Latest decision for the subject, its child runs, and their packets.
@@ -236,6 +240,23 @@ fn run_rows_tx(conn: &Connection, run_scope: &str) -> Result<Vec<RunRow>, Ledger
     ))?;
     let rows = statement.query_map([run_scope], run_row)?;
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+fn runs_with_same_work_successors_tx(
+    conn: &Connection,
+    run_scope: &str,
+) -> Result<BTreeSet<String>, LedgerError> {
+    let mut statement = conn.prepare(
+        "SELECT source.run_id FROM runs source \
+         WHERE source.run_id IN (SELECT CAST(value AS TEXT) FROM json_each(?1)) \
+           AND EXISTS (SELECT 1 FROM runs candidate \
+             WHERE candidate.run_id != source.run_id \
+               AND candidate.bead_id = source.bead_id \
+               AND candidate.created_at >= source.created_at) \
+         ORDER BY source.run_id",
+    )?;
+    let rows = statement.query_map([run_scope], |row| row.get::<_, String>(0))?;
+    rows.collect::<Result<BTreeSet<_>, _>>().map_err(Into::into)
 }
 
 fn child_identities_tx(
@@ -634,6 +655,7 @@ impl Ledger {
                 epic_children,
                 child_identities,
                 runs,
+                runs_with_same_work_successors: runs_with_same_work_successors_tx(&tx, &run_scope)?,
                 desired_work: desired_work_tx(&tx, epic_id, &run_scope)?,
                 admission_decisions: admission_decisions_tx(&tx, epic_id, &run_scope)?,
                 admission_reservations: admission_reservations_tx(&tx, epic_id, &run_scope)?,
@@ -743,6 +765,7 @@ mod tests {
                 spec_path: "spec.md".to_owned(),
                 spec_sha256: "spec-sha".to_owned(),
                 spec_revision: Some("revision".to_owned()),
+                policy_revision: None,
                 body_json: "{}".to_owned(),
             })
             .expect("packet")

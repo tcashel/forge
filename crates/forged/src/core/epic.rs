@@ -13,8 +13,9 @@ use forged_ledger::{
 use forged_proto::{machine_idempotency_key, MachineStage, NextAction, ProtoEvent, Terminal};
 use forged_types::{
     AdmissionDecisionV1, AdmissionOutcome, AdmissionSubjectKind, ErrorCode, ExecutionPackageV1,
-    NativeWorkSpecV1, OperationRequest, OperationResponse, RosterRevisionV1, SeatPurpose, Severity,
-    Verdict, WorkIdentityContextV1, WorkIdentitySubjectKind,
+    ExecutionPolicyV1, NativeWorkSpecV1, OperationRequest, OperationResponse, PolicyRevisionV1,
+    RosterRevisionV1, SeatPurpose, Severity, Verdict, WorkIdentityContextV1,
+    WorkIdentitySubjectKind,
 };
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
@@ -46,6 +47,7 @@ const ASSURANCE_STARTED: &str = "forged.epic.assurance.started";
 const ASSURANCE_FINALIZED: &str = "forged.epic.assurance.finalized";
 pub(super) const ASSURANCE_COMPLETED: &str = "forged.epic.assurance.completed";
 const ROSTER_REVISED: &str = "forged.epic.roster.revised";
+const POLICY_REVISED: &str = "forged.epic.policy.revised";
 const PACKAGE_MIGRATED: &str = "forged.epic.execution-package.migrated";
 const PACKAGE_MIGRATION: &str = "forged.epic.execution-package/1";
 const PLAN_STARTED: &str = "forged.epic.plan.started";
@@ -167,6 +169,7 @@ struct EpicView {
     paused: Option<Value>,
     pr: Option<Value>,
     roster_revisions: Vec<RosterRevisionV1>,
+    policy_revisions: Vec<PolicyRevisionV1>,
     cursor: i64,
 }
 
@@ -617,6 +620,7 @@ async fn project(ctx: &Ctx, epic: &str) -> Result<EpicView, Failure> {
         paused: None,
         pr: None,
         roster_revisions: Vec::new(),
+        policy_revisions: Vec::new(),
         cursor: events.last().map(|row| row.event_id).unwrap_or(0),
     };
     for row in events {
@@ -725,6 +729,12 @@ async fn project(ctx: &Ctx, epic: &str) -> Result<EpicView, Failure> {
                     Failure::internal(format!("epic roster revision is invalid: {error}"))
                 })?;
                 view.roster_revisions.push(revision);
+            }
+            POLICY_REVISED => {
+                let revision = serde_json::from_value(payload(&row)?).map_err(|error| {
+                    Failure::internal(format!("epic policy revision is invalid: {error}"))
+                })?;
+                view.policy_revisions.push(revision);
             }
             _ => {}
         }
@@ -1830,6 +1840,9 @@ fn active_execution_package(view: &EpicView) -> ExecutionPackageV1 {
         package.roster_sha256 = revision.roster_sha256.clone();
         package.roster = revision.roster.clone();
     }
+    if let Some(revision) = view.policy_revisions.last() {
+        package.policy = revision.policy.clone();
+    }
     package
 }
 
@@ -2180,6 +2193,7 @@ async fn status_json(ctx: &Ctx, view: EpicView) -> Result<Value, Failure> {
             .unwrap_or(&view.config.execution_package.roster_ref.name),
         "packageSha256": active_definition.package_sha256,
         "rosterRevisions": view.roster_revisions,
+        "policyRevisions": view.policy_revisions,
         "cursor": view.cursor,
         "integration": view.integration,
         "waves": view.waves,
@@ -2713,6 +2727,258 @@ pub async fn epic_revise_roster(ctx: &Ctx, req: &mut OperationRequest) -> Operat
                         roster_sha256,
                         reason: child_reason,
                         operation_prefix,
+                    })
+                })
+                .await?;
+                Ok(event_value)
+            }
+        },
+    )
+    .await;
+    match result {
+        Ok(value) => ok_response(&key, false, value),
+        Err(error) => err_response(&key, &error),
+    }
+}
+
+/// Append a config-sourced policy revision to every unmerged child and to
+/// the epic template used by future children.
+pub async fn epic_revise_policy(ctx: &Ctx, req: &mut OperationRequest) -> OperationResponse {
+    let epic = match param_str(&req.params, "epic") {
+        Ok(value) => value.to_owned(),
+        Err(error) => {
+            return err_response(&derive_key("epic_revise_policy", None, None, None), &error)
+        }
+    };
+    let reason = match param_str(&req.params, "reason") {
+        Ok(value) if !value.trim().is_empty() => value.to_owned(),
+        Ok(_) => {
+            return err_response(
+                &derive_key("epic_revise_policy", Some(&epic), None, None),
+                &Failure::invalid("policy revision requires a non-empty reason"),
+            )
+        }
+        Err(error) => {
+            return err_response(
+                &derive_key("epic_revise_policy", Some(&epic), None, None),
+                &error,
+            )
+        }
+    };
+    for field in [
+        "gateCommands",
+        "gate_commands",
+        "stageBudgetS",
+        "stage_budget_s",
+        "transportRetryBudget",
+        "transport_retry_budget",
+    ] {
+        if req.params.contains_key(field) {
+            return err_response(
+                &derive_key("epic_revise_policy", Some(&epic), None, None),
+                &Failure::invalid(
+                    "policy fields are sourced only from current config; edit config.yaml, then \
+                     run `forged epic revise-policy --epic <id> --reason <reason>`",
+                ),
+            );
+        }
+    }
+    let _guard = match acquire_driver(ctx, &epic).await {
+        Ok(guard) => guard,
+        Err(error) => {
+            return err_response(
+                &derive_key("epic_revise_policy", Some(&epic), None, None),
+                &error,
+            )
+        }
+    };
+    let view = match project(ctx, &epic).await {
+        Ok(view) => view,
+        Err(error) => {
+            return err_response(
+                &derive_key("epic_revise_policy", Some(&epic), None, None),
+                &error,
+            )
+        }
+    };
+    let current = match ctx.config.execution_policy() {
+        Ok(value) => value,
+        Err(errors) => {
+            return err_response(
+                &derive_key("epic_revise_policy", Some(&epic), None, None),
+                &Failure::invalid(format!(
+                    "policy revision is invalid: {}",
+                    serde_json::to_string(&errors).unwrap_or_default()
+                )),
+            )
+        }
+    };
+    let active_package = active_execution_package(&view);
+    let policy = super::ops::splice_policy(&active_package.policy, current.clone());
+    if let Some(error) = policy.validate().into_iter().next() {
+        return err_response(
+            &derive_key("epic_revise_policy", Some(&epic), None, None),
+            &Failure::invalid(format!(
+                "policy revision is invalid at {}: {}",
+                error.path, error.message
+            )),
+        );
+    }
+    let policy_sha256 = match crate::config::digest_of(&policy) {
+        Ok(value) => value,
+        Err(error) => {
+            return err_response(
+                &derive_key("epic_revise_policy", Some(&epic), None, None),
+                &Failure::internal(format!("digesting epic policy revision: {error}")),
+            )
+        }
+    };
+    let matching_latest = view.policy_revisions.last().is_some_and(|revision| {
+        revision.policy_sha256 == policy_sha256 && revision.reason == reason
+    });
+    let revision = if matching_latest {
+        view.policy_revisions
+            .last()
+            .map(|value| value.revision)
+            .unwrap_or(1)
+    } else {
+        view.policy_revisions
+            .last()
+            .map(|value| value.revision)
+            .unwrap_or(1)
+            .saturating_add(1)
+    };
+    default_key(
+        req,
+        derive_key(
+            "epic_revise_policy",
+            Some(&epic),
+            None,
+            Some(i64::from(revision)),
+        ),
+    );
+    req.params.insert(
+        "policySha256".to_owned(),
+        Value::String(policy_sha256.clone()),
+    );
+    if req.run_id.is_none() {
+        req.run_id = Some(epic.clone());
+    }
+    let event = PolicyRevisionV1 {
+        revision,
+        policy_sha256: policy_sha256.clone(),
+        policy,
+        reason: reason.clone(),
+    };
+    let event_value = match serde_json::to_value(&event) {
+        Ok(value) => value,
+        Err(error) => {
+            return err_response(
+                &req.idempotency_key,
+                &Failure::internal(format!("serializing epic policy revision: {error}")),
+            )
+        }
+    };
+    let active_runs = view
+        .children
+        .values()
+        .filter(|state| state.merged.is_none())
+        .map(|state| state.run_id.clone())
+        .collect::<Vec<_>>();
+    let mut writes = Vec::with_capacity(active_runs.len());
+    for run_id in active_runs {
+        let definition = {
+            let run_for_lookup = run_id.clone();
+            match on_ledger(&ctx.ledger, move |ledger| {
+                ledger.get_run_definition(&run_for_lookup)
+            })
+            .await
+            {
+                Ok(Some(value)) => value,
+                Ok(None) => {
+                    return err_response(
+                        &req.idempotency_key,
+                        &Failure::invalid(format!("run {run_id:?} has no revisable policy")),
+                    )
+                }
+                Err(error) => return err_response(&req.idempotency_key, &error),
+            }
+        };
+        let package: ExecutionPackageV1 = match serde_json::from_str(&definition.package_json) {
+            Ok(value) => value,
+            Err(error) => {
+                return err_response(
+                    &req.idempotency_key,
+                    &Failure::internal(format!(
+                        "stored execution package for run {run_id:?} does not parse: {error}"
+                    )),
+                )
+            }
+        };
+        let latest = {
+            let run_id = run_id.clone();
+            match on_ledger(&ctx.ledger, move |ledger| {
+                ledger.latest_policy_revision(&run_id)
+            })
+            .await
+            {
+                Ok(value) => value,
+                Err(error) => return err_response(&req.idempotency_key, &error),
+            }
+        };
+        let standing = match latest {
+            Some(row) => match serde_json::from_str::<ExecutionPolicyV1>(&row.policy_json) {
+                Ok(value) => value,
+                Err(error) => {
+                    return err_response(
+                        &req.idempotency_key,
+                        &Failure::internal(format!(
+                            "stored policy revision for run {run_id:?} does not parse: {error}"
+                        )),
+                    )
+                }
+            },
+            None => package.policy,
+        };
+        let child_policy = super::ops::splice_policy(&standing, current.clone());
+        let child_digest = match crate::config::digest_of(&child_policy) {
+            Ok(value) => value,
+            Err(error) => {
+                return err_response(
+                    &req.idempotency_key,
+                    &Failure::internal(format!(
+                        "digesting policy revision for run {run_id:?}: {error}"
+                    )),
+                )
+            }
+        };
+        writes.push(forged_ledger::PolicyRevisionWrite {
+            operation_id: format!("epic-policy:{epic}:{revision}:{run_id}"),
+            run_id,
+            policy: child_policy,
+            policy_sha256: child_digest,
+        });
+    }
+    let key = req.idempotency_key.clone();
+    let result = safe_effect(
+        ctx,
+        "epic_revise_policy",
+        key.clone(),
+        &epic,
+        Value::Object(req.params.clone()),
+        {
+            let epic = epic.clone();
+            move |_operation| async move {
+                let epic_for_store = epic.clone();
+                let child_reason = format!("epic {epic}: {reason}");
+                let value_for_store = event_value.clone();
+                on_ledger(&ctx.ledger, move |ledger| {
+                    ledger.append_policy_revisions_with_event(forged_ledger::PolicyRevisionBatch {
+                        epic_id: epic_for_store,
+                        event_kind: POLICY_REVISED.to_owned(),
+                        event_payload: value_for_store,
+                        writes,
+                        reason: child_reason,
                     })
                 })
                 .await?;

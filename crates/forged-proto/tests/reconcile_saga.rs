@@ -53,7 +53,8 @@ fn seed_run(ledger: &Ledger) -> String {
             spec_path: "spec.md".to_owned(),
             spec_sha256: "cafe".to_owned(),
             spec_revision: None,
-            body_json: "{}".to_owned(),
+            policy_revision: None,
+            body_json: stage_packet_body(1800),
         })
         .expect("open packet")
 }

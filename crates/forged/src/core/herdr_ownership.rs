@@ -719,6 +719,7 @@ mod tests {
                 spec_path: "spec.md".to_owned(),
                 spec_sha256: "spec".to_owned(),
                 spec_revision: None,
+                policy_revision: None,
                 body_json: "{}".to_owned(),
             })
             .expect("packet");
@@ -808,6 +809,7 @@ mod tests {
                 spec_path: "spec.md".to_owned(),
                 spec_sha256: "spec".to_owned(),
                 spec_revision: None,
+                policy_revision: None,
                 body_json: "{}".to_owned(),
             })
             .expect("packet");

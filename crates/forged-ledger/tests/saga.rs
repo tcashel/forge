@@ -39,6 +39,7 @@ fn make_packet(ledger: &Ledger, run_id: &str) -> String {
             spec_path: "specs/x.md".to_owned(),
             spec_sha256: "cafe".to_owned(),
             spec_revision: None,
+            policy_revision: None,
             body_json: "{\"schema\":\"forged.packet/1\"}".to_owned(),
         })
         .expect("open packet")
@@ -684,6 +685,7 @@ fn a_revoking_marker_records_the_scope_that_placed_it() {
             spec_path: "specs/x.md".to_owned(),
             spec_sha256: "cafe".to_owned(),
             spec_revision: None,
+            policy_revision: None,
             body_json: "{\"schema\":\"forged.packet/1\"}".to_owned(),
         })
         .expect("open packet");

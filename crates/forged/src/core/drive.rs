@@ -651,7 +651,14 @@ async fn honor(
                         .as_ref()
                         .map(|value| &value.protocol_ref),
                 )?;
-                open_packet_op(ctx, &packet).await?;
+                open_packet_op(
+                    ctx,
+                    &packet,
+                    view.active_policy_revision
+                        .as_ref()
+                        .map(|revision| revision.revision),
+                )
+                .await?;
             }
             Ok(Honored::Progressed)
         }
@@ -742,18 +749,8 @@ async fn honor_await(
                 // Someone else's provider is genuinely running. Its
                 // heartbeat proves liveness but cannot extend the frozen
                 // stage deadline anchored at the durable attempt start.
-                let stage = view
-                    .packets
-                    .iter()
-                    .find(|packet| packet.packet_id == *packet_id)
-                    .map(|packet| packet.stage)
-                    .ok_or_else(|| Failure::internal("live attempt has no stored packet"))?;
-                let budget_s = view
-                    .policy
-                    .stage_budget_s
-                    .get(&stage)
-                    .copied()
-                    .ok_or_else(|| Failure::internal("frozen policy has no stage budget"))?;
+                let packet = stored_packet_for_attempt(view, packet_id)?;
+                let budget_s = u64::from(packet.contract.budget_s);
                 let as_of = now_iso();
                 let deadline = forged_proto::stage_deadline_at(&attempt.started_at, budget_s)
                     .map_err(|error| Failure::internal(error.to_string()))?;
@@ -1189,12 +1186,6 @@ async fn execution_context(ctx: &Ctx, view: &RunView) -> Result<ExecutionContext
         push_url: push_url_of(&view.run.repo).await,
         host_policy: view.policy.host_policy,
         herdr_socket: view.policy.herdr_socket.clone(),
-        stage_budget_s: view
-            .policy
-            .stage_budget_s
-            .iter()
-            .map(|(k, v)| (*k, *v))
-            .collect(),
         termination_grace_s: view.policy.termination_grace_s,
     })
 }

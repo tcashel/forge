@@ -295,6 +295,16 @@ pub struct RosterRevisionV1 {
     pub reason: String,
 }
 
+/// One explicit, append-only execution-policy change for an existing run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PolicyRevisionV1 {
+    pub revision: u32,
+    pub policy_sha256: String,
+    pub policy: ExecutionPolicyV1,
+    pub reason: String,
+}
+
 impl ProfileDefinitionV1 {
     /// Validate a closed protocol topology with stable error paths.
     pub fn validate(&self) -> Vec<DefinitionError> {

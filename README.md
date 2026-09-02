@@ -149,6 +149,7 @@ then file, sized by lines and colored by coverage.
 - [CLI and operations guide](docs/NEXT.md)
 - [Provider-neutral orchestration](docs/adr/0032-forged-provider-neutral-rust-orchestrator.md)
 - [Planning and execution boundaries](docs/adr/0033-execution-package-ownership-boundary.md)
+- [Operational policy revisions](docs/adr/0035-operational-policy-revisions-at-durable-stage-boundaries.md)
 - [Changelog](CHANGELOG.md)
 - [Release process](RELEASE.md)
 - [Contributing](CONTRIBUTING.md)

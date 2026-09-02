@@ -17,8 +17,9 @@ use crate::events::append_event_tx;
 use crate::ledger::Ledger;
 use crate::time::now_iso;
 use crate::types::{
-    DesiredReconcileOutcome, DesiredSubjectKind, NewRun, NewRunDefinition, RosterRevisionBatch,
-    RosterRevisionRow, RunDefinitionRow, RunOutcome, RunRow, RunSettlement, RunState,
+    DesiredReconcileOutcome, DesiredSubjectKind, NewRun, NewRunDefinition, PolicyRevisionBatch,
+    PolicyRevisionRow, RosterRevisionBatch, RosterRevisionRow, RunDefinitionRow, RunOutcome,
+    RunRow, RunSettlement, RunState,
 };
 use crate::work_identity::{
     get_work_identity_tx, identity_replay_matches, insert_work_identity_tx, legacy_run_identity,
@@ -234,6 +235,25 @@ fn revision_row(row: &rusqlite::Row<'_>) -> Result<RosterRevisionRow, rusqlite::
         reason: row.get(5)?,
         created_at: row.get(6)?,
         operation_id: row.get(7)?,
+    })
+}
+
+fn policy_revision_row(row: &rusqlite::Row<'_>) -> Result<PolicyRevisionRow, rusqlite::Error> {
+    let revision: i64 = row.get(1)?;
+    Ok(PolicyRevisionRow {
+        run_id: row.get(0)?,
+        revision: revision.try_into().map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                1,
+                rusqlite::types::Type::Integer,
+                Box::new(error),
+            )
+        })?,
+        policy_json: row.get(2)?,
+        policy_sha256: row.get(3)?,
+        reason: row.get(4)?,
+        created_at: row.get(5)?,
+        operation_id: row.get(6)?,
     })
 }
 
@@ -482,6 +502,7 @@ impl Ledger {
             }
             let (profile_json, profile_sha256) = canonical(&package.profile)?;
             let (roster_json, roster_sha256) = canonical(&package.roster)?;
+            let (policy_json, policy_sha256) = canonical(&package.policy)?;
             let (package_json, package_sha256) = canonical(package)?;
             if profile_sha256 != package.profile_sha256 {
                 return Err(refused(
@@ -531,6 +552,11 @@ impl Ledger {
                 "INSERT INTO roster_revisions (run_id, revision, roster_ref_json, roster_sha256, \
                  roster_json, reason, created_at) VALUES (?1, 1, ?2, ?3, ?4, 'run-created', ?5)",
                 rusqlite::params![row.run_id, roster_ref_json, roster_sha256, roster_json, now],
+            )?;
+            tx.execute(
+                "INSERT INTO policy_revisions (run_id, revision, policy_json, policy_sha256, \
+                 reason, created_at) VALUES (?1, 1, ?2, ?3, 'run-created', ?4)",
+                rusqlite::params![row.run_id, policy_json, policy_sha256, now],
             )?;
             insert_work_identity_tx(&tx, &legacy_run_identity(&new_run, &now))?;
             // Keep the canonicalized profile alive as an explicit integrity
@@ -628,6 +654,7 @@ impl Ledger {
             }
             let (profile_json, profile_sha256) = canonical(&package.profile)?;
             let (roster_json, roster_sha256) = canonical(&package.roster)?;
+            let (policy_json, policy_sha256) = canonical(&package.policy)?;
             let (package_json, package_sha256) = canonical(package)?;
             if profile_sha256 != package.profile_sha256 {
                 return Err(refused(
@@ -690,6 +717,13 @@ impl Ledger {
                     rusqlite::params![run_id, roster_ref_json, roster_sha256, roster_json],
                     |row| row.get(0),
                 )?;
+                let policy_revision_matches: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM policy_revisions WHERE run_id = ?1 \
+                         AND revision = 1 AND policy_json = ?2 AND policy_sha256 = ?3 \
+                         AND reason = 'run-created')",
+                    rusqlite::params![run_id, policy_json, policy_sha256],
+                    |row| row.get(0),
+                )?;
                 let stored_events = {
                     let mut statement = tx.prepare(
                         "SELECT payload_json FROM events WHERE run_id = ?1 \
@@ -709,6 +743,7 @@ impl Ledger {
                 if !immutable_run_matches
                     || !definition_matches
                     || !revision_matches
+                    || !policy_revision_matches
                     || !event_matches
                     || !identity_matches
                 {
@@ -747,6 +782,11 @@ impl Ledger {
                  roster_json, reason, created_at) VALUES (?1, 1, ?2, ?3, ?4, 'run-created', ?5)",
                 rusqlite::params![row.run_id, roster_ref_json, roster_sha256, roster_json, now],
             )?;
+            tx.execute(
+                "INSERT INTO policy_revisions (run_id, revision, policy_json, policy_sha256, \
+                 reason, created_at) VALUES (?1, 1, ?2, ?3, 'run-created', ?4)",
+                rusqlite::params![row.run_id, policy_json, policy_sha256, now],
+            )?;
             append_event_tx(&tx, Some(&row.run_id), "forged.run.spec", &spec_event)?;
             insert_work_identity_tx(&tx, &identity)?;
             drop(profile_json);
@@ -769,6 +809,163 @@ impl Ledger {
                  LEFT JOIN run_package_migrations m ON m.run_id = d.run_id WHERE d.run_id = ?1"
             );
             Ok(conn.query_row(&sql, [&run_id], definition_row).optional()?)
+        })
+    }
+
+    /// Fetch the latest execution-policy revision for a run.
+    pub fn latest_policy_revision(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<PolicyRevisionRow>, LedgerError> {
+        let run_id = run_id.to_owned();
+        self.submit(move |conn| {
+            require_run(conn, &run_id)?;
+            conn.query_row(
+                "SELECT run_id, revision, policy_json, policy_sha256, reason, created_at, \
+                 operation_id FROM policy_revisions WHERE run_id = ?1 \
+                 ORDER BY revision DESC LIMIT 1",
+                [&run_id],
+                policy_revision_row,
+            )
+            .optional()
+            .map_err(Into::into)
+        })
+    }
+
+    /// List every execution-policy revision for a run in durable order.
+    pub fn list_policy_revisions(
+        &self,
+        run_id: &str,
+    ) -> Result<Vec<PolicyRevisionRow>, LedgerError> {
+        let run_id = run_id.to_owned();
+        self.submit(move |conn| {
+            require_run(conn, &run_id)?;
+            let mut statement = conn.prepare(
+                "SELECT run_id, revision, policy_json, policy_sha256, reason, created_at, \
+                 operation_id FROM policy_revisions WHERE run_id = ?1 ORDER BY revision",
+            )?;
+            let rows = statement.query_map([&run_id], policy_revision_row)?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        })
+    }
+
+    /// Append a validated execution policy as the next revision.
+    pub fn append_policy_revision(
+        &self,
+        run_id: &str,
+        policy: ExecutionPolicyV1,
+        policy_sha256: String,
+        reason: String,
+        operation_id: String,
+    ) -> Result<PolicyRevisionRow, LedgerError> {
+        let run_id = run_id.to_owned();
+        if reason.trim().is_empty() {
+            return Err(refused(
+                ErrorCode::InvalidRequest,
+                "policy revision requires a reason",
+            ));
+        }
+        if let Some(error) = policy.validate().into_iter().next() {
+            return Err(refused(
+                ErrorCode::InvalidRequest,
+                format!(
+                    "policy revision is invalid at {}: {}",
+                    error.path, error.message
+                ),
+            ));
+        }
+        let (policy_json, actual_sha256) = canonical(&policy)?;
+        if policy_sha256 != actual_sha256 {
+            return Err(refused(
+                ErrorCode::InvalidRequest,
+                "policy revision digest mismatch",
+            ));
+        }
+        self.submit(move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            require_run(&tx, &run_id)?;
+            let has_definition: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM run_definitions WHERE run_id = ?1)",
+                [&run_id],
+                |row| row.get(0),
+            )?;
+            if !has_definition {
+                return Err(refused(
+                    ErrorCode::InvalidRequest,
+                    "legacy run has no revisable policy",
+                ));
+            }
+            let existing = tx
+                .query_row(
+                    "SELECT run_id, revision, policy_json, policy_sha256, reason, created_at, \
+                     operation_id FROM policy_revisions WHERE operation_id = ?1",
+                    [&operation_id],
+                    policy_revision_row,
+                )
+                .optional()?;
+            if let Some(existing) = existing {
+                if existing.run_id == run_id
+                    && existing.policy_sha256 == policy_sha256
+                    && existing.reason == reason
+                {
+                    tx.commit()?;
+                    return Ok(existing);
+                }
+                return Err(refused(
+                    ErrorCode::InvalidRequest,
+                    "policy revision operation was reused with different content",
+                ));
+            }
+            let latest = tx
+                .query_row(
+                    "SELECT run_id, revision, policy_json, policy_sha256, reason, created_at, \
+                     operation_id FROM policy_revisions WHERE run_id = ?1 \
+                     ORDER BY revision DESC LIMIT 1",
+                    [&run_id],
+                    policy_revision_row,
+                )
+                .optional()?;
+            if let Some(latest) = latest {
+                if latest.policy_sha256 == policy_sha256 && latest.reason == reason {
+                    tx.commit()?;
+                    return Ok(latest);
+                }
+            }
+            let current: i64 = tx.query_row(
+                "SELECT COALESCE(MAX(revision), 0) FROM policy_revisions WHERE run_id = ?1",
+                [&run_id],
+                |row| row.get(0),
+            )?;
+            let next = current
+                .checked_add(1)
+                .ok_or_else(|| crate::error::internal("policy revision counter overflow"))?;
+            let now = now_iso();
+            tx.execute(
+                "INSERT INTO policy_revisions (run_id, revision, policy_json, policy_sha256, \
+                 reason, created_at, operation_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    run_id,
+                    next,
+                    policy_json,
+                    policy_sha256,
+                    reason,
+                    now,
+                    operation_id,
+                ],
+            )?;
+            let revision = u32::try_from(next)
+                .map_err(|_| crate::error::internal("policy revision does not fit u32"))?;
+            let row = PolicyRevisionRow {
+                run_id,
+                revision,
+                policy_json,
+                policy_sha256,
+                reason,
+                created_at: now,
+                operation_id: Some(operation_id),
+            };
+            tx.commit()?;
+            Ok(row)
         })
     }
 
@@ -1042,6 +1239,153 @@ impl Ledger {
                     roster_ref_json: roster_ref_json.clone(),
                     roster_sha256: roster_sha256.clone(),
                     roster_json: roster_json.clone(),
+                    reason: reason.clone(),
+                    created_at: now,
+                    operation_id: Some(operation_id),
+                });
+            }
+            append_event_tx(&tx, Some(&epic_id), &event_kind, &event_payload)?;
+            tx.commit()?;
+            Ok(rows)
+        })
+    }
+
+    /// Append child-specific validated policies and their governing epic
+    /// event in one transaction. Merged children are excluded by the caller
+    /// before this boundary.
+    pub fn append_policy_revisions_with_event(
+        &self,
+        batch: PolicyRevisionBatch,
+    ) -> Result<Vec<PolicyRevisionRow>, LedgerError> {
+        let PolicyRevisionBatch {
+            epic_id,
+            event_kind,
+            event_payload,
+            writes,
+            reason,
+        } = batch;
+        if reason.trim().is_empty() {
+            return Err(refused(
+                ErrorCode::InvalidRequest,
+                "policy revision requires a reason",
+            ));
+        }
+        let mut prepared = Vec::with_capacity(writes.len());
+        for write in writes {
+            if let Some(error) = write.policy.validate().into_iter().next() {
+                return Err(refused(
+                    ErrorCode::InvalidRequest,
+                    format!(
+                        "policy revision for run {:?} is invalid at {}: {}",
+                        write.run_id, error.path, error.message
+                    ),
+                ));
+            }
+            let (policy_json, actual_sha256) = canonical(&write.policy)?;
+            if write.policy_sha256 != actual_sha256 {
+                return Err(refused(
+                    ErrorCode::InvalidRequest,
+                    format!("policy revision digest mismatch for run {:?}", write.run_id),
+                ));
+            }
+            prepared.push((
+                write.run_id,
+                policy_json,
+                write.policy_sha256,
+                write.operation_id,
+            ));
+        }
+        self.submit(move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let event_json = serde_json::to_string(&event_payload)?;
+            let event_exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM events WHERE run_id = ?1 AND kind = ?2 \
+                 AND payload_json = ?3)",
+                rusqlite::params![epic_id, event_kind, event_json],
+                |row| row.get(0),
+            )?;
+            let mut rows = Vec::with_capacity(prepared.len());
+            if event_exists {
+                for (_, _, _, operation_id) in prepared {
+                    if let Some(existing) = tx
+                        .query_row(
+                            "SELECT run_id, revision, policy_json, policy_sha256, reason, \
+                             created_at, operation_id FROM policy_revisions \
+                             WHERE operation_id = ?1",
+                            [&operation_id],
+                            policy_revision_row,
+                        )
+                        .optional()?
+                    {
+                        rows.push(existing);
+                    }
+                }
+                tx.commit()?;
+                return Ok(rows);
+            }
+            for (run_id, policy_json, policy_sha256, operation_id) in prepared {
+                require_run(&tx, &run_id)?;
+                let has_definition: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM run_definitions WHERE run_id = ?1)",
+                    [&run_id],
+                    |row| row.get(0),
+                )?;
+                if !has_definition {
+                    return Err(refused(
+                        ErrorCode::InvalidRequest,
+                        format!("run {run_id:?} has no revisable policy"),
+                    ));
+                }
+                if let Some(existing) = tx
+                    .query_row(
+                        "SELECT run_id, revision, policy_json, policy_sha256, reason, \
+                         created_at, operation_id FROM policy_revisions WHERE operation_id = ?1",
+                        [&operation_id],
+                        policy_revision_row,
+                    )
+                    .optional()?
+                {
+                    if existing.run_id != run_id
+                        || existing.policy_sha256 != policy_sha256
+                        || existing.reason != reason
+                    {
+                        return Err(refused(
+                            ErrorCode::InvalidRequest,
+                            "epic policy operation was reused with different content",
+                        ));
+                    }
+                    rows.push(existing);
+                    continue;
+                }
+                let current: i64 = tx.query_row(
+                    "SELECT COALESCE(MAX(revision), 0) FROM policy_revisions WHERE run_id = ?1",
+                    [&run_id],
+                    |row| row.get(0),
+                )?;
+                let next = current
+                    .checked_add(1)
+                    .ok_or_else(|| crate::error::internal("policy revision counter overflow"))?;
+                let revision = u32::try_from(next)
+                    .map_err(|_| crate::error::internal("policy revision does not fit u32"))?;
+                let now = now_iso();
+                tx.execute(
+                    "INSERT INTO policy_revisions (run_id, revision, policy_json, policy_sha256, \
+                     reason, created_at, operation_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    rusqlite::params![
+                        run_id,
+                        next,
+                        policy_json,
+                        policy_sha256,
+                        reason,
+                        now,
+                        operation_id,
+                    ],
+                )?;
+                rows.push(PolicyRevisionRow {
+                    run_id,
+                    revision,
+                    policy_json,
+                    policy_sha256,
                     reason: reason.clone(),
                     created_at: now,
                     operation_id: Some(operation_id),

@@ -393,10 +393,23 @@ pub fn grant_retry(
     packet_id: &str,
     since: &str,
 ) -> Result<u32, ProtoError> {
+    grant_retry_since(ledger, run_id, packet_id, since, None)
+}
+
+/// [`grant_retry`] with a policy-revision cutoff for history-charged counts.
+pub fn grant_retry_since(
+    ledger: &Ledger,
+    run_id: &str,
+    packet_id: &str,
+    since: &str,
+    cutoff: Option<&str>,
+) -> Result<u32, ProtoError> {
     let owned_packet = packet_id.to_owned();
     let since = since.to_owned();
+    let cutoff = cutoff.map(str::to_owned);
     let payload = ledger.append_event_derived(run_id, RETRY_KIND, move |standing| {
-        let standing = transport_failures_of(standing, &owned_packet).map_err(internal)?;
+        let standing = transport_failures_of_since(standing, &owned_packet, cutoff.as_deref())
+            .map_err(internal)?;
         let count = standing.saturating_add(1);
         let retry_after = backoff_deadline(&since, count.saturating_sub(1)).map_err(internal)?;
         let payload = ProtoEvent::Retry {
@@ -427,8 +440,22 @@ pub fn grant_retry_for_attempt(
     attempt_id: i64,
     since: &str,
 ) -> Result<u32, ProtoError> {
+    grant_retry_for_attempt_since(ledger, run_id, packet_id, attempt_id, since, None)
+}
+
+/// [`grant_retry_for_attempt`] with a policy-revision cutoff for the
+/// standing retry count.
+pub fn grant_retry_for_attempt_since(
+    ledger: &Ledger,
+    run_id: &str,
+    packet_id: &str,
+    attempt_id: i64,
+    since: &str,
+    cutoff: Option<&str>,
+) -> Result<u32, ProtoError> {
     let owned_packet = packet_id.to_owned();
     let since = since.to_owned();
+    let cutoff = cutoff.map(str::to_owned);
     let payload = ledger.append_event_derived(run_id, RETRY_KIND, move |standing| {
         let parsed = parse_proto_events(standing).map_err(internal)?;
         if let Some(existing) = parsed.iter().find_map(|event| match event {
@@ -448,7 +475,8 @@ pub fn grant_retry_for_attempt(
         }) {
             return Ok((existing, false));
         }
-        let standing = transport_failures_of(standing, &owned_packet).map_err(internal)?;
+        let standing = transport_failures_of_since(standing, &owned_packet, cutoff.as_deref())
+            .map_err(internal)?;
         let count = standing.saturating_add(1);
         let retry_after = backoff_deadline(&since, count.saturating_sub(1)).map_err(internal)?;
         let payload = ProtoEvent::Retry {
@@ -502,6 +530,36 @@ pub fn transport_failures_of(rows: &[EventRow], packet_id: &str) -> Result<u32, 
             _ => None,
         })
         .unwrap_or(0))
+}
+
+fn transport_failures_of_since(
+    rows: &[EventRow],
+    packet_id: &str,
+    cutoff: Option<&str>,
+) -> Result<u32, ProtoError> {
+    if cutoff.is_none() {
+        return transport_failures_of(rows, packet_id);
+    }
+    parse_proto_events(rows)?;
+    let cutoff = cutoff.expect("checked");
+    for row in rows
+        .iter()
+        .rev()
+        .filter(|row| row.kind == RETRY_KIND && row.ts.as_str() >= cutoff)
+    {
+        let parsed = parse_proto_events(std::slice::from_ref(row))?;
+        if let Some(ProtoEvent::Retry {
+            packet_id: charged,
+            transport_failures,
+            ..
+        }) = parsed.into_iter().next()
+        {
+            if charged == packet_id {
+                return Ok(transport_failures);
+            }
+        }
+    }
+    Ok(0)
 }
 
 /// Normalize an RFC-3339 UTC string (as jiff displays it) to the ledger's
