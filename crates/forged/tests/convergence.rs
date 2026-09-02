@@ -25,7 +25,7 @@ use nix::unistd::Pid;
 // The malformed-facts injection freezes the controller without the
 // failpoints feature; it uses fully qualified nix paths.
 use serde_json::{json, Value};
-use support::TestEnv;
+use support::{fabricate_run, TestEnv};
 
 const WAIT: Duration = Duration::from_secs(60);
 
@@ -80,6 +80,63 @@ fn start_run(env: &TestEnv, run: &str) {
         "main",
     ]);
     assert_eq!(code, 0, "run start {run}: {started}");
+}
+
+fn fabricate_live_attempt(env: &TestEnv, run: &str) {
+    fabricate_run(env, run);
+    let sha = "a".repeat(64);
+    let packet = forged_types::WorkPacket {
+        schema: "forged.packet/1".to_owned(),
+        packet_id: format!("{run}/implement/1"),
+        run_id: run.to_owned(),
+        work_id: format!("bead-{run}"),
+        stage: forged_types::Stage::Implement,
+        execution: None,
+        lane_seq: None,
+        spec: forged_types::SpecRef {
+            path: "beads://fixture".to_owned(),
+            sha256: sha.clone(),
+            revision: None,
+        },
+        worktree: env.root.join("fabricated-worktree"),
+        branch: format!("work/{run}"),
+        base_ref: "main".to_owned(),
+        contract: forged_types::StageContract {
+            instructions: "hold one fabricated capacity seat".to_owned(),
+            gate_commands: Vec::new(),
+            deliverable: forged_types::Deliverable::CommitsInWorktree,
+            budget_s: 60,
+        },
+        result_schema: "forged.result/1".to_owned(),
+        provider_hints: forged_types::ProviderHints {
+            provider: "fixture".to_owned(),
+            model: "fixture".to_owned(),
+            effort: None,
+            sandbox: forged_types::Sandbox::ReadOnly,
+        },
+        field_notes: Vec::new(),
+    };
+    let ledger = env.ledger();
+    let packet_id = ledger
+        .open_packet(forged_ledger::NewPacket {
+            run_id: run.to_owned(),
+            stage: forged_types::Stage::Implement,
+            seq: 1,
+            spec_path: packet.spec.path.clone(),
+            spec_sha256: sha.clone(),
+            spec_revision: None,
+            policy_revision: None,
+            body_json: packet.stored_body().expect("stored packet"),
+        })
+        .expect("open fabricated packet");
+    ledger
+        .claim_packet(
+            &packet_id,
+            &format!("fixture:{packet_id}"),
+            &forged_ledger::SpecFence::Sha256(sha),
+        )
+        .expect("claim fabricated packet");
+    ledger.close().expect("close ledger");
 }
 
 fn start_epic(env: &TestEnv, epic: &str, children: &[(&str, &Path, bool)]) {
@@ -525,6 +582,42 @@ fn priority_update_repairs_a_priorityless_item_before_admission() {
     let (code, before) = env.forged(&["work", "show", "--id", run]);
     assert_eq!(code, 0, "show priority-less work: {before}");
     assert_eq!(before["result"]["work"]["priority"], Value::Null);
+    let (code, refused) = env.forged(&[
+        "run",
+        "submit",
+        "--run",
+        run,
+        "--idempotency-key",
+        "adm-priority-missing-submit",
+    ]);
+    assert_ne!(code, 0, "priority-less submit must refuse: {refused}");
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .is_some_and(
+                |message| message.contains("bead-malformed") && message.contains("priority")
+            ),
+        "field-naming admission refusal: {refused}"
+    );
+    assert_eq!(
+        refused["error"]["detail"],
+        json!({
+            "schema": "forged.remedy/1",
+            "verb": "work update",
+            "args": {
+                "id": run,
+                "expectedRevision": null,
+                "priority": null,
+            },
+            "reason": "set a priority with the current work revision before submitting again",
+        })
+    );
+    let ledger = env.ledger();
+    assert!(ledger
+        .get_desired_work(DesiredSubjectKind::Run, run)
+        .expect("desired query")
+        .is_none());
+    ledger.close().expect("close ledger");
     let revision = before["result"]["work"]["revision"]
         .as_i64()
         .expect("ledger revision");
@@ -576,6 +669,148 @@ fn priority_update_repairs_a_priorityless_item_before_admission() {
 
     stop_run(&env, run);
     no_live_reservations(&env);
+}
+
+#[test]
+fn submit_preflight_refuses_every_non_capacity_shape_family_with_a_remedy() {
+    let blocked = TestEnv::new("adm-preflight-blocked");
+    start_run(&blocked, "adm-preflight-blocked");
+    blocked.set_work_field("adm-preflight-blocked", "status", "blocked");
+    let (code, refusal) = blocked.forged(&["run", "submit", "--run", "adm-preflight-blocked"]);
+    assert_ne!(code, 0, "blocked work must refuse: {refusal}");
+    assert!(
+        refusal["error"]["message"]
+            .as_str()
+            .is_some_and(
+                |message| message.contains("bead-not-runnable") && message.contains("blocked")
+            ),
+        "status-naming refusal: {refusal}"
+    );
+    assert_eq!(refusal["error"]["detail"]["verb"], json!("work promote"));
+
+    let closed = TestEnv::new("adm-preflight-closed");
+    start_run(&closed, "adm-preflight-closed");
+    closed.set_work_field("adm-preflight-closed", "status", "closed");
+    let (code, refusal) = closed.forged(&["run", "submit", "--run", "adm-preflight-closed"]);
+    assert_ne!(code, 0, "closed work must refuse: {refusal}");
+    assert!(
+        refusal["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("closed")),
+        "status-naming refusal: {refusal}"
+    );
+    assert_eq!(refusal["error"]["detail"]["verb"], json!("work reopen"));
+
+    let mismatch = TestEnv::new("adm-preflight-repository");
+    start_run(&mismatch, "adm-preflight-repository");
+    mismatch.set_work_repository("adm-preflight-repository", "/other/repository");
+    let expected_repository = mismatch.repos.repo.to_string_lossy();
+    let (code, refusal) = mismatch.forged(&["run", "submit", "--run", "adm-preflight-repository"]);
+    assert_ne!(code, 0, "repository mismatch must refuse: {refusal}");
+    let message = refusal["error"]["message"]
+        .as_str()
+        .expect("repository refusal message");
+    assert!(message.contains("repository-mismatch"), "{refusal}");
+    assert!(message.contains(expected_repository.as_ref()), "{refusal}");
+    assert!(message.contains("/other/repository"), "{refusal}");
+    assert_eq!(refusal["error"]["detail"]["verb"], json!("work update"));
+
+    let unavailable = TestEnv::new("adm-preflight-unavailable");
+    start_run(&unavailable, "adm-preflight-unavailable");
+    rusqlite::Connection::open(unavailable.anvil.join("state.db"))
+        .expect("open work ledger")
+        .execute(
+            "UPDATE runs SET bead_id = 'missing-work-item' WHERE run_id = ?1",
+            ["adm-preflight-unavailable"],
+        )
+        .expect("remove run work identity");
+    let (code, refusal) =
+        unavailable.forged(&["run", "submit", "--run", "adm-preflight-unavailable"]);
+    assert_ne!(code, 0, "unavailable work must refuse: {refusal}");
+    assert!(
+        refusal["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("bead-unavailable")
+                && message.contains("missing-work-item")),
+        "work-identity refusal: {refusal}"
+    );
+    assert_eq!(refusal["error"]["detail"]["verb"], json!("work show"));
+
+    let roster = TestEnv::new("adm-preflight-roster");
+    start_run(&roster, "adm-preflight-roster");
+    rusqlite::Connection::open(roster.anvil.join("state.db"))
+        .expect("open definition ledger")
+        .execute(
+            "UPDATE run_definitions SET package_json = '{}' WHERE run_id = ?1",
+            ["adm-preflight-roster"],
+        )
+        .expect("remove provider/model launch facts");
+    let (code, refusal) = roster.forged(&["run", "submit", "--run", "adm-preflight-roster"]);
+    assert_ne!(code, 0, "missing launch facts must refuse: {refusal}");
+    assert!(
+        refusal["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("provider") && message.contains("model")),
+        "roster-seam refusal: {refusal}"
+    );
+    assert_eq!(
+        refusal["error"]["detail"]["verb"],
+        json!("run revise-roster")
+    );
+}
+
+#[test]
+fn epic_submit_uses_the_same_priority_preflight() {
+    let env = TestEnv::new("adm-epic-preflight");
+    let child_spec = env.spec.clone();
+    start_epic(
+        &env,
+        "adm-epic-preflight",
+        &[("adm-epic-preflight-child", child_spec.as_path(), true)],
+    );
+    env.set_work_field("adm-epic-preflight", "priority", "");
+    let (code, refusal) = env.forged(&["epic", "submit", "--epic", "adm-epic-preflight"]);
+    assert_ne!(code, 0, "priority-less epic submit must refuse: {refusal}");
+    assert!(
+        refusal["error"]["message"]
+            .as_str()
+            .is_some_and(
+                |message| message.contains("bead-malformed") && message.contains("priority")
+            ),
+        "epic field-naming refusal: {refusal}"
+    );
+    assert_eq!(refusal["error"]["detail"]["verb"], json!("work update"));
+}
+
+#[test]
+fn capacity_saturation_still_authorizes_and_queues_submit() {
+    let env = TestEnv::new("adm-preflight-capacity");
+    set_admission(&env, 1, 8, 3);
+    start_run(&env, "adm-preflight-capacity-target");
+    fabricate_live_attempt(&env, "adm-preflight-capacity-holder");
+
+    let (code, queued) = env.forged(&[
+        "run",
+        "submit",
+        "--run",
+        "adm-preflight-capacity-target",
+        "--idempotency-key",
+        "adm-preflight-capacity-submit",
+    ]);
+    assert_eq!(code, 0, "capacity saturation must queue: {queued}");
+    assert_eq!(queued["result"]["submitted"], json!(true));
+    assert_eq!(queued["result"]["queued"], json!(true));
+    assert_eq!(queued["result"]["controller"], Value::Null);
+    assert_eq!(
+        queued["result"]["admission"]["reason"],
+        json!("total-capacity")
+    );
+    let ledger = env.ledger();
+    assert!(ledger
+        .get_desired_work(DesiredSubjectKind::Run, "adm-preflight-capacity-target")
+        .expect("desired query")
+        .is_some());
+    ledger.close().expect("close ledger");
 }
 
 #[test]

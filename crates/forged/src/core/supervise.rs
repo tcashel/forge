@@ -4,6 +4,7 @@
 //! budget decision, and singleton fence is persisted by the same tick used
 //! by `forged supervise --once`; no transaction is held while sleeping.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -11,7 +12,9 @@ use forged_ledger::{
     AdmissionReservationRow, DesiredReconcileOutcome, DesiredReconcileUpdate,
     DesiredRestartReservation, DesiredState, DesiredSubjectKind, DesiredWorkRow, RunState,
 };
-use forged_types::{AdmissionOutcome, ErrorCode, OperationRequest, OperationResponse};
+use forged_types::{
+    AdmissionOutcome, AdmissionReason, ErrorCode, OperationRequest, OperationResponse,
+};
 use serde_json::{json, Value};
 
 use crate::config::{now_iso, HostPolicy};
@@ -25,6 +28,62 @@ const POLL_SECONDS: u64 = 5;
 const CLAIM_LEASE_SECONDS: u64 = 60;
 const MAX_BACKOFF_SECONDS: u64 = 300;
 const PROJECTION_PASS_BUDGET: Duration = Duration::from_secs(5);
+const DEFERRED_ATTENTION_SURFACE_WAKES: u32 = 3;
+
+/// Consecutive supervisor deferrals are process-local by design. A service
+/// restart resets this best-effort visibility delay; the durable admission
+/// decisions remain complete scheduling truth.
+#[derive(Default)]
+struct ConsecutiveDeferrals {
+    by_subject: BTreeMap<(DesiredSubjectKind, String), (AdmissionReason, u32)>,
+}
+
+impl ConsecutiveDeferrals {
+    fn observe(
+        &mut self,
+        kind: DesiredSubjectKind,
+        id: &str,
+        outcome: AdmissionOutcome,
+        reason: AdmissionReason,
+    ) -> bool {
+        let key = (kind, id.to_owned());
+        if outcome != AdmissionOutcome::Deferred {
+            self.by_subject.remove(&key);
+            return false;
+        }
+        let state = self.by_subject.entry(key).or_insert((reason, 0));
+        if state.0 != reason {
+            *state = (reason, 0);
+        }
+        state.1 = state.1.saturating_add(1);
+        state.1 == DEFERRED_ATTENTION_SURFACE_WAKES
+    }
+
+    fn reset(&mut self, kind: DesiredSubjectKind, id: &str) {
+        self.by_subject.remove(&(kind, id.to_owned()));
+    }
+}
+
+async fn record_deferred_attention(
+    ledger: &forged_ledger::Ledger,
+    kind: DesiredSubjectKind,
+    id: &str,
+    reason: AdmissionReason,
+) -> Result<(), Failure> {
+    let payload = json!({
+        "schema": "forged.admission.attention/1",
+        "condition": "admission-deferred",
+        "subjectKind": kind.as_str(),
+        "reason": reason,
+        "wakes": DEFERRED_ATTENTION_SURFACE_WAKES,
+    });
+    let id = id.to_owned();
+    on_ledger(ledger, move |ledger| {
+        ledger.append_event_once(&id, "forged.admission.attention", payload)?;
+        Ok(())
+    })
+    .await
+}
 
 struct ProjectionPassTask {
     handle: Option<tokio::task::JoinHandle<Value>>,
@@ -1112,9 +1171,10 @@ async fn finish_spawn_failure(
     .await
 }
 
-pub(super) async fn tick(
+async fn tick_with_deferrals(
     ctx: &Ctx,
     settlement: &mut WorkSettlementPass,
+    deferrals: &mut ConsecutiveDeferrals,
     join_settlement: bool,
 ) -> Result<Value, Failure> {
     let started_at = now_iso();
@@ -1172,9 +1232,13 @@ pub(super) async fn tick(
     let mut admission_rows = Vec::new();
     for (candidate, token) in claimed_rows {
         match reconcile_live_before_admission(ctx, &candidate, &token).await {
-            Ok(Some(report)) => subjects.push(report),
+            Ok(Some(report)) => {
+                deferrals.reset(candidate.subject_kind, &candidate.subject_id);
+                subjects.push(report);
+            }
             Ok(None) => admission_rows.push((candidate, token)),
             Err(error) => {
+                deferrals.reset(candidate.subject_kind, &candidate.subject_id);
                 // Mirror the ordinary per-subject failure path below. A
                 // crash still bypasses this code and retains the claim lease.
                 match finish_retryable(ctx, &candidate, &token, error.to_string()).await {
@@ -1218,6 +1282,7 @@ pub(super) async fn tick(
         };
         let Some(admission) = admissions.get(&(admission_kind, candidate.subject_id.clone()))
         else {
+            deferrals.reset(candidate.subject_kind, &candidate.subject_id);
             let report = finish_action(
                 ctx,
                 &candidate,
@@ -1283,8 +1348,23 @@ pub(super) async fn tick(
             )
             .await?;
             if report["action"] == "superseded" {
+                deferrals.reset(candidate.subject_kind, &candidate.subject_id);
                 subjects.push(report);
             } else {
+                if deferrals.observe(
+                    candidate.subject_kind,
+                    &candidate.subject_id,
+                    admission.decision.outcome,
+                    admission.decision.reason,
+                ) {
+                    record_deferred_attention(
+                        &ctx.ledger,
+                        candidate.subject_kind,
+                        &candidate.subject_id,
+                        admission.decision.reason,
+                    )
+                    .await?;
+                }
                 subjects.push(json!({
                     "action": action,
                     "admission": admission.decision,
@@ -1293,6 +1373,7 @@ pub(super) async fn tick(
             }
             continue;
         }
+        deferrals.reset(candidate.subject_kind, &candidate.subject_id);
         let Some(reservation) = admission.reservation.clone() else {
             return Err(Failure::internal(
                 "admitted decision has no capacity reservation",
@@ -1355,6 +1436,15 @@ pub(super) async fn tick(
         "herdrProjection": projection,
         "nextWakeAt": next_wake_at,
     }))
+}
+
+pub(super) async fn tick(
+    ctx: &Ctx,
+    settlement: &mut WorkSettlementPass,
+    join_settlement: bool,
+) -> Result<Value, Failure> {
+    let mut deferrals = ConsecutiveDeferrals::default();
+    tick_with_deferrals(ctx, settlement, &mut deferrals, join_settlement).await
 }
 
 fn sleep_until(next_wake: Option<&str>) -> Duration {
@@ -1535,6 +1625,7 @@ pub async fn supervise(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
     let mut ticks = 0u64;
     let mut last_report = Value::Null;
     let mut settlement = WorkSettlementPass::new();
+    let mut deferrals = ConsecutiveDeferrals::default();
     // The daemon's config is decided fresh per tick, so a live edit to
     // rosters, admission, or pricing is served without a service restart. A
     // malformed mid-edit file keeps the last-good snapshot rather than
@@ -1565,7 +1656,7 @@ pub async fn supervise(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
         // its durable marker lands, and the daily snapshot fires when the
         // day rolls over — not only on the start-up day.
         bootstrap_pass(&live).await;
-        match tick(&live, &mut settlement, false).await {
+        match tick_with_deferrals(&live, &mut settlement, &mut deferrals, false).await {
             Ok(report) => {
                 ticks = ticks.saturating_add(1);
                 if let Some(observer) = observer.as_mut() {
@@ -1659,5 +1750,74 @@ mod tests {
         assert_eq!(LOOP_SCHEMA, "forged.supervise.session/1");
         assert_eq!(DesiredState::Running.as_str(), "running");
         assert_eq!(DesiredReconcileOutcome::Exhausted.as_str(), "exhausted");
+    }
+
+    #[test]
+    fn consecutive_deferrals_surface_once_per_reason_without_alternating_spam() {
+        let mut deferrals = ConsecutiveDeferrals::default();
+        let observe = |deferrals: &mut ConsecutiveDeferrals, reason| {
+            deferrals.observe(
+                DesiredSubjectKind::Run,
+                "run-deferred",
+                AdmissionOutcome::Deferred,
+                reason,
+            )
+        };
+        for reason in [
+            AdmissionReason::TotalCapacity,
+            AdmissionReason::ProviderCapacity,
+            AdmissionReason::TotalCapacity,
+            AdmissionReason::ProviderCapacity,
+            AdmissionReason::TotalCapacity,
+            AdmissionReason::ProviderCapacity,
+        ] {
+            assert!(!observe(&mut deferrals, reason));
+        }
+        assert!(!observe(
+            &mut deferrals,
+            AdmissionReason::RepositoryWriteCapacity
+        ));
+        assert!(!observe(
+            &mut deferrals,
+            AdmissionReason::RepositoryWriteCapacity
+        ));
+        assert!(observe(
+            &mut deferrals,
+            AdmissionReason::RepositoryWriteCapacity
+        ));
+        assert!(!observe(
+            &mut deferrals,
+            AdmissionReason::RepositoryWriteCapacity
+        ));
+        assert!(!deferrals.observe(
+            DesiredSubjectKind::Run,
+            "run-deferred",
+            AdmissionOutcome::Admitted,
+            AdmissionReason::CapacityAvailable,
+        ));
+        assert!(!observe(&mut deferrals, AdmissionReason::WorkMalformed));
+    }
+
+    #[tokio::test]
+    async fn deferred_attention_marker_is_deduplicated_per_subject_and_reason() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ledger = forged_ledger::Ledger::open(&dir.path().join("state.db")).expect("ledger");
+        for reason in [
+            AdmissionReason::TotalCapacity,
+            AdmissionReason::TotalCapacity,
+            AdmissionReason::WorkMalformed,
+        ] {
+            record_deferred_attention(&ledger, DesiredSubjectKind::Run, "run-deferred", reason)
+                .await
+                .expect("record attention marker");
+        }
+        let events = ledger
+            .list_events(Some("run-deferred"), 0, 100)
+            .expect("list markers")
+            .into_iter()
+            .filter(|event| event.kind == "forged.admission.attention")
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 2, "one marker per distinct reason");
+        ledger.close().expect("close ledger");
     }
 }

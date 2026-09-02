@@ -13,7 +13,9 @@ use forged_ledger::{
     DesiredState, DesiredSubjectKind, EffectClass, Ledger, OperationState, OwnedHerdrCleanupState,
     SlotOutcome,
 };
-use forged_types::{AdmissionOutcome, ErrorCode, OperationRequest, OperationResponse};
+use forged_types::{
+    AdmissionOutcome, AdmissionReason, ErrorCode, OperationRequest, OperationResponse,
+};
 use serde_json::{json, Value};
 
 use crate::config::{now_iso, HostPolicy};
@@ -80,6 +82,145 @@ fn keyless_resubmit_remedy(scope: Scope, id: &str) -> forged_types::RemedyV1 {
         reason: "omit the idempotency key so forged can mint the next controller generation"
             .to_owned(),
     })
+}
+
+fn action_remedy(
+    verb: impl Into<String>,
+    args: Value,
+    reason: impl Into<String>,
+) -> forged_types::RemedyV1 {
+    let Value::Object(args) = args else {
+        unreachable!("submit preflight remedy args are objects")
+    };
+    forged_types::RemedyV1::from(forged_types::OperationActionV1 {
+        verb: verb.into(),
+        args,
+        reason: reason.into(),
+    })
+}
+
+fn admission_preflight_refusal(
+    scope: Scope,
+    id: &str,
+    refusal: &super::admission::AdmissionShapeRefusal,
+) -> (Failure, forged_types::RemedyV1) {
+    let candidate = &refusal.candidate;
+    let work_id = &candidate.work_id;
+    let message = if refusal.reason == AdmissionReason::RepositoryMismatch {
+        format!(
+            "{} {id} admission preflight refused: repository-mismatch: execution repository {:?} does not match work repository {:?}",
+            scope.noun(),
+            candidate.repository,
+            candidate.work_repository.as_deref().unwrap_or("missing")
+        )
+    } else if refusal.reason == AdmissionReason::WorkUnavailable {
+        format!(
+            "{} {id} admission preflight refused: {}: work item {work_id:?} is unavailable",
+            scope.noun(),
+            refusal.detail()
+        )
+    } else {
+        format!(
+            "{} {id} admission preflight refused: {}",
+            scope.noun(),
+            refusal.detail()
+        )
+    };
+    let remedy = match refusal.reason {
+        AdmissionReason::WorkMalformed if candidate.priority.is_none() => action_remedy(
+            "work update",
+            json!({
+                "id": work_id,
+                "expectedRevision": Value::Null,
+                "priority": Value::Null,
+            }),
+            "set a priority with the current work revision before submitting again",
+        ),
+        AdmissionReason::WorkMalformed
+            if candidate.provider.as_deref().is_none_or(str::is_empty)
+                || candidate.model.as_deref().is_none_or(str::is_empty) =>
+        {
+            let args = match scope {
+                Scope::Run => json!({
+                    "run": id,
+                    "roster": Value::Null,
+                    "reason": Value::Null,
+                }),
+                Scope::Epic => json!({
+                    "epic": id,
+                    "roster": Value::Null,
+                    "reason": Value::Null,
+                }),
+            };
+            action_remedy(
+                format!("{} revise-roster", scope.noun()),
+                args,
+                "choose a roster that supplies the required provider and model launch facts",
+            )
+        }
+        AdmissionReason::WorkMalformed
+            if candidate.repository.trim().is_empty()
+                || candidate
+                    .work_repository
+                    .as_deref()
+                    .is_none_or(str::is_empty) =>
+        {
+            action_remedy(
+                "work update",
+                json!({
+                    "id": work_id,
+                    "expectedRevision": Value::Null,
+                    "metadata": {"repository": candidate.repository},
+                }),
+                "set the work repository to the execution repository before submitting again",
+            )
+        }
+        AdmissionReason::WorkMalformed => action_remedy(
+            "work show",
+            json!({"id": work_id}),
+            "re-read the work item to recover its current revision before submitting again",
+        ),
+        AdmissionReason::WorkNotRunnable
+            if matches!(
+                candidate.work_status.as_deref(),
+                Some("blocked" | "deferred")
+            ) =>
+        {
+            action_remedy(
+                "work promote",
+                json!({"id": work_id, "expectedRevision": Value::Null}),
+                "promote the blocked work item to a runnable specification before submitting again",
+            )
+        }
+        AdmissionReason::WorkNotRunnable => action_remedy(
+            "work reopen",
+            json!({"id": work_id}),
+            "reopen the closed work item before submitting again",
+        ),
+        AdmissionReason::RepositoryMismatch => action_remedy(
+            "work update",
+            json!({
+                "id": work_id,
+                "expectedRevision": Value::Null,
+                "metadata": {"repository": candidate.repository},
+            }),
+            "align the work repository with the execution repository before submitting again",
+        ),
+        AdmissionReason::Terminal | AdmissionReason::Superseded => {
+            forged_types::RemedyV1::from(crate::core::work_supersede_action(work_id))
+        }
+        AdmissionReason::WorkUnavailable | AdmissionReason::Unauthorized => action_remedy(
+            "work show",
+            json!({"id": work_id}),
+            "restore or re-read the work item before submitting again",
+        ),
+        _ => action_remedy(
+            "work show",
+            json!({"id": work_id}),
+            "re-read the work item and resolve the reported admission refusal",
+        ),
+    };
+    (Failure::invalid(message), remedy)
 }
 
 fn payload(row: &forged_ledger::EventRow) -> Option<Value> {
@@ -1778,6 +1919,27 @@ async fn submit(ctx: &Ctx, req: &mut OperationRequest, scope: Scope) -> Operatio
         }
     };
     max_generation = max_generation.max(owned_generation.unwrap_or(0));
+
+    let preflight =
+        match super::admission::preflight_shape(ctx, (scope.desired_kind(), id.clone())).await {
+            Ok(preflight) => preflight,
+            Err(error) => {
+                return err_response(
+                    &derive_key(scope.operation(), Some(&id), None, None),
+                    &error,
+                )
+            }
+        };
+    if let Some(refusal) = preflight {
+        let key = derive_key(
+            scope.operation(),
+            Some(&id),
+            Some("admission-preflight"),
+            None,
+        );
+        let (failure, remedy) = admission_preflight_refusal(scope, &id, &refusal);
+        return remedy_response(&key, &failure, remedy);
+    }
 
     let stopped = match scope {
         Scope::Run => match super::drive::project(ctx, &id).await {

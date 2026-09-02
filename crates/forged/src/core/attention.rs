@@ -1415,35 +1415,54 @@ fn collect_domain_sources(input: &ProjectionInput<'_>) -> Result<Vec<RawAttentio
         );
     }
 
-    // A parked controller appends one durable marker after its wake
-    // threshold. The item stands while that packet's LATEST admission
-    // decision is still deferred and clears through the admit itself — no
-    // attention control resolves it. Rate-limit deferrals keep their
-    // ProviderDegraded projection above.
-    let mut parked: BTreeMap<String, (&forged_ledger::EventRow, Value)> = BTreeMap::new();
+    // A parked controller or the supervisor appends one durable marker after
+    // its wake threshold. Packet markers carry packetId; supervisor markers
+    // carry run/epic subjectKind and use the event subject directly. Either
+    // stands only while that exact subject's LATEST admission decision is
+    // still deferred and clears through the admit itself. Rate-limit
+    // deferrals keep their ProviderDegraded projection above.
+    let mut parked: BTreeMap<
+        String,
+        (
+            &forged_ledger::EventRow,
+            Value,
+            &forged_types::AdmissionDecisionV1,
+        ),
+    > = BTreeMap::new();
     for event in events(input, "forged.admission.attention") {
-        let Some(id) = event.run_id.as_ref() else {
+        let Some(event_subject_id) = event.run_id.as_ref() else {
             continue;
         };
         let payload = event_value(&event.payload_json);
         if payload.get("condition").and_then(Value::as_str) != Some("admission-deferred") {
             continue;
         }
-        if parked
-            .get(id)
-            .is_none_or(|(seen, _)| seen.event_id < event.event_id)
-        {
-            parked.insert(id.clone(), (event, payload));
-        }
-    }
-    for (event_subject_id, (event, payload)) in parked {
-        let Some(packet_id) = payload.get("packetId").and_then(Value::as_str) else {
-            continue;
+        let (decision_kind, decision_id) =
+            if let Some(packet_id) = payload.get("packetId").and_then(Value::as_str) {
+                (
+                    forged_types::AdmissionSubjectKind::Packet,
+                    packet_id.to_owned(),
+                )
+            } else {
+                let kind = match payload.get("subjectKind").and_then(Value::as_str) {
+                    Some("run") => forged_types::AdmissionSubjectKind::Run,
+                    Some("epic") => forged_types::AdmissionSubjectKind::Epic,
+                    _ => continue,
+                };
+                (kind, event_subject_id.clone())
+            };
+        let marker_reason = match payload.get("reason").cloned() {
+            None => None,
+            Some(value) => match serde_json::from_value::<AdmissionReason>(value) {
+                Ok(reason) => Some(reason),
+                Err(_) => continue,
+            },
         };
         let deferred = input.admission_decisions.iter().find(|decision| {
-            decision.subject_kind == forged_types::AdmissionSubjectKind::Packet
-                && decision.subject_id == packet_id
+            decision.subject_kind == decision_kind
+                && decision.subject_id == decision_id
                 && decision.outcome == AdmissionOutcome::Deferred
+                && marker_reason.is_none_or(|reason| decision.reason == reason)
                 && !matches!(
                     decision.reason,
                     AdmissionReason::RateLimitCeiling | AdmissionReason::StaleRateLimit
@@ -1452,17 +1471,48 @@ fn collect_domain_sources(input: &ProjectionInput<'_>) -> Result<Vec<RawAttentio
         let Some(decision) = deferred else {
             continue;
         };
-        let id = match &input.surface {
-            ProjectionSurface::Inventory => event_subject_id,
-            ProjectionSurface::Observation {
-                snapshot: observed, ..
-            } => observed
+        if parked
+            .get(event_subject_id)
+            .is_none_or(|(seen, _, _)| seen.event_id < event.event_id)
+        {
+            parked.insert(event_subject_id.clone(), (event, payload, decision));
+        }
+    }
+    for (event_subject_id, (event, payload, decision)) in parked {
+        let packet_id = payload.get("packetId").and_then(Value::as_str);
+        let id = match (&input.surface, packet_id) {
+            (ProjectionSurface::Inventory, _) => event_subject_id,
+            (
+                ProjectionSurface::Observation {
+                    snapshot: observed, ..
+                },
+                Some(packet_id),
+            ) => observed
                 .packets
                 .iter()
                 .find(|packet| packet.packet_id == packet_id)
                 .map(|packet| packet.run_id.clone())
                 .unwrap_or_else(|| observed.subject.id.clone()),
+            (ProjectionSurface::Observation { .. }, None) => event_subject_id,
         };
+        let detail = packet_id.map_or_else(
+            || {
+                format!(
+                    "{} admission remains deferred ({})",
+                    payload
+                        .get("subjectKind")
+                        .and_then(Value::as_str)
+                        .unwrap_or("subject"),
+                    super::admission::decision_reason(decision)
+                )
+            },
+            |packet_id| {
+                format!(
+                    "run is parked: packet {packet_id} admission deferred ({})",
+                    super::admission::decision_reason(decision)
+                )
+            },
+        );
         add_raw(
             &mut raw,
             &id,
@@ -1471,12 +1521,10 @@ fn collect_domain_sources(input: &ProjectionInput<'_>) -> Result<Vec<RawAttentio
             &event.ts,
             event.event_id,
             format!("event:{}", event.event_id),
-            format!(
-                "run is parked: packet {packet_id} admission deferred ({})",
-                super::admission::decision_reason(decision)
-            ),
+            detail,
             json!({
                 "packetId": packet_id,
+                "subjectKind": payload.get("subjectKind"),
                 "wakes": payload.get("wakes"),
                 "decision": decision,
             }),
@@ -2829,6 +2877,76 @@ mod tests {
             .expect("project admitted packet")
             .iter()
             .all(|item| item.condition != AttentionCondition::AdmissionDeferred));
+    }
+
+    #[test]
+    fn supervisor_markers_join_run_and_epic_decisions_without_packet_ids() {
+        for (index, (subject_kind, subject_id, entry_kind)) in [
+            (AdmissionSubjectKind::Run, "run-deferred", "slice"),
+            (AdmissionSubjectKind::Epic, "epic-deferred", "epic"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let decision = |outcome, reason| AdmissionDecisionV1 {
+                schema: ADMISSION_DECISION_SCHEMA_V1.to_owned(),
+                batch_id: format!("batch-{subject_id}"),
+                subject_kind,
+                subject_id: subject_id.to_owned(),
+                control_revision: 1,
+                repository: "/repo".to_owned(),
+                priority: Some(2),
+                provider: Some("claude".to_owned()),
+                model: Some("opus".to_owned()),
+                resource_class: AdmissionResourceClass::Read,
+                outcome,
+                reason,
+                reason_detail: None,
+                policy_revision: "policy".to_owned(),
+                evidence: AdmissionCapacityV1::default(),
+                next_eligible_wake_at: None,
+            };
+            let mut snapshot = snapshot();
+            snapshot.events_by_kind.insert(
+                "forged.admission.attention".to_owned(),
+                vec![event(
+                    i64::try_from(index + 1).expect("event id"),
+                    subject_id,
+                    "forged.admission.attention",
+                    json!({
+                        "schema": "forged.admission.attention/1",
+                        "condition": "admission-deferred",
+                        "subjectKind": serde_json::to_value(subject_kind)
+                            .expect("subject kind"),
+                        "reason": "total-capacity",
+                        "wakes": 3,
+                    }),
+                )],
+            );
+            snapshot.admission_decisions.push(decision(
+                AdmissionOutcome::Deferred,
+                AdmissionReason::TotalCapacity,
+            ));
+            let mut subject_entry = entry(subject_id);
+            subject_entry["kind"] = json!(entry_kind);
+            let items = project_active(&snapshot, &[subject_entry.clone()], &[])
+                .expect("project supervisor deferral");
+            let item = items
+                .iter()
+                .find(|item| item.condition == AttentionCondition::AdmissionDeferred)
+                .expect("supervisor deferral item");
+            assert_eq!(item.subject_id, subject_id);
+            assert!(item.detail.contains("total-capacity"), "{item:?}");
+
+            snapshot.admission_decisions[0] = decision(
+                AdmissionOutcome::Admitted,
+                AdmissionReason::CapacityAvailable,
+            );
+            assert!(project_active(&snapshot, &[subject_entry], &[])
+                .expect("project admitted subject")
+                .iter()
+                .all(|item| item.condition != AttentionCondition::AdmissionDeferred));
+        }
     }
 
     #[test]
