@@ -2044,21 +2044,22 @@ fn convergence_crash_matrix_is_effect_exact() {
     gh.authorize_epic("conv-gh-effect");
     assert_eq!(gh.reconcile_epic("conv-gh-effect").0, 0);
     assert_eq!(gh.reconcile_epic("conv-gh-effect").0, 0);
-    wait_until("clean child before merge pass", || {
-        let _ = gh.forged(&["supervise", "--once"]);
-        gh.forged(&["run", "status", "--run", "conv-gh-child"]).1["result"]["run"]["outcome"]
-            == json!("clean")
+    // Every tick in the window runs with the failpoint armed: pre-merge
+    // progress is untouched (the failpoint sits after the merge effect), and
+    // whichever tick first attempts the merge crashes — deterministically,
+    // regardless of whether cleanliness and the merge land in one tick.
+    wait_until("the merging pass crashes at the failpoint", || {
+        gh.wake_epic("conv-gh-effect");
+        let status = gh
+            .forged_cmd(&["supervise", "--once"])
+            .env("FORGED_FAILPOINT", "epic.child.merge.after")
+            .env("FORGED_FAILPOINT_MODE", "crash")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("armed epic pass");
+        !status.success()
     });
-    gh.wake_epic("conv-gh-effect");
-    let status = gh
-        .forged_cmd(&["supervise", "--once"])
-        .env("FORGED_FAILPOINT", "epic.child.merge.after")
-        .env("FORGED_FAILPOINT_MODE", "crash")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .expect("crashing epic pass");
-    assert!(!status.success());
     let merge_count = |env: &TestEnv| {
         env.gh_calls()
             .iter()
