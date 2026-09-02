@@ -1003,7 +1003,6 @@ fn unresolved_input_reparks_but_resolution_wakes_the_next_tick() {
     let env = TestEnv::new("supervise-input-resolution");
     env.enable_dynamic_gh();
     env.seed_epic("epic-input", &[("direct-decision", &env.spec, true)]);
-    env.set_work_field("direct-decision", "type", "decision");
     assert_eq!(env.forged(&["init"]).0, 0);
     let repo = env.repos.repo.to_string_lossy().into_owned();
     let spec = env.spec.to_string_lossy().into_owned();
@@ -1020,21 +1019,30 @@ fn unresolved_input_reparks_but_resolution_wakes_the_next_tick() {
         "main",
     ]);
     assert_eq!(code, 0, "epic start: {started}");
-    let (code, prepared) = env.forged(&["epic", "advance", "--epic", "epic-input"]);
-    assert_eq!(code, 0, "prepare integration: {prepared}");
-    assert!(prepared["result"]["progress"].is_object());
-
     let ledger = env.ledger();
     ledger
         .authorize_desired_work(DesiredSubjectKind::Epic, "epic-input", 0)
         .expect("authorize desired epic");
     ledger.close().expect("close");
-    let (code, wave) = env.forged(&["epic", "advance", "--epic", "epic-input"]);
-    assert_eq!(code, 0, "commit complete wave: {wave}");
-    assert!(wave["result"]["progress"]["wave"].is_number());
-    let (code, held) = env.forged(&["epic", "advance", "--epic", "epic-input"]);
+    let (code, prepared) = env.reconcile_epic("epic-input");
+    assert_eq!(code, 0, "prepare integration: {prepared}");
+    assert!(prepared["result"]["progress"].is_object());
+    let ledger = env.ledger();
+    ledger
+        .append_event(
+            Some("epic-input"),
+            "forged.epic.input.required",
+            json!({
+                "code": "fixture-input",
+                "childId": "direct-decision",
+                "detail": "operator input remains unresolved",
+            }),
+        )
+        .expect("append input requirement");
+    ledger.close().expect("close");
+    let (code, held) = env.reconcile_epic("epic-input");
     assert_eq!(code, 0, "input stop: {held}");
-    assert_eq!(held["result"]["stopped"]["code"], json!("non-code-child"));
+    assert_eq!(held["result"]["stopped"]["code"], json!("fixture-input"));
     let ledger = env.ledger();
     let parked = ledger
         .get_desired_work(DesiredSubjectKind::Epic, "epic-input")
@@ -1059,7 +1067,11 @@ fn unresolved_input_reparks_but_resolution_wakes_the_next_tick() {
     let (code, unresolved_tick) = env.forged(&["supervise", "--once"]);
     assert_eq!(code, 0, "unresolved tick: {unresolved_tick}");
     assert_eq!(
-        unresolved_tick["result"]["subjects"][0]["action"],
+        unresolved_tick["result"]["orePass"]["subjects"][0]["action"],
+        json!("stopped")
+    );
+    assert_eq!(
+        unresolved_tick["result"]["orePass"]["subjects"][0]["desiredWork"]["outcome"],
         json!("attention")
     );
     let ledger = env.ledger();
@@ -1081,7 +1093,6 @@ fn unresolved_input_reparks_but_resolution_wakes_the_next_tick() {
     );
     ledger.close().expect("close");
 
-    env.set_work_field("direct-decision", "type", "task");
     let (code, resolved) = env.forged(&[
         "epic",
         "resolve",
@@ -1102,19 +1113,22 @@ fn unresolved_input_reparks_but_resolution_wakes_the_next_tick() {
     assert!(due.next_wake_at.is_some(), "resolution wakes desired work");
     ledger.close().expect("close");
 
-    env.set_scenario("implement", "hang", 2);
     let (code, continued) = env.forged(&["supervise", "--once"]);
     assert_eq!(code, 0, "resolved tick: {continued}");
     assert_eq!(
-        continued["result"]["subjects"][0]["action"],
-        json!("restarted")
+        continued["result"]["orePass"]["subjects"][0]["action"],
+        json!("progress")
+    );
+    assert_eq!(
+        continued["result"]["orePass"]["subjects"][0]["result"]["launched"][0]["childId"],
+        json!("direct-decision")
     );
     let ledger = env.ledger();
     let running = ledger
         .get_desired_work(DesiredSubjectKind::Epic, "epic-input")
         .expect("desired query")
         .expect("desired row");
-    assert_eq!(running.controller_generation, 1);
+    assert_eq!(running.controller_generation, 0);
     assert_eq!(
         ledger
             .list_events(Some("epic-input"), 0, 65_536)
@@ -1122,21 +1136,14 @@ fn unresolved_input_reparks_but_resolution_wakes_the_next_tick() {
             .into_iter()
             .filter(|event| event.kind == "forged.controller.started")
             .count(),
-        1
+        0
     );
+    let child = ledger
+        .get_desired_work(DesiredSubjectKind::Run, "direct-decision")
+        .expect("child desired query")
+        .expect("child desired row");
+    assert_eq!(child.controller_generation, 0);
     ledger.close().expect("close");
-
-    let record: Value = serde_json::from_slice(
-        &std::fs::read(env.anvil.join("runs/epic-input/controller/controller.json"))
-            .expect("controller record"),
-    )
-    .expect("controller JSON");
-    if let Some(pid) = record["driver"]["pid"]
-        .as_i64()
-        .and_then(|pid| i32::try_from(pid).ok())
-    {
-        let _ = killpg(Pid::from_raw(pid), Signal::SIGKILL);
-    }
 }
 
 /// Seconds from `earlier` to `later`, both widened RFC3339 stamps.

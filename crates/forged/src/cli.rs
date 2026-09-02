@@ -35,7 +35,7 @@ pub enum Command {
         #[command(subcommand)]
         command: RunCmd,
     },
-    /// Durable epic/wave scheduling over work readiness.
+    /// Durable epic grouping over work readiness.
     Epic {
         /// The epic subcommand.
         #[command(subcommand)]
@@ -349,13 +349,9 @@ pub enum EpicCmd {
     Preflight(EpicPreflightArgs),
     /// Freeze an epic inventory and execution defaults.
     Start(EpicStartArgs),
-    /// Perform one durable scheduler action.
-    Advance(EpicScoped),
-    /// Drive until the final draft PR or explicit input is required.
-    Drive(EpicScoped),
-    /// Hand the epic to a detached durable controller.
+    /// Authorize the epic for the supervisor's ore pass.
     Submit(EpicSubmitArgs),
-    /// Project waves, children, blockers, and the final PR (read-only).
+    /// Project the frontier, children, blockers, and final PR (read-only).
     Status(EpicScoped),
     /// Pause scheduling after the current durable boundary.
     Pause(EpicReasonArgs),
@@ -1885,8 +1881,6 @@ pub fn command_name(command: &Command) -> &'static str {
         Command::Epic { command } => match command {
             EpicCmd::Preflight(_) => "epic_preflight",
             EpicCmd::Start(_) => "epic_start",
-            EpicCmd::Advance(_) => "epic_advance",
-            EpicCmd::Drive(_) => "epic_drive",
             EpicCmd::Submit(_) => "epic_submit",
             EpicCmd::Status(_) => "epic_status",
             EpicCmd::Pause(_) => "epic_pause",
@@ -2141,22 +2135,6 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
                         "roster": a.roster,
                         "rolling": a.rolling,
                     }),
-                ),
-            ),
-            EpicCmd::Advance(a) => (
-                "epic_advance",
-                request(
-                    a.idempotency_key,
-                    Some(a.epic.clone()),
-                    json!({"epic": a.epic}),
-                ),
-            ),
-            EpicCmd::Drive(a) => (
-                "epic_drive",
-                request(
-                    a.idempotency_key,
-                    Some(a.epic.clone()),
-                    json!({"epic": a.epic}),
                 ),
             ),
             EpicCmd::Submit(a) => (

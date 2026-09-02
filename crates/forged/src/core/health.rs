@@ -44,7 +44,7 @@ pub(crate) struct HealthInputs<'a> {
 
 impl<'a> HealthInputs<'a> {
     /// Inputs available to `epic status`: complete epic lifecycle state plus
-    /// the live controller probe. A started epic is implicit at this surface.
+    /// live pass or child-run activity. A started epic is implicit here.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn epic_status(
         terminal: bool,

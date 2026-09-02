@@ -925,6 +925,7 @@ fn an_epic_child_prefers_its_work_fields_over_its_spec_pointer() {
         json!(spec),
         "a child carrying only a `spec:` pointer keeps the file route"
     );
+    env.authorize_epic("epic-bead");
 
     // And the work-sourced child's run really is fenced on its own work.
     // A tick that hits a transiently slow git/gh call parks the epic in a
@@ -932,8 +933,8 @@ fn an_epic_child_prefers_its_work_fields_over_its_spec_pointer() {
     // clock, not by a fixed advance count.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     let packet = loop {
-        let (code, advanced) = env.forged(&["epic", "advance", "--epic", "epic-bead"]);
-        assert_eq!(code, 0, "epic advance: {advanced}");
+        let (code, advanced) = env.reconcile_epic("epic-bead");
+        assert_eq!(code, 0, "epic pass: {advanced}");
         let ledger = env.ledger();
         let packet = ledger
             .list_packets("child-fields")
@@ -978,11 +979,12 @@ fn a_no_diff_epic_child_holds_for_direct_work_completion_then_counts_as_accounte
         "main",
     ]);
     assert_eq!(code, 0, "epic start: {started}");
+    env.authorize_epic("epic-no-diff");
 
     let mut held = Value::Null;
     for _ in 0..4 {
-        let (code, advanced) = env.forged(&["epic", "advance", "--epic", "epic-no-diff"]);
-        assert_eq!(code, 0, "epic advance: {advanced}");
+        let (code, advanced) = env.reconcile_epic("epic-no-diff");
+        assert_eq!(code, 0, "epic pass: {advanced}");
         held = advanced;
         if held["result"]["stopped"]["code"] == json!("non-code-child") {
             break;
@@ -1010,7 +1012,7 @@ fn a_no_diff_epic_child_holds_for_direct_work_completion_then_counts_as_accounte
         "decision recorded in Beads",
     ]);
     assert_eq!(code, 0, "resolve direct completion: {resolved}");
-    let (code, completed) = env.forged(&["epic", "advance", "--epic", "epic-no-diff"]);
+    let (code, completed) = env.reconcile_epic("epic-no-diff");
     assert_eq!(code, 0, "advance after direct completion: {completed}");
     assert!(
         completed["result"]["stopped"]["finalPr"].is_object(),

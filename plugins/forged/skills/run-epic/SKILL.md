@@ -1,17 +1,18 @@
 ---
 name: run-epic
-description: "Submit a locked ledger-native ore epic to Forged for durable wave execution, mechanically integrate clean child slices, and stop at one draft PR to the default branch or an explicit input-required state. Use when the operator explicitly invokes /forged:run-epic."
+description: "Submit a locked ledger-native ore epic to Forged for durable frontier execution, mechanically integrate clean child slices, and stop at one draft PR to the default branch or an explicit input-required state. Use when the operator explicitly invokes /forged:run-epic."
 ---
 
 # /forged:run-epic
 
-Position: locked reviewed epic -> execution handoff. Next: durable detached
-execution under Forged's controller, then human adjudication of one draft PR.
+Position: locked reviewed epic -> execution handoff. Next: durable execution
+under Forged's supervisor ore pass, then human adjudication of one draft PR.
 
 Boundary: the lead session verifies the ledger plan, makes judgment calls, and
-performs the explicit start/submit handoff. After submit, Forged owns provider
-attempts, wave scheduling, integration custody, controllers, and evidence. The
-lead remains responsible for operator conversation and final judgment.
+performs the explicit start/submit handoff. After submit, Forged owns frontier
+scheduling, provider attempts, integration custody, child-run controllers, and
+evidence. The lead remains responsible for operator conversation and final
+judgment.
 
 ## Preflight — one read-only command
 
@@ -47,7 +48,7 @@ done
 Validate the epic and each frozen child's complete `notes`: no unchecked
 question and no unresolved critique CRUX may remain. Validate every child's
 reported `parent-child` and `blocks` dependency edges against the frozen
-inventory, intended waves, and ordering; a missing, extra, or contradictory
+inventory, intended frontier, and ordering; a missing, extra, or contradictory
 edge fails closed before approval or execution. Use the frozen child inventory
 instead of recursive expansions that exceed host output budgets.
 
@@ -78,22 +79,22 @@ forged epic submit --epic "$EPIC_ID"
 ```
 
 The start output must match the approved preflight identities. Submit the exact
-epic id and return immediately; do not build a second watcher loop around the
-durable controller.
+epic id and return immediately. Submit authorizes the epic's desired row; the
+supervisor ore pass reconciles it and child runs use the ordinary detached run
+controllers. Do not build a second watcher loop around either lifecycle.
 
 ## Execution and terminal boundary
 
 Forged may auto-merge only mechanically clean, accepted child slices into the
-epic integration branch. It must reconcile later-wave stubs with merged reality
-before dispatch. It must not merge the default branch.
+epic integration branch. It must reconcile newly ready planning stubs with
+merged reality before dispatch. It must not merge the default branch.
 
 The terminal result is exactly one draft integration-to-default PR with
 evidence for human adjudication, or an explicit input-required stop naming the
 failed gate, exhausted budget, stale assumption, conflict, or missing authority.
 
-Report the epic id, frozen children and waves, profile, integration/default
-branches, and controller identity, then include these read-only reconnect
-commands:
+Report the epic id, frozen children, profile, integration/default branches, and
+desired/pass status, then include these read-only reconnect commands:
 
 ```bash
 forged overview --epic "$EPIC_ID"
@@ -111,23 +112,21 @@ forged session read --attempt "$ATTEMPT_ID" --lines 120
 
 ## Recovery
 
-- `restart-budget-exhausted`: read the recorded failure, fix that cause, then
-  resubmit the same epic id. Resubmission mints the next controller revision;
-  resubmitting without fixing the cause repeats it.
-- The exact error code `BEADS_CONTENTION` from `epic advance` selects the
-  contention retry/backoff path: a live detached controller still owns the
-  singular epic driver slot. Back off and observe with `epic status`; do not
-  drive it concurrently. Retry only after durable status shows that controller
-  no longer owns the epic; other error codes require their own typed remedy.
+- A child `restart-budget-exhausted` condition belongs to that child run: read
+  its recorded failure and use the exact run-scoped recovery verb. Resubmitting
+  the epic does not reset a child run's controller budget.
+- `BEADS_CONTENTION` from start, revise, or resume means the supervisor ore pass
+  currently owns the epic's desired row. Back off and observe with `epic
+  status`; retry only the refused control verb after that bounded pass releases
+  its claim.
 
 When `inputRequired.childId` names a child, first adjudicate that child's native
-work-item fields through the lead session. Then clear only that recorded hold
-and submit the next detached controller generation:
+work-item fields through the lead session. Then clear only that recorded hold;
+the resolution wakes the existing desired epic:
 
 ```bash
 forged epic resolve --epic "$EPIC_ID" --child "$CHILD_ID" \
   --note "$RESOLUTION_NOTE"
-forged epic submit --epic "$EPIC_ID"
 ```
 
 For an epic-level input requirement, fix the underlying condition first, then
@@ -135,7 +134,6 @@ resolve the hold without `--child`:
 
 ```bash
 forged epic resolve --epic "$EPIC_ID" --note "$RESOLUTION_NOTE"
-forged epic submit --epic "$EPIC_ID"
 ```
 
 ## Never
@@ -143,4 +141,4 @@ forged epic submit --epic "$EPIC_ID"
 - Do not synchronize an external tracker, auto-route, install software, or
   change protocol.
 - Do not create an implicit default-branch approval.
-- Do not replace the durable controller with a polling or watcher loop.
+- Do not replace the supervisor pass with a polling or watcher loop.

@@ -1123,12 +1123,7 @@ fn all_manifest_tools_match_their_cli_counterparts() {
     );
     assert_eq!(normalized(cli), normalized(tool), "epic_start parity");
 
-    for (subcommand, tool_name) in [
-        ("advance", "epic_advance"),
-        ("drive", "epic_drive"),
-        ("submit", "epic_submit"),
-        ("status", "epic_status"),
-    ] {
+    for (subcommand, tool_name) in [("submit", "epic_submit"), ("status", "epic_status")] {
         let cli = env.forged(&["epic", subcommand, "--epic", "absent-epic"]).1;
         let tool = mcp.call_tool(
             tool_name,

@@ -408,8 +408,8 @@ pub(crate) fn attempt_identity(
     Ok((identity, controller_generation))
 }
 
-/// Exact work subject that owns a provider attempt. Detached epic children
-/// inherit their epic controller subject; direct drives remain run-scoped.
+/// Exact run subject that owns a provider attempt. Epic children become
+/// ordinary detached run controllers before a provider attempt exists.
 pub(crate) fn attempt_subject(run_id: &str) -> Result<(OwnedHerdrSubjectV1, Option<u32>), Failure> {
     let context = super::handoff::controller_context_for_attempt(run_id)?;
     Ok(match context {
@@ -496,7 +496,6 @@ mod tests {
             herdr_sock: None,
             pricing: crate::pricing::default_rate_card(),
             admission: crate::config::AdmissionPolicy::default(),
-            epic_scheduler: crate::config::EpicScheduler::Controller,
         }
     }
 

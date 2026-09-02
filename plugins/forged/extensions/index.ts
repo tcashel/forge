@@ -167,7 +167,7 @@ export default function forgedPiExtension(pi: ExtensionAPI): void {
     name: "forged_submit",
     label: "Submit to Forge",
     description:
-      "After explicit operator approval, freeze and submit one ready native work slice or epic to the detached Forged controller. Performs exactly start then submit and never merges.",
+      "After explicit operator approval, freeze and submit one ready native work slice or epic to Forged. Runs use detached controllers; epics use the supervisor pass. Performs exactly start then submit and never merges.",
     promptGuidelines: [
       "Call forged_submit only after the shared Forge skill has presented and received explicit approval for the exact subject, repository, base, profile, and roster.",
     ],

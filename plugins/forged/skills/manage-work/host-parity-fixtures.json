@@ -128,8 +128,6 @@
     "definition_validate",
     "doctor",
     "epic_abandon",
-    "epic_advance",
-    "epic_drive",
     "epic_pause",
     "epic_preflight",
     "epic_resolve",

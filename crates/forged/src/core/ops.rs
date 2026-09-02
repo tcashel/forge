@@ -377,7 +377,7 @@ async fn ready_slice_work(
     Ok(issue)
 }
 
-/// `run start` — mint the RunId from the work id (or the epic scheduler's
+/// `run start` — mint the RunId from the work id (or the epic pass's
 /// explicit child generation id) and fill `NewRun` from the config plus the
 /// `--repo` and `--base-ref` arguments. The spec comes from the work;
 /// `--spec <path>` is the deprecated file route, honored for one release.
@@ -402,7 +402,7 @@ pub async fn run_start(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespon
 }
 
 /// Start a run from an owned, already-compiled definition. This is the
-/// epic scheduler boundary: child creation never resolves mutable authoring
+/// epic group boundary: child creation never resolves mutable authoring
 /// names again.
 pub(crate) async fn run_start_with_definition(
     ctx: &Ctx,
@@ -3130,7 +3130,7 @@ struct EpicLifecycle {
 /// Between `paused` and `resumed` the greater `event_id` wins — the append
 /// position, never the `ts` string, so two control events written in the
 /// same second do not resolve by luck. A `forged.epic.pr` is terminal over
-/// both: it is the precedence `epic_advance` applies when it stops, and an
+/// both: it is the precedence the epic reconciler applies when it stops, and an
 /// epic that ended at its draft PR is not reopened by a later control
 /// event. A payload that will not parse still yields the state its kind
 /// implies, with no reason — the same degradation an unparseable start

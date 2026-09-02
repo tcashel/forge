@@ -11,10 +11,10 @@ use forged_ledger::{
 use forged_types::ErrorCode;
 use serde_json::{json, Value};
 
-use crate::config::{now_iso, EpicScheduler};
+use crate::config::now_iso;
 use crate::core::{on_ledger, Ctx, Failure};
 
-use super::epic::Step;
+use super::epic::ReconcileAction;
 
 const REPORT_SCHEMA: &str = "forged.ore-pass.report/1";
 const CLAIM_LEASE_SECONDS: u64 = 60;
@@ -115,28 +115,20 @@ async fn reconcile_claimed(
     row: DesiredWorkRow,
     token: String,
 ) -> Result<Value, Failure> {
-    if super::epic::loop_driver_live(ctx, &row.subject_id).await? {
-        let desired = finish(ctx, &row, &token, active_update(&row)?).await?;
-        return Ok(json!({
-            "action": "driver-active",
-            "epicId": row.subject_id,
-            "desiredWork": desired,
-        }));
-    }
-    match super::epic::advance_loop_once(ctx, &row.subject_id).await {
-        Ok(Step::Progress(value)) => {
+    match super::epic::reconcile_once(ctx, &row.subject_id).await {
+        Ok(ReconcileAction::Progress(value)) => {
             let desired = finish(ctx, &row, &token, active_update(&row)?).await?;
             Ok(
                 json!({"action": "progress", "epicId": row.subject_id, "result": value, "desiredWork": desired}),
             )
         }
-        Ok(Step::Wait(value)) => {
+        Ok(ReconcileAction::Wait(value)) => {
             let desired = finish(ctx, &row, &token, active_update(&row)?).await?;
             Ok(
                 json!({"action": "waiting", "epicId": row.subject_id, "result": value, "desiredWork": desired}),
             )
         }
-        Ok(Step::Stop(value)) => {
+        Ok(ReconcileAction::Stop(value)) => {
             let desired = finish(ctx, &row, &token, stop_update(&row, &value)?).await?;
             Ok(
                 json!({"action": "stopped", "epicId": row.subject_id, "result": value, "desiredWork": desired}),
@@ -161,11 +153,8 @@ async fn reconcile_claimed(
     }
 }
 
-/// Claim and reconcile each due loop-mode epic exactly once, sequentially.
+/// Claim and reconcile each due epic exactly once, sequentially.
 pub(super) async fn reconcile(ctx: &Ctx) -> Result<Value, Failure> {
-    if ctx.config.epic_scheduler != EpicScheduler::Loop {
-        return Ok(json!({"schema": REPORT_SCHEMA, "enabled": false, "subjects": []}));
-    }
     let started_at = now_iso();
     let due = {
         let now = started_at.clone();
@@ -197,7 +186,6 @@ pub(super) async fn reconcile(ctx: &Ctx) -> Result<Value, Failure> {
     }
     Ok(json!({
         "schema": REPORT_SCHEMA,
-        "enabled": true,
         "startedAt": started_at,
         "finishedAt": now_iso(),
         "considered": subjects.len() + usize::try_from(contended).unwrap_or(usize::MAX),

@@ -1821,14 +1821,97 @@ impl TestEnv {
         ledger.close().expect("close test ledger");
     }
 
-    /// Authorize a directly-driven epic fixture without starting a detached
-    /// controller. Child packet admission delegates to this parent epoch.
+    /// Authorize an epic fixture without exercising the public submit wrapper.
+    /// Child packet admission delegates to this parent epoch.
     pub fn authorize_epic(&self, epic_id: &str) {
         let ledger = self.ledger();
         ledger
             .authorize_desired_work(forged_ledger::DesiredSubjectKind::Epic, epic_id, 0)
             .expect("authorize test epic");
         ledger.close().expect("close test ledger");
+    }
+
+    /// Make one authorized epic due for a process-level supervisor tick.
+    /// Expiring a retained token models the lease boundary after a crashed
+    /// pass; a live test process never calls this concurrently with the pass.
+    pub fn wake_epic(&self, epic_id: &str) {
+        assert!(
+            self.wake_epic_if_running(epic_id),
+            "epic {epic_id} has no running desired row"
+        );
+    }
+
+    /// Make a running epic due, returning false after it reaches a stop.
+    pub fn wake_epic_if_running(&self, epic_id: &str) -> bool {
+        let connection = rusqlite::Connection::open(self.anvil.join("state.db"))
+            .expect("open desired-work clock");
+        let affected = connection
+            .execute(
+                "UPDATE desired_work SET next_wake_at = ?1, \
+                 reconcile_lease_until = CASE WHEN reconcile_token IS NULL THEN NULL ELSE ?1 END \
+                 WHERE subject_kind = 'epic' AND subject_id = ?2 AND desired_state = 'running'",
+                rusqlite::params!["2000-01-01T00:00:00.000000000Z", epic_id],
+            )
+            .expect("wake desired epic");
+        affected == 1
+    }
+
+    /// Drive one bounded epic frontier iteration through `supervise --once`.
+    /// The returned shape preserves concise assertions while the exercised
+    /// production surface is exclusively the supervisor ore pass.
+    pub fn reconcile_epic(&self, epic_id: &str) -> (i32, Value) {
+        self.wake_epic(epic_id);
+        let (code, tick) = self.forged(&["supervise", "--once"]);
+        if code != 0 {
+            return (code, tick);
+        }
+        let subject = tick["result"]["orePass"]["subjects"]
+            .as_array()
+            .and_then(|subjects| {
+                subjects
+                    .iter()
+                    .find(|subject| subject["epicId"] == json!(epic_id))
+            });
+        let Some(subject) = subject else {
+            return (code, tick);
+        };
+        let result = subject["result"].clone();
+        let projected = match subject["action"].as_str() {
+            Some("progress") => json!({"progress": result}),
+            Some("waiting") => json!({"waiting": result}),
+            Some("stopped") => json!({
+                "stopped": result
+                    .get("inputRequired")
+                    .cloned()
+                    .unwrap_or(result),
+            }),
+            Some("backoff") => json!({"backoff": subject["error"].clone()}),
+            _ => json!({"pass": subject}),
+        };
+        (
+            code,
+            json!({
+                "ok": true,
+                "reused": false,
+                "operationId": Value::Null,
+                "result": projected,
+                "error": Value::Null,
+            }),
+        )
+    }
+
+    /// Reconcile an epic until its pass reports a durable stop.
+    pub fn drive_epic_to_stop(&self, epic_id: &str) -> (i32, Value) {
+        let mut last = Value::Null;
+        for _ in 0..1_200 {
+            let (code, value) = self.reconcile_epic(epic_id);
+            if code != 0 || value["result"]["stopped"].is_object() {
+                return (code, value);
+            }
+            last = value;
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        panic!("epic {epic_id} did not reach a durable stop: {last}")
     }
 
     /// The run's worktree path.

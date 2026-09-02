@@ -1098,7 +1098,6 @@ async fn reconcile_claimed(
         ctx,
         &reserved.subject_id,
         &repo,
-        subject_scope,
         generation,
         host_policy,
         herdr_socket,
@@ -1295,10 +1294,10 @@ async fn tick_with_deferrals(
     let tick_id = uuid::Uuid::now_v7().to_string();
     let mut claimed_rows = Vec::new();
     let mut contended = 0u64;
-    for candidate in due.into_iter().filter(|candidate| {
-        !(ctx.config.epic_scheduler == crate::config::EpicScheduler::Loop
-            && candidate.subject_kind == DesiredSubjectKind::Epic)
-    }) {
+    for candidate in due
+        .into_iter()
+        .filter(|candidate| candidate.subject_kind == DesiredSubjectKind::Run)
+    {
         let token = format!("supervise:{tick_id}:{}", uuid::Uuid::now_v7());
         let now = now_iso();
         let lease = deadline_after(&now, CLAIM_LEASE_SECONDS)?;
@@ -1317,25 +1316,6 @@ async fn tick_with_deferrals(
     let mut subjects = Vec::new();
     let mut admission_rows = Vec::new();
     for (candidate, token) in claimed_rows {
-        if candidate.subject_kind == DesiredSubjectKind::Epic
-            && super::epic::has_loop_dispatch(ctx, &candidate.subject_id).await?
-        {
-            deferrals.reset(candidate.subject_kind, &candidate.subject_id);
-            subjects.push(
-                finish_attention_condition(
-                    ctx,
-                    &candidate,
-                    &token,
-                    "epic-scheduler-mode",
-                    format!(
-                        "epic {} has loop-dispatched children; set epicScheduler: loop and run supervise",
-                        candidate.subject_id
-                    ),
-                )
-                .await?,
-            );
-            continue;
-        }
         match reconcile_live_before_admission(ctx, &candidate, &token).await {
             Ok(Some(report)) => {
                 deferrals.reset(candidate.subject_kind, &candidate.subject_id);

@@ -23,7 +23,7 @@ use crate::error::{refused, LedgerError};
 pub enum DesiredSubjectKind {
     /// A slice run driven by `run drive`.
     Run,
-    /// An epic driven by `epic drive`.
+    /// An epic reconciled by the supervisor ore pass.
     Epic,
 }
 

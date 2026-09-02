@@ -1490,8 +1490,6 @@ pub async fn dispatch(ctx: &Ctx, name: &str, mut req: OperationRequest) -> Opera
         "run_accept_risk" => ops::run_accept_risk(ctx, &mut req).await,
         "epic_preflight" => epic::epic_preflight(ctx, &req).await,
         "epic_start" => epic::epic_start(ctx, &mut req).await,
-        "epic_advance" => epic::epic_advance(ctx, &req).await,
-        "epic_drive" => epic::epic_drive(ctx, &req).await,
         "epic_submit" => handoff::epic_submit(ctx, &mut req).await,
         "epic_status" => epic::epic_status(ctx, &req).await,
         "epic_pause" => epic::epic_pause(ctx, &mut req).await,

@@ -1235,9 +1235,9 @@ for path in "$plugin/skills/dispatch/SKILL.md" "$plugin/skills/run-epic/SKILL.md
 done
 check "setup config precedence mirrors runtime" check_setup_config_precedence \
   "$plugin/skills/setup/SKILL.md"
-for needle in 'The exact error code `BEADS_CONTENTION` from `epic advance`' \
-  'contention retry/backoff path' 'live detached controller' \
-  'Retry only after durable status'; do
+for needle in '`BEADS_CONTENTION` from start, revise, or resume' \
+  'supervisor ore pass' 'Back off and observe' \
+  'retry only the refused control verb'; do
   grep -Fq -- "$needle" "$plugin/skills/run-epic/SKILL.md" \
     && pass "typed epic contention recovery: $needle" \
     || fail "typed epic contention recovery: $needle"
