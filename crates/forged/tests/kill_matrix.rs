@@ -1312,12 +1312,25 @@ fn epic_merge_applied_then_pass_crashes_resumes_without_duplicate() {
     start_epic(&env, "epic-crash");
     assert_eq!(env.reconcile_epic("epic-crash").0, 0);
     assert_eq!(env.reconcile_epic("epic-crash").0, 0);
-    wait_for_clean_run(&env, "child-crash");
     let fp = env.root.join("fp-epic-merge");
     std::fs::create_dir_all(&fp).expect("fp dir");
-    let mut pass = spawn_epic_pass(&env, "epic-crash", ("epic.child.merge.after", "crash", &fp));
-    let status = pass.wait().expect("epic pass crashes");
-    assert!(!status.success(), "the pass dies after GitHub merged");
+    // Every tick in the window runs with the merge failpoint armed:
+    // pre-merge progress is untouched, and whichever tick first attempts
+    // the merge crashes — an unarmed clean-wait tick on a slow runner
+    // could otherwise merge before the armed pass ever runs.
+    let mut crashed = false;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(240);
+    while std::time::Instant::now() < deadline {
+        let mut pass =
+            spawn_epic_pass(&env, "epic-crash", ("epic.child.merge.after", "crash", &fp));
+        let status = pass.wait().expect("armed epic pass");
+        if !status.success() {
+            crashed = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(crashed, "the pass dies after GitHub merged");
 
     let merges_before = env
         .gh_calls()
