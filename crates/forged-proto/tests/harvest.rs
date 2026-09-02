@@ -52,7 +52,8 @@ async fn harvested_implement_claim_is_verified_not_trusted() {
             spec_path: "spec.md".to_owned(),
             spec_sha256: "cafe".to_owned(),
             spec_revision: None,
-            body_json: "{}".to_owned(),
+            policy_revision: None,
+            body_json: stage_packet_body(1800),
         })
         .expect("open packet");
     let claim = ledger
@@ -160,7 +161,8 @@ async fn a_pass_checks_the_history_against_ground_truth_established_once() {
                 spec_path: "spec.md".to_owned(),
                 spec_sha256: "cafe".to_owned(),
                 spec_revision: None,
-                body_json: "{}".to_owned(),
+                policy_revision: None,
+                body_json: stage_packet_body(1800),
             })
             .expect("open packet");
         let claim = ledger
@@ -261,7 +263,8 @@ async fn matching_ground_truth_records_no_mismatch() {
             spec_path: "spec.md".to_owned(),
             spec_sha256: "cafe".to_owned(),
             spec_revision: None,
-            body_json: "{}".to_owned(),
+            policy_revision: None,
+            body_json: stage_packet_body(1800),
         })
         .expect("open packet");
     let claim = ledger
@@ -331,7 +334,8 @@ async fn legacy_gate_prose_is_unknown_and_does_not_rerun_or_mismatch_gates() {
             spec_path: "spec.md".to_owned(),
             spec_sha256: "cafe".to_owned(),
             spec_revision: None,
-            body_json: "{}".to_owned(),
+            policy_revision: None,
+            body_json: stage_packet_body(1800),
         })
         .expect("open packet");
     let claim = ledger

@@ -38,6 +38,31 @@ pub fn packet_id(run_id: &str, stage: Stage, seq: i64) -> String {
     format!("{run_id}/{}/{seq}", stage_str(stage))
 }
 
+/// A packet whose frozen contract is valid at every reconciliation seam.
+pub fn stage_packet_body(budget_s: u32) -> String {
+    serde_json::json!({
+        "schema": "forged.packet/1",
+        "beadId": "bead-1",
+        "worktree": "/tmp/worktree",
+        "branch": "feat/x",
+        "baseRef": "main",
+        "contract": {
+            "instructions": "implement",
+            "gateCommands": ["cargo test --workspace"],
+            "deliverable": "commitsInWorktree",
+            "budgetS": budget_s
+        },
+        "resultSchema": "forged.result/1",
+        "providerHints": {
+            "provider": "claude",
+            "model": "test",
+            "sandbox": "workspaceWrite"
+        },
+        "fieldNotes": []
+    })
+    .to_string()
+}
+
 /// A roster covering all four provider stages.
 pub fn full_roster() -> HashMap<Stage, ProviderHints> {
     let hint = |provider: &str, model: &str| ProviderHints {
@@ -226,6 +251,7 @@ impl ViewBuilder {
             spec_path: "spec.md".to_owned(),
             spec_sha256: "cafe".to_owned(),
             spec_revision: None,
+            policy_revision: None,
             body_json: "{}".to_owned(),
             created_at: T0.to_owned(),
         });
@@ -355,6 +381,24 @@ impl ViewBuilder {
 
     /// Assemble the view.
     pub fn build(self) -> RunView {
+        let retry_grants = self
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                ProtoEvent::Retry {
+                    packet_id,
+                    transport_failures,
+                    retry_after,
+                    ..
+                } => Some(forged_proto::TimedRetryGrant {
+                    packet_id: packet_id.clone(),
+                    transport_failures: *transport_failures,
+                    retry_after: retry_after.clone(),
+                    created_at: T0.to_owned(),
+                }),
+                _ => None,
+            })
+            .collect();
         RunView {
             run: RunRow {
                 run_id: self.run_id.clone(),
@@ -382,6 +426,7 @@ impl ViewBuilder {
             inflight_operations: self.inflight,
             settled_operations: self.settled,
             proto_events: self.events,
+            retry_grants,
             roster: self.roster,
             policy: forged_types::ExecutionPolicyV1 {
                 gate_commands: vec!["cargo test --workspace".to_owned()],
@@ -402,6 +447,7 @@ impl ViewBuilder {
             now: T0.to_owned(),
             execution_package: None,
             active_roster_revision: None,
+            active_policy_revision: None,
             profile_escalations: Vec::new(),
             accepted_risk: None,
         }

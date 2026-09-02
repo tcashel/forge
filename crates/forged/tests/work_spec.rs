@@ -723,6 +723,7 @@ fn the_re_pins_refusals_still_stand_now_that_it_bypasses_the_operation() {
         spec_path: packet.spec_path.clone(),
         spec_sha256: "cafe".to_owned(),
         spec_revision: Some("a-later-write-token".to_owned()),
+        policy_revision: None,
         body_json: packet.body_json.clone(),
     };
     let refused = ledger

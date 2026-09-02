@@ -40,6 +40,7 @@ fn seat(env: &TestEnv) -> (String, i64, forged_ledger::SpecFence) {
             spec_path: env.spec.to_string_lossy().into_owned(),
             spec_sha256: sha.clone(),
             spec_revision: None,
+            policy_revision: None,
             body_json: json!({"fabricated": true}).to_string(),
         })
         .expect("open packet");

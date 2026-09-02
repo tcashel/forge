@@ -29,6 +29,7 @@ fn new_packet(run_id: &str) -> NewPacket {
         spec_path: "specs/y.md".to_owned(),
         spec_sha256: "beef".to_owned(),
         spec_revision: None,
+        policy_revision: None,
         body_json: "{\"schema\":\"forged.packet/1\"}".to_owned(),
     }
 }
@@ -643,6 +644,7 @@ fn idempotency_identity_spans_run_and_effect_class() {
             spec_path: "specs/y.md".to_owned(),
             spec_sha256: "beef".to_owned(),
             spec_revision: None,
+            policy_revision: None,
             body_json: "{}".to_owned(),
         })
         .expect("open packet");

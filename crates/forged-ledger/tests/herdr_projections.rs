@@ -72,6 +72,7 @@ fn seed(ledger: &Ledger) -> (String, i64, String) {
             spec_path: "spec.md".into(),
             spec_sha256: "body".into(),
             spec_revision: None,
+            policy_revision: None,
             body_json: packet.stored_body().unwrap(),
         })
         .unwrap();

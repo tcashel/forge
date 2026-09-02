@@ -13,8 +13,9 @@ use forged_ledger::{
 use forged_provider::{CodexDriver, PiDriver, ProviderDriver};
 use forged_types::{
     request_sha256, AttentionCondition, AttentionItemV1, AttentionResolutionDisposition,
-    AttentionState, ErrorCode, ExecutionPackageV1, OperationRequest, OperationResponse, RunId,
-    WorkIdentityContextV1, WorkIdentitySubjectKind, WorkPacket, WorkRefKind, WorkRefV1,
+    AttentionState, ErrorCode, ExecutionPackageV1, ExecutionPolicyV1, OperationRequest,
+    OperationResponse, RunId, WorkIdentityContextV1, WorkIdentitySubjectKind, WorkPacket,
+    WorkRefKind, WorkRefV1,
 };
 use serde_json::{json, Value};
 
@@ -1451,10 +1452,7 @@ pub async fn run_status(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
             }),
         };
         let definition = match definition {
-            Some(row) => {
-                let package: forged_types::ExecutionPackageV1 = serde_json::from_str(&row.package_json)
-                    .map_err(|error| Failure::internal(format!("stored execution package: {error}")))?;
-                json!({
+            Some(row) => json!({
                 "protocolRef": serde_json::from_str::<Value>(&row.protocol_ref_json)
                     .map_err(|error| Failure::internal(format!("stored protocol ref: {error}")))?,
                 "profileRef": serde_json::from_str::<Value>(&row.profile_ref_json)
@@ -1470,8 +1468,12 @@ pub async fn run_status(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
                     .transpose()
                     .map_err(|error| Failure::internal(format!("stored roster ref: {error}")))?,
                 "activeRosterSha256": revision.as_ref().map(|value| &value.roster_sha256),
-                "policy": package.policy,
-            })},
+                "policyRevision": view.active_policy_revision.as_ref()
+                    .map(|value| value.revision),
+                "activePolicySha256": view.active_policy_revision.as_ref()
+                    .map(|value| &value.policy_sha256),
+                "policy": &view.policy,
+            }),
             None => Value::Null,
         };
         let execution = view.execution_package.as_ref().map(|package| {
@@ -1510,6 +1512,7 @@ pub async fn run_status(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
                         "roleId": semantic.role_id,
                         "purpose": semantic.purpose,
                         "round": semantic.round,
+                        "policyRevision": row.policy_revision,
                         "provider": selected.provider_hints.provider,
                         "model": selected.provider_hints.model,
                         "effort": selected.provider_hints.effort,
@@ -1562,6 +1565,7 @@ pub async fn run_status(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
                         .unwrap_or_else(|| stage_str(p.stage).to_owned()),
                     "storageLane": stage_str(p.stage),
                     "seq": p.seq,
+                    "policyRevision": p.policy_revision,
                 })).collect::<Vec<_>>(),
                 "liveAttempts": view.live_attempts.iter().map(|a| json!({
                     "attemptId": a.attempt_id,
@@ -1656,6 +1660,213 @@ pub async fn definition_validate(ctx: &Ctx, req: &OperationRequest) -> Operation
             Err(errors) => Ok(json!({"valid": false, "errors": errors})),
         }
     })
+    .await
+}
+
+// ------------------------------------------------------ run revise policy
+
+pub(crate) fn splice_policy(
+    standing: &ExecutionPolicyV1,
+    current: ExecutionPolicyV1,
+) -> ExecutionPolicyV1 {
+    ExecutionPolicyV1 {
+        gate_commands: current.gate_commands,
+        stage_budget_s: current.stage_budget_s,
+        transport_retry_budget: current.transport_retry_budget,
+        termination_grace_s: standing.termination_grace_s,
+        host_policy: standing.host_policy,
+        herdr_socket: standing.herdr_socket.clone(),
+    }
+}
+
+/// Append a config-sourced operational-policy revision while retaining the
+/// standing identity-adjacent fields.
+pub async fn run_revise_policy(ctx: &Ctx, req: &mut OperationRequest) -> OperationResponse {
+    let run_id = match param_str(&req.params, "run") {
+        Ok(value) => value.to_owned(),
+        Err(error) => {
+            return err_response(&derive_key("run_revise_policy", None, None, None), &error)
+        }
+    };
+    let reason = match param_str(&req.params, "reason") {
+        Ok(value) if !value.trim().is_empty() => value.to_owned(),
+        Ok(_) => {
+            return err_response(
+                &derive_key("run_revise_policy", Some(&run_id), None, None),
+                &Failure::invalid("policy revision requires a non-empty reason"),
+            )
+        }
+        Err(error) => {
+            return err_response(
+                &derive_key("run_revise_policy", Some(&run_id), None, None),
+                &error,
+            )
+        }
+    };
+    for field in [
+        "gateCommands",
+        "gate_commands",
+        "stageBudgetS",
+        "stage_budget_s",
+        "transportRetryBudget",
+        "transport_retry_budget",
+    ] {
+        if req.params.contains_key(field) {
+            return err_response(
+                &derive_key("run_revise_policy", Some(&run_id), None, None),
+                &Failure::invalid(
+                    "policy fields are sourced only from current config; edit config.yaml, then \
+                     run `forged run revise-policy --run <id> --reason <reason>`",
+                ),
+            );
+        }
+    }
+    let definition = {
+        let run_for_lookup = run_id.clone();
+        match on_ledger(&ctx.ledger, move |ledger| {
+            ledger.get_run_definition(&run_for_lookup)
+        })
+        .await
+        {
+            Ok(Some(value)) => value,
+            Ok(None) => {
+                return err_response(
+                    &derive_key("run_revise_policy", Some(&run_id), None, None),
+                    &Failure::invalid("legacy run has no revisable policy"),
+                )
+            }
+            Err(error) => {
+                return err_response(
+                    &derive_key("run_revise_policy", Some(&run_id), None, None),
+                    &error,
+                )
+            }
+        }
+    };
+    let package: ExecutionPackageV1 = match serde_json::from_str(&definition.package_json) {
+        Ok(value) => value,
+        Err(error) => {
+            return err_response(
+                &derive_key("run_revise_policy", Some(&run_id), None, None),
+                &Failure::internal(format!("stored execution package does not parse: {error}")),
+            )
+        }
+    };
+    let latest = {
+        let run_for_lookup = run_id.clone();
+        match on_ledger(&ctx.ledger, move |ledger| {
+            ledger.latest_policy_revision(&run_for_lookup)
+        })
+        .await
+        {
+            Ok(value) => value,
+            Err(error) => {
+                return err_response(
+                    &derive_key("run_revise_policy", Some(&run_id), None, None),
+                    &error,
+                )
+            }
+        }
+    };
+    let standing = match latest.as_ref() {
+        Some(row) => match serde_json::from_str::<ExecutionPolicyV1>(&row.policy_json) {
+            Ok(value) => value,
+            Err(error) => {
+                return err_response(
+                    &derive_key("run_revise_policy", Some(&run_id), None, None),
+                    &Failure::internal(format!("stored policy revision does not parse: {error}")),
+                )
+            }
+        },
+        None => package.policy,
+    };
+    let current = match ctx.config.execution_policy() {
+        Ok(value) => value,
+        Err(errors) => {
+            return err_response(
+                &derive_key("run_revise_policy", Some(&run_id), None, None),
+                &Failure::invalid(format!(
+                    "policy revision is invalid: {}",
+                    serde_json::to_string(&errors)
+                        .unwrap_or_else(|_| "validation failed".to_owned())
+                )),
+            )
+        }
+    };
+    let policy = splice_policy(&standing, current);
+    if let Some(error) = policy.validate().into_iter().next() {
+        return err_response(
+            &derive_key("run_revise_policy", Some(&run_id), None, None),
+            &Failure::invalid(format!(
+                "policy revision is invalid at {}: {}",
+                error.path, error.message
+            )),
+        );
+    }
+    let policy_sha256 = match crate::config::digest_of(&policy) {
+        Ok(value) => value,
+        Err(error) => {
+            return err_response(
+                &derive_key("run_revise_policy", Some(&run_id), None, None),
+                &Failure::internal(format!("digesting policy revision: {error}")),
+            )
+        }
+    };
+    let matching_latest = latest
+        .as_ref()
+        .is_some_and(|row| row.policy_sha256 == policy_sha256 && row.reason == reason);
+    let revision = if matching_latest {
+        latest.as_ref().map(|row| row.revision).unwrap_or(1)
+    } else {
+        latest
+            .as_ref()
+            .map(|row| row.revision)
+            .unwrap_or(0)
+            .saturating_add(1)
+    };
+    default_key(
+        req,
+        derive_key(
+            "run_revise_policy",
+            Some(&run_id),
+            None,
+            Some(i64::from(revision)),
+        ),
+    );
+    req.params.insert(
+        "policySha256".to_owned(),
+        Value::String(policy_sha256.clone()),
+    );
+    if req.run_id.is_none() {
+        req.run_id = Some(run_id.clone());
+    }
+    fenced(
+        ctx,
+        "run_revise_policy",
+        EffectClass::SafeRetry,
+        req,
+        None,
+        move |operation| async move {
+            let _submit_guard = super::handoff::acquire_run_submit(ctx, &run_id).await?;
+            let row = {
+                let run_id = run_id.clone();
+                let digest = policy_sha256.clone();
+                on_ledger(&ctx.ledger, move |ledger| {
+                    ledger.append_policy_revision(&run_id, policy, digest, reason, operation)
+                })
+                .await?
+            };
+            let policy: Value = serde_json::from_str(&row.policy_json)
+                .map_err(|error| Failure::internal(format!("stored policy revision: {error}")))?;
+            Ok(json!({
+                "run_id": row.run_id,
+                "revision": row.revision,
+                "policy": policy,
+                "policy_sha256": row.policy_sha256,
+                "reason": row.reason,
+            }))
+        },
+    )
     .await
 }
 
@@ -2056,7 +2267,11 @@ pub async fn packet_show(ctx: &Ctx, req: &OperationRequest) -> OperationResponse
                 "claimant": a.claimant,
             }));
         }
-        Ok(json!({"packet": packet, "attempts": attempts}))
+        Ok(json!({
+            "packet": packet,
+            "policyRevision": row.policy_revision,
+            "attempts": attempts,
+        }))
     })
     .await
 }
@@ -5378,4 +5593,55 @@ pub async fn worktree_retire(ctx: &Ctx, req: &OperationRequest) -> OperationResp
         },
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    use forged_types::{ExecutionPolicyV1, HostPolicyV1, Stage};
+
+    use super::splice_policy;
+
+    #[test]
+    fn policy_splice_changes_only_the_revisable_trio() {
+        let standing = ExecutionPolicyV1 {
+            gate_commands: vec!["wrong gate".to_owned()],
+            stage_budget_s: BTreeMap::from([
+                (Stage::Implement, 10),
+                (Stage::ReviewClaude, 11),
+                (Stage::ReviewCodex, 12),
+                (Stage::Fix, 13),
+            ]),
+            termination_grace_s: 17,
+            transport_retry_budget: 1,
+            host_policy: HostPolicyV1::Preferred,
+            herdr_socket: Some(PathBuf::from("/standing/herdr.sock")),
+        };
+        let current = ExecutionPolicyV1 {
+            gate_commands: vec!["correct gate".to_owned()],
+            stage_budget_s: BTreeMap::from([
+                (Stage::Implement, 20),
+                (Stage::ReviewClaude, 21),
+                (Stage::ReviewCodex, 22),
+                (Stage::Fix, 23),
+            ]),
+            termination_grace_s: 99,
+            transport_retry_budget: 5,
+            host_policy: HostPolicyV1::Off,
+            herdr_socket: Some(PathBuf::from("/drifted/herdr.sock")),
+        };
+
+        let spliced = splice_policy(&standing, current.clone());
+        assert_eq!(spliced.gate_commands, current.gate_commands);
+        assert_eq!(spliced.stage_budget_s, current.stage_budget_s);
+        assert_eq!(
+            spliced.transport_retry_budget,
+            current.transport_retry_budget
+        );
+        assert_eq!(spliced.termination_grace_s, standing.termination_grace_s);
+        assert_eq!(spliced.host_policy, standing.host_policy);
+        assert_eq!(spliced.herdr_socket, standing.herdr_socket);
+    }
 }

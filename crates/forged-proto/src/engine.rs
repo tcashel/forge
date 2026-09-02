@@ -11,8 +11,8 @@
 use std::collections::{BTreeMap, HashMap};
 
 use forged_ledger::{
-    AttemptRow, AttemptState, OperationRow, OperationState, PacketRow, RosterRevisionRow,
-    RunOutcome, RunRow, RunState,
+    AttemptRow, AttemptState, OperationRow, OperationState, PacketRow, PolicyRevisionRow,
+    RosterRevisionRow, RunOutcome, RunRow, RunState,
 };
 use forged_types::{
     AcceptedRisk, EscalationTrigger, ExecutionPackageV1, ExecutionPolicyV1, Outcome,
@@ -64,6 +64,9 @@ pub struct RunView {
     pub settled_operations: Vec<OperationRow>,
     /// `proto.*` events for this run, in `event_id` order, already parsed.
     pub proto_events: Vec<ProtoEvent>,
+    /// Retry grants with their ledger timestamps, preserving the policy
+    /// revision cutoff that plain protocol payloads intentionally omit.
+    pub retry_grants: Vec<TimedRetryGrant>,
     /// Caller-supplied per-stage provider hints. `advance` copies the
     /// stage's entry verbatim and never invents hint values.
     ///
@@ -86,6 +89,9 @@ pub struct RunView {
     /// The roster revision overlaid into `execution_package`. Its durable
     /// creation boundary resets transport fallback for the revised roster.
     pub active_roster_revision: Option<RosterRevisionRow>,
+    /// The execution-policy revision overlaid into `execution_package`.
+    /// Its creation boundary resets history-charged retry accounting.
+    pub active_policy_revision: Option<PolicyRevisionRow>,
     /// Durable adaptive-profile transitions, in event order.
     pub profile_escalations: Vec<ProfileEscalation>,
     /// The operator's durable post-budget decision, when one was recorded.
@@ -117,6 +123,19 @@ pub struct TerminalAttempt {
     /// Durable attempt start time, used to associate transport fallback with
     /// the roster revision active when the attempt began.
     pub started_at: String,
+}
+
+/// One durable retry grant paired with its ledger append time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimedRetryGrant {
+    /// Packet charged by the grant.
+    pub packet_id: String,
+    /// Failure count carried by the grant.
+    pub transport_failures: u32,
+    /// Earliest next claim time.
+    pub retry_after: String,
+    /// Ledger append time used as the policy-revision cutoff.
+    pub created_at: String,
 }
 
 /// One packet the caller must open.
@@ -1459,33 +1478,34 @@ fn transport_retry_state(
     packet_id: &str,
     history: &[TerminalAttempt],
 ) -> (u32, Option<String>) {
-    match latest_retry(view, packet_id) {
+    let cutoff = view
+        .active_policy_revision
+        .as_ref()
+        .map(|revision| revision.created_at.as_str());
+    match latest_retry(view, packet_id, cutoff) {
         Some((transport_failures, retry_after)) => (transport_failures, Some(retry_after)),
-        None => (transport_failures(history), None),
+        None => (transport_failures(history, cutoff), None),
     }
 }
 
 /// The packet's latest `proto.retry` grant: its failure count and deadline.
-fn latest_retry(view: &RunView, packet_id: &str) -> Option<(u32, String)> {
-    view.proto_events.iter().rev().find_map(|e| match e {
-        ProtoEvent::Retry {
-            packet_id: p,
-            transport_failures,
-            retry_after,
-            ..
-        } if p == packet_id => Some((*transport_failures, retry_after.clone())),
-        _ => None,
+fn latest_retry(view: &RunView, packet_id: &str, cutoff: Option<&str>) -> Option<(u32, String)> {
+    view.retry_grants.iter().rev().find_map(|grant| {
+        (grant.packet_id == packet_id
+            && cutoff.is_none_or(|boundary| grant.created_at.as_str() >= boundary))
+        .then(|| (grant.transport_failures, grant.retry_after.clone()))
     })
 }
 
 /// Failures charged to a packet's bounded budget, from its terminal history —
 /// the fallback used only until the packet's first `proto.retry` grant.
 /// Transport and unspawned failures share the budget, so both are counted.
-fn transport_failures(history: &[TerminalAttempt]) -> u32 {
+fn transport_failures(history: &[TerminalAttempt], cutoff: Option<&str>) -> u32 {
     let count = history
         .iter()
         .filter(|t| {
-            t.state == AttemptState::Failed
+            cutoff.is_none_or(|boundary| t.started_at.as_str() >= boundary)
+                && t.state == AttemptState::Failed
                 && matches!(
                     classify_failure(t.fail_note.as_deref().unwrap_or("")),
                     FailureKind::Transport | FailureKind::Unspawned

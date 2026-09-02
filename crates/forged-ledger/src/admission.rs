@@ -1461,6 +1461,7 @@ mod tests {
                 spec_path: format!("specs/{suffix}.md"),
                 spec_sha256: "feed".to_owned(),
                 spec_revision: None,
+                policy_revision: None,
                 body_json: json!({
                     "providerHints": {
                         "provider": "codex",

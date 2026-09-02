@@ -61,6 +61,7 @@ fn open_review_packet(env: &TestEnv, run_id: &str, seq: i64) -> String {
             spec_path: packet.spec.path.clone(),
             spec_sha256: packet.spec.sha256.clone(),
             spec_revision: packet.spec.revision.clone(),
+            policy_revision: None,
             body_json: packet.stored_body().expect("stored packet"),
         })
         .expect("open review packet");

@@ -1751,6 +1751,7 @@ mod tests {
                 spec_path: packet.spec.path.clone(),
                 spec_sha256: packet.spec.sha256.clone(),
                 spec_revision: None,
+                policy_revision: None,
                 body_json: packet.stored_body().unwrap(),
             })
             .unwrap();

@@ -122,6 +122,7 @@ impl ControlPlaneFixture {
                 spec_path: packet.spec.path.clone(),
                 spec_sha256: digest.clone(),
                 spec_revision: None,
+                policy_revision: None,
                 body_json: packet.stored_body().expect("stored packet"),
             })
             .expect("open packet");
@@ -538,11 +539,13 @@ fn modern_projections_and_all_five_apps_converge_on_real_envelopes() {
     tools.sort();
     assert_eq!(
         tools.len(),
-        65,
+        67,
         "the integrated public tool inventory moved"
     );
+    assert!(tools.contains(&"epic_revise_policy".to_owned()));
     assert!(tools.contains(&"explain".to_owned()));
     assert!(tools.contains(&"review_publish".to_owned()));
+    assert!(tools.contains(&"run_revise_policy".to_owned()));
     assert!(tools.contains(&"session_inventory".to_owned()));
     let mut resources = mcp.list_resources();
     resources.sort();

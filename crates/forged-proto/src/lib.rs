@@ -25,12 +25,12 @@ pub mod reconcile;
 pub use engine::{
     advance, backoff_deadline, classify_failure, machine_idempotency_key, transport_backoff_s,
     FailureKind, MachineStage, NextAction, PacketIntent, ProfileEscalation, RunView, Terminal,
-    TerminalAttempt, MACHINE_STEPS,
+    TerminalAttempt, TimedRetryGrant, MACHINE_STEPS,
 };
 pub use error::{PortError, ProtoError};
 pub use events::{
-    grant_retry, grant_retry_for_attempt, parse_proto_events, record, transport_failures_of,
-    widen_rfc3339, GatePhase, ProtoEvent,
+    grant_retry, grant_retry_for_attempt, grant_retry_for_attempt_since, grant_retry_since,
+    parse_proto_events, record, transport_failures_of, widen_rfc3339, GatePhase, ProtoEvent,
 };
 pub use ports::{
     KillOutcome, LeaseReclaim, PrSnapshot, ReconcilePorts, ResolveState, SessionLiveness,

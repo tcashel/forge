@@ -419,6 +419,7 @@ fn open_implement_packet(env: &TestEnv, run: &str, seq: i64) -> (String, String)
             spec_path: packet.spec.path.clone(),
             spec_sha256: sha.clone(),
             spec_revision: None,
+            policy_revision: None,
             body_json: packet.stored_body().expect("stored packet"),
         })
         .expect("open packet");

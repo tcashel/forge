@@ -963,6 +963,7 @@ mod tests {
                 spec_path: "/dev/null".to_owned(),
                 spec_sha256: "sha".to_owned(),
                 spec_revision: None,
+                policy_revision: None,
                 body_json: "{}".to_owned(),
             })
             .expect("open packet");

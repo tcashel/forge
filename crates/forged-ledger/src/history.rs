@@ -129,7 +129,8 @@ impl Ledger {
             let packets = {
                 let mut statement = tx.prepare(
                     "SELECT p.packet_id, p.run_id, p.stage, p.seq, p.spec_path, \
-                            p.spec_sha256, p.spec_revision, p.body_json, p.created_at \
+                            p.spec_sha256, p.spec_revision, p.policy_revision, p.body_json, \
+                            p.created_at \
                      FROM packets p \
                      WHERE EXISTS (SELECT 1 FROM attempts a WHERE a.packet_id = p.packet_id \
                                    AND ((a.started_at >= ?1 AND a.started_at < ?2) \
