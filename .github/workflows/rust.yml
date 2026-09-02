@@ -228,13 +228,13 @@ jobs:
           set -euo pipefail
           listed='forged herdr_orphan_failpoint ore_loop_failpoint kill_matrix run_status_failpoint work_identity_failpoint work_settlement_failpoint convergence supervise e2e_drive mcp_lazy_init review_publish'
           missing=0
-          for file in $(grep -l 'cfg(feature = "failpoints")' crates/forged/tests/*.rs); do
+          while IFS= read -r file; do
             bin="$(basename "$file" .rs)"
             case " $listed " in
               *" $bin "*) ;;
               *) echo "test binary '$bin' has failpoint-gated tests but is not in the failpoints leg filter" >&2; missing=1 ;;
             esac
-          done
+          done < <(grep -l 'cfg(feature = "failpoints")' crates/forged/tests/*.rs)
           exit "$missing"
 
       - name: failpoints
