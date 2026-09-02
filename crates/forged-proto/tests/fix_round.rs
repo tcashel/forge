@@ -148,6 +148,22 @@ fn a_transport_failure_with_no_grant_yet_counts_from_history_and_waits_on_nothin
 }
 
 #[test]
+fn readmission_never_backs_off_or_exhausts_regardless_of_count() {
+    let mut builder = at_fix().budget(0);
+    for _ in 0..32 {
+        builder = builder.failed(Stage::Fix, 1, "readmit: admission facts moved");
+    }
+    let view = builder.build();
+    assert_eq!(
+        advance(&view),
+        NextAction::AwaitPacket {
+            packet_id: packet_id(RUN, Stage::Fix, 1),
+            not_before: None,
+        }
+    );
+}
+
+#[test]
 fn policy_revision_cutoff_does_not_rescore_pre_revision_failures() {
     let mut builder = at_fix().budget(1);
     for _ in 0..4 {

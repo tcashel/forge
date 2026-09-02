@@ -260,6 +260,9 @@ fn every_seam_member_is_consumable() {
                 assert_eq!(code, ErrorCode::InvalidRequest);
                 assert!(!message.is_empty());
             }
+            LedgerError::AdmissionMoved { .. } => {
+                panic!("unexpected admitted-attempt fence result")
+            }
             LedgerError::Internal { message } => panic!("unexpected Internal: {message}"),
         }
     }

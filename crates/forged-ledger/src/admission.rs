@@ -2480,6 +2480,130 @@ mod tests {
     }
 
     #[test]
+    fn pre_spawn_fence_distinguishes_stale_token_and_each_moved_admission_leg() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ledger = Ledger::open(&dir.path().join("stale.db")).expect("ledger");
+        let (_, packet_id) = seed_packet(&ledger, "stale-leg");
+        let (_, attempt) = claim_admitted(&ledger, &packet_id, "batch-stale-leg");
+        ledger
+            .fail_packet(&packet_id, &attempt.claim_token, "test settlement")
+            .expect("settle attempt");
+        let before = ledger
+            .get_attempt(attempt.attempt_id)
+            .expect("attempt before stale fence");
+        let error = ledger
+            .assert_admitted_attempt_live(&attempt.claim_token)
+            .expect_err("terminal token is stale");
+        assert!(matches!(
+            error,
+            LedgerError::Refused {
+                code: ErrorCode::StaleClaimToken,
+                ..
+            }
+        ));
+        assert_eq!(
+            ledger
+                .get_attempt(attempt.attempt_id)
+                .expect("attempt after"),
+            before
+        );
+
+        let ledger = Ledger::open(&dir.path().join("control.db")).expect("ledger");
+        let (run_id, packet_id) = seed_packet(&ledger, "control-leg");
+        let (reservation, attempt) = claim_admitted(&ledger, &packet_id, "batch-control-leg");
+        ledger
+            .authorize_desired_work(DesiredSubjectKind::Run, &run_id, 1)
+            .expect("move desired control revision");
+        let before = ledger.get_attempt(attempt.attempt_id).expect("before");
+        let error = ledger
+            .assert_admitted_attempt_live(&attempt.claim_token)
+            .expect_err("control revision moved");
+        assert_eq!(error.code(), ErrorCode::StaleClaimToken);
+        let LedgerError::AdmissionMoved {
+            leg,
+            reservation: Some(old),
+            current: Some(new),
+        } = error
+        else {
+            panic!("expected control AdmissionMoved")
+        };
+        assert_eq!(leg, crate::AdmissionMoveLeg::Control);
+        assert_eq!(old.control_revision, reservation.control_revision);
+        assert_eq!(new.control_revision, reservation.control_revision + 1);
+        assert_eq!(old.provider, "codex");
+        assert_eq!(new.provider, "codex");
+        assert_eq!(
+            ledger.get_attempt(attempt.attempt_id).expect("after"),
+            before
+        );
+
+        let path = dir.path().join("reservation.db");
+        let ledger = Ledger::open(&path).expect("ledger");
+        let (_, packet_id) = seed_packet(&ledger, "reservation-leg");
+        let (_, attempt) = claim_admitted(&ledger, &packet_id, "batch-reservation-leg");
+        rusqlite::Connection::open(&path)
+            .expect("second process")
+            .execute(
+                "UPDATE admission_reservations SET state = 'released' WHERE owner_id = ?1",
+                [attempt.attempt_id.to_string()],
+            )
+            .expect("remove active reservation");
+        let before = ledger.get_attempt(attempt.attempt_id).expect("before");
+        let error = ledger
+            .assert_admitted_attempt_live(&attempt.claim_token)
+            .expect_err("reservation moved");
+        assert_eq!(error.code(), ErrorCode::StaleClaimToken);
+        let LedgerError::AdmissionMoved {
+            leg,
+            reservation: None,
+            current: Some(current),
+        } = error
+        else {
+            panic!("expected reservation AdmissionMoved")
+        };
+        assert_eq!(leg, crate::AdmissionMoveLeg::Reservation);
+        assert_eq!(current.provider, "codex");
+        assert_eq!(
+            ledger.get_attempt(attempt.attempt_id).expect("after"),
+            before
+        );
+
+        let path = dir.path().join("facts.db");
+        let ledger = Ledger::open(&path).expect("ledger");
+        let (_, packet_id) = seed_packet(&ledger, "facts-leg");
+        let (_, attempt) = claim_admitted(&ledger, &packet_id, "batch-facts-leg");
+        rusqlite::Connection::open(&path)
+            .expect("second process")
+            .execute(
+                "UPDATE packets SET body_json = json_set(body_json, \
+                 '$.providerHints.model', 'revised-model') WHERE packet_id = ?1",
+                [&packet_id],
+            )
+            .expect("revise durable provider facts");
+        let before = ledger.get_attempt(attempt.attempt_id).expect("before");
+        let error = ledger
+            .assert_admitted_attempt_live(&attempt.claim_token)
+            .expect_err("effective facts moved");
+        assert_eq!(error.code(), ErrorCode::StaleClaimToken);
+        let LedgerError::AdmissionMoved {
+            leg,
+            reservation: Some(old),
+            current: Some(new),
+        } = error
+        else {
+            panic!("expected facts AdmissionMoved")
+        };
+        assert_eq!(leg, crate::AdmissionMoveLeg::Facts);
+        assert_eq!(old.model, "gpt-test");
+        assert_eq!(new.model, "revised-model");
+        assert_eq!(old.control_revision, new.control_revision);
+        assert_eq!(
+            ledger.get_attempt(attempt.attempt_id).expect("after"),
+            before
+        );
+    }
+
+    #[test]
     fn pre_spawn_fence_rejects_control_or_provider_facts_that_changed_after_claim() {
         for mutation in ["control", "provider"] {
             let dir = tempfile::tempdir().expect("tempdir");

@@ -4,6 +4,20 @@ This file records user-visible changes to Forge.
 
 ## [Unreleased]
 
+### Fixed
+
+- A dead state reachable by revising a roster (or pausing and resuming)
+  while a child's packet was claimed but not yet spawned: the pre-spawn
+  admission fence refused the attempt as a nonrecoverable controller
+  death and left it `running`, so every relaunched controller adopted
+  the same attempt and died identically until the restart budget was
+  exhausted. The fence now reports which admission leg moved; the
+  controller settles the attempt with a `readmit:` note (never charged,
+  never backed off) and re-claims the packet under the current facts;
+  and controller-death recovery reconciles live attempts even when no
+  operation is in flight, so an orphaned unspawned attempt is revoked
+  through the ordinary saga.
+
 ## [0.7.0] - 2026-09-02
 
 The Ore Loop release (epic ore-070, PRs #229-#239): epic execution

@@ -5149,46 +5149,60 @@ fn epic_roster_revision_updates_current_and_future_children() {
     let future_package: forged_types::ExecutionPackageV1 =
         serde_json::from_str(&future_definition.package_json).expect("future package");
     assert_eq!(future_package.roster_ref.name, "all-codex");
-    let runs = ["roster-child-one", "roster-child-two"];
-    for run in runs {
-        let attempt = ledger
-            .list_packets(run)
-            .expect("packets")
+    // A revision applies at durable stage boundaries: an attempt admitted
+    // before it keeps the roster it was admitted with (on a slow host the
+    // current child's implementation seat may already be running, or be
+    // re-admitted under the revised roster when the revision beats its
+    // spawn). The timing-independent contract is that every attempt
+    // claimed AFTER the revision uses the revised roster — for the current
+    // child that is at least its review seat, for the future child every
+    // seat.
+    let revised_at = ledger
+        .list_events(Some("epic-roster"), 0, 4096)
+        .expect("epic events")
+        .into_iter()
+        .find(|event| {
+            event.kind == "forged.epic.roster.revised"
+                && serde_json::from_str::<Value>(&event.payload_json)
+                    .ok()
+                    .and_then(|payload| payload.get("revision")?.as_i64())
+                    == Some(2)
+        })
+        .map(|event| event.ts)
+        .expect("roster revision event");
+    for (run, must_have_post_revision_attempt) in
+        [("roster-child-one", false), ("roster-child-two", true)]
+    {
+        let attempt_ids: std::collections::BTreeSet<i64> = ledger
+            .list_events(Some(run), 0, 4096)
+            .expect("run events")
             .into_iter()
-            .find(|packet| {
-                forged_proto::stored_packet(packet)
-                    .ok()
-                    .and_then(|packet| packet.execution)
-                    .is_some_and(|execution| {
-                        execution.purpose == forged_types::SeatPurpose::Implement
-                    })
+            .filter(|event| event.kind == "attempt.state")
+            .filter_map(|event| {
+                serde_json::from_str::<Value>(&event.payload_json)
+                    .ok()?
+                    .get("attemptId")?
+                    .as_i64()
             })
-            .and_then(|packet| {
-                ledger
-                    .list_live_attempts(Some(run))
-                    .ok()
-                    .and_then(|attempts| {
-                        attempts
-                            .into_iter()
-                            .find(|attempt| attempt.packet_id == packet.packet_id)
-                    })
-                    .or_else(|| {
-                        let events = ledger.list_events(Some(run), 0, 4096).ok()?;
-                        let attempt_id = events.into_iter().find_map(|event| {
-                            let value: Value = serde_json::from_str(&event.payload_json).ok()?;
-                            (event.kind == "attempt.state"
-                                && value.get("packetId")?.as_str()? == packet.packet_id)
-                                .then(|| value.get("attemptId")?.as_i64())
-                                .flatten()
-                        })?;
-                        ledger.get_attempt(attempt_id).ok()
-                    })
-            })
-            .expect("implementation attempt");
-        assert!(
-            attempt.claimant.starts_with("codex:"),
-            "{run} must use the revised roster: {attempt:?}"
-        );
+            .collect();
+        assert!(!attempt_ids.is_empty(), "{run} ran no attempts");
+        let post_revision: Vec<forged_ledger::AttemptRow> = attempt_ids
+            .into_iter()
+            .map(|id| ledger.get_attempt(id).expect("attempt row"))
+            .filter(|attempt| attempt.started_at >= revised_at)
+            .collect();
+        if must_have_post_revision_attempt {
+            assert!(
+                !post_revision.is_empty(),
+                "{run} must run at least one seat after the revision"
+            );
+        }
+        for attempt in &post_revision {
+            assert!(
+                attempt.claimant.starts_with("codex:"),
+                "{run} attempt claimed after the roster revision at {revised_at} must use the revised roster: {attempt:?}"
+            );
+        }
     }
     ledger.close().expect("close ledger");
     let (_, status) = env.forged(&["epic", "status", "--epic", "epic-roster"]);

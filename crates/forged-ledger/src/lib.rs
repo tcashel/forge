@@ -44,7 +44,7 @@ mod work_identity;
 mod work_lease;
 mod work_settlement;
 
-pub use error::LedgerError;
+pub use error::{AdmissionFenceFacts, AdmissionMoveLeg, LedgerError};
 pub use herdr_layouts::HERDR_LAYOUT_CLEANUP_RETRY_BUDGET;
 pub use herdr_projections::{ClaimedHerdrProjectionEffect, HERDR_PROJECTION_RETRY_BUDGET};
 pub use history::{HistoryAttemptRow, HistorySnapshot, HISTORY_EVENT_KINDS};
