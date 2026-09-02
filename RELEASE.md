@@ -105,9 +105,12 @@ git push origin v0.5.0
 
 Pushing the tag is what starts the release workflow. `preflight` re-validates
 the version and CHANGELOG heading, re-checks plugin parity, re-provisions the
-pinned Beads probe, and additionally asserts the pushed tag matches the
-workspace version. `test`, `failpoints`, and the four-target `package` matrix
-then run in parallel, and `release` runs last once all of them succeed:
+pinned Beads probe, asserts the pushed tag matches the workspace version, and
+requires a successful `rust.yml` push run for the tagged commit — the Linux
+suite ran on that exact SHA when it landed on `main`, and publication trusts
+that run instead of repeating it. The macOS `test-macos` and
+`failpoints-macos` legs and the four-target `package` matrix then run in
+parallel, and `release` runs last once all of them succeed:
 it refuses a tag whose commit is not reachable from `origin/main`, refuses a
 version that is not strictly newer than the current published release,
 extracts the matching curated changelog section, creates a draft release,
@@ -197,12 +200,15 @@ service qualification.
 
 ## Recover a failed release
 
-- If `preflight`, `test`, `failpoints`, or `package` fails on the tag push,
-  the `release` job never starts and no draft exists. Fix the cause on
-  `main` through a normal PR, delete the failed tag locally and on the
-  remote (`git tag -d vX.Y.Z && git push origin :refs/tags/vX.Y.Z`), and
+- If `preflight`, `test-macos`, `failpoints-macos`, or `package` fails on
+  the tag push, the `release` job never starts and no draft exists. Fix the
+  cause on `main` through a normal PR, delete the failed tag locally and on
+  the remote (`git tag -d vX.Y.Z && git push origin :refs/tags/vX.Y.Z`), and
   push the tag again once `main` is fixed. No release was ever created for
-  that tag, so this is not moving or reusing a released tag.
+  that tag, so this is not moving or reusing a released tag. A `preflight`
+  refusal of "no successful rust.yml push run exists" means the tagged
+  commit's own `rust.yml` run on `main` failed or was cancelled: re-run it
+  there until it is green, then push the tag again.
 - If the `release` job fails BEFORE publication (draft creation, asset
   assembly, upload, or draft verification), re-running just that job is
   safe: `create-gh-release-action` deletes and recreates its draft release

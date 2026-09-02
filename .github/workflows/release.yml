@@ -36,9 +36,8 @@ concurrency:
   # by a later event landing on the same group.
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
-# This env block must stay identical to rust.yml's: rust-cache hashes
-# CARGO*/RUST* env values into its cache key, and the test and failpoints
-# jobs here restore the caches rust.yml saves from main (matched by job id).
+# This env block stays identical to rust.yml's so any job that restores a
+# rust-cache entry saved from main (matched by job id) finds the same key.
 env:
   CARGO_TERM_COLOR: always
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
@@ -50,6 +49,9 @@ jobs:
   # must stay fast enough to run on every PR.
   preflight:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
     outputs:
       tag: ${{ steps.version.outputs.tag }}
       version: ${{ steps.version.outputs.version }}
@@ -120,73 +122,26 @@ jobs:
             exit 1
           fi
 
-  # Full workspace test suite. Tag-only: PRs get the fast doctor probe above,
-  # not a second uncached run of the whole suite CI already covers.
-  #
-  # This job and `failpoints` restore rust.yml's caches (same job id, same
-  # env), so their runner image MUST match rust.yml's — restoring artifacts
-  # built against a newer glibc onto an older image fails with missing
-  # GLIBC_* symbols at publication time.
-  test:
-    # A custom `if` on a job with `needs` replaces the implicit success
-    # check, not layers on it — `success()` must be explicit or a failed
-    # preflight would not stop this job from starting on a tag push.
-    if: success() && startsWith(github.ref, 'refs/tags/')
-    needs: preflight
-    runs-on: ubuntu-latest
-    env:
-      VERSION: ${{ needs.preflight.outputs.version }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
-        with:
-          cache-save-if: 'false'
-
-      - uses: ./.github/actions/provision-beads
-        with:
-          export-gated-test-env: 'true'
-
-      - uses: taiki-e/install-action@37f7c5781271959fb65b6b35224e28652ff2b63d # v2.87.0
-        with:
-          tool: cargo-nextest@0.9.143
-
-      - name: Build
-        run: cargo build --workspace --locked
-
-      - name: Test
-        run: cargo nextest run --workspace
-
-      - name: Verify binary version
-        run: test "$(target/debug/forged --version)" = "forged $VERSION"
-
-  # Failpoint matrix runs in its own job so it doesn't serialize behind the
-  # full workspace test job above.
-  failpoints:
-    if: success() && startsWith(github.ref, 'refs/tags/')
-    needs: preflight
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
-        with:
-          cache-save-if: 'false'
-
-      - uses: ./.github/actions/provision-beads
-        with:
-          export-gated-test-env: 'true'
-
-      - uses: taiki-e/install-action@37f7c5781271959fb65b6b35224e28652ff2b63d # v2.87.0
-        with:
-          tool: cargo-nextest@0.9.143
-
-      - name: Failpoint matrix
-        run: cargo nextest run -p forged --features failpoints
+      # The Linux suite ran on this exact commit when it landed on main
+      # (rust.yml, push event); publication trusts that run instead of
+      # repeating it. Fails closed: no successful push run for the tagged
+      # SHA means no release. macOS assurance and the package matrix still
+      # run below — they are what only the release run provides.
+      - name: Require a green rust.yml run for the tagged commit
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_id="$(gh api \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/rust.yml/runs?head_sha=$GITHUB_SHA&event=push&status=success&per_page=1" \
+            --jq '.workflow_runs[0].id // empty')"
+          if [[ -z "$run_id" ]]; then
+            echo "no successful rust.yml push run exists for $GITHUB_SHA; fix main and re-tag" >&2
+            exit 1
+          fi
+          echo "rust.yml run $run_id is green for $GITHUB_SHA"
 
   # Darwin assurance: forged runs on operator Macs and its reclaim saga is
   # process-group signaling, where darwin semantics diverge from Linux. The
@@ -331,7 +286,7 @@ jobs:
 
   release:
     if: success() && startsWith(github.ref, 'refs/tags/')
-    needs: [preflight, test, failpoints, test-macos, failpoints-macos, package]
+    needs: [preflight, test-macos, failpoints-macos, package]
     runs-on: ubuntu-latest
     permissions:
       contents: write
