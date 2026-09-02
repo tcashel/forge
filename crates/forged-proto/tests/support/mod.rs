@@ -347,6 +347,7 @@ impl ViewBuilder {
         self.events.push(ProtoEvent::Retry {
             packet_id: pid,
             attempt_id: None,
+            policy_revision: None,
             transport_failures: failures,
             retry_after: after.to_owned(),
         });

@@ -3670,6 +3670,133 @@ fn real_provider_timeouts_exhaust_the_frozen_retry_budget() {
 }
 
 #[test]
+fn policy_revision_between_deadline_retries_stays_projectable_and_stoppable() {
+    let env = TestEnv::new("forged-retry-policy-revision");
+    let config_path = env.anvil.join("config.json");
+    let mut config: Value =
+        serde_json::from_str(&std::fs::read_to_string(&config_path).expect("read retry config"))
+            .expect("retry config JSON");
+    config["stage_budget_s"]["implement"] = json!(1);
+    config["transport_retry_budget"] = json!(3);
+    std::fs::write(
+        &config_path,
+        serde_json::to_vec_pretty(&config).expect("retry config JSON"),
+    )
+    .expect("write retry config");
+    env.set_scenario("implement", "hang", 2);
+    assert_eq!(env.forged(&["init"]).0, 0);
+    let run = "bead-retry-policy-revision";
+    env.seed_frontier(run);
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let spec = env.spec.to_string_lossy().into_owned();
+    let (code, started) = env.forged(&[
+        "run",
+        "start",
+        "--work",
+        run,
+        "--repo",
+        &repo,
+        "--spec",
+        &spec,
+        "--base-ref",
+        "main",
+        "--profile",
+        "lean",
+    ]);
+    assert_eq!(code, 0, "start: {started}");
+    env.authorize_run(run);
+
+    for _ in 0..3 {
+        let (code, advanced) = env.forged(&["run", "advance", "--run", run]);
+        assert_eq!(code, 0, "first deadline: {advanced}");
+    }
+    let first_rows = env
+        .ledger()
+        .list_events(Some(run), 0, 1_000)
+        .expect("first retry events");
+    assert_eq!(
+        first_rows
+            .iter()
+            .filter(|event| event.kind == "proto.retry")
+            .count(),
+        1
+    );
+
+    config["transport_retry_budget"] = json!(4);
+    std::fs::write(
+        &config_path,
+        serde_json::to_vec_pretty(&config).expect("revised retry config JSON"),
+    )
+    .expect("write revised retry config");
+    let (code, revised) = env.forged(&[
+        "run",
+        "revise-policy",
+        "--run",
+        run,
+        "--reason",
+        "reset retry accounting after the first deadline",
+    ]);
+    assert_eq!(code, 0, "revise policy: {revised}");
+    assert_eq!(revised["result"]["revision"], json!(2));
+
+    let (code, second_deadline) = env.forged(&["run", "advance", "--run", run]);
+    assert_eq!(code, 0, "second deadline: {second_deadline}");
+    let (code, status) = env.forged(&["run", "status", "--run", run]);
+    assert_eq!(code, 0, "status after revision-scoped retry: {status}");
+    assert_eq!(status["result"]["run"]["state"], json!("active"));
+
+    let ledger = env.ledger();
+    let rows = ledger.list_events(Some(run), 0, 1_000).expect("events");
+    let raw_retries = rows
+        .iter()
+        .filter(|event| event.kind == "proto.retry")
+        .map(|event| serde_json::from_str::<Value>(&event.payload_json).expect("retry payload"))
+        .collect::<Vec<_>>();
+    assert_eq!(raw_retries.len(), 2, "both deadline grants are durable");
+    assert_eq!(raw_retries[0]["transportFailures"], json!(1));
+    assert_eq!(raw_retries[1]["transportFailures"], json!(1));
+    assert_ne!(raw_retries[0]["attemptId"], raw_retries[1]["attemptId"]);
+    assert_ne!(raw_retries[0]["retryAfter"], raw_retries[1]["retryAfter"]);
+    let parsed_retries = forged_proto::parse_proto_events(&rows)
+        .expect("the run remains projectable")
+        .into_iter()
+        .filter(|event| matches!(event, forged_proto::ProtoEvent::Retry { .. }))
+        .count();
+    assert_eq!(parsed_retries, 2, "both grants survive strict replay");
+    assert_eq!(
+        status["result"]["run"]["nextAction"]["awaitPacket"]["notBefore"],
+        raw_retries[1]["retryAfter"],
+        "transport retry state selects the post-cutoff count/deadline"
+    );
+    ledger.close().expect("close ledger");
+
+    let worktree = env.worktree(run);
+    assert!(worktree.exists(), "the active run owns its worktree");
+    let sha = "d".repeat(40);
+    let stop_args = [
+        "run",
+        "stop",
+        "--run",
+        run,
+        "--outcome",
+        "landed",
+        "--pr",
+        "245",
+        "--sha",
+        &sha,
+        "--reason",
+        "retry policy revision acceptance fixture",
+    ];
+    let (code, stopped) = env.forged(&stop_args);
+    assert_eq!(code, 0, "landed stop: {stopped}");
+    assert_eq!(stopped["result"]["worktreeRetired"], json!(true));
+    assert!(!worktree.exists(), "landed stop retires the worktree");
+    let (code, replayed) = env.forged(&stop_args);
+    assert_eq!(code, 0, "identical landed replay: {replayed}");
+    assert_eq!(replayed["reused"], json!(true));
+}
+
+#[test]
 fn roster_revision_resets_transport_fallback_to_its_first_candidate() {
     let env = TestEnv::new("forged-roster-revision-fallback");
     env.forged(&["init"]);

@@ -92,6 +92,9 @@ pub enum ProtoEvent {
         /// pre-claim grants omit it because they have no durable attempt
         /// identity.
         attempt_id: Option<i64>,
+        /// The policy revision governing a pre-claim grant. Attempt-scoped
+        /// and legacy grants omit it.
+        policy_revision: Option<u64>,
         /// How many transport failures that packet has accumulated.
         transport_failures: u32,
         /// When the packet may be claimed again (30-byte RFC-3339 UTC).
@@ -230,6 +233,7 @@ impl ProtoEvent {
             ProtoEvent::Retry {
                 packet_id,
                 attempt_id,
+                policy_revision,
                 transport_failures,
                 retry_after,
             } => {
@@ -241,6 +245,11 @@ impl ProtoEvent {
                 });
                 if let (Some(map), Some(attempt_id)) = (payload.as_object_mut(), attempt_id) {
                     map.insert("attemptId".to_owned(), Value::from(*attempt_id));
+                }
+                if let (Some(map), Some(policy_revision)) =
+                    (payload.as_object_mut(), policy_revision)
+                {
+                    map.insert("policyRevision".to_owned(), Value::from(*policy_revision));
                 }
                 payload
             }
@@ -319,9 +328,17 @@ impl ProtoEvent {
             ProtoEvent::Pr { .. } => "pr".to_owned(),
             ProtoEvent::Retry {
                 packet_id,
+                attempt_id,
+                policy_revision,
                 transport_failures,
                 ..
-            } => format!("retry/{packet_id}/{transport_failures}"),
+            } => match (attempt_id, policy_revision) {
+                (Some(attempt_id), _) => format!("retry/{packet_id}/attempt/{attempt_id}"),
+                (None, Some(policy_revision)) => {
+                    format!("retry/{packet_id}/rev{policy_revision}/{transport_failures}")
+                }
+                (None, None) => format!("retry/{packet_id}/{transport_failures}"),
+            },
             ProtoEvent::Review { seq, stage, .. } => {
                 format!("review/{}/{seq}", stage_str(*stage))
             }
@@ -393,16 +410,19 @@ pub fn grant_retry(
     packet_id: &str,
     since: &str,
 ) -> Result<u32, ProtoError> {
-    grant_retry_since(ledger, run_id, packet_id, since, None)
+    grant_retry_since(ledger, run_id, packet_id, since, None, None)
 }
 
 /// [`grant_retry`] with a policy-revision cutoff for history-charged counts.
+/// `policy_revision` is emitted only by the pre-claim caller, pairing that
+/// cutoff with a collision-free logical key.
 pub fn grant_retry_since(
     ledger: &Ledger,
     run_id: &str,
     packet_id: &str,
     since: &str,
     cutoff: Option<&str>,
+    policy_revision: Option<u64>,
 ) -> Result<u32, ProtoError> {
     let owned_packet = packet_id.to_owned();
     let since = since.to_owned();
@@ -415,6 +435,7 @@ pub fn grant_retry_since(
         let payload = ProtoEvent::Retry {
             packet_id: owned_packet.clone(),
             attempt_id: None,
+            policy_revision,
             transport_failures: count,
             retry_after,
         }
@@ -464,6 +485,7 @@ pub fn grant_retry_for_attempt_since(
                 transport_failures,
                 retry_after,
                 packet_id,
+                ..
             } if *charged == attempt_id => Some(json!({
                 "schemaVersion": 1,
                 "packetId": packet_id,
@@ -482,6 +504,7 @@ pub fn grant_retry_for_attempt_since(
         let payload = ProtoEvent::Retry {
             packet_id: owned_packet.clone(),
             attempt_id: Some(attempt_id),
+            policy_revision: None,
             transport_failures: count,
             retry_after,
         }
@@ -766,6 +789,15 @@ fn parse_retry(row: &EventRow, value: &Value) -> Result<ProtoEvent, ProtoError> 
                 value
                     .as_i64()
                     .ok_or_else(|| malformed(row, "attemptId is not an integer or null"))
+            })
+            .transpose()?,
+        policy_revision: value
+            .get("policyRevision")
+            .filter(|value| !value.is_null())
+            .map(|value| {
+                value
+                    .as_u64()
+                    .ok_or_else(|| malformed(row, "policyRevision is not an integer or null"))
             })
             .transpose()?,
         transport_failures,
@@ -1103,6 +1135,105 @@ mod tests {
             matches!(err, ProtoError::MalformedEvent { event_id: 2, .. }),
             "{err}"
         );
+    }
+
+    #[test]
+    fn attempt_scoped_retry_grants_with_equal_counts_are_distinct() {
+        // Payload-only fixture shaped like ore-071 rows 14779 and 14791:
+        // both are the first failure since their policy cutoff, but each
+        // belongs to a different durable attempt.
+        let rows = vec![
+            row(
+                14779,
+                "proto.retry",
+                json!({
+                    "schemaVersion": 1,
+                    "packetId": "ore-071/implementation/0",
+                    "attemptId": 427,
+                    "transportFailures": 1,
+                    "retryAfter": "2026-09-02T16:19:44.000000000Z",
+                }),
+            ),
+            row(
+                14791,
+                "proto.retry",
+                json!({
+                    "schemaVersion": 1,
+                    "packetId": "ore-071/implementation/0",
+                    "attemptId": 429,
+                    "transportFailures": 1,
+                    "retryAfter": "2026-09-02T17:20:15.000000000Z",
+                }),
+            ),
+        ];
+
+        let parsed = parse_proto_events(&rows).expect("attempt-scoped grants parse");
+        assert_eq!(parsed.len(), 2);
+        assert!(matches!(
+            &parsed[0],
+            ProtoEvent::Retry {
+                attempt_id: Some(427),
+                transport_failures: 1,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &parsed[1],
+            ProtoEvent::Retry {
+                attempt_id: Some(429),
+                transport_failures: 1,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn revision_scoped_pre_claim_grants_with_equal_counts_are_distinct() {
+        let rows = vec![
+            row(
+                1,
+                "proto.retry",
+                json!({
+                    "schemaVersion": 1,
+                    "packetId": "run-1/implementation/0",
+                    "policyRevision": 1,
+                    "transportFailures": 1,
+                    "retryAfter": "2026-09-02T00:00:30.000000000Z",
+                }),
+            ),
+            row(
+                2,
+                "proto.retry",
+                json!({
+                    "schemaVersion": 1,
+                    "packetId": "run-1/implementation/0",
+                    "policyRevision": 2,
+                    "transportFailures": 1,
+                    "retryAfter": "2026-09-02T00:01:30.000000000Z",
+                }),
+            ),
+        ];
+
+        let parsed = parse_proto_events(&rows).expect("revision-scoped grants parse");
+        assert_eq!(parsed.len(), 2);
+        assert!(matches!(
+            &parsed[0],
+            ProtoEvent::Retry {
+                attempt_id: None,
+                policy_revision: Some(1),
+                transport_failures: 1,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &parsed[1],
+            ProtoEvent::Retry {
+                attempt_id: None,
+                policy_revision: Some(2),
+                transport_failures: 1,
+                ..
+            }
+        ));
     }
 
     #[test]

@@ -524,6 +524,8 @@ async fn deadline_order(
         .await?
         .map(|revision| revision.created_at)
     };
+    // ADR-0035:50-52: a failure that started before the active policy cutoff
+    // is not rescored and earns no retry grant.
     if cutoff
         .as_ref()
         .is_some_and(|boundary| current.started_at.as_str() < boundary.as_str())

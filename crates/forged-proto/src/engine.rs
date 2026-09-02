@@ -64,8 +64,9 @@ pub struct RunView {
     pub settled_operations: Vec<OperationRow>,
     /// `proto.*` events for this run, in `event_id` order, already parsed.
     pub proto_events: Vec<ProtoEvent>,
-    /// Retry grants with their ledger timestamps, preserving the policy
-    /// revision cutoff that plain protocol payloads intentionally omit.
+    /// Retry grants with their ledger timestamps. The timestamp preserves
+    /// the policy cutoff boundary; a retry payload's optional revision only
+    /// scopes pre-claim grant identity.
     pub retry_grants: Vec<TimedRetryGrant>,
     /// Caller-supplied per-stage provider hints. `advance` copies the
     /// stage's entry verbatim and never invents hint values.
@@ -1461,7 +1462,12 @@ fn transport_leg<'v>(
     packet_id: &'v str,
     history: &[TerminalAttempt],
 ) -> LegState<'v> {
-    let (attempts, not_before) = transport_retry_state(view, packet_id, history);
+    let cutoff = view
+        .active_policy_revision
+        .as_ref()
+        .map(|revision| revision.created_at.as_str());
+    let (attempts, not_before) =
+        transport_retry_state(&view.retry_grants, packet_id, history, cutoff);
     if attempts > view.policy.transport_retry_budget {
         LegState::Exhausted { attempts }
     } else {
@@ -1484,23 +1490,24 @@ fn transport_leg<'v>(
 /// failure of a packet, before its grant was recorded. That fallback yields
 /// no deadline, which is honest — none has been granted.
 fn transport_retry_state(
-    view: &RunView,
+    retry_grants: &[TimedRetryGrant],
     packet_id: &str,
     history: &[TerminalAttempt],
+    cutoff: Option<&str>,
 ) -> (u32, Option<String>) {
-    let cutoff = view
-        .active_policy_revision
-        .as_ref()
-        .map(|revision| revision.created_at.as_str());
-    match latest_retry(view, packet_id, cutoff) {
+    match latest_retry(retry_grants, packet_id, cutoff) {
         Some((transport_failures, retry_after)) => (transport_failures, Some(retry_after)),
         None => (transport_failures(history, cutoff), None),
     }
 }
 
 /// The packet's latest `proto.retry` grant: its failure count and deadline.
-fn latest_retry(view: &RunView, packet_id: &str, cutoff: Option<&str>) -> Option<(u32, String)> {
-    view.retry_grants.iter().rev().find_map(|grant| {
+fn latest_retry(
+    retry_grants: &[TimedRetryGrant],
+    packet_id: &str,
+    cutoff: Option<&str>,
+) -> Option<(u32, String)> {
+    retry_grants.iter().rev().find_map(|grant| {
         (grant.packet_id == packet_id
             && cutoff.is_none_or(|boundary| grant.created_at.as_str() >= boundary))
         .then(|| (grant.transport_failures, grant.retry_after.clone()))
@@ -1666,6 +1673,31 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(transport_failures(&history, None), 0);
+    }
+
+    #[test]
+    fn policy_cutoff_selects_the_post_revision_retry_grant() {
+        let packet_id = "run-1/implementation/0";
+        let cutoff = "2026-09-02T00:01:00.000000000Z";
+        let grants = vec![
+            TimedRetryGrant {
+                packet_id: packet_id.to_owned(),
+                transport_failures: 1,
+                retry_after: "2026-09-02T00:00:30.000000000Z".to_owned(),
+                created_at: "2026-09-02T00:00:00.000000000Z".to_owned(),
+            },
+            TimedRetryGrant {
+                packet_id: packet_id.to_owned(),
+                transport_failures: 1,
+                retry_after: "2026-09-02T00:01:30.000000000Z".to_owned(),
+                created_at: cutoff.to_owned(),
+            },
+        ];
+
+        assert_eq!(
+            transport_retry_state(&grants, packet_id, &[], Some(cutoff)),
+            (1, Some("2026-09-02T00:01:30.000000000Z".to_owned()))
+        );
     }
 
     #[test]
