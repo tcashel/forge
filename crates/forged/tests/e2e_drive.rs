@@ -5173,14 +5173,33 @@ fn epic_roster_revision_updates_current_and_future_children() {
                             .find(|attempt| attempt.packet_id == packet.packet_id)
                     })
                     .or_else(|| {
+                        // The attempt that RAN the stage, not the first one
+                        // claimed: a roster revision landing between claim
+                        // and spawn re-admits the first attempt (settled
+                        // `failed` with a `readmit:` note) and a successor
+                        // completes under the revised roster.
                         let events = ledger.list_events(Some(run), 0, 4096).ok()?;
-                        let attempt_id = events.into_iter().find_map(|event| {
-                            let value: Value = serde_json::from_str(&event.payload_json).ok()?;
-                            (event.kind == "attempt.state"
-                                && value.get("packetId")?.as_str()? == packet.packet_id)
-                                .then(|| value.get("attemptId")?.as_i64())
-                                .flatten()
-                        })?;
+                        let transitions: Vec<(i64, String)> = events
+                            .into_iter()
+                            .filter(|event| event.kind == "attempt.state")
+                            .filter_map(|event| {
+                                let value: Value =
+                                    serde_json::from_str(&event.payload_json).ok()?;
+                                (value.get("packetId")?.as_str()? == packet.packet_id).then(
+                                    || {
+                                        Some((
+                                            value.get("attemptId")?.as_i64()?,
+                                            value.get("new")?.as_str()?.to_owned(),
+                                        ))
+                                    },
+                                )?
+                            })
+                            .collect();
+                        let attempt_id = transitions
+                            .iter()
+                            .find(|(_, state)| state == "completed")
+                            .map(|(id, _)| *id)
+                            .or_else(|| transitions.iter().map(|(id, _)| *id).max())?;
                         ledger.get_attempt(attempt_id).ok()
                     })
             })
