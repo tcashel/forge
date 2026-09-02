@@ -12,6 +12,25 @@ is only the one-shot legacy import source. If you find yourself looking for
 `bin/forge.ts`, `src/`, `bun run check`, or runtime bd calls, you are
 working from stale context.
 
+Read [`docs/SYSTEM.md`](docs/SYSTEM.md) before touching anything: it is
+the map of the layers, nouns, ids, and where each truth lives.
+[`docs/LIFECYCLE.md`](docs/LIFECYCLE.md) is the one lifecycle every work
+item moves through; [`docs/DRIVING.md`](docs/DRIVING.md) is how an agent
+drives the system from responses alone.
+
+## Design bar — every surface, no exceptions
+
+The operator of record is a fresh-context agent
+([ADR-0036](docs/adr/0036-agent-is-the-operator-one-id-one-lifecycle-one-next.md)).
+Every verb, response, and refusal is judged by whether such an agent can
+act on it without reading docs: one id resolves everywhere; every
+projection carries `subject`, `lifecycle`, `health`, and `next` with at
+most one `should`; every refusal names its recovery verb in
+`forged.remedy/1`; every list is bounded with `coverage` and never returns
+spec bodies unless asked; a rule the agent must remember is a missing
+affordance. A slice that adds to the surface states in its PR what it
+deletes from the agent's burden.
+
 ## Gates — run all of them before calling anything done
 
 ```bash

@@ -1,6 +1,8 @@
 # Architecture Decision Records
 
-This directory holds dated, numbered decisions about Forge → Juicer.
+This directory holds dated, numbered decisions about Forge. ADRs 0001–0031
+are the pre-`forged` trail (the TypeScript product lines superseded by
+0032) and are retained as history; 0032 onward describe the shipped system.
 Each ADR is **self-contained**. Read individual files on demand — **do not load this directory wholesale** into agent context.
 
 ## How to use
@@ -49,20 +51,29 @@ Each ADR is **self-contained**. Read individual files on demand — **do not loa
 | 0033 | [Execution packages separate planning, orchestration, and provider cognition](./0033-execution-package-ownership-boundary.md) | Accepted |
 | 0034 | [The ledger owns the work graph; bd becomes the one-shot import source](./0034-ledger-native-work-store.md) | Accepted |
 | 0035 | [Operational policy revisions apply at durable stage boundaries](./0035-operational-policy-revisions-at-durable-stage-boundaries.md) | Accepted |
+| 0036 | [The agent is the operator: one id, one lifecycle, one next](./0036-agent-is-the-operator-one-id-one-lifecycle-one-next.md) | Proposed |
 
 ## Foundational ADRs
 
-If you're trying to understand the shape of the product quickly, read these in order:
+If you're trying to understand the shape of the product quickly, read
+[`../SYSTEM.md`](../SYSTEM.md) first, then these in order:
 
-1. [`0021-two-track-build-path`](./0021-two-track-build-path.md) — the meta-architecture (TS prototype → Rust product)
-2. [`0019-sessions-are-jobs`](./0019-sessions-are-jobs.md) — the core thesis (jobs, not shows)
-3. [`0014-differentiation-before-execution`](./0014-differentiation-before-execution.md) — the roadmap priority
-4. [`0005-plan-as-document`](./0005-plan-as-document.md) — the central product surface
-5. [`0001-juicer-separate-from-juice`](./0001-juicer-separate-from-juice.md) — the product boundary
+1. [`0032-forged-provider-neutral-rust-orchestrator`](./0032-forged-provider-neutral-rust-orchestrator.md) — the bet: one provider-neutral Rust kernel, effects fenced by confirmed death
+2. [`0033-execution-package-ownership-boundary`](./0033-execution-package-ownership-boundary.md) — who owns what: lead agent, ledger, Forged, providers, GitHub
+3. [`0034-ledger-native-work-store`](./0034-ledger-native-work-store.md) — the work graph lives in the ledger
+4. [`0035-operational-policy-revisions-at-durable-stage-boundaries`](./0035-operational-policy-revisions-at-durable-stage-boundaries.md) — operational policy is revisable at durable boundaries
+5. [`0036-agent-is-the-operator-one-id-one-lifecycle-one-next`](./0036-agent-is-the-operator-one-id-one-lifecycle-one-next.md) — the surface is designed for an agent operator
+
+Still-load-bearing ideas from the pre-`forged` trail: [`0019-sessions-are-jobs`](./0019-sessions-are-jobs.md) (jobs, not shows), [`0004-bring-your-own-agent`](./0004-bring-your-own-agent.md), [`0008-critics-are-agents`](./0008-critics-are-agents.md), [`0010-permissive-licenses-only`](./0010-permissive-licenses-only.md).
 
 ## Pending decisions
 
-Forward-looking decisions to capture as ADRs when they're made. Pulled from the original `DECISIONS.md` log.
+Decisions ADR-0036 leaves open for adjudication at planning time are listed
+in [`../plans/ore-080-driver-surface.md`](../plans/ore-080-driver-surface.md#open-questions-for-adjudication).
+
+The list below predates `forged` (pulled from the original `DECISIONS.md`
+log for the TypeScript product lines) and is retained as history; none of
+it is on the current roadmap.
 
 - Track A UI shell: web dashboard vs. Tauri wrapper (Phase A0)
 - GPUI version pinning strategy (after Phase B0)
