@@ -1,3 +1,5 @@
+![Forge orchestration banner](docs/assets/forge-hero-v5.png)
+
 # Forge
 
 [![codecov](https://codecov.io/gh/tcashel/forge/branch/main/graph/badge.svg)](https://codecov.io/gh/tcashel/forge)
