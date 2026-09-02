@@ -129,7 +129,7 @@ pub struct AdmissionInputsV1 {
     pub schema: String,
     pub as_of: String,
     pub policy_revision: String,
-    /// Hash of the ledger facts whose capacity is revalidated by the writer.
+    /// Stringified monotonic sequence for the scheduling facts revalidated by the writer.
     pub ledger_revision: String,
     pub candidates: Vec<AdmissionCandidateV1>,
     pub capacity: AdmissionCapacityV1,

@@ -1269,11 +1269,21 @@ impl Ledger {
     pub fn work_items(&self, ids: &[String]) -> Result<Vec<WorkItemSnapshot>, LedgerError> {
         let ids = ids.to_vec();
         self.submit(move |conn| {
-            let mut out = Vec::with_capacity(ids.len());
+            let snapshots = collection_tx(
+                conn,
+                WorkItemCollection::ExactIds,
+                &ids,
+                &WorkItemFilters::default(),
+            )?;
+            let mut by_id = snapshots
+                .into_iter()
+                .map(|snapshot| (snapshot.work_id.clone(), snapshot))
+                .collect::<BTreeMap<_, _>>();
             let mut seen = std::collections::BTreeSet::new();
-            for id in &ids {
+            let mut out = Vec::with_capacity(by_id.len());
+            for id in ids {
                 if seen.insert(id.clone()) {
-                    if let Some(snapshot) = snapshot_tx(conn, id)? {
+                    if let Some(snapshot) = by_id.remove(&id) {
                         out.push(snapshot);
                     }
                 }
@@ -2785,6 +2795,31 @@ mod tests {
             .map(|s| s.work_id)
             .collect();
         assert_eq!(ready, ["beads-high", "beads-nopri"]);
+    }
+
+    #[test]
+    fn exact_work_items_batch_preserves_first_request_order() {
+        let (_dir, ledger) = ledger();
+        ledger
+            .create_work_item(item("beads-a", WorkStatus::Open))
+            .unwrap();
+        ledger
+            .create_work_item(item("beads-b", WorkStatus::Open))
+            .unwrap();
+        let rows = ledger
+            .work_items(&[
+                "beads-b".to_owned(),
+                "missing".to_owned(),
+                "beads-a".to_owned(),
+                "beads-b".to_owned(),
+            ])
+            .expect("one exact-id batch");
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.work_id.as_str())
+                .collect::<Vec<_>>(),
+            ["beads-b", "beads-a"]
+        );
     }
 
     #[test]

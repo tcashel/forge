@@ -4,6 +4,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
+use std::future::Future;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use forged_ledger::{
     AdmissionBatchWrite, AdmissionDurableCandidate, AdmissionLedgerSnapshot,
@@ -25,6 +28,9 @@ use crate::core::{on_ledger, Ctx, Failure};
 const RESERVATION_RECOVERY_SECONDS: u64 = 60;
 const SNAPSHOT_RETRY_LIMIT: usize = 16;
 const SNAPSHOT_CHANGED_MESSAGE: &str = "admission ledger facts changed before allocation";
+const SNAPSHOT_RETRY_BASE_MS: u64 = 2;
+const SNAPSHOT_RETRY_MAX_MS: u64 = 64;
+static SNAPSHOT_RETRY_JITTER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
 pub(crate) struct AdmissionResult {
@@ -502,20 +508,47 @@ fn snapshot_changed(failure: &Failure) -> bool {
         && failure.message.ends_with(SNAPSHOT_CHANGED_MESSAGE)
 }
 
-pub(crate) async fn admit(
-    ctx: &Ctx,
-    targets: Vec<(DesiredSubjectKind, String)>,
-    explicit_submit: Option<(DesiredSubjectKind, String)>,
-) -> Result<Vec<AdmissionResult>, Failure> {
+fn snapshot_retry_delay(attempt: usize, jitter: u64) -> Duration {
+    let shift = u32::try_from(attempt).unwrap_or(u32::MAX).min(63);
+    let ceiling_ms = SNAPSHOT_RETRY_BASE_MS
+        .saturating_mul(1_u64 << shift)
+        .min(SNAPSHOT_RETRY_MAX_MS);
+    let floor_ms = (ceiling_ms / 2).max(1);
+    let span = ceiling_ms - floor_ms + 1;
+    Duration::from_millis(floor_ms + jitter % span)
+}
+
+fn snapshot_retry_jitter() -> u64 {
+    let sequence = SNAPSHOT_RETRY_JITTER_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let clock = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    clock ^ sequence.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+}
+
+async fn retry_snapshot_changes<T, F, Fut>(mut operation: F) -> Result<T, Failure>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, Failure>>,
+{
     for attempt in 0..SNAPSHOT_RETRY_LIMIT {
-        match admit_once(ctx, targets.clone(), explicit_submit.clone()).await {
+        match operation().await {
             Err(failure) if snapshot_changed(&failure) && attempt + 1 < SNAPSHOT_RETRY_LIMIT => {
-                tokio::task::yield_now().await;
+                tokio::time::sleep(snapshot_retry_delay(attempt, snapshot_retry_jitter())).await;
             }
             result => return result,
         }
     }
     unreachable!("bounded admission retry loop always returns")
+}
+
+pub(crate) async fn admit(
+    ctx: &Ctx,
+    targets: Vec<(DesiredSubjectKind, String)>,
+    explicit_submit: Option<(DesiredSubjectKind, String)>,
+) -> Result<Vec<AdmissionResult>, Failure> {
+    retry_snapshot_changes(|| admit_once(ctx, targets.clone(), explicit_submit.clone())).await
 }
 
 async fn admit_once(
@@ -679,15 +712,7 @@ pub(crate) async fn admit_packet_facts(
     ctx: &Ctx,
     packet: &PacketAdmission,
 ) -> Result<AdmissionResult, Failure> {
-    for attempt in 0..SNAPSHOT_RETRY_LIMIT {
-        match admit_packet_facts_once(ctx, packet).await {
-            Err(failure) if snapshot_changed(&failure) && attempt + 1 < SNAPSHOT_RETRY_LIMIT => {
-                tokio::task::yield_now().await;
-            }
-            result => return result,
-        }
-    }
-    unreachable!("bounded packet admission retry loop always returns")
+    retry_snapshot_changes(|| admit_packet_facts_once(ctx, packet)).await
 }
 
 async fn admit_packet_facts_once(
@@ -878,6 +903,108 @@ mod tests {
     #[test]
     fn protocol_names_never_make_a_blocked_work_runnable() {
         assert!(!runnable("blocked"));
+    }
+
+    #[test]
+    fn snapshot_retry_backoff_is_bounded_and_jittered() {
+        for attempt in 0..SNAPSHOT_RETRY_LIMIT - 1 {
+            let lower = snapshot_retry_delay(attempt, 0);
+            let upper = snapshot_retry_delay(attempt, u64::MAX);
+            assert!(lower >= Duration::from_millis(1));
+            assert!(lower <= Duration::from_millis(SNAPSHOT_RETRY_MAX_MS));
+            assert!(upper >= Duration::from_millis(1));
+            assert!(upper <= Duration::from_millis(SNAPSHOT_RETRY_MAX_MS));
+        }
+        assert_ne!(
+            snapshot_retry_delay(3, 0),
+            snapshot_retry_delay(3, u64::MAX),
+            "the retry seam must vary within its bounded window"
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_change_refusal_retries_before_returning_success() {
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let result = retry_snapshot_changes(|| {
+            let attempt = calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            async move {
+                if attempt == 0 {
+                    Err(Failure {
+                        code: forged_types::ErrorCode::OperationInProgress,
+                        message: format!("ledger: {SNAPSHOT_CHANGED_MESSAGE}"),
+                        recoverable: true,
+                    })
+                } else {
+                    Ok("admitted")
+                }
+            }
+        })
+        .await
+        .expect("second snapshot succeeds");
+        assert_eq!(result, "admitted");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn scheduling_write_interleave_is_rejected_then_retried() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.db");
+        let ledger = Ledger::open(&path).expect("ledger");
+        let run_id = "run-retry-interleave".to_owned();
+        ledger
+            .create_run(NewRun {
+                run_id: RunId::new(&run_id).expect("run id"),
+                work_id: "bead-retry-interleave".to_owned(),
+                repo: "example/repo".to_owned(),
+                base_ref: "main".to_owned(),
+                branch: "work/retry-interleave".to_owned(),
+            })
+            .expect("run");
+        ledger
+            .authorize_desired_work(DesiredSubjectKind::Run, &run_id, 1)
+            .expect("authorize");
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let reservations = retry_snapshot_changes(|| {
+            let attempt = calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let ledger = ledger.clone();
+            let path = path.clone();
+            let run_id = run_id.clone();
+            async move {
+                let snapshot = ledger.admission_snapshot(None).map_err(Failure::from)?;
+                let inputs = AdmissionInputsV1 {
+                    schema: ADMISSION_INPUTS_SCHEMA_V1.to_owned(),
+                    as_of: snapshot.as_of,
+                    policy_revision: "policy".to_owned(),
+                    ledger_revision: snapshot.ledger_revision,
+                    candidates: vec![candidate(&run_id, 0, "codex")],
+                    capacity: snapshot.capacity,
+                    spend: snapshot.spend,
+                    latest_rate_limits: snapshot.latest_rate_limits,
+                };
+                let (inputs, decisions) =
+                    evaluate(inputs, &AdmissionPolicy::default(), &BTreeMap::new())?;
+                if attempt == 0 {
+                    rusqlite::Connection::open(path)
+                        .expect("second process")
+                        .execute(
+                            "UPDATE runs SET repo = 'changed/repo' WHERE run_id = ?1",
+                            [&run_id],
+                        )
+                        .expect("interleave scheduling write");
+                }
+                ledger
+                    .commit_admission_batch(AdmissionBatchWrite {
+                        inputs,
+                        decisions,
+                        recovery_deadline: "9999-01-01T00:00:00Z".to_owned(),
+                    })
+                    .map_err(Failure::from)
+            }
+        })
+        .await
+        .expect("fresh snapshot admits after stale refusal");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
+        assert_eq!(reservations.len(), 1);
     }
 
     fn candidate(id: &str, priority: i64, provider: &str) -> AdmissionCandidateV1 {
@@ -1131,6 +1258,38 @@ mod tests {
         assert_eq!(
             serde_json::to_vec(&first).unwrap(),
             serde_json::to_vec(&second).unwrap()
+        );
+    }
+
+    #[test]
+    fn decision_content_is_byte_identical_across_revision_token_formats() {
+        let inputs = AdmissionInputsV1 {
+            schema: ADMISSION_INPUTS_SCHEMA_V1.to_owned(),
+            as_of: "2030-01-01T00:00:00.000000000Z".to_owned(),
+            policy_revision: "policy".to_owned(),
+            ledger_revision: "a".repeat(64),
+            candidates: vec![candidate("fixed", 0, "codex")],
+            capacity: AdmissionCapacityV1::default(),
+            spend: Vec::new(),
+            latest_rate_limits: Vec::new(),
+        };
+        let mut sequenced = inputs.clone();
+        sequenced.ledger_revision = "42".to_owned();
+        let (_, hashed_decisions) =
+            evaluate(inputs, &AdmissionPolicy::default(), &BTreeMap::new()).expect("hashed");
+        let (_, sequenced_decisions) =
+            evaluate(sequenced, &AdmissionPolicy::default(), &BTreeMap::new()).expect("sequenced");
+        let comparable_bytes = |decisions: Vec<AdmissionDecisionV1>| {
+            let mut value = serde_json::to_value(decisions).expect("decision JSON");
+            for decision in value.as_array_mut().expect("decision array") {
+                decision["batchId"] = Value::String("revision-derived-batch".to_owned());
+            }
+            serde_json::to_vec(&value).expect("decision bytes")
+        };
+        assert_eq!(
+            comparable_bytes(hashed_decisions),
+            comparable_bytes(sequenced_decisions),
+            "only the input-derived replay identity may reflect the revision token"
         );
     }
 
