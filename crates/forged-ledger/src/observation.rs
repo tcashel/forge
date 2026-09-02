@@ -655,9 +655,7 @@ impl Ledger {
                 epic_children,
                 child_identities,
                 runs,
-                runs_with_same_work_successors: runs_with_same_work_successors_tx(
-                    &tx, &run_scope,
-                )?,
+                runs_with_same_work_successors: runs_with_same_work_successors_tx(&tx, &run_scope)?,
                 desired_work: desired_work_tx(&tx, epic_id, &run_scope)?,
                 admission_decisions: admission_decisions_tx(&tx, epic_id, &run_scope)?,
                 admission_reservations: admission_reservations_tx(&tx, epic_id, &run_scope)?,

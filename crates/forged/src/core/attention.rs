@@ -523,9 +523,9 @@ fn exhausted_run_has_successor(input: &ProjectionInput<'_>, subject_id: &str) ->
                     && candidate.work_id == subject.work_id
                     && candidate.created_at >= subject.created_at
             }),
-            ProjectionSurface::Observation { snapshot, .. } => snapshot
-                .runs_with_same_work_successors
-                .contains(subject_id),
+            ProjectionSurface::Observation { snapshot, .. } => {
+                snapshot.runs_with_same_work_successors.contains(subject_id)
+            }
         }
 }
 
