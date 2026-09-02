@@ -146,31 +146,16 @@ async fn settle_deadline_retry(
     }
     let since = current.updated_at;
     let started_at = current.started_at;
-    let cutoff = {
-        let run_id = run_id.to_owned();
-        on_ledger(&ctx.ledger, move |ledger| {
-            ledger.latest_policy_revision(&run_id)
-        })
-        .await?
-        .map(|revision| revision.created_at)
-    };
-    if cutoff
-        .as_ref()
-        .is_some_and(|boundary| started_at.as_str() < boundary.as_str())
-    {
-        on_ledger(&ctx.ledger, move |ledger| ledger.mark_timed_out(attempt_id)).await?;
-        return Ok(PacketOutcome::Transport(note));
-    }
     let run_id = run_id.to_owned();
     let packet_id = packet_id.to_owned();
     on_ledger(&ctx.ledger, move |ledger| {
-        forged_proto::grant_retry_for_attempt_since(
+        forged_proto::grant_retry_for_attempt_under_active_policy(
             ledger,
             &run_id,
             &packet_id,
             attempt_id,
             &since,
-            cutoff.as_deref(),
+            &started_at,
         )
         .map_err(|error| forged_ledger::LedgerError::Internal {
             message: error.to_string(),
@@ -1242,31 +1227,22 @@ async fn charge_retry(
     since: String,
     failure_started_at: String,
 ) -> Result<(), Failure> {
-    let cutoff = {
-        let run_id = run_id.to_owned();
-        on_ledger(&ctx.ledger, move |ledger| {
-            ledger.latest_policy_revision(&run_id)
-        })
-        .await?
-        .map(|revision| revision.created_at)
-    };
-    if cutoff
-        .as_ref()
-        .is_some_and(|boundary| failure_started_at.as_str() < boundary.as_str())
-    {
-        return Ok(());
-    }
     let run_id = run_id.to_owned();
     let packet_id = packet_id.to_owned();
     on_ledger(&ctx.ledger, move |l| {
-        forged_proto::grant_retry_since(l, &run_id, &packet_id, &since, cutoff.as_deref()).map_err(
-            |e| match e {
-                forged_proto::ProtoError::Ledger(inner) => inner,
-                other => forged_ledger::LedgerError::Internal {
-                    message: other.to_string(),
-                },
-            },
+        forged_proto::grant_retry_under_active_policy(
+            l,
+            &run_id,
+            &packet_id,
+            &since,
+            &failure_started_at,
         )
+        .map_err(|e| match e {
+            forged_proto::ProtoError::Ledger(inner) => inner,
+            other => forged_ledger::LedgerError::Internal {
+                message: other.to_string(),
+            },
+        })
     })
     .await?;
     Ok(())
@@ -3579,6 +3555,26 @@ mod settle_tests {
         }
     }
 
+    fn install_policy_cutoff(root: &Path, created_at: &str) {
+        let connection =
+            rusqlite::Connection::open(root.join("state.db")).expect("open policy fixture");
+        connection
+            .execute(
+                "INSERT INTO policy_revisions \
+                 (run_id, revision, policy_json, policy_sha256, reason, created_at) \
+                 VALUES (?1, 2, '{}', 'fixture', 'fixture cutoff', ?2)",
+                rusqlite::params![RUN_ID, created_at],
+            )
+            .expect("insert policy cutoff");
+    }
+
+    fn retry_state(ledger: &Ledger, packet_id: &str) -> u32 {
+        let events = ledger
+            .list_events(Some(RUN_ID), 0, 1_000)
+            .expect("retry events");
+        forged_proto::transport_failures_of(&events, packet_id).expect("retry state")
+    }
+
     struct ClaimedFixture {
         ctx: Ctx,
         ledger: Ledger,
@@ -4110,6 +4106,143 @@ mod settle_tests {
             !dirs.result().exists(),
             "deadline evidence must not be written for another revocation scope"
         );
+    }
+
+    #[tokio::test]
+    async fn pre_cutoff_failures_at_all_three_sites_are_not_rescored() {
+        let settle_root = tempfile::tempdir().expect("settle tempdir");
+        let settle_socket = settle_root.path().join("herdr.sock");
+        let settle = claimed_fixture(settle_root.path(), &settle_socket).await;
+        install_policy_cutoff(settle_root.path(), "9999-01-01T00:00:00.000000000Z");
+        settle
+            .ledger
+            .revoke_attempt_scoped(
+                settle.attempt_id,
+                "transport: stage deadline exceeded: pre-cutoff settle fixture",
+                RevokeScope::Deadline,
+            )
+            .expect("deadline marker");
+        let before = retry_state(&settle.ledger, &settle.packet_id);
+        let outcome = settle_deadline_retry(
+            &settle.ctx,
+            RUN_ID,
+            &settle.packet_id,
+            settle.attempt_id,
+            "transport: stage deadline exceeded: pre-cutoff settle fixture".to_owned(),
+        )
+        .await
+        .expect("settle pre-cutoff deadline");
+        assert!(matches!(outcome, PacketOutcome::Transport(_)));
+        assert_eq!(retry_state(&settle.ledger, &settle.packet_id), before);
+        assert_eq!(
+            settle
+                .ledger
+                .get_attempt(settle.attempt_id)
+                .expect("settled attempt")
+                .state,
+            AttemptState::Failed
+        );
+
+        let charge_root = tempfile::tempdir().expect("charge tempdir");
+        let charge_socket = charge_root.path().join("herdr.sock");
+        let charge = claimed_fixture(charge_root.path(), &charge_socket).await;
+        install_policy_cutoff(charge_root.path(), "9999-01-01T00:00:00.000000000Z");
+        let before = retry_state(&charge.ledger, &charge.packet_id);
+        charge_retry(
+            &charge.ctx,
+            RUN_ID,
+            &charge.packet_id,
+            now_iso(),
+            "2000-01-01T00:00:00.000000000Z".to_owned(),
+        )
+        .await
+        .expect("skip pre-cutoff pre-claim failure");
+        assert_eq!(retry_state(&charge.ledger, &charge.packet_id), before);
+
+        let reconcile_root = tempfile::tempdir().expect("reconcile tempdir");
+        let reconcile_socket = reconcile_root.path().join("herdr.sock");
+        let _seen = start_mock_herdr(&reconcile_socket, MockBehavior::Normal);
+        let reconcile_fixture = claimed_fixture(reconcile_root.path(), &reconcile_socket).await;
+        install_policy_cutoff(reconcile_root.path(), "9999-01-01T00:00:00.000000000Z");
+        let reconcile_dirs =
+            PacketDirs::new(&reconcile_fixture.packet_dir, reconcile_fixture.attempt_id);
+        std::fs::create_dir_all(reconcile_dirs.attempt_path()).expect("attempt dir");
+        std::fs::write(
+            reconcile_dirs.attempt_path().join("provider.pid"),
+            exited_provider_pid().to_string(),
+        )
+        .expect("dead provider pid");
+        reconcile_fixture
+            .ledger
+            .revoke_attempt_scoped(
+                reconcile_fixture.attempt_id,
+                "transport: stage deadline exceeded: pre-cutoff reconcile fixture",
+                RevokeScope::Deadline,
+            )
+            .expect("reconcile deadline marker");
+        let before = retry_state(&reconcile_fixture.ledger, &reconcile_fixture.packet_id);
+        let report = forged_proto::reconcile(
+            &reconcile_fixture.ledger,
+            RUN_ID,
+            &reconcile_fixture.ports,
+            &forged_proto::ReconcileConfig {
+                stage_budget_s: Default::default(),
+                termination_grace_s: 5,
+                gate_commands: Vec::new(),
+            },
+            &now_iso(),
+        )
+        .await
+        .expect("reconcile pre-cutoff deadline");
+        assert_eq!(report.timed_out, vec![reconcile_fixture.attempt_id]);
+        assert_eq!(
+            retry_state(&reconcile_fixture.ledger, &reconcile_fixture.packet_id),
+            before
+        );
+
+        for (ledger, packet_id) in [
+            (&settle.ledger, settle.packet_id.as_str()),
+            (&charge.ledger, charge.packet_id.as_str()),
+            (
+                &reconcile_fixture.ledger,
+                reconcile_fixture.packet_id.as_str(),
+            ),
+        ] {
+            assert_eq!(retry_state(ledger, packet_id), 0);
+            assert!(ledger
+                .list_events(Some(RUN_ID), 0, 1_000)
+                .expect("events")
+                .iter()
+                .all(|event| event.kind != "proto.retry"));
+        }
+    }
+
+    #[tokio::test]
+    async fn pre_claim_retry_carries_the_active_policy_revision() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let socket = root.path().join("herdr.sock");
+        let fixture = claimed_fixture(root.path(), &socket).await;
+        install_policy_cutoff(root.path(), "2000-01-01T00:00:00.000000000Z");
+
+        let outcome = grant_pre_claim_retry(
+            &fixture.ctx,
+            &fixture.packet_id,
+            "transport: pre-claim fixture".to_owned(),
+        )
+        .await
+        .expect("grant retry");
+        assert!(matches!(outcome, PacketOutcome::Transport(_)));
+        let retries = fixture
+            .ledger
+            .list_events(Some(RUN_ID), 0, 1_000)
+            .expect("events")
+            .into_iter()
+            .filter(|event| event.kind == "proto.retry")
+            .collect::<Vec<_>>();
+        assert_eq!(retries.len(), 1);
+        let payload: Value = serde_json::from_str(&retries[0].payload_json).expect("retry payload");
+        assert_eq!(payload["policyRevision"], Value::from(2));
+        assert!(payload.get("attemptId").is_none());
     }
 
     #[tokio::test]

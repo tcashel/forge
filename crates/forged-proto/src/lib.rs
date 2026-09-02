@@ -29,8 +29,10 @@ pub use engine::{
 };
 pub use error::{PortError, ProtoError};
 pub use events::{
-    grant_retry, grant_retry_for_attempt, grant_retry_for_attempt_since, grant_retry_since,
-    parse_proto_events, record, transport_failures_of, widen_rfc3339, GatePhase, ProtoEvent,
+    grant_retry, grant_retry_for_attempt, grant_retry_for_attempt_since,
+    grant_retry_for_attempt_under_active_policy, grant_retry_since,
+    grant_retry_under_active_policy, parse_proto_events, record, transport_failures_of,
+    widen_rfc3339, GatePhase, ProtoEvent,
 };
 pub use ports::{
     KillOutcome, LeaseReclaim, PrSnapshot, ReconcilePorts, ResolveState, SessionLiveness,

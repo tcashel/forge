@@ -156,6 +156,7 @@ fn every_proto_event_kind_round_trips_through_the_ledger() {
         ProtoEvent::Retry {
             packet_id: packet_id(RUN, Stage::Fix, 1),
             attempt_id: None,
+            policy_revision: None,
             transport_failures: 1,
             retry_after: "2026-08-12T00:00:30.000000000Z".to_owned(),
         },

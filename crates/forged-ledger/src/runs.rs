@@ -257,6 +257,22 @@ fn policy_revision_row(row: &rusqlite::Row<'_>) -> Result<PolicyRevisionRow, rus
     })
 }
 
+pub(crate) fn latest_policy_revision_tx(
+    conn: &Connection,
+    run_id: &str,
+) -> Result<Option<PolicyRevisionRow>, LedgerError> {
+    require_run(conn, run_id)?;
+    conn.query_row(
+        "SELECT run_id, revision, policy_json, policy_sha256, reason, created_at, \
+         operation_id FROM policy_revisions WHERE run_id = ?1 \
+         ORDER BY revision DESC LIMIT 1",
+        [run_id],
+        policy_revision_row,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
 fn canonical<T: Serialize>(value: &T) -> Result<(String, String), LedgerError> {
     let value = serde_json::to_value(value)?;
     let bytes = canonical_json_bytes(&value)
@@ -818,18 +834,7 @@ impl Ledger {
         run_id: &str,
     ) -> Result<Option<PolicyRevisionRow>, LedgerError> {
         let run_id = run_id.to_owned();
-        self.submit(move |conn| {
-            require_run(conn, &run_id)?;
-            conn.query_row(
-                "SELECT run_id, revision, policy_json, policy_sha256, reason, created_at, \
-                 operation_id FROM policy_revisions WHERE run_id = ?1 \
-                 ORDER BY revision DESC LIMIT 1",
-                [&run_id],
-                policy_revision_row,
-            )
-            .optional()
-            .map_err(Into::into)
-        })
+        self.submit(move |conn| latest_policy_revision_tx(conn, &run_id))
     }
 
     /// List every execution-policy revision for a run in durable order.
