@@ -54,7 +54,8 @@ The two `cargo nextest run` gates need `cargo-nextest` on `PATH` (a
 development tool, not a Cargo dependency — cargo cannot declare binary tool
 deps); the operator installs it, never an agent. Its config at
 `.config/nextest.toml` carries the serialization contract for
-`crates/forged/tests/supervise.rs`. Under any other runner — plain
+`crates/forged/tests/supervise.rs` and
+`crates/forged/tests/supervise_failpoint.rs`. Under any other runner — plain
 `cargo test` included — those cases SKIP loudly unless `RUST_TEST_THREADS=1`
 marks a deliberately serial run. If you see those skips, switch runners; never
 reintroduce an in-process lock to chase them.

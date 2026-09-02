@@ -5,7 +5,8 @@
 # used to take: nextest runs every test in its own process, where a
 # process-local lock serializes nothing. Under any runner that does not read
 # this file, those cases skip loudly (see require_serialized_runner in
-# crates/forged/tests/supervise.rs).
+# crates/forged/tests/support/supervise.rs, used by both `supervise` and
+# `supervise_failpoint`).
 
 # nextest is this workspace's test runner; the floor matches the version CI
 # pins. Below it, nextest refuses to run (exit 92) rather than half-honoring
@@ -28,11 +29,11 @@ supervise-process-fixtures = { max-threads = 1 }
 epic-process-fixtures = { max-threads = 2 }
 
 [[profile.default.overrides]]
-filter = 'package(=forged) & binary(=supervise)'
+filter = 'package(=forged) & (binary(=supervise) | binary(=supervise_failpoint))'
 test-group = 'supervise-process-fixtures'
 
 [[profile.default.overrides]]
-filter = 'package(=forged) & (binary(=e2e_drive) | binary(=convergence) | binary(=kill_matrix) | binary(=ore_loop) | binary(=ore_loop_failpoint))'
+filter = 'package(=forged) & (binary(=e2e_drive) | binary(=e2e_drive_failpoint) | binary(=convergence) | binary(=convergence_failpoint) | binary(=kill_matrix) | binary(=ore_loop) | binary(=ore_loop_failpoint))'
 test-group = 'epic-process-fixtures'
 
 # JUnit XML for the Codecov test-results upload, written to
