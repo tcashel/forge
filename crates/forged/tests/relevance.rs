@@ -117,6 +117,7 @@ fn the_shared_registry_names_every_emitter_and_direct_remedy_builder() {
             "fn action_remedy(",
             "pause scheduling before abandoning the epic",
             "reopen the work item before retrying",
+            "Narrow the frontier with --repo or request a bounded page with --limit",
         ]
     );
     assert_eq!(

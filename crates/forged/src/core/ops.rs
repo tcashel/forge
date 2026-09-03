@@ -4260,6 +4260,37 @@ pub(super) fn projection_symptoms(
     }
 }
 
+/// The entry's classed next actions: every unresolved attention item's
+/// `nextActions`, deduplicated by (verb, args). A summary row keeps the
+/// typed `next` the driver reads (ADR-0036) without carrying the items.
+fn operations_next_actions(entry: &Value) -> Value {
+    let mut actions: Vec<Value> = Vec::new();
+    for item in entry
+        .pointer("/attentionItems/items")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if item.get("state").and_then(Value::as_str) == Some("resolved") {
+            continue;
+        }
+        for action in item
+            .get("nextActions")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let duplicate = actions.iter().any(|seen| {
+                seen.get("verb") == action.get("verb") && seen.get("args") == action.get("args")
+            });
+            if !duplicate {
+                actions.push(action.clone());
+            }
+        }
+    }
+    Value::Array(actions)
+}
+
 fn operations_attention_counts(entry: &Value) -> Value {
     let mut decisions = 0usize;
     let mut symptoms = 0usize;
@@ -4363,6 +4394,7 @@ fn operations_entry(entry: Value, detail: ProjectionDetail) -> Value {
         "liveSeats": entry.get("liveSeats").cloned().unwrap_or(json!(0)),
         "spend": entry.get("spend").cloned().unwrap_or(Value::Null),
         "nextAction": operations_next_action(&entry),
+        "next": operations_next_actions(&entry),
         "pr": entry.get("pr").cloned().unwrap_or(Value::Null),
         "delivery": entry.get("delivery").cloned().unwrap_or(Value::Null),
         "attention": attention,

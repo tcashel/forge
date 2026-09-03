@@ -2421,9 +2421,27 @@ fn summarize_work_detail(full: &Value) -> Value {
     let mut decisions = 0usize;
     let mut symptoms = 0usize;
     let mut acknowledged = 0usize;
+    // The summary keeps the typed `next` the driver reads (ADR-0036): every
+    // unresolved item's classed actions, deduplicated by (verb, args).
+    let mut next: Vec<Value> = Vec::new();
     for item in &attention {
         if item.get("state").and_then(Value::as_str) == Some("acknowledged") {
             acknowledged += 1;
+        }
+        if item.get("state").and_then(Value::as_str) != Some("resolved") {
+            for action in item
+                .get("nextActions")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let duplicate = next.iter().any(|seen| {
+                    seen.get("verb") == action.get("verb") && seen.get("args") == action.get("args")
+                });
+                if !duplicate {
+                    next.push(action.clone());
+                }
+            }
         }
         let condition = item.get("condition").cloned().and_then(|value| {
             serde_json::from_value::<forged_types::AttentionCondition>(value).ok()
@@ -2448,6 +2466,7 @@ fn summarize_work_detail(full: &Value) -> Value {
             .first()
             .and_then(|item| item.get("recommendedAction"))
             .or_else(|| full.pointer("/status/nextAction")),
+        "next": next,
         "desired": {"total": full.pointer("/desired/total")},
         "admission": {
             "decisionTotal": full.pointer("/admission/decisions/total"),
