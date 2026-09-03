@@ -6,6 +6,8 @@
 
 #![allow(dead_code)]
 
+use forged_types::AttentionCondition;
+
 pub const SUBJECT_TOTAL: usize = 120;
 pub const ATTENTION_TOTAL: usize = 62;
 pub const BLOCKED_SYMPTOM_TOTAL: usize = 47;
@@ -13,20 +15,63 @@ pub const DECISION_TOTAL: usize = 10;
 pub const RUNNING_TOTAL: usize = 2;
 pub const RECENT_LANDED_TOTAL: usize = 3;
 
-pub const COVERAGE_CONDITIONS: [&str; 7] = [
-    "input-required",
-    "restart-budget-exhausted",
-    "review-budget-exhausted",
-    "reviewer-disagreement",
-    "quarantined",
-    "missing-cost",
-    "retry-exhausted",
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FixtureDecisionContext {
+    Ordinary,
+    ReviewBudgetExhausted,
+    Attemptless,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FixtureDecision {
+    pub condition: AttentionCondition,
+    pub context: FixtureDecisionContext,
+}
+
+pub const COVERAGE_CONDITIONS: [FixtureDecision; 7] = [
+    FixtureDecision {
+        condition: AttentionCondition::InputRequired,
+        context: FixtureDecisionContext::Ordinary,
+    },
+    FixtureDecision {
+        condition: AttentionCondition::RestartBudgetExhausted,
+        context: FixtureDecisionContext::Ordinary,
+    },
+    FixtureDecision {
+        condition: AttentionCondition::ReviewerDisagreement,
+        context: FixtureDecisionContext::ReviewBudgetExhausted,
+    },
+    FixtureDecision {
+        condition: AttentionCondition::ReviewerDisagreement,
+        context: FixtureDecisionContext::Ordinary,
+    },
+    FixtureDecision {
+        condition: AttentionCondition::Quarantined,
+        context: FixtureDecisionContext::Ordinary,
+    },
+    FixtureDecision {
+        condition: AttentionCondition::MissingCost,
+        context: FixtureDecisionContext::Ordinary,
+    },
+    FixtureDecision {
+        condition: AttentionCondition::RetryExhausted,
+        context: FixtureDecisionContext::Ordinary,
+    },
 ];
 
-pub const EXEMPT_CONDITIONS: [&str; 3] = [
-    "ambiguous-effect",
-    "merge-approval",
-    "missing-evidence-attemptless",
+pub const EXEMPT_CONDITIONS: [FixtureDecision; 3] = [
+    FixtureDecision {
+        condition: AttentionCondition::AmbiguousEffect,
+        context: FixtureDecisionContext::Ordinary,
+    },
+    FixtureDecision {
+        condition: AttentionCondition::MergeApproval,
+        context: FixtureDecisionContext::Ordinary,
+    },
+    FixtureDecision {
+        condition: AttentionCondition::MissingEvidence,
+        context: FixtureDecisionContext::Attemptless,
+    },
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,8 +91,9 @@ pub struct FixtureSubject {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FixtureAttention {
     pub subject_id: String,
-    pub condition: &'static str,
+    pub condition: AttentionCondition,
     pub decision: bool,
+    pub decision_context: Option<FixtureDecisionContext>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,36 +126,39 @@ pub fn operator_store_fixture() -> OperatorStoreFixture {
     for subject in subjects.iter().skip(5).take(BLOCKED_SYMPTOM_TOTAL) {
         attention.push(FixtureAttention {
             subject_id: subject.id.clone(),
-            condition: "blocked",
+            condition: AttentionCondition::Blocked,
             decision: false,
+            decision_context: None,
         });
     }
-    for (subject, condition) in subjects
+    for (subject, case) in subjects
         .iter()
         .skip(5 + BLOCKED_SYMPTOM_TOTAL)
         .zip(COVERAGE_CONDITIONS.iter().chain(EXEMPT_CONDITIONS.iter()))
     {
         attention.push(FixtureAttention {
             subject_id: subject.id.clone(),
-            condition,
+            condition: case.condition,
             decision: true,
+            decision_context: Some(case.context),
         });
     }
     for (subject, condition) in subjects
         .iter()
         .skip(5 + BLOCKED_SYMPTOM_TOTAL + DECISION_TOTAL)
         .zip([
-            "controller-dead",
-            "failed-gate",
-            "provider-degraded",
-            "admission-deferred",
-            "work-settlement-pending",
+            AttentionCondition::ControllerDead,
+            AttentionCondition::FailedGate,
+            AttentionCondition::ProviderDegraded,
+            AttentionCondition::AdmissionDeferred,
+            AttentionCondition::WorkSettlementPending,
         ])
     {
         attention.push(FixtureAttention {
             subject_id: subject.id.clone(),
             condition,
             decision: false,
+            decision_context: None,
         });
     }
 
@@ -124,6 +173,7 @@ pub fn operator_store_fixture() -> OperatorStoreFixture {
 pub enum ActionSiteKind {
     Emitter,
     Remedy,
+    Constructor,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,6 +181,7 @@ pub struct ActionSite {
     pub kind: ActionSiteKind,
     pub path: &'static str,
     pub marker: &'static str,
+    pub literal_ordinal: Option<usize>,
 }
 
 /// The complete registry of next-action emitters and direct remedy builders.
@@ -139,35 +190,60 @@ pub const ACTION_SITES: &[ActionSite] = &[
         kind: ActionSiteKind::Emitter,
         path: "src/core/work_ops.rs",
         marker: "pub(crate) fn projection_actions(",
+        literal_ordinal: Some(0),
     },
     ActionSite {
         kind: ActionSiteKind::Emitter,
         path: "src/core/ops.rs",
         marker: "pub(crate) fn run_projection_actions(",
+        literal_ordinal: None,
     },
     ActionSite {
         kind: ActionSiteKind::Emitter,
         path: "src/core/attention.rs",
         marker: "pub(crate) fn recommendation_actions(",
+        literal_ordinal: Some(0),
     },
     ActionSite {
         kind: ActionSiteKind::Remedy,
         path: "src/core/handoff.rs",
         marker: "fn keyless_resubmit_remedy(",
+        literal_ordinal: Some(0),
     },
     ActionSite {
         kind: ActionSiteKind::Remedy,
         path: "src/core/handoff.rs",
         marker: "fn action_remedy(",
+        literal_ordinal: Some(1),
     },
     ActionSite {
         kind: ActionSiteKind::Remedy,
         path: "src/core/epic.rs",
         marker: "pause scheduling before abandoning the epic",
+        literal_ordinal: Some(0),
     },
     ActionSite {
         kind: ActionSiteKind::Remedy,
         path: "src/core/ops.rs",
         marker: "reopen the work item before retrying",
+        literal_ordinal: None,
+    },
+    ActionSite {
+        kind: ActionSiteKind::Constructor,
+        path: "src/core/ops.rs",
+        marker: "pub(crate) fn retry_action_with_class(",
+        literal_ordinal: Some(0),
+    },
+    ActionSite {
+        kind: ActionSiteKind::Constructor,
+        path: "src/core/ops.rs",
+        marker: "fn classified_action(",
+        literal_ordinal: Some(1),
+    },
+    ActionSite {
+        kind: ActionSiteKind::Constructor,
+        path: "src/core/mod.rs",
+        marker: "pub(crate) fn work_supersede_action(",
+        literal_ordinal: Some(0),
     },
 ];

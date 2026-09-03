@@ -1515,7 +1515,9 @@ pub(crate) fn run_projection_actions(
                 retry_action(&run.run_id, retry_reason(run)),
             ];
         }
-        Some(forged_ledger::RunOutcome::Superseded) => return Vec::new(),
+        Some(forged_ledger::RunOutcome::Superseded) => {
+            unreachable!("superseded implies a recorded successor")
+        }
         Some(forged_ledger::RunOutcome::Cancelled) | None => {}
         Some(forged_ledger::RunOutcome::Landed) => unreachable!("handled above"),
     }

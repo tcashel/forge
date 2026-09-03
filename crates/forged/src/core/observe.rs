@@ -775,6 +775,8 @@ async fn explain_work_item(ctx: &Ctx, work: WorkItemSnapshot) -> Result<Value, F
             || (run.delivery_pr.is_some() && run.delivery_sha.is_some())
         {
             "landed"
+        } else if run.state == forged_ledger::RunState::Active {
+            "running"
         } else {
             work_verdict.unwrap_or_else(|| super::health::execution_health(inputs))
         };
@@ -846,15 +848,45 @@ async fn subject_attention_actions(
         })
     {
         for action in item.next_actions {
-            if actions.len() == EXPLAIN_COLLECTION_CAP {
-                return Ok(actions);
-            }
             if !actions.contains(&action) {
                 actions.push(action);
             }
         }
     }
-    Ok(actions)
+    Ok(rank_subject_actions(actions))
+}
+
+fn rank_subject_actions(
+    mut actions: Vec<forged_types::OperationActionV1>,
+) -> Vec<forged_types::OperationActionV1> {
+    let mut first_should = None;
+    for (index, action) in actions.iter_mut().enumerate() {
+        if action.class != forged_types::ActionClass::Should {
+            continue;
+        }
+        if first_should.is_none() {
+            first_should = Some(index);
+        } else {
+            action.class = forged_types::ActionClass::Can;
+        }
+    }
+    if let Some(index) = first_should {
+        actions[..=index].rotate_right(1);
+    }
+
+    let mut ranked = Vec::with_capacity(actions.len().min(EXPLAIN_COLLECTION_CAP));
+    for action in actions {
+        if ranked.iter().any(|seen: &forged_types::OperationActionV1| {
+            seen.verb == action.verb && seen.args == action.args
+        }) {
+            continue;
+        }
+        ranked.push(action);
+        if ranked.len() == EXPLAIN_COLLECTION_CAP {
+            break;
+        }
+    }
+    ranked
 }
 
 async fn explain_run(ctx: &Ctx, id: String) -> Result<Value, Failure> {
@@ -887,7 +919,9 @@ async fn explain_run(ctx: &Ctx, id: String) -> Result<Value, Failure> {
         .await?
         .map(|revision| revision.revision)
     };
-    let next = super::ops::run_projection_actions(run);
+    let mut next = subject_attention_actions(ctx, AttentionSubjectKind::Run, &id).await?;
+    next.extend(super::ops::run_projection_actions(run));
+    let next = rank_subject_actions(next);
     Ok(json!({
         "schema": "forged.explain/1",
         "kind": "run",

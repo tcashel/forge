@@ -33,7 +33,7 @@ filter = 'package(=forged) & (binary(=supervise) | binary(=supervise_failpoint))
 test-group = 'supervise-process-fixtures'
 
 [[profile.default.overrides]]
-filter = 'package(=forged) & (binary(=e2e_drive) | binary(=e2e_drive_failpoint) | binary(=convergence) | binary(=convergence_failpoint) | binary(=kill_matrix) | binary(=ore_loop) | binary(=ore_loop_failpoint))'
+filter = 'package(=forged) & (binary(=e2e_drive) | binary(=e2e_drive_failpoint) | binary(=convergence) | binary(=convergence_failpoint) | binary(=kill_matrix) | binary(=ore_loop) | binary(=ore_loop_failpoint) | binary(=coverage) | binary(=relevance))'
 test-group = 'epic-process-fixtures'
 
 # JUnit XML for the Codecov test-results upload, written to

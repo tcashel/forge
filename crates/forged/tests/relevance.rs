@@ -2,6 +2,7 @@ mod support;
 
 use forged_ledger::RunOutcome;
 use serde_json::{json, Value};
+use std::collections::BTreeSet;
 use support::operator_store::{ActionSiteKind, ACTION_SITES};
 use support::{fabricate_run, TestEnv};
 
@@ -87,6 +88,7 @@ fn the_shared_registry_names_every_emitter_and_direct_remedy_builder() {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut emitters = Vec::new();
     let mut remedies = Vec::new();
+    let mut constructors = Vec::new();
     for site in ACTION_SITES {
         let source = std::fs::read_to_string(manifest.join(site.path))
             .unwrap_or_else(|error| panic!("{}: {error}", site.path));
@@ -97,6 +99,7 @@ fn the_shared_registry_names_every_emitter_and_direct_remedy_builder() {
         match site.kind {
             ActionSiteKind::Emitter => emitters.push(site.marker),
             ActionSiteKind::Remedy => remedies.push(site.marker),
+            ActionSiteKind::Constructor => constructors.push(site.marker),
         }
     }
     assert_eq!(
@@ -115,5 +118,59 @@ fn the_shared_registry_names_every_emitter_and_direct_remedy_builder() {
             "pause scheduling before abandoning the epic",
             "reopen the work item before retrying",
         ]
+    );
+    assert_eq!(
+        constructors,
+        [
+            "pub(crate) fn retry_action_with_class(",
+            "fn classified_action(",
+            "pub(crate) fn work_supersede_action(",
+        ]
+    );
+
+    let registered = ACTION_SITES
+        .iter()
+        .filter_map(|site| {
+            site.literal_ordinal
+                .map(|ordinal| (site.path.to_owned(), ordinal))
+        })
+        .collect::<BTreeSet<_>>();
+    let mut discovered = BTreeSet::new();
+    let mut pending = vec![manifest.join("src")];
+    while let Some(path) = pending.pop() {
+        for entry in
+            std::fs::read_dir(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()))
+        {
+            let entry = entry.expect("source directory entry");
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            if path.extension().and_then(|extension| extension.to_str()) != Some("rs") {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+            let relative = path
+                .strip_prefix(manifest)
+                .expect("source under manifest")
+                .to_string_lossy()
+                .into_owned();
+            let mut ordinal = 0;
+            for line in source.lines() {
+                if line
+                    .find("OperationActionV1 {")
+                    .is_some_and(|offset| !line[..offset].contains("->"))
+                {
+                    discovered.insert((relative.clone(), ordinal));
+                    ordinal += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(
+        discovered, registered,
+        "every direct OperationActionV1 literal must be classified in ACTION_SITES"
     );
 }

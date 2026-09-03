@@ -333,7 +333,12 @@ fn restart_exhaustion_advertises_stop_then_retry_and_clears_durably() {
     let env = TestEnv::new("forged-attention-restart-actions");
     env.forged(&["init"]);
     let run = "attention-restart";
-    start_run(&env, run);
+    env.seed_work_spec(
+        "bead-attention-restart",
+        "Exercise the advertised attention recovery verb.",
+        "- the advertised verb executes",
+    );
+    fabricate_run(&env, run);
     env.authorize_run(run);
     exhaust_restart_budget(&env, run);
 
@@ -375,6 +380,17 @@ fn restart_exhaustion_advertises_stop_then_retry_and_clears_durably() {
     assert!(retry["reason"]
         .as_str()
         .is_some_and(|reason| reason.contains("current spec")));
+
+    let (code, explained) = env.forged(&["explain", "--id", run]);
+    assert_eq!(code, 0, "explain exhausted run: {explained}");
+    let explain_should = explained["result"]["next"]
+        .as_array()
+        .expect("explain next actions")
+        .iter()
+        .filter(|action| action["class"] == json!("should"))
+        .collect::<Vec<_>>();
+    assert_eq!(explain_should.len(), 1, "{explained}");
+    assert_eq!(explain_should[0]["verb"], json!("run retry"));
 
     env.set_work_field(
         run,
