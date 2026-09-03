@@ -4,6 +4,15 @@ This file records user-visible changes to Forge.
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-09-02
+
+Two dead states closed and a leaner CI gate: a roster revision can no
+longer strand an unspawned child (ore-071, PR #245); a `run revise-policy`
+between two deadline retries can no longer make a run unreadable by every
+verb (ore-073, PR #247); and pull requests stop running the forged suite
+three times, with the slow legs split into partitioned matrices (PRs #244
+and #249).
+
 ### Fixed
 
 - A dead state reachable by revising a roster (or pausing and resuming)
@@ -17,6 +26,32 @@ This file records user-visible changes to Forge.
   and controller-death recovery reconciles live attempts even when no
   operation is in flight, so an orphaned unspawned attempt is revoked
   through the ordinary saga.
+- Retry grants collided across a policy revision: the transport-failure
+  count restarts at the `run revise-policy` cutoff (ADR-0035), so two
+  deadline grants on one packet could share the logical key
+  `retry/<packet>/1`, and the strict replay parser then refused the whole
+  run — `run status`, `events`, `stop`, everything — with
+  `INTERNAL malformed event`. Grants are now keyed by attempt
+  (`retry/<packet>/attempt/<id>`), pre-claim grants by policy revision via
+  one additive optional payload field (`policyRevision`), legacy rows keep
+  their old key, and the parser stays strict. The revision lookup, cutoff
+  decision, count, and append share one ledger transaction, so a
+  concurrent revision can no longer stamp a grant with a stale cutoff. A
+  run already stranded this way projects again after upgrading; its
+  identical `run stop` replay completes the aftermath.
+
+### Changed
+
+- CI: the `failpoints` leg runs only crate-gated `*_failpoint` binaries
+  (every feature-gated test now lives in one), coverage runs only on
+  pushes to `main`, and the release workflow requires a green `rust.yml`
+  run for the tagged commit instead of re-running the Linux suites. The
+  `test` and `failpoints` legs are `--partition hash:K/N` matrices (four
+  and three partitions), nextest reserves one CPU for spawned controller
+  trees (`test-threads = -1`) and lets two epic process fixtures run at
+  once, and the crate-gate guard fails closed. Measured on the first
+  matrix run: the slowest partition finishes in 6.8 minutes where the
+  serialized failpoints leg took 27.
 
 ## [0.7.0] - 2026-09-02
 
@@ -326,7 +361,8 @@ historical TypeScript `v0.4.0` product has been replaced and is unsupported.
 - Refuses non-normalized or root-equivalent install prefixes before touching a
   live path.
 
-[Unreleased]: https://github.com/tcashel/forge/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/tcashel/forge/compare/v0.7.1...HEAD
+[0.7.1]: https://github.com/tcashel/forge/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/tcashel/forge/compare/v0.6.3...v0.7.0
 [0.6.3]: https://github.com/tcashel/forge/compare/v0.6.2...v0.6.3
 [0.6.2]: https://github.com/tcashel/forge/compare/v0.6.1...v0.6.2
