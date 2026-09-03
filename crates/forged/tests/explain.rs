@@ -108,6 +108,67 @@ fn an_open_work_item_points_to_work_show_and_existing_work_actions() {
 }
 
 #[test]
+fn closed_and_parked_epic_work_items_use_lifecycle_verdicts() {
+    let env = TestEnv::new("forged-explain-work-lifecycle-verdicts");
+    assert_eq!(env.forged(&["init"]).0, 0);
+    for (id, status, verdict) in [
+        ("explain-closed-epic", "closed", "closed"),
+        ("explain-parked-epic", "deferred", "parked"),
+    ] {
+        env.set_work_field(id, "type", "epic");
+        env.set_work_field(id, "status", status);
+        let (code, response) = env.forged(&["explain", "--id", id]);
+        assert_eq!(code, 0, "{id}: {response}");
+        assert_eq!(result(&response)["kind"], json!("work-item"));
+        assert_eq!(result(&response)["how"]["verdict"], json!(verdict));
+    }
+}
+
+#[test]
+fn landed_delivery_outranks_the_closed_work_verdict() {
+    let env = TestEnv::new("forged-explain-landed-work-verdict");
+    assert_eq!(env.forged(&["init"]).0, 0);
+    let run = "explain-landed-work";
+    let work = "bead-explain-landed-work";
+    env.set_work_field(work, "type", "epic");
+    env.set_work_field(work, "status", "closed");
+    fabricate_run(&env, run);
+    let ledger = env.ledger();
+    ledger
+        .settle_run(
+            run,
+            forged_ledger::RunOutcome::Landed,
+            "fixture delivery landed".to_owned(),
+            Some(42),
+            Some("a".repeat(40)),
+            None,
+        )
+        .expect("settle landed fixture");
+    ledger.close().expect("close ledger");
+
+    let (code, response) = env.forged(&["explain", "--id", work]);
+    assert_eq!(code, 0, "landed work explain: {response}");
+    assert_eq!(result(&response)["how"]["verdict"], json!("landed"));
+}
+
+#[test]
+fn a_running_latest_run_outranks_closed_and_parked_work_verdicts() {
+    let env = TestEnv::new("forged-explain-running-work-verdict");
+    assert_eq!(env.forged(&["init"]).0, 0);
+    for (run, status) in [
+        ("explain-running-closed", "closed"),
+        ("explain-running-parked", "deferred"),
+    ] {
+        fabricate_run(&env, run);
+        let work = format!("bead-{run}");
+        env.set_work_field(&work, "status", status);
+        let (code, response) = env.forged(&["explain", "--id", &work]);
+        assert_eq!(code, 0, "{run}: {response}");
+        assert_eq!(result(&response)["how"]["verdict"], json!("running"));
+    }
+}
+
+#[test]
 fn an_exact_work_item_outranks_its_same_named_run_and_names_that_run() {
     let env = TestEnv::new("forged-explain-work-run-alias");
     assert_eq!(env.forged(&["init"]).0, 0);
@@ -157,6 +218,62 @@ fn a_stopped_run_uses_its_health_and_retry_first_action() {
     assert_eq!(result(&response)["kind"], json!("run"));
     assert_eq!(result(&response)["how"]["verdict"], json!("terminal"));
     assert_next(&response, "run retry");
+}
+
+#[test]
+fn multiple_run_decisions_keep_one_should_and_order_it_first() {
+    let env = TestEnv::new("forged-explain-run-decision-ranking");
+    assert_eq!(env.forged(&["init"]).0, 0);
+    let run = "explain-ranked-run";
+    fabricate_run(&env, run);
+    let ledger = env.ledger();
+    ledger
+        .append_event(
+            Some(run),
+            "proto.quarantine",
+            json!({"packetId": format!("{run}/implement/0"), "attemptId": 7, "reason": "fixture fence"}),
+        )
+        .expect("quarantine decision");
+    ledger
+        .record_usage(forged_ledger::NewUsage {
+            run_id: run.to_owned(),
+            packet_id: Some(format!("{run}/implement/0")),
+            attempt_id: None,
+            provider: "fixture".to_owned(),
+            model: "fixture".to_owned(),
+            input_tokens: 1,
+            output_tokens: 1,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            cost_usd: None,
+            pricing_basis: None,
+            rate_limit_used_percent: None,
+            web_search_requests: None,
+        })
+        .expect("missing-cost decision");
+    ledger.close().expect("close ledger");
+
+    let (code, response) = env.forged(&["explain", "--id", run]);
+    assert_eq!(code, 0, "explain ranked run: {response}");
+    let next = result(&response)["next"].as_array().expect("next actions");
+    assert_eq!(next[0]["class"], json!("should"), "{response}");
+    assert_eq!(
+        next.iter()
+            .filter(|action| action["class"] == json!("should"))
+            .count(),
+        1,
+        "{response}"
+    );
+    let decision_classes = next
+        .iter()
+        .filter(|action| action["verb"] == json!("attention resolve"))
+        .map(|action| action["class"].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        decision_classes,
+        [json!("should"), json!("can")],
+        "{response}"
+    );
 }
 
 #[test]

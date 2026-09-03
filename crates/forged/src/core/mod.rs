@@ -983,6 +983,7 @@ pub(crate) fn work_supersede_action(work_id: &str) -> OperationActionV1 {
         verb: "work supersede".to_owned(),
         args,
         reason: "create the successor first with work create".to_owned(),
+        class: forged_types::ActionClass::Can,
     }
 }
 

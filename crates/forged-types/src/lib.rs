@@ -47,7 +47,8 @@ pub use contract::{
 };
 pub use controller_env::{CONTROLLER_ENV, OPERATOR_STATE_ENV};
 pub use envelope::{
-    OpError, OperationActionV1, OperationRequest, OperationResponse, RemedyV1, REMEDY_SCHEMA_V1,
+    ActionClass, OpError, OperationActionV1, OperationRequest, OperationResponse, RemedyV1,
+    REMEDY_SCHEMA_V1,
 };
 pub use error::ErrorCode;
 pub use herdr_layout::{

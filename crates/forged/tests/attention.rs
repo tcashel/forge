@@ -167,6 +167,7 @@ fn attention_is_identical_across_surfaces_and_controls_are_occurrence_fenced() {
                 "note": null,
             },
             "reason": "bind the adjudicated disposition and note for this exact quarantined occurrence",
+            "class": "should",
         }]),
         "ore-070.5 deliberately moves the quarantined action pin"
     );
@@ -286,6 +287,7 @@ fn source_backed_attention_cannot_substitute_for_domain_resolution() {
             "verb": "work reopen",
             "args": {"id": "bead-attention-blocked"},
             "reason": blocked["recommendedAction"]["text"],
+            "class": "repair",
         }]),
         "the closed recommendation mapping publishes one domain verb"
     );
@@ -331,7 +333,12 @@ fn restart_exhaustion_advertises_stop_then_retry_and_clears_durably() {
     let env = TestEnv::new("forged-attention-restart-actions");
     env.forged(&["init"]);
     let run = "attention-restart";
-    start_run(&env, run);
+    env.seed_work_spec(
+        "bead-attention-restart",
+        "Exercise the advertised attention recovery verb.",
+        "- the advertised verb executes",
+    );
+    fabricate_run(&env, run);
     env.authorize_run(run);
     exhaust_restart_budget(&env, run);
 
@@ -343,6 +350,7 @@ fn restart_exhaustion_advertises_stop_then_retry_and_clears_durably() {
             "verb": "run stop",
             "args": {"run": run, "outcome": null, "reason": null},
             "reason": "stop with an outcome and reason, then retry the terminal run",
+            "class": "should",
         }]),
         "an active run must never advertise run retry"
     );
@@ -363,6 +371,7 @@ fn restart_exhaustion_advertises_stop_then_retry_and_clears_durably() {
         .expect("terminal exhausted run attention");
     let retry = &terminal["nextActions"][0];
     assert_eq!(retry["verb"], json!("run retry"));
+    assert_eq!(retry["class"], json!("should"));
     assert_eq!(
         retry["args"],
         json!({"id": run, "runId": null}),
@@ -371,6 +380,17 @@ fn restart_exhaustion_advertises_stop_then_retry_and_clears_durably() {
     assert!(retry["reason"]
         .as_str()
         .is_some_and(|reason| reason.contains("current spec")));
+
+    let (code, explained) = env.forged(&["explain", "--id", run]);
+    assert_eq!(code, 0, "explain exhausted run: {explained}");
+    let explain_should = explained["result"]["next"]
+        .as_array()
+        .expect("explain next actions")
+        .iter()
+        .filter(|action| action["class"] == json!("should"))
+        .collect::<Vec<_>>();
+    assert_eq!(explain_should.len(), 1, "{explained}");
+    assert_eq!(explain_should[0]["verb"], json!("run retry"));
 
     env.set_work_field(
         run,
@@ -457,6 +477,7 @@ fn epic_input_attention_advertises_and_executes_epic_resolve() {
             "verb": "epic resolve",
             "args": {"epic": epic, "child": null, "note": null},
             "reason": "bind the held child when the input requirement names one and record the resolution note",
+            "class": "should",
         }])
     );
     let action = &item["nextActions"][0];
@@ -500,6 +521,7 @@ fn provider_exhaustion_advertises_and_executes_run_roster_revision() {
             "verb": "run revise-roster",
             "args": {"run": run, "roster": null, "reason": null},
             "reason": "bind a configured roster name and the reason for revising provider policy",
+            "class": "should",
         }])
     );
     let action = &item["nextActions"][0];
@@ -580,6 +602,7 @@ fn review_disagreement_advertises_accept_risk_only_after_a_persisted_terminal_re
                 "note": null,
             },
             "reason": "bind the adjudicated disposition and note for this exact review disagreement",
+            "class": "should",
         }]),
         "accept-risk must be absent while terminal review evidence is not in the required stopped-blocked state"
     );
@@ -599,16 +622,22 @@ fn review_disagreement_advertises_accept_risk_only_after_a_persisted_terminal_re
 
     let gated_item =
         attention(&overview(&env), gated, "reviewer-disagreement").expect("gated disagreement");
-    assert_eq!(
-        gated_item["nextActions"][0]["verb"],
-        json!("attention resolve")
-    );
-    let accept = &gated_item["nextActions"][1];
+    let accept = &gated_item["nextActions"][0];
     assert_eq!(accept["verb"], json!("run accept-risk"));
+    assert_eq!(accept["class"], json!("should"));
     assert_eq!(
         accept["args"],
         json!({"run": gated, "acceptedBy": null, "rationale": null})
     );
+    assert!(gated_item["nextActions"].as_array().is_some_and(|actions| {
+        actions
+            .iter()
+            .any(|action| action["verb"] == json!("run retry") && action["class"] == json!("can"))
+            && actions.iter().any(|action| {
+                action["verb"] == json!("run adjudicate-settlement")
+                    && action["class"] == json!("repair")
+            })
+    }));
     let (code, accepted) = env.forged(&[
         "run",
         "accept-risk",
@@ -636,6 +665,7 @@ fn review_disagreement_advertises_accept_risk_only_after_a_persisted_terminal_re
         "accepted-risk state must not keep advertising a non-replayable generic acceptance"
     );
     assert_eq!(after["nextActions"][0]["verb"], json!("attention resolve"));
+    assert_eq!(after["nextActions"][0]["class"], json!("should"));
 }
 
 #[test]
@@ -922,6 +952,7 @@ fn missing_evidence_is_adjudicated_per_occurrence_with_its_full_attempt_scope() 
                 "note": null,
             },
             "reason": "bind a nonblank note explaining why this attempt-only evidence was never captured",
+            "class": "repair",
         }])
     );
     let evidence_action = item["nextActions"][0].clone();

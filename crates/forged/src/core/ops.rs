@@ -808,6 +808,14 @@ pub(crate) fn retry_action(
     run_id: &str,
     reason: impl Into<String>,
 ) -> forged_types::OperationActionV1 {
+    retry_action_with_class(run_id, reason, forged_types::ActionClass::Can)
+}
+
+pub(crate) fn retry_action_with_class(
+    run_id: &str,
+    reason: impl Into<String>,
+    class: forged_types::ActionClass,
+) -> forged_types::OperationActionV1 {
     let Value::Object(args) = json!({"id": run_id, "runId": Value::Null}) else {
         unreachable!("run retry action args are an object")
     };
@@ -815,11 +823,15 @@ pub(crate) fn retry_action(
         verb: "run retry".to_owned(),
         args,
         reason: reason.into(),
+        class,
     }
 }
 
 pub(crate) fn retry_reason(run: &forged_ledger::RunRow) -> &'static str {
-    if run.terminal_outcome == Some(forged_ledger::RunOutcome::InputRequired) {
+    if matches!(
+        run.terminal_outcome,
+        Some(forged_ledger::RunOutcome::Blocked | forged_ledger::RunOutcome::InputRequired)
+    ) {
         "apply the requested decision or amendment, then retry"
     } else {
         "re-run the current spec after the world changed"
@@ -827,6 +839,15 @@ pub(crate) fn retry_reason(run: &forged_ledger::RunRow) -> &'static str {
 }
 
 fn action(verb: &str, args: Value, reason: impl Into<String>) -> forged_types::OperationActionV1 {
+    classified_action(verb, args, reason, forged_types::ActionClass::Can)
+}
+
+fn classified_action(
+    verb: &str,
+    args: Value,
+    reason: impl Into<String>,
+    class: forged_types::ActionClass,
+) -> forged_types::OperationActionV1 {
     let Value::Object(args) = args else {
         unreachable!("operation action args are an object")
     };
@@ -834,6 +855,7 @@ fn action(verb: &str, args: Value, reason: impl Into<String>) -> forged_types::O
         verb: verb.to_owned(),
         args,
         reason: reason.into(),
+        class,
     }
 }
 
@@ -955,10 +977,11 @@ pub async fn run_retry(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespon
                 "work {} is closed and cannot admit a retry",
                 source.work_id
             )),
-            action(
+            classified_action(
                 "work reopen",
                 json!({"id": source.work_id}),
                 "reopen the work item before retrying",
+                forged_types::ActionClass::Repair,
             ),
         );
     }
@@ -1458,6 +1481,45 @@ pub(crate) fn run_projection_actions(
             json!({"run": successor}),
             format!("inspect successor run {successor}"),
         )];
+    }
+    match run.terminal_outcome {
+        Some(forged_ledger::RunOutcome::Clean | forged_ledger::RunOutcome::AcceptedRisk) => {
+            return vec![
+                classified_action(
+                    "run stop",
+                    json!({
+                        "run": run.run_id,
+                        "outcome": "landed",
+                        "reason": null,
+                        "pr": null,
+                        "sha": null,
+                    }),
+                    "merge the reviewed PR on GitHub first",
+                    forged_types::ActionClass::Should,
+                ),
+                retry_action(&run.run_id, retry_reason(run)),
+            ];
+        }
+        Some(forged_ledger::RunOutcome::Blocked | forged_ledger::RunOutcome::InputRequired) => {
+            return vec![
+                classified_action(
+                    "work update",
+                    json!({
+                        "id": run.work_id,
+                        "expectedRevision": null,
+                        "description": null,
+                    }),
+                    retry_reason(run),
+                    forged_types::ActionClass::Should,
+                ),
+                retry_action(&run.run_id, retry_reason(run)),
+            ];
+        }
+        Some(forged_ledger::RunOutcome::Superseded) => {
+            unreachable!("superseded implies a recorded successor")
+        }
+        Some(forged_ledger::RunOutcome::Cancelled) | None => {}
+        Some(forged_ledger::RunOutcome::Landed) => unreachable!("handled above"),
     }
     let mut supersede = work_supersede_action(&run.work_id);
     supersede.reason =

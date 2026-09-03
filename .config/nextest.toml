@@ -27,6 +27,10 @@ supervise-process-fixtures = { max-threads = 1 }
 # this group may use two. The worst case is two epic trees plus one supervise
 # tree, with the reserved CPU for spawned work but no in-process slack.
 epic-process-fixtures = { max-threads = 2 }
+# `coverage` and `relevance` drive the forged CLI as a subprocess per case
+# (no daemon, no controller tree), so they get their own throttle: they
+# neither take an epic slot nor fan out beside the process-tree groups.
+cli-subprocess-fixtures = { max-threads = 1 }
 
 [[profile.default.overrides]]
 filter = 'package(=forged) & (binary(=supervise) | binary(=supervise_failpoint))'
@@ -35,6 +39,10 @@ test-group = 'supervise-process-fixtures'
 [[profile.default.overrides]]
 filter = 'package(=forged) & (binary(=e2e_drive) | binary(=e2e_drive_failpoint) | binary(=convergence) | binary(=convergence_failpoint) | binary(=kill_matrix) | binary(=ore_loop) | binary(=ore_loop_failpoint))'
 test-group = 'epic-process-fixtures'
+
+[[profile.default.overrides]]
+filter = 'package(=forged) & (binary(=coverage) | binary(=relevance))'
+test-group = 'cli-subprocess-fixtures'
 
 # JUnit XML for the Codecov test-results upload, written to
 # `target/nextest/ci/junit.xml`. CI selects this profile with NEXTEST_PROFILE=ci
