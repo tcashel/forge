@@ -229,6 +229,12 @@ pub const ACTION_SITES: &[ActionSite] = &[
         literal_ordinal: None,
     },
     ActionSite {
+        kind: ActionSiteKind::Remedy,
+        path: "src/core/work_ops.rs",
+        marker: "Narrow the frontier with --repo or request a bounded page with --limit",
+        literal_ordinal: Some(1),
+    },
+    ActionSite {
         kind: ActionSiteKind::Constructor,
         path: "src/core/ops.rs",
         marker: "pub(crate) fn retry_action_with_class(",

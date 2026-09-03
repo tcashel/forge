@@ -1229,6 +1229,7 @@ pub async fn work_ready(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
             args,
             reason: "Narrow the frontier with --repo or request a bounded page with --limit"
                 .to_owned(),
+            class: forged_types::ActionClass::Repair,
         });
         if let Some(error) = response.error.as_mut() {
             error.detail =
