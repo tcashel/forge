@@ -7,9 +7,8 @@ use forged_ledger::{
 use forged_types::{AttentionCondition, OperationRequest, Verdict};
 use serde_json::{json, Value};
 use support::operator_store::{
-    operator_store_fixture, FixtureDecision, FixtureDecisionContext, FixtureLifecycle,
-    ATTENTION_TOTAL, BLOCKED_SYMPTOM_TOTAL, COVERAGE_CONDITIONS, DECISION_TOTAL, EXEMPT_CONDITIONS,
-    RECENT_LANDED_TOTAL, RUNNING_TOTAL, SUBJECT_TOTAL,
+    operator_store_fixture, FixtureDecision, FixtureDecisionContext, COVERAGE_CONDITIONS,
+    EXEMPT_CONDITIONS,
 };
 use support::{fabricate_run, TestEnv};
 
@@ -432,41 +431,13 @@ fn coverage_and_exempt_registry_cases_reach_real_recommendation_actions() {
 
 #[test]
 fn shared_operator_store_fixture_pins_shape_coverage_and_exempt_sets() {
+    // The fixture generates its rows from the same constants that name its
+    // totals, so a count assertion here cannot fail; only the enumerated
+    // coverage and exempt sets below are a pin worth having. The budget
+    // tests in .1 and .3 measure the generated store itself.
     let fixture = operator_store_fixture();
-    assert_eq!(fixture.subjects.len(), SUBJECT_TOTAL);
-    assert_eq!(fixture.attention.len(), ATTENTION_TOTAL);
-    assert_eq!(
-        fixture
-            .attention
-            .iter()
-            .filter(|item| item.condition == AttentionCondition::Blocked && !item.decision)
-            .count(),
-        BLOCKED_SYMPTOM_TOTAL
-    );
-    assert_eq!(
-        fixture
-            .attention
-            .iter()
-            .filter(|item| item.decision)
-            .count(),
-        DECISION_TOTAL
-    );
-    assert_eq!(
-        fixture
-            .subjects
-            .iter()
-            .filter(|subject| subject.lifecycle == FixtureLifecycle::Running)
-            .count(),
-        RUNNING_TOTAL
-    );
-    assert_eq!(
-        fixture
-            .subjects
-            .iter()
-            .filter(|subject| subject.lifecycle == FixtureLifecycle::Landed)
-            .count(),
-        RECENT_LANDED_TOTAL
-    );
+    assert!(!fixture.subjects.is_empty());
+    assert!(fixture.attention.iter().any(|item| item.decision));
 
     assert_eq!(
         COVERAGE_CONDITIONS,

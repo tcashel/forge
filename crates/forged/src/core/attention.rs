@@ -329,12 +329,22 @@ pub(crate) fn recommendation_actions(
             forged_types::ActionClass::Should,
         )],
         Action::ReviseRoster => match subject_kind {
-            AttentionSubjectKind::Run => vec![classified_action(
-                "run revise-roster",
-                json!({"run": subject_id, "roster": Value::Null, "reason": Value::Null}),
-                "bind a configured roster name and the reason for revising provider policy",
-                forged_types::ActionClass::Should,
-            )],
+            AttentionSubjectKind::Run => {
+                // A revision binds at the run's next durable boundary; a
+                // stopped run has none, so there the revision is optional
+                // context and the lifecycle `run retry` carries the `should`.
+                let class = if run.is_some_and(|run| run.state == RunState::Active) {
+                    forged_types::ActionClass::Should
+                } else {
+                    forged_types::ActionClass::Can
+                };
+                vec![classified_action(
+                    "run revise-roster",
+                    json!({"run": subject_id, "roster": Value::Null, "reason": Value::Null}),
+                    "bind a configured roster name and the reason for revising provider policy",
+                    class,
+                )]
+            }
             AttentionSubjectKind::Epic => vec![classified_action(
                 "epic revise-roster",
                 json!({"epic": subject_id, "roster": Value::Null, "reason": Value::Null}),

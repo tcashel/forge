@@ -853,14 +853,37 @@ async fn subject_attention_actions(
             }
         }
     }
-    Ok(rank_subject_actions(actions))
+    Ok(actions)
 }
 
+/// Rank one subject's advertised actions into its `next`. Duplicates (same
+/// verb and args) merge into the earliest occurrence and keep the strongest
+/// class, so a lifecycle `can` and a decision `should` for one verb collapse
+/// into one `should`. Then exactly one `should` survives — the first in
+/// emitter order, which callers arrange lifecycle-first so a run's own
+/// outcome outranks an open decision — and it moves to `next[0]`; every
+/// later `should` demotes to `can`. Returns the list capped at
+/// `EXPLAIN_COLLECTION_CAP` with the pre-cap total so the caller states
+/// coverage.
 fn rank_subject_actions(
-    mut actions: Vec<forged_types::OperationActionV1>,
-) -> Vec<forged_types::OperationActionV1> {
+    actions: Vec<forged_types::OperationActionV1>,
+) -> (Vec<forged_types::OperationActionV1>, usize) {
+    let mut merged: Vec<forged_types::OperationActionV1> = Vec::with_capacity(actions.len());
+    for action in actions {
+        if let Some(seen) = merged
+            .iter_mut()
+            .find(|seen| seen.verb == action.verb && seen.args == action.args)
+        {
+            if action.class == forged_types::ActionClass::Should {
+                seen.class = forged_types::ActionClass::Should;
+            }
+            continue;
+        }
+        merged.push(action);
+    }
+    let total = merged.len();
     let mut first_should = None;
-    for (index, action) in actions.iter_mut().enumerate() {
+    for (index, action) in merged.iter_mut().enumerate() {
         if action.class != forged_types::ActionClass::Should {
             continue;
         }
@@ -871,22 +894,19 @@ fn rank_subject_actions(
         }
     }
     if let Some(index) = first_should {
-        actions[..=index].rotate_right(1);
+        merged[..=index].rotate_right(1);
     }
+    merged.truncate(EXPLAIN_COLLECTION_CAP);
+    (merged, total)
+}
 
-    let mut ranked = Vec::with_capacity(actions.len().min(EXPLAIN_COLLECTION_CAP));
-    for action in actions {
-        if ranked.iter().any(|seen: &forged_types::OperationActionV1| {
-            seen.verb == action.verb && seen.args == action.args
-        }) {
-            continue;
-        }
-        ranked.push(action);
-        if ranked.len() == EXPLAIN_COLLECTION_CAP {
-            break;
-        }
-    }
-    ranked
+fn next_coverage(shown: usize, total: usize) -> Value {
+    json!({
+        "shown": shown,
+        "total": total,
+        "limit": EXPLAIN_COLLECTION_CAP,
+        "truncated": total > shown,
+    })
 }
 
 async fn explain_run(ctx: &Ctx, id: String) -> Result<Value, Failure> {
@@ -919,9 +939,12 @@ async fn explain_run(ctx: &Ctx, id: String) -> Result<Value, Failure> {
         .await?
         .map(|revision| revision.revision)
     };
-    let mut next = subject_attention_actions(ctx, AttentionSubjectKind::Run, &id).await?;
-    next.extend(super::ops::run_projection_actions(run));
-    let next = rank_subject_actions(next);
+    // Lifecycle first: the run's own outcome names the one `should`; open
+    // decisions on the same subject merge into it or demote to `can`.
+    let mut next = super::ops::run_projection_actions(run);
+    next.extend(subject_attention_actions(ctx, AttentionSubjectKind::Run, &id).await?);
+    let (next, next_total) = rank_subject_actions(next);
+    let next_coverage = next_coverage(next.len(), next_total);
     Ok(json!({
         "schema": "forged.explain/1",
         "kind": "run",
@@ -944,6 +967,7 @@ async fn explain_run(ctx: &Ctx, id: String) -> Result<Value, Failure> {
         },
         "how": explain_how(inputs),
         "next": next,
+        "nextCoverage": next_coverage,
     }))
 }
 
@@ -968,7 +992,10 @@ async fn explain_epic(ctx: &Ctx, id: String) -> Result<Value, Failure> {
             })
         })
         .collect::<Vec<_>>();
-    let next = subject_attention_actions(ctx, AttentionSubjectKind::Epic, &id).await?;
+    let (next, next_total) = rank_subject_actions(
+        subject_attention_actions(ctx, AttentionSubjectKind::Epic, &id).await?,
+    );
+    let next_coverage = next_coverage(next.len(), next_total);
     Ok(json!({
         "schema": "forged.explain/1",
         "kind": "epic",
@@ -987,6 +1014,7 @@ async fn explain_epic(ctx: &Ctx, id: String) -> Result<Value, Failure> {
         },
         "how": explain_how_with_verdict(inputs, verdict),
         "next": next,
+        "nextCoverage": next_coverage,
     }))
 }
 
@@ -2284,6 +2312,72 @@ pub async fn work_detail(ctx: &Ctx, req: &OperationRequest) -> OperationResponse
         project_work_detail(ctx, snapshot).await
     })
     .await
+}
+
+#[cfg(test)]
+mod rank_tests {
+    use forged_types::{ActionClass, OperationActionV1};
+    use serde_json::json;
+
+    use super::{rank_subject_actions, EXPLAIN_COLLECTION_CAP};
+
+    // Deserialized, not constructed: the relevance registry scans this
+    // crate for direct `OperationActionV1` construction sites, and a test
+    // helper is not an emitter.
+    fn action(verb: &str, run: &str, class: ActionClass) -> OperationActionV1 {
+        serde_json::from_value(json!({
+            "verb": verb,
+            "args": {"run": run},
+            "reason": "",
+            "class": class,
+        }))
+        .expect("test action deserializes")
+    }
+
+    #[test]
+    fn lifecycle_should_outranks_a_decision_should_which_demotes_to_can() {
+        let (ranked, total) = rank_subject_actions(vec![
+            action("run stop", "r", ActionClass::Should),
+            action("attention resolve", "r", ActionClass::Should),
+        ]);
+        assert_eq!(total, 2);
+        assert_eq!(ranked[0].verb, "run stop");
+        assert_eq!(ranked[0].class, ActionClass::Should);
+        assert_eq!(ranked[1].class, ActionClass::Can);
+    }
+
+    #[test]
+    fn a_decision_should_upgrades_the_same_lifecycle_can_instead_of_duplicating() {
+        let (ranked, total) = rank_subject_actions(vec![
+            action("run retry", "r", ActionClass::Can),
+            action("work supersede", "r", ActionClass::Can),
+            action("run retry", "r", ActionClass::Should),
+        ]);
+        assert_eq!(total, 2, "duplicates merge before ranking");
+        assert_eq!(ranked.len(), 2);
+        assert_eq!(ranked[0].verb, "run retry");
+        assert_eq!(ranked[0].class, ActionClass::Should);
+        assert_eq!(
+            ranked
+                .iter()
+                .filter(|action| action.class == ActionClass::Should)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn the_first_should_moves_to_the_front_and_the_cap_reports_the_total() {
+        let mut actions = (0..EXPLAIN_COLLECTION_CAP + 3)
+            .map(|index| action("can", &format!("r{index}"), ActionClass::Can))
+            .collect::<Vec<_>>();
+        actions.push(action("should", "r", ActionClass::Should));
+        let (ranked, total) = rank_subject_actions(actions);
+        assert_eq!(total, EXPLAIN_COLLECTION_CAP + 4);
+        assert_eq!(ranked.len(), EXPLAIN_COLLECTION_CAP);
+        assert_eq!(ranked[0].verb, "should");
+        assert!(ranked[0].args.contains_key("run"));
+    }
 }
 
 #[cfg(test)]

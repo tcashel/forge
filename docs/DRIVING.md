@@ -60,15 +60,19 @@ forged explain --id <id>
 `explain` resolves any id (work item, run, attempt, attention) and
 answers what it is, its lifecycle stage, one health verdict with its
 inputs, and `next`. Read `next[0]` when its class is `should`. If there
-is no `should`, the subject is terminal or idle: do nothing to it.
+is no `should`, nothing is required of you: the subject is terminal or
+idle. `can` actions are optional; `repair` actions fix a state the
+ledger cannot leave on its own. When a run's own outcome and an open
+decision both name a `should`, the outcome wins and the decision's
+action is listed as `can`.
 
 Make routine engineering judgments yourself. Ask the operator only when
 a decision changes product scope, external authority, or accepts risk
 — and ask with the exact tuple the decision needs (id, revision, the
 options, the consequence, the cost).
 
-**Today:** `explain` reports execution health only; a closed epic reads
-`not-started` and a landed item still advertises `work reopen`. Treat
+**Today:** `explain` reads `landed`, `closed`, and `parked` from the
+ledger, and a closed item lists `work reopen` only as `repair`. Treat
 `status: closed` and `outcome: landed` as terminal regardless of
 `next`.
 
