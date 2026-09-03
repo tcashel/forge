@@ -1,4 +1,4 @@
-![Forge orchestration banner](docs/assets/forge-hero-v5.png)
+![Forge orchestration banner](docs/assets/forge-hero-v6.png)
 
 # Forge
 
