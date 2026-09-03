@@ -1384,6 +1384,7 @@ fn projection_defaults_are_bounded_and_full_preserves_the_v071_keys() {
             "delivery",
             "executionHealth",
             "liveSeats",
+            "next",
             "nextAction",
             "pr",
             "spend",

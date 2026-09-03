@@ -385,7 +385,7 @@ fn coverage_and_exempt_registry_cases_reach_real_recommendation_actions() {
         })
         .collect::<Vec<_>>();
 
-    let projected = result(&env, &["overview"]);
+    let projected = result(&env, &["overview", "--detail", "full"]);
     for (case, subject) in coverage_subjects {
         let item = attention_item(&projected, &subject, case);
         let should = item["nextActions"]
