@@ -149,6 +149,13 @@ jobs:
     # `success()` is not implied once a custom `if` is present (see `changes`).
     if: success() && needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      # Stable hashes keep each test in one explicit partition. Four partitions
+      # balance this process-fixture-heavy leg on the 4-vCPU runners; remeasure
+      # membership and durations before changing the count.
+      matrix:
+        partition: [1, 2, 3, 4]
     # Job-level, never workflow-level: the workflow env block above must stay
     # byte-identical to release.yml's or rust-cache's key diverges. NEXTEST_* is
     # not among the CARGO*/RUST* prefixes rust-cache hashes, so the caches these
@@ -164,8 +171,11 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
           # Only persist the cache from main; PR branches restore it read-only
-          # so near-duplicate multi-GB caches don't pile up in the pool.
-          cache-save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          # so near-duplicate multi-GB caches don't pile up in the pool. Every
+          # partition compiles the same workspace and test binaries (partitioning
+          # selects tests, not compilation), so one leg's save is every leg's
+          # cache and only partition 1 saves.
+          cache-save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.partition == 1 }}
 
       - uses: taiki-e/install-action@37f7c5781271959fb65b6b35224e28652ff2b63d # v2.87.0
         with:
@@ -178,7 +188,9 @@ jobs:
         run: cargo build --workspace --locked
 
       - name: test
-        run: cargo nextest run --workspace
+        run: >-
+          cargo nextest run --workspace
+          --partition hash:${{ matrix.partition }}/4
 
       # Uploads on failure too — a red run is exactly when the per-test detail
       # is worth having. Observational only: nothing here gates ci-ok.
@@ -188,13 +200,19 @@ jobs:
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: target/nextest/ci/junit.xml
-          flags: workspace
+          flags: workspace,workspace-partition-${{ matrix.partition }}-of-4
 
   failpoints:
     needs: changes
     # `success()` is not implied once a custom `if` is present (see `changes`).
     if: success() && needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      # This leg uses the same stable hash contract with its independently
+      # measured count. Every failpoint test still runs in exactly one shard.
+      matrix:
+        partition: [1, 2, 3]
     env:
       NEXTEST_PROFILE: ci
     steps:
@@ -206,8 +224,11 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
           # Only persist the cache from main; PR branches restore it read-only
-          # so near-duplicate multi-GB caches don't pile up in the pool.
-          cache-save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          # so near-duplicate multi-GB caches don't pile up in the pool. Every
+          # partition compiles the same workspace and test binaries (partitioning
+          # selects tests, not compilation), so one leg's save is every leg's
+          # cache and only partition 1 saves.
+          cache-save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.partition == 1 }}
 
       - uses: taiki-e/install-action@37f7c5781271959fb65b6b35224e28652ff2b63d # v2.87.0
         with:
@@ -218,30 +239,39 @@ jobs:
       - name: runner facts
         run: nproc; free -g | sed -n 2p
 
-      # Only the binaries that carry `cfg(feature = "failpoints")` tests run
-      # here; every other forged test already ran unchanged in `test`. The
-      # guard below fails the leg if a gated test appears in a binary this
-      # list does not name, so the filter can never silently skip one.
-      - name: failpoint binaries are all listed
+      # This leg's contract is crate-gated binaries only: every test BINARY
+      # source (crates/forged/tests/*.rs, the enforced glob) that contains
+      # `cfg(feature = "failpoints")` must open with the crate gate. Files
+      # under tests/support/ are modules compiled into those binaries, not
+      # binaries, so they are outside the glob on purpose. The guard is
+      # position-agnostic and has no allow-list, so a mixed binary can never
+      # silently reintroduce duplicate non-failpoint tests here.
+      - name: failpoint test binaries are crate gated
         shell: bash
         run: |
           set -euo pipefail
-          listed='forged herdr_orphan_failpoint ore_loop_failpoint kill_matrix run_status_failpoint work_identity_failpoint work_settlement_failpoint convergence supervise e2e_drive mcp_lazy_init review_publish'
           missing=0
+          found=0
           while IFS= read -r file; do
-            bin="$(basename "$file" .rs)"
-            case " $listed " in
-              *" $bin "*) ;;
-              *) echo "test binary '$bin' has failpoint-gated tests but is not in the failpoints leg filter" >&2; missing=1 ;;
-            esac
-          done < <(grep -l 'cfg(feature = "failpoints")' crates/forged/tests/*.rs)
+            found=$((found + 1))
+            if ! grep -q '^#!\[cfg(feature = "failpoints")\]' "$file"; then
+              echo "$file has failpoint-gated tests but is not crate gated" >&2
+              missing=1
+            fi
+          done < <(grep -l 'cfg(feature = "failpoints")' crates/forged/tests/*.rs || true)
+          # Fail closed: an empty population means the glob or cwd is wrong,
+          # not that every binary is gated.
+          if [[ "$found" -eq 0 ]]; then
+            echo "the crate-gate guard found no gated test sources under crates/forged/tests" >&2
+            exit 1
+          fi
           exit "$missing"
 
       - name: failpoints
         run: >-
           cargo nextest run -p forged --features failpoints
-          -E 'binary(=forged) | binary(/_failpoint$/) | binary(=kill_matrix) | binary(=convergence)
-          | binary(=supervise) | binary(=e2e_drive) | binary(=mcp_lazy_init) | binary(=review_publish)'
+          --partition hash:${{ matrix.partition }}/3
+          -E 'binary(=forged) | binary(/_failpoint$/) | binary(=kill_matrix)'
 
       # Distinct flag: this run is the same crate under a different feature set,
       # so Codecov must not fold it into the workspace suite.
@@ -251,7 +281,7 @@ jobs:
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: target/nextest/ci/junit.xml
-          flags: failpoints
+          flags: failpoints,failpoints-partition-${{ matrix.partition }}-of-3
 
   # Line coverage for the default feature set, reported to Codecov but not
   # gated on. This measures the workspace as it ships. The failpoint kill-matrix is
