@@ -275,10 +275,12 @@ the manifest's deprecation column; never rename a stored string.
 A read must fit one tool result. Targets **(ADR-0036)**: `next` ≤ 4 KB
 JSON at default limits; `explain`, `work show`, `run status` ≤ 8 KB;
 list verbs return summary rows with `coverage` and a cursor; spec
-bodies and event tails are opt-in (`--detail full`, `--limit`). Today
-`operations overview` exceeds 800 KB on the operator store and is
-unusable as a tool result; use `--group needs-me --limit 20` or
-`attention list --classification decision` until `next` lands.
+bodies and event tails are opt-in (`--detail full`, `--limit`). Since
+ore-080.3 every list verb answers with summary rows under those
+budgets by default: `operations overview` returns 30 summary entries
+with attention as counts plus decisions, `work detail` and
+`overview --run` fit 8 KB, and `--detail full` restores the complete
+bodies (the pre-0.7.2 shape) when a reader asks for them.
 
 ## Read next
 
