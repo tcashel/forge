@@ -777,7 +777,7 @@ pub struct AttemptCompactArgs {
 #[derive(Debug, Subcommand)]
 pub enum SessionCmd {
     /// List durable provider-session metadata for a run.
-    List(RunScoped),
+    List(SessionListArgs),
     /// Inventory durable provider attempts across runs and repositories.
     Inventory(SessionInventoryArgs),
     /// Read recent output from a Herdr-backed attempt.
@@ -786,6 +786,23 @@ pub enum SessionCmd {
     Message(SessionMessageArgs),
     /// Revoke and confirmed-stop one attempt.
     Stop(SessionStopArgs),
+}
+
+/// Bounded `session list` flags.
+#[derive(Debug, Args)]
+pub struct SessionListArgs {
+    /// The run id.
+    #[arg(long)]
+    pub run: String,
+    /// Maximum sessions, 1..=500 (default 100).
+    #[arg(long)]
+    pub limit: Option<u64>,
+    /// Opaque continuation cursor toward older sessions.
+    #[arg(long)]
+    pub cursor: Option<String>,
+    /// Override the derived idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
 }
 
 /// Exact attempt activity accepted by `session inventory`.
@@ -979,32 +996,56 @@ pub struct EventsArgs {
     #[arg(long)]
     pub limit: Option<u64>,
     /// Return bounded payload summaries instead of embedded artifacts/logs.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "detail")]
     pub summary: bool,
+    /// Explicit projection detail (the no-flag default keeps full payloads).
+    #[arg(long, value_enum)]
+    pub detail: Option<ProjectionDetailArg>,
     /// Override the derived idempotency key.
     #[arg(long)]
     pub idempotency_key: Option<String>,
 }
 
+/// Closed projection detail accepted by bounded read surfaces.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum ProjectionDetailArg {
+    Summary,
+    Full,
+}
+
+impl ProjectionDetailArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Summary => "summary",
+            Self::Full => "full",
+        }
+    }
+}
+
 /// `overview` flags. At most one scope; none projects the portfolio.
 #[derive(Debug, Args)]
-#[group(required = false, multiple = false, args = ["run", "epic", "id"])]
 pub struct OverviewArgs {
     /// Project one slice run.
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["epic", "id"])]
     pub run: Option<String>,
     /// Project one epic and its child runs.
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["run", "id"])]
     pub epic: Option<String>,
     /// Project whichever of the two this id names, or list the candidates.
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["run", "epic"])]
     pub id: Option<String>,
     /// Return event rows with event_id greater than this.
     #[arg(long)]
     pub after: Option<i64>,
-    /// Maximum event rows in the polling page (default 100).
+    /// Maximum event rows (summary default 30; full default 100).
     #[arg(long)]
     pub limit: Option<u64>,
+    /// Projection detail (default summary; full restores the v0.7.1 body).
+    #[arg(long, value_enum)]
+    pub detail: Option<ProjectionDetailArg>,
+    /// Include symptom attention items where this projection carries an attention rail.
+    #[arg(long)]
+    pub symptoms: bool,
     /// Override the read-only idempotency key.
     #[arg(long)]
     pub idempotency_key: Option<String>,
@@ -1041,9 +1082,15 @@ pub struct OperationsOverviewArgs {
     /// One source: `durable` or `live-plan`.
     #[arg(long)]
     pub source: Option<String>,
-    /// Maximum rows across all groups (default 200, maximum 500).
+    /// Maximum rows across all groups (default 30, maximum 200).
     #[arg(long)]
     pub limit: Option<u64>,
+    /// Projection detail (default summary; full restores diagnostic fields).
+    #[arg(long, value_enum)]
+    pub detail: Option<ProjectionDetailArg>,
+    /// Include symptom attention items as well as decision items.
+    #[arg(long)]
+    pub symptoms: bool,
     /// Override the read-only idempotency key.
     #[arg(long)]
     pub idempotency_key: Option<String>,
@@ -1162,8 +1209,14 @@ pub struct WorkReadyArgs {
     #[arg(long)]
     pub cursor: Option<String>,
     /// Return complete work-item snapshots instead of summary rows.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "detail")]
     pub full: bool,
+    /// Projection detail (default summary; full returns complete snapshots).
+    #[arg(long, value_enum)]
+    pub detail: Option<ProjectionDetailArg>,
+    /// Return the complete frontier when it contains at most 500 items.
+    #[arg(long, conflicts_with_all = ["cursor", "limit"])]
+    pub all: bool,
     /// Maximum ready items, 1..=500 (default 100).
     #[arg(long)]
     pub limit: Option<u64>,
@@ -1519,6 +1572,12 @@ pub struct WorkListArgs {
     /// Exact custody holder.
     #[arg(long)]
     pub assignee: Option<String>,
+    /// Maximum rows across all groups (default 30, maximum 200).
+    #[arg(long)]
+    pub limit: Option<u64>,
+    /// Projection detail (default summary; full restores diagnostic fields).
+    #[arg(long, value_enum)]
+    pub detail: Option<ProjectionDetailArg>,
     /// Override the read-only idempotency key.
     #[arg(long)]
     pub idempotency_key: Option<String>,
@@ -1639,6 +1698,12 @@ pub struct WorkDetailArgs {
     /// Maximum event rows (default 100, maximum 1000).
     #[arg(long)]
     pub limit: Option<u64>,
+    /// Projection detail (default summary; full restores the v0.7.1 body).
+    #[arg(long, value_enum)]
+    pub detail: Option<ProjectionDetailArg>,
+    /// Include symptom attention items where this projection carries an attention rail.
+    #[arg(long)]
+    pub symptoms: bool,
     /// Override the read-only idempotency key.
     #[arg(long)]
     pub idempotency_key: Option<String>,
@@ -2283,14 +2348,21 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
             ),
         },
         Command::Session { command } => match command {
-            SessionCmd::List(a) => (
-                "session_list",
-                request(
-                    a.idempotency_key,
-                    Some(a.run.clone()),
-                    json!({"run": a.run}),
-                ),
-            ),
+            SessionCmd::List(a) => {
+                let mut params = Map::new();
+                let run = a.run;
+                params.insert("run".to_owned(), json!(run.clone()));
+                if let Some(limit) = a.limit {
+                    params.insert("limit".to_owned(), json!(limit));
+                }
+                if let Some(cursor) = a.cursor {
+                    params.insert("cursor".to_owned(), json!(cursor));
+                }
+                (
+                    "session_list",
+                    request(a.idempotency_key, Some(run), Value::Object(params)),
+                )
+            }
             SessionCmd::Inventory(a) => {
                 let mut params = Map::new();
                 for (name, value) in [
@@ -2393,19 +2465,25 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
                 ),
             ),
         },
-        Command::Events(a) => (
-            "events_tail",
-            request(
-                a.idempotency_key,
-                a.run.clone(),
-                json!({
-                    "run": a.run,
-                    "after": a.after,
-                    "limit": a.limit,
-                    "summary": a.summary,
-                }),
-            ),
-        ),
+        Command::Events(a) => ("events_tail", {
+            let mut params = Map::new();
+            if let Some(run) = &a.run {
+                params.insert("run".to_owned(), json!(run));
+            }
+            if let Some(after) = a.after {
+                params.insert("after".to_owned(), json!(after));
+            }
+            if let Some(limit) = a.limit {
+                params.insert("limit".to_owned(), json!(limit));
+            }
+            if a.summary {
+                params.insert("summary".to_owned(), json!(true));
+            }
+            if let Some(detail) = a.detail {
+                params.insert("detail".to_owned(), json!(detail.as_str()));
+            }
+            request(a.idempotency_key, a.run.clone(), Value::Object(params))
+        }),
         Command::Overview(a) => {
             let scope = a
                 .run
@@ -2431,6 +2509,12 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
             if let Some(limit) = a.limit {
                 params.insert("limit".to_owned(), json!(limit));
             }
+            if let Some(detail) = a.detail {
+                params.insert("detail".to_owned(), json!(detail.as_str()));
+            }
+            if a.symptoms {
+                params.insert("symptoms".to_owned(), json!(true));
+            }
             (
                 "overview",
                 request(a.idempotency_key, scope, Value::Object(params)),
@@ -2450,6 +2534,12 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
                 }
                 if let Some(limit) = a.limit {
                     params.insert("limit".to_owned(), json!(limit));
+                }
+                if let Some(detail) = a.detail {
+                    params.insert("detail".to_owned(), json!(detail.as_str()));
+                }
+                if a.symptoms {
+                    params.insert("symptoms".to_owned(), json!(true));
                 }
                 (
                     "operations_overview",
@@ -2482,6 +2572,12 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
                     if let Some(value) = value {
                         params.insert(name.to_owned(), json!(value));
                     }
+                }
+                if let Some(limit) = a.limit {
+                    params.insert("limit".to_owned(), json!(limit));
+                }
+                if let Some(detail) = a.detail {
+                    params.insert("detail".to_owned(), json!(detail.as_str()));
                 }
                 (
                     "work_list",
@@ -2531,6 +2627,12 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
                 }
                 if let Some(limit) = a.limit {
                     params.insert("limit".to_owned(), json!(limit));
+                }
+                if let Some(detail) = a.detail {
+                    params.insert("detail".to_owned(), json!(detail.as_str()));
+                }
+                if a.symptoms {
+                    params.insert("symptoms".to_owned(), json!(true));
                 }
                 // The subject id or the bare id, whichever form is present.
                 let run_id = params
@@ -2596,8 +2698,11 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
                 if let Some(cursor) = a.cursor {
                     params.insert("cursor".to_owned(), json!(cursor));
                 }
-                if a.full {
-                    params.insert("detail".to_owned(), json!("full"));
+                if let Some(detail) = a.detail.or(a.full.then_some(ProjectionDetailArg::Full)) {
+                    params.insert("detail".to_owned(), json!(detail.as_str()));
+                }
+                if a.all {
+                    params.insert("all".to_owned(), json!(true));
                 }
                 if let Some(limit) = a.limit {
                     params.insert("limit".to_owned(), json!(limit));

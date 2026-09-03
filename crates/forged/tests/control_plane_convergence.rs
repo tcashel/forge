@@ -571,11 +571,13 @@ fn modern_projections_and_all_five_apps_converge_on_real_envelopes() {
             &repository,
             "--limit",
             "50",
+            "--detail",
+            "full",
         ])
         .1;
     let operations_raw = mcp.call_tool_result(
         "operations_overview",
-        envelope(json!({"repo": repository, "limit": 50})),
+        envelope(json!({"repo": repository, "limit": 50, "detail": "full"})),
     );
     let operations = assert_raw_parity(operations_cli, &operations_raw, "Operations");
 
@@ -588,11 +590,13 @@ fn modern_projections_and_all_five_apps_converge_on_real_envelopes() {
             "run",
             "--subject-id",
             "run-a",
+            "--detail",
+            "full",
         ])
         .1;
     let detail_raw = mcp.call_tool_result(
         "work_detail",
-        envelope(json!({"subjectKind": "run", "subjectId": "run-a"})),
+        envelope(json!({"subjectKind": "run", "subjectId": "run-a", "detail": "full"})),
     );
     let detail = assert_raw_parity(detail_cli, &detail_raw, "Work Detail");
 
@@ -629,10 +633,13 @@ fn modern_projections_and_all_five_apps_converge_on_real_envelopes() {
     );
     let sessions = assert_raw_parity(session_cli, &session_raw, "Agent Sessions");
 
-    let overview_cli = fixture.env.forged(&["overview", "--run", "run-a"]).1;
+    let overview_cli = fixture
+        .env
+        .forged(&["overview", "--run", "run-a", "--detail", "full"])
+        .1;
     let overview_raw = mcp.call_tool_result(
         "overview",
-        json!({"schemaVersion": 1, "runId": "run-a", "params": {"run": "run-a"}}),
+        json!({"schemaVersion": 1, "runId": "run-a", "params": {"run": "run-a", "detail": "full"}}),
     );
     let overview = assert_raw_parity(overview_cli, &overview_raw, "legacy Overview");
 
@@ -752,7 +759,9 @@ fn durable_and_plan_reads_answer_from_the_store_without_cross_repository_leakage
     let repository = fixture.repository_a();
     let before = fixture.fingerprint();
 
-    let (code, operations) = fixture.env.forged(&["operations", "overview"]);
+    let (code, operations) = fixture
+        .env
+        .forged(&["operations", "overview", "--detail", "full"]);
     assert_eq!(code, 0, "operations overview: {operations}");
     assert_eq!(
         operations["result"]["sourceHealth"]["beads"]["state"],

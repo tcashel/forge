@@ -281,7 +281,7 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
   async function openDetail(row) {
     const target=detailTarget(row);if(!target||!host.connected||!host.capabilities.serverTools||state.loading)return;
     state.loading=true;state.detail=null;state.detailError=false;render();
-    try { const result=await request("tools/call",{name:"work_detail",arguments:{schemaVersion:1,params:target}});const envelope=envelopeFrom(result);const detail=envelope?.result??envelope;if(envelope?.ok===false||detail?.schema!=="forged.work-detail/1")throw new Error("detail failed");state.detail=detail; }
+    try { const result=await request("tools/call",{name:"work_detail",arguments:{schemaVersion:1,params:{...target,detail:"full"}}});const envelope=envelopeFrom(result);const detail=envelope?.result??envelope;if(envelope?.ok===false||detail?.schema!=="forged.work-detail/1")throw new Error("detail failed");state.detail=detail; }
     catch { state.detailError=true; }
     finally { state.loading=false;render(); }
   }

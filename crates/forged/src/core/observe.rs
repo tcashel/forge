@@ -42,27 +42,59 @@ fn result(response: OperationResponse) -> Result<Value, Failure> {
     })
 }
 
-async fn events(ctx: &Ctx, run_id: &str, after: i64, limit: Option<u64>) -> Result<Value, Failure> {
+async fn events(
+    ctx: &Ctx,
+    run_id: &str,
+    after: i64,
+    limit: u64,
+    detail: super::ops::ProjectionDetail,
+) -> Result<Value, Failure> {
+    let detail = match detail {
+        super::ops::ProjectionDetail::Summary => "summary",
+        super::ops::ProjectionDetail::Full => "full",
+    };
     result(
         super::ops::events_tail(
             ctx,
             &request(
                 run_id,
-                json!({"run": run_id, "after": after, "limit": limit}),
+                json!({"run": run_id, "after": after, "limit": limit, "detail": detail}),
             ),
         )
         .await,
     )
 }
 
-fn event_payloads(all: &Value, kind: impl Fn(&str) -> bool) -> Vec<Value> {
-    all.get("events")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter(|event| event.get("kind").and_then(Value::as_str).is_some_and(&kind))
-        .cloned()
-        .collect()
+const FULL_EVENT_HISTORY_LIMIT: u32 = 4_096;
+const SUMMARY_EVENT_PAGE_LIMIT: u64 = 30;
+const FULL_EVENT_PAGE_LIMIT: u64 = 100;
+
+async fn subject_events_by_kind(
+    ctx: &Ctx,
+    run_id: &str,
+    kind: &str,
+) -> Result<Vec<Value>, Failure> {
+    let run_id = run_id.to_owned();
+    let kind = kind.to_owned();
+    let rows = on_ledger(&ctx.ledger, move |ledger| {
+        ledger.list_subject_events_by_kind(&run_id, &kind, FULL_EVENT_HISTORY_LIMIT)
+    })
+    .await?;
+    rows.iter().map(event_json).collect()
+}
+
+async fn subject_events_by_kind_prefix(
+    ctx: &Ctx,
+    run_id: &str,
+    prefix: &str,
+) -> Result<Vec<Value>, Failure> {
+    let run_id = run_id.to_owned();
+    let prefix = prefix.to_owned();
+    let rows = on_ledger(&ctx.ledger, move |ledger| {
+        ledger.list_subject_events_by_kind_prefix(&run_id, &prefix, FULL_EVENT_HISTORY_LIMIT)
+    })
+    .await?;
+    rows.iter().map(event_json).collect()
 }
 
 async fn packet_artifacts(ctx: &Ctx, view: &forged_proto::RunView) -> Result<Vec<Value>, Failure> {
@@ -201,16 +233,56 @@ async fn policy_revisions(ctx: &Ctx, run_id: &str) -> Result<Vec<Value>, Failure
         .collect()
 }
 
-async fn run_overview(ctx: &Ctx, run_id: &str, after: i64, limit: u64) -> Result<Value, Failure> {
+fn summary_run_status(status: &Value) -> Value {
+    json!({
+        "runId": status.get("runId"),
+        "state": status.get("state"),
+        "stopReason": status.get("stopReason"),
+        "outcome": status.get("outcome"),
+        "currentStage": status.get("currentStage"),
+        "gateState": status.get("gateState"),
+        "claimHealth": status.get("claimHealth"),
+        "nextAction": status.get("nextAction"),
+    })
+}
+
+fn finding_counts(findings: &[Finding]) -> Value {
+    let mut counts = BTreeMap::<String, usize>::new();
+    for finding in findings {
+        let severity = serde_json::to_value(finding)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("severity")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| "unknown".to_owned());
+        *counts.entry(severity).or_default() += 1;
+    }
+    json!({"total": findings.len(), "bySeverity": counts})
+}
+
+async fn run_overview(
+    ctx: &Ctx,
+    run_id: &str,
+    after: i64,
+    limit: u64,
+    detail: super::ops::ProjectionDetail,
+) -> Result<Value, Failure> {
     let status =
         result(super::ops::run_status(ctx, &request(run_id, json!({"run": run_id}))).await)?;
-    let workers =
-        result(super::sessions::session_list(ctx, &request(run_id, json!({"run": run_id}))).await)?;
     let usage =
         result(super::ops::usage_report(ctx, &request(run_id, json!({"run": run_id}))).await)?;
-    let all_events = events(ctx, run_id, 0, None).await?;
-    let event_page = events(ctx, run_id, after, Some(limit)).await?;
+    let event_page = events(ctx, run_id, after, limit, detail).await?;
     let view = super::drive::project(ctx, run_id).await?;
+    let workers = if detail == super::ops::ProjectionDetail::Full {
+        Some(result(
+            super::sessions::session_list(ctx, &request(run_id, json!({"run": run_id}))).await,
+        )?)
+    } else {
+        None
+    };
     let packet_ids = view
         .packets
         .iter()
@@ -232,6 +304,34 @@ async fn run_overview(ctx: &Ctx, run_id: &str, after: i64, limit: u64) -> Result
             .collect::<Vec<_>>()
     };
     let findings = super::drive::latest_review_findings(&view);
+    if detail == super::ops::ProjectionDetail::Summary {
+        let worker_total = view.live_attempts.len();
+        return Ok(json!({
+            "schema": "forged.overview/1",
+            "kind": "slice",
+            "id": run_id,
+            "identity": status.pointer("/run/identity"),
+            "events": event_page.get("events"),
+            "cursor": event_page.get("last_event_id"),
+            "coverage": event_page.get("coverage"),
+            "status": summary_run_status(status.get("run").unwrap_or(&Value::Null)),
+            "workers": {"total": worker_total},
+            "gates": {
+                "latestState": status.pointer("/run/gateState"),
+            },
+            "reviews": {
+                "findingCounts": finding_counts(&findings),
+            },
+            "admission": {"total": run_admission.len()},
+            "usage": {
+                "totals": usage.pointer("/usage/totals").cloned().unwrap_or(Value::Null),
+            },
+        }));
+    }
+    let workers = workers.expect("full detail reads session metadata");
+    let gates = subject_events_by_kind(ctx, run_id, "proto.gate").await?;
+    let review_events = subject_events_by_kind(ctx, run_id, "proto.review").await?;
+    let interventions = subject_events_by_kind_prefix(ctx, run_id, "forged.intervention.").await?;
     let roster_revisions = roster_revisions(ctx, run_id).await?;
     let policy_revisions = policy_revisions(ctx, run_id).await?;
     Ok(json!({
@@ -242,14 +342,14 @@ async fn run_overview(ctx: &Ctx, run_id: &str, after: i64, limit: u64) -> Result
         "cursor": event_page.get("last_event_id"),
         "status": status.get("run"),
         "workers": workers,
-        "gates": event_payloads(&all_events, |kind| kind == "proto.gate"),
+        "gates": gates,
         "reviews": {
-            "events": event_payloads(&all_events, |kind| kind == "proto.review"),
+            "events": review_events,
             "latestFindings": findings,
         },
         "packetHistory": packet_history(&view),
         "artifacts": packet_artifacts(ctx, &view).await?,
-        "interventions": event_payloads(&all_events, |kind| kind.starts_with("forged.intervention.")),
+        "interventions": interventions,
         "rosterRevisions": roster_revisions,
         "policyRevisions": policy_revisions,
         "admission": run_admission,
@@ -316,11 +416,16 @@ fn absorb_usage(
     }
 }
 
-async fn epic_overview(ctx: &Ctx, epic_id: &str, after: i64, limit: u64) -> Result<Value, Failure> {
+async fn epic_overview(
+    ctx: &Ctx,
+    epic_id: &str,
+    after: i64,
+    limit: u64,
+    detail: super::ops::ProjectionDetail,
+) -> Result<Value, Failure> {
     let status =
         result(super::epic::epic_status(ctx, &request(epic_id, json!({"epic": epic_id}))).await)?;
-    let all_events = events(ctx, epic_id, 0, None).await?;
-    let event_page = events(ctx, epic_id, after, Some(limit)).await?;
+    let event_page = events(ctx, epic_id, after, limit, detail).await?;
     let epic_admission = {
         let epic_id = epic_id.to_owned();
         on_ledger(&ctx.ledger, move |ledger| {
@@ -333,8 +438,13 @@ async fn epic_overview(ctx: &Ctx, epic_id: &str, after: i64, limit: u64) -> Resu
     };
     let mut child_runs = Vec::new();
     let mut workers = Vec::new();
+    let mut worker_total = 0u64;
     let mut gates = Vec::new();
+    let mut passed_gates = 0u64;
+    let mut failed_gates = 0u64;
+    let mut unknown_gates = 0u64;
     let mut reviews = Vec::new();
+    let mut review_total = 0u64;
     let mut artifacts = Vec::new();
     let mut interventions = Vec::new();
     let mut usage = BTreeMap::<&'static str, f64>::new();
@@ -349,48 +459,67 @@ async fn epic_overview(ctx: &Ctx, epic_id: &str, after: i64, limit: u64) -> Resu
         let Some(run_id) = child.get("runId").and_then(Value::as_str) else {
             continue;
         };
-        match run_overview(ctx, run_id, 0, limit.min(25)).await {
+        match run_overview(ctx, run_id, 0, limit.min(25), detail).await {
             Ok(mut overview) => {
-                workers.extend(
-                    overview
-                        .pointer("/workers/sessions")
-                        .and_then(Value::as_array)
-                        .into_iter()
-                        .flatten()
-                        .cloned(),
-                );
-                gates.extend(
-                    overview
-                        .get("gates")
-                        .and_then(Value::as_array)
-                        .into_iter()
-                        .flatten()
-                        .cloned(),
-                );
-                reviews.extend(
-                    overview
-                        .pointer("/reviews/latestFindings")
-                        .and_then(Value::as_array)
-                        .into_iter()
-                        .flatten()
-                        .cloned(),
-                );
-                artifacts.extend(
-                    overview
-                        .get("artifacts")
-                        .and_then(Value::as_array)
-                        .into_iter()
-                        .flatten()
-                        .cloned(),
-                );
-                interventions.extend(
-                    overview
-                        .get("interventions")
-                        .and_then(Value::as_array)
-                        .into_iter()
-                        .flatten()
-                        .cloned(),
-                );
+                if detail == super::ops::ProjectionDetail::Full {
+                    workers.extend(
+                        overview
+                            .pointer("/workers/sessions")
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .cloned(),
+                    );
+                    gates.extend(
+                        overview
+                            .get("gates")
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .cloned(),
+                    );
+                    reviews.extend(
+                        overview
+                            .pointer("/reviews/latestFindings")
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .cloned(),
+                    );
+                    artifacts.extend(
+                        overview
+                            .get("artifacts")
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .cloned(),
+                    );
+                    interventions.extend(
+                        overview
+                            .get("interventions")
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .cloned(),
+                    );
+                } else {
+                    worker_total += overview
+                        .pointer("/workers/total")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                    match overview
+                        .pointer("/gates/latestState")
+                        .and_then(Value::as_str)
+                    {
+                        Some("passed") => passed_gates += 1,
+                        Some("failed") => failed_gates += 1,
+                        _ => unknown_gates += 1,
+                    }
+                    review_total += overview
+                        .pointer("/reviews/findingCounts/total")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                }
                 for (key, value) in totals(&overview) {
                     *usage.entry(key).or_default() += value;
                 }
@@ -405,6 +534,39 @@ async fn epic_overview(ctx: &Ctx, epic_id: &str, after: i64, limit: u64) -> Resu
             })),
         }
     }
+    if detail == super::ops::ProjectionDetail::Summary {
+        return Ok(json!({
+            "schema": "forged.overview/1",
+            "kind": "epic",
+            "id": epic_id,
+            "identity": status.get("identity"),
+            "events": event_page.get("events"),
+            "cursor": event_page.get("last_event_id"),
+            "coverage": event_page.get("coverage"),
+            "status": {
+                "state": status.get("state"),
+                "executionHealth": status.get("executionHealth"),
+                "desiredState": status.get("desiredState"),
+                "nextAction": status.get("nextAction"),
+            },
+            "children": {
+                "total": child_runs.len(),
+                "items": child_runs,
+            },
+            "workers": {"total": worker_total},
+            "gates": {
+                "passed": passed_gates,
+                "failed": failed_gates,
+                "unknown": unknown_gates,
+            },
+            "reviews": {"findingCounts": {"total": review_total}},
+            "admission": {"total": epic_admission.len()},
+            "usage": {"totals": usage},
+            "inputRequired": status.get("inputRequired"),
+            "paused": status.get("paused"),
+        }));
+    }
+    let scheduler_events = subject_events_by_kind_prefix(ctx, epic_id, "forged.epic.").await?;
     Ok(json!({
         "schema": "forged.overview/1",
         "kind": "epic",
@@ -419,7 +581,7 @@ async fn epic_overview(ctx: &Ctx, epic_id: &str, after: i64, limit: u64) -> Resu
         "artifacts": artifacts,
         "interventions": interventions,
         "admission": epic_admission,
-        "schedulerEvents": event_payloads(&all_events, |kind| kind.starts_with("forged.epic.")),
+        "schedulerEvents": scheduler_events,
         "usage": {
             "rows": usage_rows,
             "totals": usage,
@@ -433,23 +595,20 @@ async fn epic_overview(ctx: &Ctx, epic_id: &str, after: i64, limit: u64) -> Resu
     }))
 }
 
-/// The newest entries a portfolio carries.
+/// The maximum diagnostic entries a full portfolio carries. Summary mode
+/// inherits Operations' 30-row default.
 ///
 /// The inventory grows for the life of the operator's ledger and is never
 /// pruned, so an uncapped portfolio eventually becomes a payload no host
-/// will carry. Two hundred: an entry is a dozen scalar keys — ~300 bytes —
-/// so a full page is under 100 KB, well below the epic projection this same
-/// tool already returns, which embeds a whole child overview per child. It
-/// is also more concurrent work than an operator runs, so truncation is the
-/// exception `total` exists to announce; `work_list` serves the inventory
-/// whole for a caller that wants the tail.
+/// will carry. Full retains the v0.7.1 cap so its body remains a compatible
+/// superset.
 const PORTFOLIO_CAP: usize = 200;
 
 /// The portfolio: every unit of work and what needs a human, for a caller
 /// that cannot name a subject yet.
 ///
-/// Newest first, capped at [`PORTFOLIO_CAP`] with the totals stated, so a
-/// consumer distinguishes a complete answer from a truncated one. `spend`
+/// Newest first, 30 summary entries by default and up to
+/// [`PORTFOLIO_CAP`] in full detail, with totals stated. `spend`
 /// and `attentionTotal` cover the WHOLE inventory, never the capped page:
 /// a figure that quietly described only what fit would be read as complete.
 /// `attention` is present and empty when nothing needs a human — an omitted
@@ -458,7 +617,17 @@ const PORTFOLIO_CAP: usize = 200;
 /// Carries no event page: `after`/`limit` address one subject's stream, and
 /// the portfolio is the level above any subject.
 async fn portfolio_overview(ctx: &Ctx, req: &OperationRequest) -> Result<Value, Failure> {
-    let operations = super::ops::operations_projection(ctx, req).await?;
+    let detail = super::ops::projection_detail(req, "overview")?;
+    let mut operations_req = req.clone();
+    if detail == super::ops::ProjectionDetail::Full {
+        operations_req
+            .params
+            .insert("limit".to_owned(), json!(PORTFOLIO_CAP));
+        operations_req
+            .params
+            .insert("symptoms".to_owned(), json!(true));
+    }
+    let operations = super::ops::operations_projection(ctx, &operations_req).await?;
     let queue_groups = super::ops::durable_compatibility_groups(&operations);
     let entries = queue_groups
         .iter()
@@ -470,17 +639,22 @@ async fn portfolio_overview(ctx: &Ctx, req: &OperationRequest) -> Result<Value, 
         .and_then(Value::as_u64)
         .unwrap_or(entries.len() as u64);
     let attention_total = operations
-        .get("attention")
-        .and_then(Value::as_array)
-        .map_or(0, Vec::len);
-    let attention = operations
-        .get("attention")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .take(PORTFOLIO_CAP)
-        .cloned()
-        .collect::<Vec<_>>();
+        .pointer("/counts/attention")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let attention = if detail == super::ops::ProjectionDetail::Full {
+        operations
+            .get("attention")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .take(PORTFOLIO_CAP)
+            .cloned()
+            .collect::<Vec<_>>()
+            .into()
+    } else {
+        operations.get("attention").cloned().unwrap_or(Value::Null)
+    };
     let admission = entries
         .iter()
         .flat_map(|entry| {
@@ -496,10 +670,18 @@ async fn portfolio_overview(ctx: &Ctx, req: &OperationRequest) -> Result<Value, 
         .iter()
         .filter_map(|entry| entry.get("liveSeats").and_then(Value::as_u64))
         .sum::<u64>();
+    let cap = if detail == super::ops::ProjectionDetail::Full {
+        json!(PORTFOLIO_CAP)
+    } else {
+        operations
+            .pointer("/coverage/limit")
+            .cloned()
+            .unwrap_or(json!(30))
+    };
     let queue = json!({
         "groups": queue_groups,
         "total": total,
-        "cap": PORTFOLIO_CAP,
+        "cap": cap,
         "asOf": operations.pointer("/capturedAt/ledger").cloned().unwrap_or(Value::Null),
     });
     Ok(json!({
@@ -507,14 +689,13 @@ async fn portfolio_overview(ctx: &Ctx, req: &OperationRequest) -> Result<Value, 
         "kind": "portfolio",
         "entries": entries,
         "total": total,
-        "cap": PORTFOLIO_CAP,
+        "cap": cap,
         "liveSeats": live_seats,
         "attention": attention,
         "attentionTotal": attention_total,
         "queue": queue,
-        // Verbatim Operations counts. `coverage` is deliberately NOT passed
-        // through: this payload already carries `cap`, and two
-        // differently-defined caps in one envelope is a trap.
+        "coverage": operations.get("coverage").cloned().unwrap_or(Value::Null),
+        // Verbatim Operations counts.
         "counts": operations.get("counts").cloned().unwrap_or(Value::Null),
         "admission": admission,
         "spend": {
@@ -1138,6 +1319,8 @@ pub async fn overview(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
         let run = param_opt_str(&req.params, "run");
         let epic = param_opt_str(&req.params, "epic");
         let id = param_opt_str(&req.params, "id");
+        let detail = super::ops::projection_detail(req, "overview")?;
+        super::ops::projection_symptoms(req, "overview")?;
         for key in ["run", "epic", "id"] {
             if req.params.contains_key(key) && param_opt_str(&req.params, key).is_none() {
                 return Err(Failure::invalid(format!(
@@ -1161,11 +1344,13 @@ pub async fn overview(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
         if after < 0 {
             return Err(Failure::invalid("overview after must be non-negative"));
         }
-        let limit = req
-            .params
-            .get("limit")
-            .and_then(Value::as_u64)
-            .unwrap_or(100);
+        let limit = req.params.get("limit").and_then(Value::as_u64).unwrap_or(
+            if detail == super::ops::ProjectionDetail::Full {
+                FULL_EVENT_PAGE_LIMIT
+            } else {
+                SUMMARY_EVENT_PAGE_LIMIT
+            },
+        );
         if limit == 0 || limit > 1_000 {
             return Err(Failure::invalid(
                 "overview limit must be between 1 and 1000",
@@ -1189,13 +1374,13 @@ pub async fn overview(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
         }
         match (run, epic, id) {
             (None, None, None) => portfolio_overview(ctx, req).await,
-            (Some(run), None, None) => run_overview(ctx, run, after, limit).await,
-            (None, Some(epic), None) => epic_overview(ctx, epic, after, limit).await,
+            (Some(run), None, None) => run_overview(ctx, run, after, limit, detail).await,
+            (None, Some(epic), None) => epic_overview(ctx, epic, after, limit, detail).await,
             // A resolved id projects through the SAME call the explicit
             // param makes, so the two answers cannot drift.
             (None, None, Some(id)) => match resolve(ctx, id).await? {
-                Resolved::Slice(run) => run_overview(ctx, &run, after, limit).await,
-                Resolved::Epic(epic) => epic_overview(ctx, &epic, after, limit).await,
+                Resolved::Slice(run) => run_overview(ctx, &run, after, limit, detail).await,
+                Resolved::Epic(epic) => epic_overview(ctx, &epic, after, limit, detail).await,
                 Resolved::Unresolved(resolution) => Ok(json!({
                     "schema": "forged.overview/1",
                     "resolution": resolution,
@@ -2207,6 +2392,90 @@ async fn project_work_detail(
     }))
 }
 
+fn summarize_work_detail(full: &Value) -> Value {
+    let gate_items = full
+        .get("gates")
+        .and_then(|value| value.get("items"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let findings = full
+        .pointer("/reviews/latestFindings")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut finding_by_severity = BTreeMap::<String, usize>::new();
+    for finding in &findings {
+        let severity = finding
+            .get("severity")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_owned();
+        *finding_by_severity.entry(severity).or_default() += 1;
+    }
+    let attention = full
+        .get("attention")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut decisions = 0usize;
+    let mut symptoms = 0usize;
+    let mut acknowledged = 0usize;
+    for item in &attention {
+        if item.get("state").and_then(Value::as_str) == Some("acknowledged") {
+            acknowledged += 1;
+        }
+        let condition = item.get("condition").cloned().and_then(|value| {
+            serde_json::from_value::<forged_types::AttentionCondition>(value).ok()
+        });
+        match condition.map(super::attention::classification) {
+            Some(super::attention::AttentionClass::Decision) => decisions += 1,
+            Some(super::attention::AttentionClass::Symptom) => symptoms += 1,
+            None => {}
+        }
+    }
+    json!({
+        "schema": "forged.work-detail/1",
+        "kind": full.get("kind"),
+        "id": full.get("id"),
+        "workRef": full.get("workRef"),
+        "identity": full.get("identity"),
+        "titleSource": full.get("titleSource"),
+        "status": full.get("status"),
+        "delivery": full.get("delivery"),
+        "deadlineKills": full.get("deadlineKills"),
+        "nextAction": attention
+            .first()
+            .and_then(|item| item.get("recommendedAction"))
+            .or_else(|| full.pointer("/status/nextAction")),
+        "desired": {"total": full.pointer("/desired/total")},
+        "admission": {
+            "decisionTotal": full.pointer("/admission/decisions/total"),
+            "reservationTotal": full.pointer("/admission/reservations/total"),
+        },
+        "children": {"total": full.pointer("/children/total")},
+        "workers": {"total": full.pointer("/workers/total")},
+        "usage": {"totals": full.pointer("/usage/totals")},
+        "effectCustody": {"total": full.pointer("/effectCustody/total")},
+        "gates": {
+            "total": full.pointer("/gates/total"),
+            "latest": gate_items.last(),
+        },
+        "reviews": {
+            "resultTotal": full.pointer("/reviews/resultTotal"),
+            "findingCounts": {"total": findings.len(), "bySeverity": finding_by_severity},
+        },
+        "attention": {
+            "counts": {
+                "decisions": decisions,
+                "symptoms": symptoms,
+                "acknowledged": acknowledged,
+            },
+            "total": full.get("attentionTotal"),
+        },
+    })
+}
+
 /// Work projection used by the Work Detail App.
 ///
 /// Addressed by EXACTLY one form: the canonical `subjectKind`/`subjectId`
@@ -2220,6 +2489,8 @@ async fn project_work_detail(
 /// with identical envelopes.
 pub async fn work_detail(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
     read_only("work_detail", req, || async {
+        let detail = super::ops::projection_detail(req, "work detail")?;
+        super::ops::projection_symptoms(req, "work detail")?;
         // A present addressing key must name a subject: `param_named_str`
         // reads `""`, whitespace, `null` and a non-string alike as absent,
         // and treating those as omitted would answer a caller's failed
@@ -2309,7 +2580,12 @@ pub async fn work_detail(ctx: &Ctx, req: &OperationRequest) -> OperationResponse
             ledger.work_observation_snapshot(kind, &id, after, event_limit)
         })
         .await?;
-        project_work_detail(ctx, snapshot).await
+        let full = project_work_detail(ctx, snapshot).await?;
+        Ok(if detail == super::ops::ProjectionDetail::Full {
+            full
+        } else {
+            summarize_work_detail(&full)
+        })
     })
     .await
 }

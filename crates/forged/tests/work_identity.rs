@@ -30,7 +30,7 @@ fn start_run(env: &TestEnv, id: &str, title: &str) -> Value {
 }
 
 fn listed_identity(env: &TestEnv, id: &str) -> (Value, Value) {
-    let (code, listed) = env.forged(&["work", "list"]);
+    let (code, listed) = env.forged(&["work", "list", "--detail", "full"]);
     assert_eq!(code, 0, "work list: {listed}");
     let entry = listed["result"]["runs"]
         .as_array()

@@ -236,6 +236,10 @@ pub struct ProviderSessionInventoryRowV1 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProviderSessionInventoryCoverageV1 {
+    pub shown: u64,
+    pub total: u64,
+    pub truncated: bool,
+    pub next_cursor: Option<String>,
     pub missing_work_identity: u64,
     pub missing_repository: u64,
     pub missing_desired_work: u64,

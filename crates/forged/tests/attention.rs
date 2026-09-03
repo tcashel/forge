@@ -14,7 +14,7 @@ fn append(env: &TestEnv, run: &str, kind: &str, payload: Value) {
 }
 
 fn overview(env: &TestEnv) -> Value {
-    let (code, envelope) = env.forged(&["overview"]);
+    let (code, envelope) = env.forged(&["overview", "--detail", "full"]);
     assert_eq!(code, 0, "{envelope}");
     envelope["result"].clone()
 }
@@ -174,7 +174,7 @@ fn attention_is_identical_across_surfaces_and_controls_are_occurrence_fenced() {
     let attention_id = item["attentionId"].as_str().expect("attention id");
     let occurrence_id = item["occurrenceId"].as_str().expect("occurrence id");
 
-    let (code, listed) = env.forged(&["work", "list"]);
+    let (code, listed) = env.forged(&["work", "list", "--detail", "full"]);
     assert_eq!(code, 0, "{listed}");
     assert_eq!(listed["result"]["attention"], initial["attention"]);
     assert_eq!(listed["result"]["attentionTotal"], json!(1));
@@ -409,7 +409,7 @@ fn restart_exhaustion_advertises_stop_then_retry_and_clears_durably() {
         attention(&overview(&env), run, "restart-budget-exhausted").is_none(),
         "a terminal exhausted source with a live same-work successor clears"
     );
-    let (code, detail) = env.forged(&["work", "detail", "--id", run]);
+    let (code, detail) = env.forged(&["work", "detail", "--id", run, "--detail", "full"]);
     assert_eq!(code, 0, "original run Work Detail: {detail}");
     assert!(
         attention(&detail["result"], run, "restart-budget-exhausted").is_none(),
@@ -433,7 +433,7 @@ fn restart_exhaustion_advertises_stop_then_retry_and_clears_durably() {
         attention(&overview(&env), run, "restart-budget-exhausted").is_none(),
         "clearance survives the successor's own settlement"
     );
-    let (code, detail) = env.forged(&["work", "detail", "--id", run]);
+    let (code, detail) = env.forged(&["work", "detail", "--id", run, "--detail", "full"]);
     assert_eq!(code, 0, "post-settlement Work Detail: {detail}");
     assert!(
         attention(&detail["result"], run, "restart-budget-exhausted").is_none(),
@@ -974,7 +974,14 @@ fn missing_evidence_is_adjudicated_per_occurrence_with_its_full_attempt_scope() 
 
     // Surface parity while open: work_detail names the same occurrence, so
     // the address it serves can pass resolve validation.
-    let (code, detail) = env.forged(&["work", "detail", "--id", "attention-evidence"]);
+    let (code, detail) = env.forged(&[
+        "work",
+        "detail",
+        "--id",
+        "attention-evidence",
+        "--detail",
+        "full",
+    ]);
     assert_eq!(code, 0, "{detail}");
     let observed = attention(&detail["result"], "attention-evidence", "missing-evidence")
         .expect("work_detail missing-evidence");
@@ -1086,7 +1093,14 @@ fn missing_evidence_is_adjudicated_per_occurrence_with_its_full_attempt_scope() 
             .all(|group| group["condition"] != json!("missing-evidence")),
         "{listed}"
     );
-    let (code, detail) = env.forged(&["work", "detail", "--id", "attention-evidence"]);
+    let (code, detail) = env.forged(&[
+        "work",
+        "detail",
+        "--id",
+        "attention-evidence",
+        "--detail",
+        "full",
+    ]);
     assert_eq!(code, 0, "{detail}");
     assert!(
         attention(&detail["result"], "attention-evidence", "missing-evidence").is_none(),
@@ -1254,7 +1268,14 @@ fn merged_delivery_evidence_defers_adjudication_until_the_pr_is_repaired() {
     // cursor), so while the delivery gap is live its attempt-only
     // occurrence id differs from the rail's merged id and a resolve
     // against it fails closed as stale. The rail is the resolve surface.
-    let (code, detail) = env.forged(&["work", "detail", "--id", "attention-merged"]);
+    let (code, detail) = env.forged(&[
+        "work",
+        "detail",
+        "--id",
+        "attention-merged",
+        "--detail",
+        "full",
+    ]);
     assert_eq!(code, 0, "{detail}");
     let derived = attention(&detail["result"], "attention-merged", "missing-evidence")
         .expect("work_detail missing-evidence");
@@ -1321,7 +1342,14 @@ fn merged_delivery_evidence_defers_adjudication_until_the_pr_is_repaired() {
     );
     // With the settlement source gone the anti-joins agree again, so the
     // occurrence id work_detail prints is the one the rail validates.
-    let (code, detail) = env.forged(&["work", "detail", "--id", "attention-merged"]);
+    let (code, detail) = env.forged(&[
+        "work",
+        "detail",
+        "--id",
+        "attention-merged",
+        "--detail",
+        "full",
+    ]);
     assert_eq!(code, 0, "{detail}");
     let repaired_view = attention(&detail["result"], "attention-merged", "missing-evidence")
         .expect("work_detail attempt-scoped missing-evidence");
@@ -1402,7 +1430,14 @@ fn interrupted_attempts_never_owe_a_manifest_on_any_surface() {
         attention(&overview(&env), "attention-interrupted", "missing-evidence").is_none(),
         "an interrupted attempt never owed a manifest"
     );
-    let (code, detail) = env.forged(&["work", "detail", "--id", "attention-interrupted"]);
+    let (code, detail) = env.forged(&[
+        "work",
+        "detail",
+        "--id",
+        "attention-interrupted",
+        "--detail",
+        "full",
+    ]);
     assert_eq!(code, 0, "{detail}");
     assert!(
         attention(
@@ -1567,7 +1602,7 @@ fn attention_list_groups_decisions_first_and_serves_complete_rail_items() {
 
     // Items are the complete unmodified forged.attention-item/1 objects the
     // embedded operations_overview rail serves.
-    let (code, ops) = env.forged(&["operations", "overview"]);
+    let (code, ops) = env.forged(&["operations", "overview", "--detail", "full"]);
     assert_eq!(code, 0, "{ops}");
     for (run, condition) in [
         ("att-a", "quarantined"),
@@ -1599,7 +1634,7 @@ fn attention_list_serves_the_plan_only_blocked_work_exactly_as_the_rail() {
     env.set_work_field("plan-blk", "title", "Blocked plan-only bead");
     env.set_work_repository("plan-blk", &repository);
 
-    let (code, ops) = env.forged(&["operations", "overview"]);
+    let (code, ops) = env.forged(&["operations", "overview", "--detail", "full"]);
     assert_eq!(code, 0, "{ops}");
     let rail = attention(&ops["result"], "plan-blk", "blocked")
         .unwrap_or_else(|| panic!("plan-only blocked bead is on the rail: {ops}"));

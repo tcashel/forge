@@ -215,7 +215,7 @@ fn set_used(env: &TestEnv, run: &str, used: u32) {
 }
 
 fn attention_conditions(env: &TestEnv, run: &str) -> Vec<Value> {
-    let (code, response) = env.forged(&["overview"]);
+    let (code, response) = env.forged(&["overview", "--detail", "full"]);
     assert_eq!(code, 0, "overview: {response}");
     response["result"]["attention"]
         .as_array()
@@ -227,7 +227,7 @@ fn attention_conditions(env: &TestEnv, run: &str) -> Vec<Value> {
 }
 
 fn queue_blocker(env: &TestEnv, run: &str) -> Value {
-    let (code, response) = env.forged(&["work", "list"]);
+    let (code, response) = env.forged(&["work", "list", "--detail", "full"]);
     assert_eq!(code, 0, "work list: {response}");
     response["result"]["runs"]
         .as_array()
@@ -1003,7 +1003,7 @@ fn a_deterministic_custody_refusal_parks_after_one_charge_and_a_new_episode_retr
         mutations,
         "the parked episode performs no more work writes"
     );
-    let overview = env.forged(&["overview"]).1;
+    let overview = env.forged(&["overview", "--detail", "full"]).1;
     let attention = overview["result"]["attention"]
         .as_array()
         .expect("attention")
@@ -1242,7 +1242,7 @@ fn a_failing_close_charges_monotonically_backs_off_and_exhausts_while_the_probe_
         vec![json!("beads-settlement-pending")],
         "the standing condition keeps flagging the owed promise"
     );
-    let (code, overview) = env.forged(&["overview"]);
+    let (code, overview) = env.forged(&["overview", "--detail", "full"]);
     assert_eq!(code, 0, "overview: {overview}");
     let evidence = overview["result"]["attention"]
         .as_array()

@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 use support::{fabricate_epic, fabricate_run, McpClient, TestEnv};
 
 fn portfolio(env: &TestEnv) -> Value {
-    let (code, response) = env.forged(&["overview"]);
+    let (code, response) = env.forged(&["overview", "--detail", "full"]);
     assert_eq!(code, 0, "overview with no scope: {response}");
     assert_eq!(response["ok"], json!(true), "{response}");
     response["result"].clone()
@@ -274,7 +274,7 @@ fn work_list_and_no_scope_overview_share_the_same_operator_groups() {
     fabricate_run(&env, "pf-queued");
 
     let overview = portfolio(&env);
-    let (code, listed) = env.forged(&["work", "list"]);
+    let (code, listed) = env.forged(&["work", "list", "--detail", "full"]);
     assert_eq!(code, 0, "work list: {listed}");
     let overview_groups = overview["queue"]["groups"]
         .as_array()
@@ -578,11 +578,13 @@ fn a_compatibility_group_states_what_it_excluded_instead_of_reporting_zero() {
     // page cap where `total - count` would invent rows.
     assert_eq!(planned["total"], json!(durable + excluded), "{planned}");
 
-    // The verbatim Operations counts ride the header; `entries` keeps its
-    // legacy durable-only boundary.
+    // The verbatim Operations counts and additive coverage ride the header;
+    // `entries` keeps its legacy durable-only boundary.
     assert_eq!(value["counts"]["planOnly"], json!(2), "{value}");
     assert_eq!(value["counts"]["durable"], json!(1), "{value}");
-    assert_eq!(value["coverage"], Value::Null, "{value}");
+    assert_eq!(value["coverage"]["shown"], json!(3), "{value}");
+    assert_eq!(value["coverage"]["total"], json!(3), "{value}");
+    assert_eq!(value["coverage"]["nextCursor"], Value::Null, "{value}");
     let rows = entries(&value);
     assert_eq!(rows.len(), 1, "{value}");
     assert!(

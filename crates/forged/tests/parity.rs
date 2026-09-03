@@ -244,6 +244,16 @@ fn all_manifest_tools_match_their_cli_counterparts() {
             "overview param {param} must advertise type {ty}: {schema}"
         );
     }
+    assert!(
+        properties["detail"]
+            .to_string()
+            .contains("ProjectionDetailParam"),
+        "overview advertises the closed detail enum: {properties}"
+    );
+    assert!(
+        properties.get("symptoms").is_some(),
+        "overview advertises params.symptoms: {properties}"
+    );
     let description = overview_tool["description"].as_str().unwrap_or_default();
     assert!(
         description.contains("At most one of params.run, params.epic, or params.id is accepted"),
@@ -297,7 +307,7 @@ fn all_manifest_tools_match_their_cli_counterparts() {
         .pointer("/inputSchema/properties/params/properties")
         .cloned()
         .unwrap_or(Value::Null);
-    for param in ["repo", "cursor", "detail", "limit"] {
+    for param in ["repo", "cursor", "detail", "limit", "all"] {
         assert!(
             ready_schema.get(param).is_some(),
             "work_ready advertises params.{param}: {ready_schema}"
@@ -314,6 +324,7 @@ fn all_manifest_tools_match_their_cli_counterparts() {
         "params.cursor",
         "params.detail",
         "params.limit",
+        "params.all",
         "nextCursor",
         "100",
         "500",
@@ -433,7 +444,7 @@ fn all_manifest_tools_match_their_cli_counterparts() {
         .pointer("/inputSchema/properties/params/properties")
         .cloned()
         .unwrap_or(Value::Null);
-    for param in ["repo", "group", "source", "limit"] {
+    for param in ["repo", "group", "source", "limit", "detail", "symptoms"] {
         assert!(
             operation_properties.get(param).is_some(),
             "operations_overview advertises params.{param}: {operation_properties}"
@@ -474,7 +485,15 @@ fn all_manifest_tools_match_their_cli_counterparts() {
         .pointer("/inputSchema/properties/params/properties")
         .cloned()
         .unwrap_or(Value::Null);
-    for param in ["subjectKind", "subjectId", "id", "after", "limit"] {
+    for param in [
+        "subjectKind",
+        "subjectId",
+        "id",
+        "after",
+        "limit",
+        "detail",
+        "symptoms",
+    ] {
         assert!(
             detail_properties.get(param).is_some(),
             "work_detail advertises params.{param}: {detail_properties}"
@@ -864,10 +883,19 @@ fn all_manifest_tools_match_their_cli_counterparts() {
         "run_adjudicate_settlement parity"
     );
 
-    let cli = env.forged(&["overview", "--run", "absent"]).1;
+    let cli = env
+        .forged(&[
+            "overview",
+            "--run",
+            "absent",
+            "--detail",
+            "summary",
+            "--symptoms",
+        ])
+        .1;
     let tool = mcp.call_tool(
         "overview",
-        json!({"schemaVersion": 1, "runId": "absent", "params": {"run": "absent"}}),
+        json!({"schemaVersion": 1, "runId": "absent", "params": {"run": "absent", "detail": "summary", "symptoms": true}}),
     );
     assert_eq!(normalized(cli), normalized(tool), "overview parity");
     let structured = mcp.call_tool_result(
@@ -932,10 +960,21 @@ fn all_manifest_tools_match_their_cli_counterparts() {
         normalized(tool.clone()),
         "operations_overview parity"
     );
+    assert_eq!(tool["result"]["attention"]["counts"]["symptoms"], json!(1));
+    assert_eq!(tool["result"]["attention"]["decisions"], json!([]));
     assert!(
-        tool.pointer("/result/attention/0/nextActions")
+        tool["result"]["attention"].get("symptoms").is_none(),
+        "summary attention omits symptom rows unless requested: {tool}"
+    );
+    let symptoms = mcp.call_tool(
+        "operations_overview",
+        envelope(json!({"repo": repository, "limit": 25, "symptoms": true})),
+    );
+    assert!(
+        symptoms
+            .pointer("/result/attention/symptoms/0/nextActions")
             .is_some_and(Value::is_array),
-        "attention items add nextActions without replacing legacy fields: {tool}"
+        "requested symptom items retain nextActions: {symptoms}"
     );
     let structured = mcp.call_tool_result(
         "operations_overview",
@@ -968,11 +1007,14 @@ fn all_manifest_tools_match_their_cli_counterparts() {
             "absent",
             "--limit",
             "25",
+            "--detail",
+            "summary",
+            "--symptoms",
         ])
         .1;
     let tool = mcp.call_tool(
         "work_detail",
-        envelope(json!({"subjectKind": "run", "subjectId": "absent", "limit": 25})),
+        envelope(json!({"subjectKind": "run", "subjectId": "absent", "limit": 25, "detail": "summary", "symptoms": true})),
     );
     assert_eq!(normalized(cli), normalized(tool), "work_detail parity");
     let structured = mcp.call_tool_result(

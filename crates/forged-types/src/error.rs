@@ -37,13 +37,15 @@ pub enum ErrorCode {
     /// death fence is possible: settlement requires the explicit
     /// `run adjudicate-settlement` decision, never a retry.
     AdjudicationRequired,
+    /// `work ready --all` cannot return more than the bounded frontier cap.
+    FrontierTooLarge,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const ALL: [(ErrorCode, &str); 20] = [
+    const ALL: [(ErrorCode, &str); 21] = [
         (ErrorCode::InvalidRequest, "INVALID_REQUEST"),
         (ErrorCode::RunNotFound, "RUN_NOT_FOUND"),
         (ErrorCode::PacketNotClaimable, "PACKET_NOT_CLAIMABLE"),
@@ -67,11 +69,12 @@ mod tests {
         (ErrorCode::GhError, "GH_ERROR"),
         (ErrorCode::Internal, "INTERNAL"),
         (ErrorCode::AdjudicationRequired, "ADJUDICATION_REQUIRED"),
+        (ErrorCode::FrontierTooLarge, "FRONTIER_TOO_LARGE"),
     ];
 
     #[test]
-    fn serializes_to_exactly_the_twenty_screaming_snake_strings() {
-        assert_eq!(ALL.len(), 20);
+    fn serializes_to_exactly_the_twenty_one_screaming_snake_strings() {
+        assert_eq!(ALL.len(), 21);
         for (code, expected) in ALL {
             let json = serde_json::to_value(code).expect("serializes");
             assert_eq!(json, serde_json::Value::String(expected.to_owned()));

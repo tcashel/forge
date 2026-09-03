@@ -1703,6 +1703,32 @@ fn interventions_cross_a_durable_boundary_and_sessions_stay_observable() {
         }),
         "every provider session inherits the run's exact durable identity: {listed}"
     );
+    assert!(
+        sessions.len() > 1,
+        "the workflow fixture must exercise session continuation: {listed}"
+    );
+    let (code, newest) = env.forged(&["session", "list", "--run", "bead-session", "--limit", "1"]);
+    assert_eq!(code, 0, "newest session page: {newest}");
+    assert_eq!(newest["result"]["sessions"][0], sessions[0]);
+    let cursor = newest["result"]["coverage"]["nextCursor"]
+        .as_str()
+        .expect("newest page continuation");
+    let (code, older) = env.forged(&[
+        "session",
+        "list",
+        "--run",
+        "bead-session",
+        "--limit",
+        "1",
+        "--cursor",
+        cursor,
+    ]);
+    assert_eq!(code, 0, "older session page: {older}");
+    assert_eq!(older["result"]["sessions"][0], sessions[1]);
+    assert_ne!(
+        older["result"]["sessions"][0]["attemptId"], newest["result"]["sessions"][0]["attemptId"],
+        "continuation must advance toward older sessions"
+    );
 
     let (_, events) = env.forged(&["events", "--run", "bead-session", "--limit", "1000"]);
     let kinds: Vec<&str> = events["result"]["events"]
@@ -2250,6 +2276,11 @@ fn run_drive_reaches_done_with_one_draft_pr_and_real_commits() {
     // The events surface replays the run's stream, proto kinds included.
     let (code, events) = env.forged(&["events", "--run", "bead-e2e"]);
     assert_eq!(code, 0, "events: {events}");
+    assert_eq!(
+        events["result"]["summary"],
+        json!(false),
+        "the legacy no-flag events contract keeps complete payloads: {events}"
+    );
     let kinds: Vec<&str> = events["result"]["events"]
         .as_array()
         .expect("events array")
@@ -2265,6 +2296,16 @@ fn run_drive_reaches_done_with_one_draft_pr_and_real_commits() {
     ] {
         assert!(kinds.contains(&kind), "{kind} in stream: {kinds:?}");
     }
+    let full_gate = events["result"]["events"]
+        .as_array()
+        .expect("events")
+        .iter()
+        .find(|event| event["kind"] == json!("proto.gate"))
+        .expect("full gate event");
+    assert!(
+        full_gate["payload"]["rows"].is_array(),
+        "the no-flag payload is not summarized: {full_gate}"
+    );
     let review_events = events["result"]["events"]
         .as_array()
         .expect("events")
@@ -2441,7 +2482,8 @@ fn profiles_scale_topology_and_an_explicit_roster_revision_switches_provider_fam
         status["result"]["run"]["definition"]["rosterRevision"],
         json!(2)
     );
-    let (code, overview) = switched.forged(&["overview", "--run", "bead-switch"]);
+    let (code, overview) =
+        switched.forged(&["overview", "--run", "bead-switch", "--detail", "full"]);
     assert_eq!(code, 0, "overview after revision: {overview}");
     let revisions = overview["result"]["rosterRevisions"]
         .as_array()
@@ -4744,7 +4786,7 @@ fn epic_and_slice_execution_health_and_deferrals_read_from_every_surface() {
     }
 
     // The portfolio row carries the same derived verdict.
-    let (code, operations) = env.forged(&["operations", "overview"]);
+    let (code, operations) = env.forged(&["operations", "overview", "--detail", "full"]);
     assert_eq!(code, 0, "{operations}");
     let entry = operations["result"]["queue"]["groups"]
         .as_array()

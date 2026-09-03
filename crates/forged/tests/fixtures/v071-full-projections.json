@@ -1,0 +1,720 @@
+{
+  "operations": {
+    "attention": [],
+    "capturedAt": {
+      "beads": "<timestamp>",
+      "ledger": "<timestamp>"
+    },
+    "counts": {
+      "admitted": 0,
+      "attention": 0,
+      "durable": 1,
+      "live": 0,
+      "planOnly": 0,
+      "queued": 0,
+      "recent": 0,
+      "reviewReady": 0
+    },
+    "coverage": {
+      "available": 1,
+      "filteredOut": 0,
+      "limit": 200,
+      "matching": 1,
+      "shown": 1,
+      "total": 1,
+      "truncated": false
+    },
+    "queue": {
+      "groups": [
+        {
+          "code": "needs-me",
+          "entries": [],
+          "label": "Needs me",
+          "shown": 0,
+          "total": 0
+        },
+        {
+          "code": "ready-to-merge",
+          "entries": [],
+          "label": "Ready to merge",
+          "shown": 0,
+          "total": 0
+        },
+        {
+          "code": "running",
+          "entries": [],
+          "label": "Running",
+          "shown": 0,
+          "total": 0
+        },
+        {
+          "code": "stalled-or-recoverable",
+          "entries": [
+            {
+              "admission": {
+                "decisions": [],
+                "reservations": [],
+                "source": "ledger"
+              },
+              "attentionItems": {
+                "items": [],
+                "source": "projection"
+              },
+              "baseRef": "main",
+              "beadId": "bead-golden-run",
+              "blocker": "Work was not returned by the bounded live read",
+              "branch": "forged/golden-run",
+              "ci": {
+                "detail": "CI state is not recorded durably",
+                "status": "unknown"
+              },
+              "claimHealth": {
+                "assignee": null,
+                "detail": "Work was not returned by the bounded live read",
+                "expectedAssignee": "forged:bead-golden-run:0",
+                "known": false,
+                "staleInProgress": false,
+                "status": null
+              },
+              "controller": null,
+              "costUsdKnown": 0,
+              "createdAt": "<timestamp>",
+              "currentAgent": null,
+              "currentSeat": null,
+              "currentStage": null,
+              "delivery": null,
+              "deliveryFact": {
+                "source": "ledger",
+                "value": null
+              },
+              "desired": null,
+              "detailTarget": {
+                "subjectId": "golden-run",
+                "subjectKind": "run"
+              },
+              "execution": {
+                "controller": null,
+                "currentAgent": null,
+                "currentSeat": null,
+                "currentStage": null,
+                "liveSeats": 0,
+                "source": "ledger"
+              },
+              "executionHealth": "unsubmitted",
+              "id": "golden-run",
+              "identity": {
+                "bead": {
+                  "id": "bead-golden-run",
+                  "revision": null,
+                  "title": null
+                },
+                "capturedAt": "<timestamp>",
+                "displayTitle": "golden-run [<repo-label>]",
+                "epic": null,
+                "project": null,
+                "repository": {
+                  "label": "<repo-label>",
+                  "path": "<repo>"
+                },
+                "schema": "forged.work-identity/1",
+                "source": "legacy-fallback",
+                "subject": {
+                  "id": "golden-run",
+                  "kind": "run"
+                }
+              },
+              "kind": "slice",
+              "lastProgressAt": "<timestamp>",
+              "liveSeats": 0,
+              "nextAction": "Inspect the blocker and resubmit only after controller death is verified",
+              "outcome": null,
+              "pr": null,
+              "progressAgeInput": {
+                "asOf": "<timestamp>",
+                "lastProgressAt": "<timestamp>"
+              },
+              "queueGroup": "Stalled or recoverable",
+              "repo": "<repo>",
+              "repositoryScope": {
+                "identity": null,
+                "known": false,
+                "source": "unknown"
+              },
+              "rowsMissingCost": 0,
+              "source": "durable",
+              "spend": {
+                "costUsdKnown": 0,
+                "rowsMissingCost": 0
+              },
+              "state": "active",
+              "stopReason": null,
+              "supersededBy": null,
+              "title": "golden-run [<repo-label>]",
+              "titleSource": {
+                "beadId": "bead-golden-run",
+                "known": false,
+                "source": "unknown",
+                "value": "golden-run [<repo-label>]"
+              },
+              "updatedAt": "<timestamp>",
+              "workRef": {
+                "id": "golden-run",
+                "kind": "run",
+                "schema": "forged.work-ref/1"
+              }
+            }
+          ],
+          "label": "Stalled or recoverable",
+          "shown": 1,
+          "total": 1
+        },
+        {
+          "code": "planned",
+          "entries": [],
+          "label": "Planned",
+          "shown": 0,
+          "total": 0
+        }
+      ],
+      "total": 1
+    },
+    "schema": "forged.operations-overview/1",
+    "scope": {
+      "repository": null
+    },
+    "sourceHealth": {
+      "beads": {
+        "error": null,
+        "state": "available"
+      },
+      "ledger": {
+        "state": "available"
+      },
+      "plan": {
+        "discovered": 0,
+        "error": null,
+        "limit": 500,
+        "state": "available",
+        "truncated": false
+      }
+    },
+    "spend": {
+      "complete": true,
+      "costUsdKnown": 0,
+      "rowsMissingCost": 0
+    }
+  },
+  "work-detail": {
+    "admission": {
+      "decisions": {
+        "items": [],
+        "limit": 200,
+        "total": 0,
+        "truncated": false
+      },
+      "reservations": {
+        "items": [],
+        "limit": 200,
+        "total": 0,
+        "truncated": false
+      },
+      "source": "ledger"
+    },
+    "artifactCoverage": {
+      "limit": 200,
+      "source": "ledger-manifest-metadata",
+      "total": 0,
+      "truncated": false
+    },
+    "artifacts": [],
+    "attempts": {
+      "items": [],
+      "limit": 200,
+      "total": 0,
+      "truncated": false
+    },
+    "attention": [],
+    "attentionCoverage": {
+      "controlsComplete": true,
+      "eventBackedConditionsComplete": true,
+      "source": "atomic-work-observation",
+      "subjectScoped": true
+    },
+    "attentionLimit": 200,
+    "attentionTotal": 0,
+    "attentionTruncated": false,
+    "children": {
+      "items": [],
+      "limit": 200,
+      "total": 0,
+      "truncated": false
+    },
+    "cursor": 0,
+    "deadlineKills": 0,
+    "delivery": {
+      "known": false,
+      "pr": null,
+      "sha": null,
+      "source": "ledger"
+    },
+    "desired": {
+      "items": [],
+      "limit": 200,
+      "total": 0,
+      "truncated": false
+    },
+    "effectCustody": {
+      "items": [],
+      "limit": 200,
+      "total": 0,
+      "truncated": false
+    },
+    "events": {
+      "after": 0,
+      "events": [],
+      "hasMore": false,
+      "limit": 100,
+      "nextAfter": 0,
+      "source": "ledger",
+      "total": 0,
+      "truncated": false
+    },
+    "gates": {
+      "items": [],
+      "limit": 200,
+      "total": 0,
+      "truncated": false
+    },
+    "id": "golden-run",
+    "identity": {
+      "bead": {
+        "id": "bead-golden-run",
+        "revision": null,
+        "title": null
+      },
+      "capturedAt": "<timestamp>",
+      "displayTitle": "golden-run [<repo-label>]",
+      "epic": null,
+      "project": null,
+      "repository": {
+        "label": "<repo-label>",
+        "path": "<repo>"
+      },
+      "schema": "forged.work-identity/1",
+      "source": "legacy-fallback",
+      "subject": {
+        "id": "golden-run",
+        "kind": "run"
+      }
+    },
+    "kind": "slice",
+    "packets": {
+      "items": [],
+      "limit": 200,
+      "total": 0,
+      "truncated": false
+    },
+    "reviews": {
+      "latestFindingLimit": 200,
+      "latestFindingTotal": 0,
+      "latestFindings": [],
+      "latestFindingsTruncated": false,
+      "resultLimit": 200,
+      "resultTotal": 0,
+      "results": [],
+      "resultsTruncated": false
+    },
+    "schema": "forged.work-detail/1",
+    "status": {
+      "createdAt": "<timestamp>",
+      "outcome": null,
+      "source": "ledger",
+      "state": "active",
+      "stopReason": null,
+      "supersededBy": null,
+      "updatedAt": "<timestamp>"
+    },
+    "titleSource": {
+      "beadId": "bead-golden-run",
+      "known": false,
+      "source": "unknown",
+      "value": "golden-run [<repo-label>]"
+    },
+    "usage": {
+      "byRun": {
+        "items": [
+          {
+            "runId": "golden-run",
+            "totals": {
+              "cacheReadTokens": 0,
+              "cacheWriteTokens": 0,
+              "costUsdKnown": 0,
+              "inputTokens": 0,
+              "outputTokens": 0,
+              "rowsMissingCost": 0
+            }
+          }
+        ],
+        "limit": 200,
+        "total": 1,
+        "truncated": false
+      },
+      "rowLimit": 200,
+      "rowTotal": 0,
+      "rows": [],
+      "rowsTruncated": false,
+      "source": "ledger",
+      "totals": {
+        "cacheReadTokens": 0,
+        "cacheWriteTokens": 0,
+        "costUsdKnown": 0,
+        "inputTokens": 0,
+        "outputTokens": 0,
+        "rowsMissingCost": 0
+      }
+    },
+    "workRef": {
+      "id": "golden-run",
+      "kind": "run",
+      "schema": "forged.work-ref/1"
+    },
+    "workers": {
+      "limit": 200,
+      "sessions": [],
+      "source": "durable-owned-herdr",
+      "total": 0,
+      "truncated": false
+    }
+  },
+  "portfolio": {
+    "admission": [],
+    "attention": [],
+    "attentionTotal": 0,
+    "cap": 200,
+    "counts": {
+      "admitted": 0,
+      "attention": 0,
+      "durable": 1,
+      "live": 0,
+      "planOnly": 0,
+      "queued": 0,
+      "recent": 0,
+      "reviewReady": 0
+    },
+    "entries": [
+      {
+        "admission": {
+          "decisions": [],
+          "reservations": [],
+          "source": "ledger"
+        },
+        "attentionItems": {
+          "items": [],
+          "source": "projection"
+        },
+        "baseRef": "main",
+        "beadId": "bead-golden-run",
+        "blocker": "Work was not returned by the bounded live read",
+        "branch": "forged/golden-run",
+        "ci": {
+          "detail": "CI state is not recorded durably",
+          "status": "unknown"
+        },
+        "claimHealth": {
+          "assignee": null,
+          "detail": "Work was not returned by the bounded live read",
+          "expectedAssignee": "forged:bead-golden-run:0",
+          "known": false,
+          "staleInProgress": false,
+          "status": null
+        },
+        "controller": null,
+        "costUsdKnown": 0,
+        "createdAt": "<timestamp>",
+        "currentAgent": null,
+        "currentSeat": null,
+        "currentStage": null,
+        "delivery": null,
+        "deliveryFact": {
+          "source": "ledger",
+          "value": null
+        },
+        "desired": null,
+        "detailTarget": {
+          "subjectId": "golden-run",
+          "subjectKind": "run"
+        },
+        "execution": {
+          "controller": null,
+          "currentAgent": null,
+          "currentSeat": null,
+          "currentStage": null,
+          "liveSeats": 0,
+          "source": "ledger"
+        },
+        "executionHealth": "unsubmitted",
+        "id": "golden-run",
+        "identity": {
+          "bead": {
+            "id": "bead-golden-run",
+            "revision": null,
+            "title": null
+          },
+          "capturedAt": "<timestamp>",
+          "displayTitle": "golden-run [<repo-label>]",
+          "epic": null,
+          "project": null,
+          "repository": {
+            "label": "<repo-label>",
+            "path": "<repo>"
+          },
+          "schema": "forged.work-identity/1",
+          "source": "legacy-fallback",
+          "subject": {
+            "id": "golden-run",
+            "kind": "run"
+          }
+        },
+        "kind": "slice",
+        "lastProgressAt": "<timestamp>",
+        "liveSeats": 0,
+        "nextAction": "Inspect the blocker and resubmit only after controller death is verified",
+        "outcome": null,
+        "pr": null,
+        "progressAgeInput": {
+          "asOf": "<timestamp>",
+          "lastProgressAt": "<timestamp>"
+        },
+        "queueGroup": "Stalled or recoverable",
+        "repo": "<repo>",
+        "repositoryScope": {
+          "identity": null,
+          "known": false,
+          "source": "unknown"
+        },
+        "rowsMissingCost": 0,
+        "source": "durable",
+        "spend": {
+          "costUsdKnown": 0,
+          "rowsMissingCost": 0
+        },
+        "state": "active",
+        "stopReason": null,
+        "supersededBy": null,
+        "title": "golden-run [<repo-label>]",
+        "titleSource": {
+          "beadId": "bead-golden-run",
+          "known": false,
+          "source": "unknown",
+          "value": "golden-run [<repo-label>]"
+        },
+        "updatedAt": "<timestamp>",
+        "workRef": {
+          "id": "golden-run",
+          "kind": "run",
+          "schema": "forged.work-ref/1"
+        }
+      }
+    ],
+    "kind": "portfolio",
+    "liveSeats": 0,
+    "queue": {
+      "asOf": "<timestamp>",
+      "cap": 200,
+      "groups": [
+        {
+          "code": "needs-me",
+          "count": 0,
+          "entries": [],
+          "excluded": {
+            "livePlan": 0
+          },
+          "name": "Needs me",
+          "shown": 0,
+          "total": 0
+        },
+        {
+          "code": "ready-to-merge",
+          "count": 0,
+          "entries": [],
+          "excluded": {
+            "livePlan": 0
+          },
+          "name": "Ready to merge",
+          "shown": 0,
+          "total": 0
+        },
+        {
+          "code": "running",
+          "count": 0,
+          "entries": [],
+          "excluded": {
+            "livePlan": 0
+          },
+          "name": "Running",
+          "shown": 0,
+          "total": 0
+        },
+        {
+          "code": "stalled-or-recoverable",
+          "count": 1,
+          "entries": [
+            {
+              "admission": {
+                "decisions": [],
+                "reservations": [],
+                "source": "ledger"
+              },
+              "attentionItems": {
+                "items": [],
+                "source": "projection"
+              },
+              "baseRef": "main",
+              "beadId": "bead-golden-run",
+              "blocker": "Work was not returned by the bounded live read",
+              "branch": "forged/golden-run",
+              "ci": {
+                "detail": "CI state is not recorded durably",
+                "status": "unknown"
+              },
+              "claimHealth": {
+                "assignee": null,
+                "detail": "Work was not returned by the bounded live read",
+                "expectedAssignee": "forged:bead-golden-run:0",
+                "known": false,
+                "staleInProgress": false,
+                "status": null
+              },
+              "controller": null,
+              "costUsdKnown": 0,
+              "createdAt": "<timestamp>",
+              "currentAgent": null,
+              "currentSeat": null,
+              "currentStage": null,
+              "delivery": null,
+              "deliveryFact": {
+                "source": "ledger",
+                "value": null
+              },
+              "desired": null,
+              "detailTarget": {
+                "subjectId": "golden-run",
+                "subjectKind": "run"
+              },
+              "execution": {
+                "controller": null,
+                "currentAgent": null,
+                "currentSeat": null,
+                "currentStage": null,
+                "liveSeats": 0,
+                "source": "ledger"
+              },
+              "executionHealth": "unsubmitted",
+              "id": "golden-run",
+              "identity": {
+                "bead": {
+                  "id": "bead-golden-run",
+                  "revision": null,
+                  "title": null
+                },
+                "capturedAt": "<timestamp>",
+                "displayTitle": "golden-run [<repo-label>]",
+                "epic": null,
+                "project": null,
+                "repository": {
+                  "label": "<repo-label>",
+                  "path": "<repo>"
+                },
+                "schema": "forged.work-identity/1",
+                "source": "legacy-fallback",
+                "subject": {
+                  "id": "golden-run",
+                  "kind": "run"
+                }
+              },
+              "kind": "slice",
+              "lastProgressAt": "<timestamp>",
+              "liveSeats": 0,
+              "nextAction": "Inspect the blocker and resubmit only after controller death is verified",
+              "outcome": null,
+              "pr": null,
+              "progressAgeInput": {
+                "asOf": "<timestamp>",
+                "lastProgressAt": "<timestamp>"
+              },
+              "queueGroup": "Stalled or recoverable",
+              "repo": "<repo>",
+              "repositoryScope": {
+                "identity": null,
+                "known": false,
+                "source": "unknown"
+              },
+              "rowsMissingCost": 0,
+              "source": "durable",
+              "spend": {
+                "costUsdKnown": 0,
+                "rowsMissingCost": 0
+              },
+              "state": "active",
+              "stopReason": null,
+              "supersededBy": null,
+              "title": "golden-run [<repo-label>]",
+              "titleSource": {
+                "beadId": "bead-golden-run",
+                "known": false,
+                "source": "unknown",
+                "value": "golden-run [<repo-label>]"
+              },
+              "updatedAt": "<timestamp>",
+              "workRef": {
+                "id": "golden-run",
+                "kind": "run",
+                "schema": "forged.work-ref/1"
+              }
+            }
+          ],
+          "excluded": {
+            "livePlan": 0
+          },
+          "name": "Stalled or recoverable",
+          "shown": 1,
+          "total": 1
+        },
+        {
+          "code": "planned",
+          "count": 0,
+          "entries": [],
+          "excluded": {
+            "livePlan": 0
+          },
+          "name": "Planned",
+          "shown": 0,
+          "total": 0
+        }
+      ],
+      "total": 1
+    },
+    "schema": "forged.overview/1",
+    "sourceHealth": {
+      "beads": {
+        "error": null,
+        "state": "available"
+      },
+      "ledger": {
+        "state": "available"
+      },
+      "plan": {
+        "discovered": 0,
+        "error": null,
+        "limit": 500,
+        "state": "available",
+        "truncated": false
+      }
+    },
+    "spend": {
+      "costUsdKnown": 0,
+      "rowsMissingCost": 0
+    },
+    "total": 1
+  }
+}

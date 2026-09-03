@@ -934,6 +934,10 @@ fn project(
         legacy_herdr: coverage.legacy_herdr_rows,
         unknown_host: coverage.unknown_host_rows,
     };
+    coverage.shown = summary.returned;
+    coverage.total = summary.total_matched;
+    coverage.truncated = next_cursor.is_some();
+    coverage.next_cursor = next_cursor.clone();
     for (count, name) in [
         (coverage.missing_desired_work, "missing-desired-work"),
         (
