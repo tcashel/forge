@@ -192,6 +192,10 @@ pub struct WorkHistorySubjectV1 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WorkHistoryCoverageV1 {
+    pub shown: u64,
+    pub total: u64,
+    pub truncated: bool,
+    pub next_cursor: Option<String>,
     pub durable_subjects: u64,
     pub returned_subjects: u64,
     pub legacy_stopped_without_settlement: u64,

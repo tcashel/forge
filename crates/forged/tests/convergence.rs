@@ -1003,7 +1003,7 @@ fn convergence_review_and_attention_are_bounded() {
         "exhaustion attention is a singleton"
     );
     ledger.close().expect("close ledger");
-    let (code, overview) = attention.forged(&["overview"]);
+    let (code, overview) = attention.forged(&["overview", "--detail", "full"]);
     assert_eq!(code, 0, "attention overview: {overview}");
     let items = overview["result"]["attention"]
         .as_array()
@@ -1050,7 +1050,7 @@ fn convergence_review_and_attention_are_bounded() {
         .as_str()
         .expect("attention occurrence id")
         .to_owned();
-    let (code, stable_overview) = attention.forged(&["overview"]);
+    let (code, stable_overview) = attention.forged(&["overview", "--detail", "full"]);
     assert_eq!(code, 0, "stable attention overview: {stable_overview}");
     let stable_item = stable_overview["result"]["attention"]
         .as_array()
@@ -1064,7 +1064,7 @@ fn convergence_review_and_attention_are_bounded() {
     attention.authorize_run("conv-restart-attention");
     let recurrent = exhaust_restart_budget(&attention, "conv-restart-attention");
     assert!(recurrent.control_revision > exhausted_before.control_revision);
-    let (code, recurrent_overview) = attention.forged(&["overview"]);
+    let (code, recurrent_overview) = attention.forged(&["overview", "--detail", "full"]);
     assert_eq!(
         code, 0,
         "recurrent attention overview: {recurrent_overview}"

@@ -4047,8 +4047,9 @@ fn assignee_selector(req: &OperationRequest, operation: &str) -> Result<Option<S
     Ok(Some(value.to_owned()))
 }
 
-/// `work list` — the discovery surface, serving [`inventory`] whole or the
-/// exact subset selected from native work status, custody, and metadata.
+/// `work list` — the discovery surface, serving 30 summary rows by default or
+/// the exact bounded subset selected from native work status, custody, and
+/// metadata. `detail=full` restores the diagnostic row fields.
 ///
 /// The one entry point that takes no id, so a caller with no prior knowledge
 /// can enumerate the inventory and then address any entry.
@@ -4077,7 +4078,7 @@ pub async fn work_list(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
         let attention = projection
             .get("attention")
             .cloned()
-            .unwrap_or_else(|| json!([]));
+            .unwrap_or_else(|| json!({"counts": {"decisions": 0, "symptoms": 0, "acknowledged": 0}, "decisions": []}));
         let total = projection
             .pointer("/counts/durable")
             .and_then(Value::as_u64)
@@ -4090,7 +4091,8 @@ pub async fn work_list(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
                 "cap": projection.pointer("/coverage/limit").cloned().unwrap_or(json!(OPERATIONS_DEFAULT_LIMIT)),
                 "asOf": projection.pointer("/capturedAt/ledger").cloned().unwrap_or(Value::Null),
             },
-            "attentionTotal": attention.as_array().map_or(0, Vec::len),
+            "coverage": projection.get("coverage").cloned().unwrap_or(Value::Null),
+            "attentionTotal": projection.pointer("/counts/attention").cloned().unwrap_or(json!(0)),
             "attention": attention,
             "sourceHealth": projection.get("sourceHealth").cloned().unwrap_or(Value::Null),
         }))
@@ -4121,12 +4123,30 @@ pub(super) fn durable_compatibility_groups(projection: &Value) -> Vec<Value> {
                 .collect::<Vec<_>>();
             let entries = rows
                 .iter()
-                .filter(|entry| entry.get("source").and_then(Value::as_str) == Some("durable"))
+                .filter(|entry| {
+                    let source = entry
+                        .get("source")
+                        .or_else(|| entry.pointer("/subject/source"))
+                        .and_then(Value::as_str);
+                    source == Some("durable")
+                        || (source.is_none()
+                            && entry.pointer("/subject/kind").and_then(Value::as_str)
+                                != Some("plan"))
+                })
                 .map(|entry| (*entry).clone())
                 .collect::<Vec<_>>();
             let live_plan = rows
                 .iter()
-                .filter(|entry| entry.get("source").and_then(Value::as_str) == Some("live-plan"))
+                .filter(|entry| {
+                    let source = entry
+                        .get("source")
+                        .or_else(|| entry.pointer("/subject/source"))
+                        .and_then(Value::as_str);
+                    source == Some("live-plan")
+                        || (source.is_none()
+                            && entry.pointer("/subject/kind").and_then(Value::as_str)
+                                == Some("plan"))
+                })
                 .count();
             json!({
                 "name": group.get("label").cloned().unwrap_or(Value::Null),
@@ -4141,9 +4161,151 @@ pub(super) fn durable_compatibility_groups(projection: &Value) -> Vec<Value> {
         .collect()
 }
 
-const OPERATIONS_DEFAULT_LIMIT: u64 = 200;
-const OPERATIONS_MAX_LIMIT: u64 = 500;
+const OPERATIONS_DEFAULT_LIMIT: u64 = 30;
+const OPERATIONS_MAX_LIMIT: u64 = 200;
 const LIVE_PLAN_LIMIT: usize = 500;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum ProjectionDetail {
+    Summary,
+    Full,
+}
+
+pub(super) fn projection_detail(
+    req: &OperationRequest,
+    operation: &str,
+) -> Result<ProjectionDetail, Failure> {
+    match req.params.get("detail") {
+        None => Ok(ProjectionDetail::Summary),
+        Some(Value::String(value)) if value == "summary" => Ok(ProjectionDetail::Summary),
+        Some(Value::String(value)) if value == "full" => Ok(ProjectionDetail::Full),
+        Some(_) => Err(Failure::invalid(format!(
+            "{operation} detail must be \"summary\" or \"full\""
+        ))),
+    }
+}
+
+pub(super) fn projection_symptoms(
+    req: &OperationRequest,
+    operation: &str,
+) -> Result<bool, Failure> {
+    match req.params.get("symptoms") {
+        None => Ok(false),
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(_) => Err(Failure::invalid(format!(
+            "{operation} symptoms must be a boolean"
+        ))),
+    }
+}
+
+fn operations_attention_counts(entry: &Value) -> Value {
+    let mut decisions = 0usize;
+    let mut symptoms = 0usize;
+    for item in entry
+        .pointer("/attentionItems/items")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let condition = item
+            .get("condition")
+            .cloned()
+            .and_then(|value| serde_json::from_value::<AttentionCondition>(value).ok());
+        match condition.map(super::attention::classification) {
+            Some(super::attention::AttentionClass::Decision) => decisions += 1,
+            Some(super::attention::AttentionClass::Symptom) => symptoms += 1,
+            None => {}
+        }
+    }
+    json!({"decisions": decisions, "symptoms": symptoms})
+}
+
+fn operations_subject(entry: &Value) -> Value {
+    let identity = entry.get("identity").cloned().unwrap_or(Value::Null);
+    let id = entry.get("id").and_then(Value::as_str);
+    let title = entry
+        .pointer("/titleSource/value")
+        .and_then(Value::as_str)
+        .or_else(|| entry.get("title").and_then(Value::as_str))
+        .or_else(|| identity.get("displayTitle").and_then(Value::as_str))
+        .map(|title| {
+            let concise = title
+                .strip_suffix(']')
+                .and_then(|title| title.rsplit_once(" [").map(|(title, _)| title))
+                .unwrap_or(title);
+            if concise.strip_prefix("bead-") == id {
+                id.unwrap_or(concise)
+            } else {
+                concise
+            }
+        });
+    json!({
+        "kind": if entry.get("source").and_then(Value::as_str) == Some("live-plan") {
+            json!("plan")
+        } else {
+            identity.pointer("/subject/kind").cloned().unwrap_or_else(|| {
+                if entry.get("kind").and_then(Value::as_str) == Some("epic") {
+                    json!("epic")
+                } else {
+                    json!("run")
+                }
+            })
+        },
+        "id": entry.get("id").cloned().unwrap_or(Value::Null),
+        "title": title,
+    })
+}
+
+fn operations_claim_health(entry: &Value) -> Value {
+    let claim = entry.get("claimHealth").unwrap_or(&Value::Null);
+    if claim.get("known").and_then(Value::as_bool) != Some(true) {
+        json!("unknown")
+    } else if claim.get("staleInProgress").and_then(Value::as_bool) == Some(true) {
+        json!("stale")
+    } else {
+        json!("ok")
+    }
+}
+
+fn operations_next_action(entry: &Value) -> Value {
+    match entry.get("queueGroup").and_then(Value::as_str) {
+        Some("Planned") => {
+            if entry.get("source").and_then(Value::as_str) == Some("live-plan") {
+                json!("run start")
+            } else {
+                json!("run submit")
+            }
+        }
+        Some("Stalled or recoverable") => json!("verify controller, then resubmit"),
+        _ => entry.get("nextAction").cloned().unwrap_or(Value::Null),
+    }
+}
+
+fn operations_entry(entry: Value, detail: ProjectionDetail) -> Value {
+    let subject = operations_subject(&entry);
+    let attention = operations_attention_counts(&entry);
+    if detail == ProjectionDetail::Full {
+        let mut entry = entry;
+        if let Some(object) = entry.as_object_mut() {
+            object.insert("subject".to_owned(), subject);
+            object.insert("attention".to_owned(), attention);
+        }
+        return entry;
+    }
+    json!({
+        "subject": subject,
+        "state": entry.get("state").cloned().unwrap_or(Value::Null),
+        "executionHealth": entry.get("executionHealth").cloned().unwrap_or(Value::Null),
+        "claimHealth": operations_claim_health(&entry),
+        "currentStage": entry.get("currentStage").cloned().unwrap_or(Value::Null),
+        "liveSeats": entry.get("liveSeats").cloned().unwrap_or(json!(0)),
+        "spend": entry.get("spend").cloned().unwrap_or(Value::Null),
+        "nextAction": operations_next_action(&entry),
+        "pr": entry.get("pr").cloned().unwrap_or(Value::Null),
+        "delivery": entry.get("delivery").cloned().unwrap_or(Value::Null),
+        "attention": attention,
+    })
+}
 
 pub(super) fn queue_code(label: &str) -> Option<&'static str> {
     match label {
@@ -4779,6 +4941,8 @@ pub async fn operations_overview(ctx: &Ctx, req: &OperationRequest) -> Operation
         let repository = repository_selector(req, "operations_overview")?;
         let status = work_status_selector(req, "work_list")?;
         let assignee = assignee_selector(req, "work_list")?;
+        let detail = projection_detail(req, "operations_overview")?;
+        let include_symptoms = projection_symptoms(req, "operations_overview")?;
         let limit = req
             .params
             .get("limit")
@@ -4837,7 +5001,21 @@ pub async fn operations_overview(ctx: &Ctx, req: &OperationRequest) -> Operation
             plan_truncated,
             ..
         } = universe;
-        let attention = super::attention::project_active(&snapshot, &entries, &work_summaries)?
+        let attention_items =
+            super::attention::project_active(&snapshot, &entries, &work_summaries)?;
+        let attention_decisions = attention_items
+            .iter()
+            .filter(|item| {
+                super::attention::classification(item.condition)
+                    == super::attention::AttentionClass::Decision
+            })
+            .count();
+        let attention_symptoms = attention_items.len().saturating_sub(attention_decisions);
+        let attention_acknowledged = attention_items
+            .iter()
+            .filter(|item| item.state == AttentionState::Acknowledged)
+            .count();
+        let attention = attention_items
             .into_iter()
             .map(|item| {
                 serde_json::to_value(item).map_err(|error| {
@@ -4882,7 +5060,11 @@ pub async fn operations_overview(ctx: &Ctx, req: &OperationRequest) -> Operation
             }
             let total = rows.len();
             matching_total += total;
-            let shown: Vec<Value> = rows.into_iter().take(remaining).collect();
+            let shown: Vec<Value> = rows
+                .into_iter()
+                .take(remaining)
+                .map(|entry| operations_entry(entry, detail))
+                .collect();
             remaining = remaining.saturating_sub(shown.len());
             shown_total += shown.len();
             groups.push(json!({
@@ -4950,6 +5132,52 @@ pub async fn operations_overview(ctx: &Ctx, req: &OperationRequest) -> Operation
                         || entry.get("outcome").is_some_and(|value| !value.is_null()))
             })
             .count();
+        let decisions = attention
+            .iter()
+            .filter(|item| {
+                item.get("condition")
+                    .cloned()
+                    .and_then(|value| serde_json::from_value::<AttentionCondition>(value).ok())
+                    .is_some_and(|condition| {
+                        super::attention::classification(condition)
+                            == super::attention::AttentionClass::Decision
+                    })
+            })
+            .take(limit as usize)
+            .cloned()
+            .collect::<Vec<_>>();
+        let symptoms = include_symptoms.then(|| {
+            attention
+                .iter()
+                .filter(|item| {
+                    item.get("condition")
+                        .cloned()
+                        .and_then(|value| serde_json::from_value::<AttentionCondition>(value).ok())
+                        .is_some_and(|condition| {
+                            super::attention::classification(condition)
+                                == super::attention::AttentionClass::Symptom
+                        })
+                })
+                .take(limit as usize)
+                .cloned()
+                .collect::<Vec<_>>()
+        });
+        let mut attention_projection = json!({
+            "counts": {
+                "decisions": attention_decisions,
+                "symptoms": attention_symptoms,
+                "acknowledged": attention_acknowledged,
+            },
+            "decisions": decisions,
+        });
+        if let Some(symptoms) = symptoms {
+            attention_projection["symptoms"] = json!(symptoms);
+        }
+        let attention = if detail == ProjectionDetail::Full {
+            json!(attention)
+        } else {
+            attention_projection
+        };
         Ok(json!({
             "schema": "forged.operations-overview/1",
             "scope": {"repository": repository},
@@ -4966,6 +5194,7 @@ pub async fn operations_overview(ctx: &Ctx, req: &OperationRequest) -> Operation
                 "limit": limit,
                 "filteredOut": total.saturating_sub(matching_total),
                 "truncated": shown_total < matching_total || plan_truncated,
+                "nextCursor": Value::Null,
             },
             "counts": {
                 "durable": entries
@@ -4977,7 +5206,7 @@ pub async fn operations_overview(ctx: &Ctx, req: &OperationRequest) -> Operation
                 "queued": queued,
                 "reviewReady": review_ready,
                 "recent": recent,
-                "attention": attention.len(),
+                "attention": attention_decisions + attention_symptoms,
                 "planOnly": entries
                     .iter()
                     .filter(|entry| {
@@ -5244,6 +5473,12 @@ pub async fn attention_list(ctx: &Ctx, req: &OperationRequest) -> OperationRespo
                 "symptoms": symptoms,
                 "shown": shown_total,
                 "total": total,
+            },
+            "coverage": {
+                "shown": shown_total,
+                "total": total,
+                "truncated": shown_total < total,
+                "nextCursor": Value::Null,
             },
             "groups": groups,
         }))
@@ -5648,41 +5883,41 @@ pub async fn events_tail(ctx: &Ctx, req: &OperationRequest) -> OperationResponse
     read_only("events_tail", req, || async {
         let run = param_opt_str(&req.params, "run").map(str::to_owned);
         let after = req.params.get("after").and_then(Value::as_i64).unwrap_or(0);
-        let limit = req.params.get("limit").and_then(Value::as_u64);
-        let summary = req
+        if after < 0 {
+            return Err(Failure::invalid("events after must be non-negative"));
+        }
+        let limit = req
             .params
-            .get("summary")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let rows = {
+            .get("limit")
+            .map(|value| {
+                value
+                    .as_u64()
+                    .ok_or_else(|| Failure::invalid("events limit must be an unsigned integer"))
+            })
+            .transpose()?
+            .unwrap_or(100);
+        if !(1..=1_000).contains(&limit) {
+            return Err(Failure::invalid("events limit must be between 1 and 1000"));
+        }
+        let detail = projection_detail(req, "events")?;
+        if let Some(summary) = req.params.get("summary") {
+            if !summary.is_boolean() {
+                return Err(Failure::invalid("events summary must be a boolean"));
+            }
+        }
+        let summary = detail == ProjectionDetail::Summary;
+        let (mut rows, total) = {
             let run = run.clone();
             on_ledger(&ctx.ledger, move |l| {
-                let mut out = Vec::new();
-                let mut cursor = after;
-                loop {
-                    let page_size: u32 = match limit {
-                        Some(limit) => {
-                            let remaining = limit.saturating_sub(out.len() as u64);
-                            if remaining == 0 {
-                                return Ok(out);
-                            }
-                            u32::try_from(remaining.min(256)).unwrap_or(256)
-                        }
-                        None => 256,
-                    };
-                    let page = l.list_events(run.as_deref(), cursor, page_size)?;
-                    let full = page.len() == page_size as usize;
-                    if let Some(last) = page.last() {
-                        cursor = last.event_id;
-                    }
-                    out.extend(page);
-                    if !full {
-                        return Ok(out);
-                    }
-                }
+                let total = l.count_events(run.as_deref(), after)?;
+                let page_limit = u32::try_from(limit.saturating_add(1)).unwrap_or(1_001);
+                let rows = l.list_events(run.as_deref(), after, page_limit)?;
+                Ok((rows, total))
             })
             .await?
         };
+        let truncated = rows.len() > limit as usize;
+        rows.truncate(limit as usize);
         // Render proto.* kinds through the replay parser — a stream this
         // command cannot replay is surfaced, not hidden.
         forged_proto::parse_proto_events(&rows).map_err(Failure::from)?;
@@ -5700,7 +5935,18 @@ pub async fn events_tail(ctx: &Ctx, req: &OperationRequest) -> OperationResponse
                 })
             })
             .collect();
-        Ok(json!({"events": events, "last_event_id": last_event_id, "summary": summary}))
+        let shown = events.len();
+        Ok(json!({
+            "events": events,
+            "last_event_id": last_event_id,
+            "summary": summary,
+            "coverage": {
+                "shown": shown,
+                "total": total,
+                "truncated": truncated,
+                "nextCursor": truncated.then_some(last_event_id),
+            },
+        }))
     })
     .await
 }

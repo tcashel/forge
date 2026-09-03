@@ -1362,7 +1362,7 @@ fn split_apps_are_dependency_free_safe_and_javascript_valid() {
     }
 
     let html = std::fs::read_to_string(operations).expect("read Operations App");
-    assert!(html.contains("entry.detailTarget"));
+    assert!(html.contains("detailTarget(entry)"));
     assert!(html.contains("host.capabilities.serverTools"));
     assert!(html.contains("name: \"operations_overview\""));
     assert!(html.contains("name: \"work_detail\""));
@@ -2421,16 +2421,26 @@ fn operations_durable_row_fetches_exact_work_detail_with_projected_fallback_rese
     );
     let mut scenario = triage_scenario(listed, empty_work_map(vec![], vec![]), json!("absent"));
     let entry = json!({
-        "id": "display-alias",
+        "subject": {
+            "id": "run-1",
+            "kind": "run",
+            "title": "Durable work",
+            "source": "durable",
+            "repository": "/repo"
+        },
         "state": "active",
-        "source": "durable",
-        "identity": {"displayTitle": "Durable work", "repository": {"path": "/repo", "label": "repo"}},
-        "titleSource": {"known": true, "value": "Durable work", "source": "identity.displayTitle"},
-        "lastProgressAt": "2026-08-22T11:00:00.000Z",
-        "detailTarget": {"subjectKind": "run", "subjectId": "run-1"},
+        "executionHealth": "running",
+        "claimHealth": {"known": true, "staleInProgress": false},
+        "currentStage": "implement",
+        "liveSeats": 1,
+        "spend": {"costUsdKnown": 1.25, "rowsMissingCost": 0},
+        "nextAction": "Wait for the active implementation seat",
+        "pr": null,
+        "delivery": null,
+        "attention": {"decisions": 0, "symptoms": 0}
     });
     scenario["toolResult"]["structuredContent"]["result"]["coverage"] =
-        json!({"total": 1, "shown": 1, "matching": 1, "truncated": false});
+        json!({"total": 1, "shown": 1, "matching": 1, "truncated": false, "nextCursor": null});
     scenario["toolResult"]["structuredContent"]["result"]["queue"] = json!({
         "groups": [{"code": "running", "label": "Running", "total": 1, "shown": 1, "entries": [entry]}]
     });
@@ -2442,8 +2452,8 @@ fn operations_durable_row_fetches_exact_work_detail_with_projected_fallback_rese
         "identity": {"displayTitle": "Exact durable detail", "repository": {"path": "/repo", "label": "repo"}},
         "titleSource": {"known": true, "value": "Exact durable detail", "source": "identity.displayTitle"},
         "status": {"state": "active"},
-        "workers": {"sessions": [{"attemptId": 7}]},
-        "reviews": {"latestFindingTotal": 2},
+        "workers": {"total": 1},
+        "reviews": {"findingCounts": {"total": 2, "bySeverity": {"high": 2}}},
         "usage": {"totals": {"costUsdKnown": 1.25, "rowsMissingCost": 0}}
     }}});
     scenario["actions"] = json!([{"type": "click", "class": "row", "index": 0}]);
@@ -2455,7 +2465,7 @@ fn operations_durable_row_fetches_exact_work_detail_with_projected_fallback_rese
             .and_then(|calls| calls.last()),
         Some(&json!({
             "name": "work_detail",
-            "arguments": {"schemaVersion": 1, "params": {"subjectKind": "run", "subjectId": "run-1"}}
+            "arguments": {"schemaVersion": 1, "params": {"id": "run-1"}}
         })),
         "durable drill-down uses the exact projection target: {report}"
     );

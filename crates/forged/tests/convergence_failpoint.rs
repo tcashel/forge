@@ -171,7 +171,7 @@ fn capacity_deferral_parks_the_controller_instead_of_recycling() {
         json!("repository-write-capacity"),
         "{status}"
     );
-    let (code, listed) = env.forged(&["overview"]);
+    let (code, listed) = env.forged(&["overview", "--detail", "full"]);
     assert_eq!(code, 0, "overview: {listed}");
     let parked_items = listed["result"]["attention"]
         .as_array()
@@ -206,7 +206,7 @@ fn capacity_deferral_parks_the_controller_instead_of_recycling() {
                 .iter()
                 .any(|attempt| attempt.packet_id == packet)
     });
-    let (code, cleared) = env.forged(&["overview"]);
+    let (code, cleared) = env.forged(&["overview", "--detail", "full"]);
     assert_eq!(code, 0, "post-admit overview: {cleared}");
     assert!(
         cleared["result"]["attention"]

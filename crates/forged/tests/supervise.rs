@@ -1165,7 +1165,7 @@ fn a_terminal_drive_error_records_durable_evidence() {
 }
 
 fn controller_dead_attention(env: &TestEnv, run: &str) -> Option<Value> {
-    let (code, overview) = env.forged(&["overview"]);
+    let (code, overview) = env.forged(&["overview", "--detail", "full"]);
     assert_eq!(code, 0, "{overview}");
     overview["result"]["attention"]
         .as_array()

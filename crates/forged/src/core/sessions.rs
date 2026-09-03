@@ -254,11 +254,28 @@ fn param_attempt(params: &serde_json::Map<String, Value>) -> Result<i64, Failure
 pub async fn session_list(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
     read_only("session_list", req, || async {
         let run_id = param_str(&req.params, "run")?;
+        let limit = req
+            .params
+            .get("limit")
+            .map(|value| {
+                value.as_u64().ok_or_else(|| {
+                    Failure::invalid("session list limit must be an unsigned integer")
+                })
+            })
+            .transpose()?
+            .unwrap_or(100);
+        if !(1..=500).contains(&limit) {
+            return Err(Failure::invalid(
+                "session list limit must be between 1 and 500",
+            ));
+        }
         let identity =
             super::work_identity::load(ctx, WorkIdentitySubjectKind::Run, run_id).await?;
         let events = run_events(ctx, run_id).await?;
+        let records = session_records(&events);
+        let total = records.len();
         let mut sessions = Vec::new();
-        for record in session_records(&events) {
+        for record in records.into_iter().take(limit as usize) {
             let attempt_id = record.attempt_id;
             let attempt =
                 on_ledger(&ctx.ledger, move |ledger| ledger.get_attempt(attempt_id)).await?;
@@ -299,11 +316,18 @@ pub async fn session_list(ctx: &Ctx, req: &OperationRequest) -> OperationRespons
             }));
         }
         let pending = pending_interventions(ctx, run_id).await?;
+        let shown = sessions.len();
         Ok(json!({
             "runId": run_id,
             "identity": identity,
             "sessions": sessions,
-            "pendingInterventions": pending.len()
+            "pendingInterventions": pending.len(),
+            "coverage": {
+                "shown": shown,
+                "total": total,
+                "truncated": shown < total,
+                "nextCursor": Value::Null,
+            },
         }))
     })
     .await

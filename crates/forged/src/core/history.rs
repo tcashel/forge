@@ -1183,6 +1183,10 @@ fn project(snapshot: HistorySnapshot, request: &HistoryRequest) -> Result<WorkHi
         ));
     }
     let coverage = WorkHistoryCoverageV1 {
+        shown: u64::try_from(subjects.len()).unwrap_or(u64::MAX),
+        total: u64::try_from(durable_subjects).unwrap_or(u64::MAX),
+        truncated: next_cursor.is_some(),
+        next_cursor: next_cursor.clone(),
         durable_subjects: u64::try_from(durable_subjects).unwrap_or(u64::MAX),
         returned_subjects: u64::try_from(subjects.len()).unwrap_or(u64::MAX),
         legacy_stopped_without_settlement: u64::try_from(legacy_count).unwrap_or(u64::MAX),

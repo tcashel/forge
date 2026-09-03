@@ -2441,7 +2441,8 @@ fn profiles_scale_topology_and_an_explicit_roster_revision_switches_provider_fam
         status["result"]["run"]["definition"]["rosterRevision"],
         json!(2)
     );
-    let (code, overview) = switched.forged(&["overview", "--run", "bead-switch"]);
+    let (code, overview) =
+        switched.forged(&["overview", "--run", "bead-switch", "--detail", "full"]);
     assert_eq!(code, 0, "overview after revision: {overview}");
     let revisions = overview["result"]["rosterRevisions"]
         .as_array()
@@ -4744,7 +4745,7 @@ fn epic_and_slice_execution_health_and_deferrals_read_from_every_surface() {
     }
 
     // The portfolio row carries the same derived verdict.
-    let (code, operations) = env.forged(&["operations", "overview"]);
+    let (code, operations) = env.forged(&["operations", "overview", "--detail", "full"]);
     assert_eq!(code, 0, "{operations}");
     let entry = operations["result"]["queue"]["groups"]
         .as_array()

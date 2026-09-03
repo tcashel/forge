@@ -165,6 +165,7 @@ pub struct OverviewArgs {
 /// so domain questions keep their domain answers.
 #[derive(Debug, Default, Deserialize, Serialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars", inline)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct OverviewParams {
     /// Project one slice run, by run id.
     #[serde(
@@ -195,6 +196,21 @@ pub struct OverviewParams {
     /// Maximum event rows in the polling page, 1..=1000 (default 100).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u64>,
+    /// Projection detail; omission is summary and full restores the v0.7.1 body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<ProjectionDetailParam>,
+    /// Include symptom attention items where this projection carries an attention rail.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub symptoms: bool,
+}
+
+/// Closed projection detail accepted by bounded read surfaces.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(rename_all = "lowercase")]
+pub enum ProjectionDetailParam {
+    Summary,
+    Full,
 }
 
 /// A scope key that is PRESENT must name something.
@@ -320,6 +336,12 @@ pub struct WorkListParams {
         skip_serializing_if = "Option::is_none"
     )]
     pub assignee: Option<String>,
+    /// Maximum rows across all groups, 1..=200 (default 30).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u64>,
+    /// Projection detail; omission is summary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<ProjectionDetailParam>,
 }
 
 impl WorkListArgs {
@@ -384,6 +406,9 @@ pub struct WorkReadyParams {
     /// Maximum ready items, 1..=500 (default 100).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u64>,
+    /// Return the complete frontier or refuse when it exceeds 500 items.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub all: bool,
 }
 
 impl WorkReadyArgs {
@@ -704,9 +729,15 @@ pub struct OperationsOverviewParams {
         skip_serializing_if = "Option::is_none"
     )]
     pub source: Option<String>,
-    /// Maximum rows across all groups, 1..=500 (default 200).
+    /// Maximum rows across all groups, 1..=200 (default 30).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u64>,
+    /// Projection detail; omission is summary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<ProjectionDetailParam>,
+    /// Include symptom items in the top-level attention projection.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub symptoms: bool,
 }
 
 impl OperationsOverviewArgs {
@@ -999,6 +1030,12 @@ pub struct WorkDetailParams {
     /// Maximum event rows, 1..=1000 (default 100).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u64>,
+    /// Projection detail; omission is summary and full restores the v0.7.1 body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<ProjectionDetailParam>,
+    /// Include symptom attention items where this projection carries an attention rail.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub symptoms: bool,
 }
 
 fn named_string<'de, D>(deserializer: D) -> Result<String, D::Error>
@@ -1416,11 +1453,12 @@ impl ForgedServer {
     /// Unified reconnect projection, rendered by the optional MCP App.
     #[tool(
         name = "overview",
-        description = "Project one slice or epic with workers, evidence, usage, and events. \
+        description = "Project one slice or epic as a bounded summary; params.detail=\"full\" \
+                       restores diagnostic workers, evidence, and event payloads. \
                        Run status and mapped attention items carry nextActions. \
                        At most one of params.run, params.epic, or params.id is accepted, and \
-                       omitting all three projects the portfolio: every run and epic, newest \
-                       first, with an attention rail. params.id resolves either kind and \
+                       omitting all three projects the portfolio: 30 newest summary rows by \
+                       default, with coverage and an attention rail. params.id resolves either kind and \
                        answers with candidates when it cannot; use work_list to enumerate \
                        every id.",
         meta = overview_tool_meta()
@@ -1443,7 +1481,7 @@ impl ForgedServer {
     /// Bounded operator queue and live-plan projection.
     #[tool(
         name = "operations_overview",
-        description = "Project bounded planned, queued, active, blocked, and mergeable work. Attention items carry honesty-tested nextActions when their recommendation code has a mapped domain verb. Optional params.repo, params.group, params.source, and params.limit filters never widen on invalid input.",
+        description = "Project 30 bounded summary rows by default across planned, queued, active, blocked, and mergeable work. coverage states truncation; params.detail=\"full\" restores diagnostic fields and params.symptoms includes symptom attention items beside decisions. Optional params.repo, params.group, params.source, and params.limit filters never widen on invalid input. Attention items carry honesty-tested nextActions when their recommendation code has a mapped domain verb.",
         meta = operations_overview_tool_meta()
     )]
     pub async fn operations_overview(
@@ -1766,7 +1804,8 @@ impl ForgedServer {
                        by default. Optional params.repo filters exact work metadata.repository. \
                        params.detail=\"full\" restores complete snapshots; params.limit is \
                        1..=500 and defaults to 100. Pass the returned nextCursor as \
-                       params.cursor to continue the same priority/work-id order."
+                       params.cursor to continue the same priority/work-id order, or pass \
+                       params.all to return the whole frontier when it is at most 500 items."
     )]
     pub async fn work_ready(&self, args: Parameters<WorkReadyArgs>) -> CallToolResult {
         self.call("work_ready", args.0.into_envelope()).await
@@ -1775,12 +1814,13 @@ impl ForgedServer {
     /// The discovery surface — the one tool that needs no id.
     #[tool(
         name = "work_list",
-        description = "List all forged work — every slice run and every started epic, live and \
-                       historical, each labelled slice or epic. Takes no id: this is how a \
+        description = "List 30 summary rows by default across forged slice runs and started epics. \
+                       coverage states the full matching total; params.detail=\"full\" restores \
+                       diagnostic row fields. Takes no id: this is how a \
                        caller with no prior knowledge discovers the ids the other tools require. \
                        Attention items include mapped nextActions. \
-                       Optional params.repo, params.status, and params.assignee are exact, \
-                       composable work-store filters."
+                       Optional params.repo, params.status, params.assignee, and params.limit are \
+                       exact, composable work-store filters."
     )]
     pub async fn work_list(&self, args: Parameters<WorkListArgs>) -> CallToolResult {
         self.call("work_list", args.0.into_envelope()).await
@@ -1811,7 +1851,7 @@ impl ForgedServer {
     /// Durable subject projection for the Work Detail App.
     #[tool(
         name = "work_detail",
-        description = "Project one durable run or epic, including mapped attention nextActions. Address it with EXACTLY one form: the exact params.subjectKind + params.subjectId pair, or a bare params.id resolved against the durable inventory (an exact id beats any prefix, a unique prefix resolves, anything else answers with resolution candidates). params.after and params.limit page its event tail.",
+        description = "Project one durable run or epic as a bounded summary, including mapped attention nextActions; params.detail=\"full\" restores attempts, artifacts, findings, and the event tail. Address it with EXACTLY one form: the exact params.subjectKind + params.subjectId pair, or a bare params.id resolved against the durable inventory (an exact id beats any prefix, a unique prefix resolves, anything else answers with resolution candidates). params.after and params.limit page the full-detail event tail.",
         meta = work_detail_tool_meta()
     )]
     pub async fn work_detail(&self, args: Parameters<WorkDetailArgs>) -> CallToolResult {

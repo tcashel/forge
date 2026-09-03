@@ -91,7 +91,7 @@ fn work_ready_summarizes_by_default_and_full_round_trips_complete_rows() {
     let summarized = result(&env, &["work", "ready"]);
     assert_eq!(
         summarized["filters"],
-        json!({"detail": "summary", "limit": 100})
+        json!({"detail": "summary", "limit": 100, "all": false})
     );
     assert_eq!(summarized["totals"], json!({"shown": 1, "total": 1}));
     let row = &summarized["ready"][0];
@@ -127,7 +127,10 @@ fn work_ready_summarizes_by_default_and_full_round_trips_complete_rows() {
     );
 
     let full = result(&env, &["work", "ready", "--full"]);
-    assert_eq!(full["filters"], json!({"detail": "full", "limit": 100}));
+    assert_eq!(
+        full["filters"],
+        json!({"detail": "full", "limit": 100, "all": false})
+    );
     assert_eq!(
         full["ready"][0], created["work"],
         "--full preserves the complete pre-summary snapshot shape and bytes"
@@ -318,6 +321,46 @@ fn work_ready_reports_total_and_shown_across_the_default_bound() {
 }
 
 #[test]
+fn work_ready_all_returns_one_complete_frontier_or_a_recovery_refusal() {
+    let env = TestEnv::new("forged-work-ready-all");
+    assert_eq!(env.forged(&["init"]).0, 0);
+    seed_ready_items(&env, 500);
+
+    let complete = result(&env, &["work", "ready", "--all"]);
+    assert_eq!(
+        complete["filters"],
+        json!({"detail": "summary", "limit": 500, "all": true})
+    );
+    assert_eq!(
+        complete["coverage"],
+        json!({"shown": 500, "total": 500, "truncated": false, "nextCursor": null})
+    );
+    assert_eq!(
+        complete["ready"].as_array().expect("whole frontier").len(),
+        500
+    );
+
+    let oversized = TestEnv::new("forged-work-ready-all-oversized");
+    assert_eq!(oversized.forged(&["init"]).0, 0);
+    seed_ready_items(&oversized, 501);
+    let (code, refusal) = oversized.forged(&["work", "ready", "--all"]);
+    assert_ne!(code, 0, "an oversized frontier must refuse: {refusal}");
+    assert_eq!(refusal["error"]["code"], json!("FRONTIER_TOO_LARGE"));
+    assert_eq!(
+        refusal["error"]["detail"]["schema"],
+        json!("forged.remedy/1")
+    );
+    assert_eq!(refusal["error"]["detail"]["verb"], json!("work ready"));
+    assert_eq!(refusal["error"]["detail"]["args"]["limit"], json!(500));
+    assert!(
+        refusal["error"]["detail"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("--repo") && reason.contains("--limit")),
+        "the refusal names both recovery selectors: {refusal}"
+    );
+}
+
+#[test]
 fn work_ready_repository_filter_composes_with_summary_bounds() {
     let env = TestEnv::new("forged-work-ready-repository");
     assert_eq!(env.forged(&["init"]).0, 0);
@@ -347,7 +390,7 @@ fn work_ready_repository_filter_composes_with_summary_bounds() {
     );
     assert_eq!(
         ready["filters"],
-        json!({"detail": "summary", "limit": 1, "repo": "/repo/a"})
+        json!({"detail": "summary", "limit": 1, "all": false, "repo": "/repo/a"})
     );
     assert_eq!(ready["totals"], json!({"shown": 1, "total": 2}));
     assert_eq!(ready["ready"][0]["id"], json!("ready-a-1"));
@@ -1646,7 +1689,7 @@ fn abandoning_a_started_epic_opens_a_clean_epoch() {
     assert_ne!(code, 0, "an abandoned epoch has no started state: {status}");
 
     // ...the inventory folds the boundary as stopped-with-reason...
-    let listed = result(&env, &["work", "list"]);
+    let listed = result(&env, &["work", "list", "--detail", "full"]);
     let entry = listed["runs"]
         .as_array()
         .expect("inventory")
@@ -1709,7 +1752,7 @@ fn abandoning_a_started_epic_opens_a_clean_epoch() {
 
     // ...and the fresh epoch's start supersedes the boundary in the
     // inventory fold.
-    let listed = result(&env, &["work", "list"]);
+    let listed = result(&env, &["work", "list", "--detail", "full"]);
     let entry = listed["runs"]
         .as_array()
         .expect("inventory")

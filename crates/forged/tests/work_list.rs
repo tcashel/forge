@@ -145,7 +145,13 @@ fn fabricate_epic_in_repository(env: &TestEnv, epic_id: &str, repository: &str) 
 fn run_ids(envelope: &Value) -> BTreeSet<String> {
     runs_of(envelope)
         .into_iter()
-        .filter_map(|entry| entry["id"].as_str().map(str::to_owned))
+        .filter_map(|entry| {
+            entry
+                .get("id")
+                .or_else(|| entry.pointer("/subject/id"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
         .collect()
 }
 
@@ -155,7 +161,13 @@ fn queue_ids(envelope: &Value) -> BTreeSet<String> {
         .into_iter()
         .flatten()
         .flat_map(|group| group["entries"].as_array().into_iter().flatten())
-        .filter_map(|entry| entry["id"].as_str().map(str::to_owned))
+        .filter_map(|entry| {
+            entry
+                .get("id")
+                .or_else(|| entry.pointer("/subject/id"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
         .collect()
 }
 
@@ -163,7 +175,7 @@ fn queue_ids(envelope: &Value) -> BTreeSet<String> {
 fn an_empty_ledger_enumerates_to_an_empty_list() {
     let env = TestEnv::new("forged-work-list-empty");
     env.forged(&["init"]);
-    let (code, response) = env.forged(&["work", "list"]);
+    let (code, response) = env.forged(&["work", "list", "--detail", "full"]);
     assert_eq!(code, 0, "work list: {response}");
     assert_eq!(response["ok"], json!(true));
     assert_eq!(response["result"]["runs"], json!([]));
@@ -236,7 +248,7 @@ fn the_operator_queue_is_human_named_grouped_and_honest_about_unknowns() {
         .expect("record in-flight draft PR");
     ledger.close().expect("close ledger");
 
-    let (code, response) = env.forged(&["work", "list"]);
+    let (code, response) = env.forged(&["work", "list", "--detail", "full"]);
     assert_eq!(code, 0, "work list: {response}");
     let groups = response["result"]["queue"]["groups"]
         .as_array()
@@ -351,7 +363,8 @@ fn repository_scope_uses_exact_work_metadata_for_slices_epics_and_renamed_checko
     env.set_work_repository("bead-repo-renamed", renamed_checkout);
 
     let scoped = |repository: &str| {
-        let (code, response) = env.forged(&["work", "list", "--repo", repository]);
+        let (code, response) =
+            env.forged(&["work", "list", "--repo", repository, "--detail", "full"]);
         assert_eq!(code, 0, "work list --repo {repository}: {response}");
         assert_eq!(run_ids(&response), queue_ids(&response), "queue parity");
         response
@@ -401,7 +414,7 @@ fn repository_scope_uses_exact_work_metadata_for_slices_epics_and_renamed_checko
         assert_eq!(response["result"]["queue"]["total"], json!(0));
     }
 
-    let (code, unfiltered) = env.forged(&["work", "list"]);
+    let (code, unfiltered) = env.forged(&["work", "list", "--detail", "full"]);
     assert_eq!(code, 0, "unfiltered work list: {unfiltered}");
     assert_eq!(
         run_ids(&unfiltered),
@@ -530,7 +543,7 @@ fn a_slice_and_an_epic_are_labelled_by_their_events() {
     fabricate_run(&env, "wl-slice");
     fabricate_epic(&env, "wl-epic");
 
-    let (code, response) = env.forged(&["work", "list"]);
+    let (code, response) = env.forged(&["work", "list", "--detail", "full"]);
     assert_eq!(code, 0, "work list: {response}");
     assert_eq!(runs_of(&response).len(), 2);
 
@@ -573,7 +586,7 @@ fn live_seats_are_counted_per_run() {
     fabricate_run(&env, "wl-idle");
     fabricate_live_seats(&env, "wl-busy", 2);
 
-    let (code, response) = env.forged(&["work", "list"]);
+    let (code, response) = env.forged(&["work", "list", "--detail", "full"]);
     assert_eq!(code, 0, "work list: {response}");
     assert_eq!(entry(&response, "wl-busy")["liveSeats"], json!(2));
     assert_eq!(entry(&response, "wl-idle")["liveSeats"], json!(0));
@@ -603,7 +616,7 @@ fn a_started_epic_is_listed_though_it_has_no_run_row() {
     ]);
     assert_eq!(code, 0, "epic start: {started}");
 
-    let (code, response) = env.forged(&["work", "list"]);
+    let (code, response) = env.forged(&["work", "list", "--detail", "full"]);
     assert_eq!(code, 0, "work list: {response}");
     // The started epic is the whole inventory: no child has run yet, and the
     // epic itself never gets a run row.
@@ -641,7 +654,7 @@ fn started_epic(name: &str, epic: &str, child: &str) -> (TestEnv, String, String
 
 /// The epic entry `work list` currently reports.
 fn epic_entry(env: &TestEnv, epic: &str) -> Value {
-    let (code, response) = env.forged(&["work", "list"]);
+    let (code, response) = env.forged(&["work", "list", "--detail", "full"]);
     assert_eq!(code, 0, "work list: {response}");
     entry(&response, epic)
 }
@@ -839,7 +852,7 @@ fn an_id_with_a_run_row_and_a_start_event_is_one_epic_entry() {
     let (env, _, _) = started_epic("forged-work-list-both", "epic-both", "child-both");
     fabricate_run(&env, "epic-both");
 
-    let (code, response) = env.forged(&["work", "list"]);
+    let (code, response) = env.forged(&["work", "list", "--detail", "full"]);
     assert_eq!(code, 0, "work list: {response}");
     assert_eq!(
         runs_of(&response).len(),
@@ -887,7 +900,7 @@ fn a_stopped_run_reports_its_reason() {
         .expect("stop the run");
     ledger.close().expect("close");
 
-    let (code, response) = env.forged(&["work", "list"]);
+    let (code, response) = env.forged(&["work", "list", "--detail", "full"]);
     assert_eq!(code, 0, "work list: {response}");
     let slice = entry(&response, "wl-stopped");
     assert_eq!(slice["kind"], json!("slice"));
