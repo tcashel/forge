@@ -1024,6 +1024,23 @@ fn projection_defaults_are_bounded_and_full_preserves_the_v071_keys() {
     for index in 0..35 {
         fabricate_run(&env, &format!("budget-{index:02}"));
     }
+    let overview_event_total = {
+        let ledger = env.ledger();
+        for ordinal in 0..125 {
+            ledger
+                .append_event(
+                    Some("budget-34"),
+                    "projection.fixture",
+                    json!({"ordinal": ordinal}),
+                )
+                .expect("append overview event fixture");
+        }
+        let total = ledger
+            .count_events(Some("budget-34"), 0)
+            .expect("count overview event fixture");
+        ledger.close().expect("close ledger");
+        total
+    };
 
     let (code, operations) = env.forged(&["operations", "overview"]);
     assert_eq!(code, 0, "operations summary: {operations}");
@@ -1202,7 +1219,21 @@ fn projection_defaults_are_bounded_and_full_preserves_the_v071_keys() {
 
     let (code, overview) = env.forged(&["overview", "--run", "budget-34"]);
     assert_eq!(code, 0, "run overview summary: {overview}");
-    assert!(overview["result"]["events"].is_array());
+    assert_eq!(
+        overview["result"]["events"].as_array().map(Vec::len),
+        Some(30),
+        "summary overview must read only its default event page: {overview}"
+    );
+    assert_eq!(
+        overview["result"]["coverage"],
+        json!({
+            "shown": 30,
+            "total": overview_event_total,
+            "truncated": true,
+            "nextCursor": overview["result"]["cursor"],
+        }),
+        "summary overview must state the bounded event page: {overview}"
+    );
     for full_only in ["packetHistory", "artifacts", "interventions"] {
         assert!(overview["result"].get(full_only).is_none(), "{overview}");
     }
@@ -1216,6 +1247,13 @@ fn projection_defaults_are_bounded_and_full_preserves_the_v071_keys() {
     );
     let (code, full_overview) = env.forged(&["overview", "--run", "budget-34", "--detail", "full"]);
     assert_eq!(code, 0, "run overview full: {full_overview}");
+    assert_eq!(
+        full_overview["result"]["events"]["events"]
+            .as_array()
+            .map(Vec::len),
+        Some(100),
+        "full overview preserves the v0.7.1 default event page: {full_overview}"
+    );
     for key in [
         "schema",
         "kind",

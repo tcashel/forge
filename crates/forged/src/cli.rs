@@ -1034,7 +1034,7 @@ pub struct OverviewArgs {
     /// Return event rows with event_id greater than this.
     #[arg(long)]
     pub after: Option<i64>,
-    /// Maximum event rows in the polling page (default 100).
+    /// Maximum event rows (summary default 30; full default 100).
     #[arg(long)]
     pub limit: Option<u64>,
     /// Projection detail (default summary; full restores the v0.7.1 body).

@@ -193,7 +193,7 @@ pub struct OverviewParams {
     /// (default 0).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub after: Option<i64>,
-    /// Maximum event rows in the polling page, 1..=1000 (default 100).
+    /// Maximum event rows, 1..=1000 (summary default 30; full default 100).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u64>,
     /// Projection detail; omission is summary and full restores the v0.7.1 body.

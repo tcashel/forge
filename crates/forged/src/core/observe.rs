@@ -66,6 +66,8 @@ async fn events(
 }
 
 const FULL_EVENT_HISTORY_LIMIT: u32 = 4_096;
+const SUMMARY_EVENT_PAGE_LIMIT: u64 = 30;
+const FULL_EVENT_PAGE_LIMIT: u64 = 100;
 
 async fn subject_events_by_kind(
     ctx: &Ctx,
@@ -1253,11 +1255,13 @@ pub async fn overview(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
         if after < 0 {
             return Err(Failure::invalid("overview after must be non-negative"));
         }
-        let limit = req
-            .params
-            .get("limit")
-            .and_then(Value::as_u64)
-            .unwrap_or(100);
+        let limit = req.params.get("limit").and_then(Value::as_u64).unwrap_or(
+            if detail == super::ops::ProjectionDetail::Full {
+                FULL_EVENT_PAGE_LIMIT
+            } else {
+                SUMMARY_EVENT_PAGE_LIMIT
+            },
+        );
         if limit == 0 || limit > 1_000 {
             return Err(Failure::invalid(
                 "overview limit must be between 1 and 1000",
