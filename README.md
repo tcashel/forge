@@ -151,6 +151,7 @@ then file, sized by lines and colored by coverage.
 - [The one lifecycle](docs/LIFECYCLE.md)
 - [Driving Forge — the agent's runbook](docs/DRIVING.md)
 - [The Five of the Living Thread](docs/CHARACTERS.md) — visual lore and character reference
+- [The Company of the Bright Road](docs/CHARACTERS_CELTIC.md) — pre-Roman Irish comparison canon
 - [Lead-agent plugin and host setup](plugins/forged/README.md)
 - [CLI and operations guide, and roadmap](docs/NEXT.md)
 - [Provider-neutral orchestration](docs/adr/0032-forged-provider-neutral-rust-orchestrator.md)

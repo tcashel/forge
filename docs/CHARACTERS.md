@@ -14,6 +14,9 @@ bridge or product. It is every idea that crossed from imagination into durable
 reality because the guild had enough time, evidence, craft, and persistence to
 finish it.
 
+The pre-Roman Irish comparison set is
+[The Company of the Bright Road](CHARACTERS_CELTIC.md).
+
 ![The Five of the Living Thread at the Span](assets/forge-hero-v7.png)
 
 ## The guild at a glance
