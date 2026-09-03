@@ -10,6 +10,11 @@
 
 #![allow(dead_code)]
 
+pub mod convergence;
+pub mod e2e_drive;
+pub mod review_publish;
+pub mod supervise;
+
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Output, Stdio};
