@@ -1,8 +1,8 @@
 mod support;
 
 use forged_ledger::{
-    DesiredReconcileOutcome, DesiredReconcileUpdate, DesiredRestartReservation, DesiredState,
-    DesiredSubjectKind, EffectClass, RunOutcome,
+    DesiredReconcileOutcome, DesiredReconcileUpdate, DesiredRestartReservation, DesiredSubjectKind,
+    EffectClass, RunOutcome,
 };
 use forged_types::{AttentionCondition, OperationRequest, Verdict};
 use serde_json::{json, Value};
