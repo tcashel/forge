@@ -39,7 +39,7 @@ const document = {
 
 const source = [
   "el", "arr", "at", "DECISION_CONDITIONS", "SYMPTOM_CONDITIONS",
-  "conditionRows", "semanticState", "semanticLabel", "chip", "panel", "viewWaves",
+  "attentionRows", "subjectOf", "conditionRows", "semanticState", "semanticLabel", "chip", "panel", "viewWaves",
 ]
   .map(lift)
   .join("\n");

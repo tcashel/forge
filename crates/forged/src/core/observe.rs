@@ -645,8 +645,13 @@ async fn portfolio_overview(ctx: &Ctx, req: &OperationRequest) -> Result<Value, 
     let attention = if detail == super::ops::ProjectionDetail::Full {
         operations
             .get("attention")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .take(PORTFOLIO_CAP)
             .cloned()
-            .unwrap_or_else(|| json!([]))
+            .collect::<Vec<_>>()
+            .into()
     } else {
         operations.get("attention").cloned().unwrap_or(Value::Null)
     };
@@ -665,10 +670,18 @@ async fn portfolio_overview(ctx: &Ctx, req: &OperationRequest) -> Result<Value, 
         .iter()
         .filter_map(|entry| entry.get("liveSeats").and_then(Value::as_u64))
         .sum::<u64>();
+    let cap = if detail == super::ops::ProjectionDetail::Full {
+        json!(PORTFOLIO_CAP)
+    } else {
+        operations
+            .pointer("/coverage/limit")
+            .cloned()
+            .unwrap_or(json!(30))
+    };
     let queue = json!({
         "groups": queue_groups,
         "total": total,
-        "cap": operations.pointer("/coverage/limit").cloned().unwrap_or(json!(30)),
+        "cap": cap,
         "asOf": operations.pointer("/capturedAt/ledger").cloned().unwrap_or(Value::Null),
     });
     Ok(json!({
@@ -676,7 +689,7 @@ async fn portfolio_overview(ctx: &Ctx, req: &OperationRequest) -> Result<Value, 
         "kind": "portfolio",
         "entries": entries,
         "total": total,
-        "cap": operations.pointer("/coverage/limit").cloned().unwrap_or(json!(30)),
+        "cap": cap,
         "liveSeats": live_seats,
         "attention": attention,
         "attentionTotal": attention_total,

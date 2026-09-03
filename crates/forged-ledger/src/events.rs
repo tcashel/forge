@@ -315,6 +315,39 @@ impl Ledger {
         })
     }
 
+    /// Count and read one bounded event page on the ledger actor as one
+    /// snapshot. A concurrent append cannot land between the coverage count
+    /// and the rows whose coverage it describes.
+    pub fn list_events_with_count(
+        &self,
+        run_id: Option<&str>,
+        after_event_id: i64,
+        limit: u32,
+    ) -> Result<(Vec<EventRow>, u64), LedgerError> {
+        let run_id = run_id.map(str::to_owned);
+        self.submit(move |conn| {
+            let count = conn.query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE event_id > ?1 AND (?2 IS NULL OR run_id = ?2)",
+                rusqlite::params![after_event_id, run_id],
+                |row| row.get::<_, i64>(0),
+            )?;
+            let total = u64::try_from(count).map_err(|_| LedgerError::Internal {
+                message: "event count was negative".to_owned(),
+            })?;
+            let mut statement = conn.prepare(
+                "SELECT event_id, ts, run_id, kind, payload_json FROM events
+                 WHERE event_id > ?1 AND (?2 IS NULL OR run_id = ?2)
+                 ORDER BY event_id ASC LIMIT ?3",
+            )?;
+            let rows = statement.query_map(
+                rusqlite::params![after_event_id, run_id, i64::from(limit)],
+                event_row,
+            )?;
+            Ok((rows.collect::<Result<Vec<_>, _>>()?, total))
+        })
+    }
+
     /// Bounded rows for one subject and exact event kind, oldest first.
     pub fn list_subject_events_by_kind(
         &self,
@@ -332,6 +365,41 @@ impl Ledger {
             let rows = statement
                 .query_map(rusqlite::params![run_id, kind, i64::from(limit)], event_row)?;
             rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        })
+    }
+
+    /// Newest-first page for one subject and exact event kind, together with
+    /// the complete kind count from the same ledger-actor snapshot. `before`
+    /// is an exclusive event-id cursor toward older rows.
+    pub fn list_subject_events_by_kind_desc_with_count(
+        &self,
+        run_id: &str,
+        kind: &str,
+        before: Option<i64>,
+        limit: u32,
+    ) -> Result<(Vec<EventRow>, u64), LedgerError> {
+        let run_id = run_id.to_owned();
+        let kind = kind.to_owned();
+        self.submit(move |conn| {
+            let count = conn.query_row(
+                "SELECT COUNT(*) FROM events WHERE run_id = ?1 AND kind = ?2",
+                rusqlite::params![run_id, kind],
+                |row| row.get::<_, i64>(0),
+            )?;
+            let total = u64::try_from(count).map_err(|_| LedgerError::Internal {
+                message: "event count was negative".to_owned(),
+            })?;
+            let mut statement = conn.prepare(
+                "SELECT event_id, ts, run_id, kind, payload_json FROM events
+                 WHERE run_id = ?1 AND kind = ?2
+                   AND (?3 IS NULL OR event_id < ?3)
+                 ORDER BY event_id DESC LIMIT ?4",
+            )?;
+            let rows = statement.query_map(
+                rusqlite::params![run_id, kind, before, i64::from(limit)],
+                event_row,
+            )?;
+            Ok((rows.collect::<Result<Vec<_>, _>>()?, total))
         })
     }
 
@@ -565,6 +633,11 @@ mod tests {
         }
 
         assert_eq!(ledger.count_events(Some("subject-a"), 0).expect("count"), 4);
+        let (page, total) = ledger
+            .list_events_with_count(Some("subject-a"), 0, 2)
+            .expect("atomic event page");
+        assert_eq!(page.len(), 2);
+        assert_eq!(total, 4);
         let gates = ledger
             .list_subject_events_by_kind("subject-a", "proto.gate", 1)
             .expect("bounded gates");
@@ -572,6 +645,26 @@ mod tests {
         assert_eq!(gates[0].run_id.as_deref(), Some("subject-a"));
         assert_eq!(gates[0].kind, "proto.gate");
         assert!(gates[0].payload_json.contains("\"ordinal\":1"));
+        let (newest, total) = ledger
+            .list_subject_events_by_kind_desc_with_count(
+                "subject-a",
+                "proto.gate",
+                None,
+                1,
+            )
+            .expect("newest gate page");
+        assert_eq!(total, 2);
+        assert!(newest[0].payload_json.contains("\"ordinal\":3"));
+        let (older, total) = ledger
+            .list_subject_events_by_kind_desc_with_count(
+                "subject-a",
+                "proto.gate",
+                Some(newest[0].event_id),
+                1,
+            )
+            .expect("older gate page");
+        assert_eq!(total, 2);
+        assert!(older[0].payload_json.contains("\"ordinal\":1"));
 
         let interventions = ledger
             .list_subject_events_by_kind_prefix("subject-a", "forged.intervention.", 8)

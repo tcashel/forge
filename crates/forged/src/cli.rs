@@ -797,6 +797,9 @@ pub struct SessionListArgs {
     /// Maximum sessions, 1..=500 (default 100).
     #[arg(long)]
     pub limit: Option<u64>,
+    /// Opaque continuation cursor toward older sessions.
+    #[arg(long)]
+    pub cursor: Option<String>,
     /// Override the derived idempotency key.
     #[arg(long)]
     pub idempotency_key: Option<String>,
@@ -993,9 +996,9 @@ pub struct EventsArgs {
     #[arg(long)]
     pub limit: Option<u64>,
     /// Return bounded payload summaries instead of embedded artifacts/logs.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "detail")]
     pub summary: bool,
-    /// Projection detail (default summary; full restores complete payloads).
+    /// Explicit projection detail (the no-flag default keeps full payloads).
     #[arg(long, value_enum)]
     pub detail: Option<ProjectionDetailArg>,
     /// Override the derived idempotency key.
@@ -2351,6 +2354,9 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
                 params.insert("run".to_owned(), json!(run.clone()));
                 if let Some(limit) = a.limit {
                     params.insert("limit".to_owned(), json!(limit));
+                }
+                if let Some(cursor) = a.cursor {
+                    params.insert("cursor".to_owned(), json!(cursor));
                 }
                 (
                     "session_list",

@@ -420,7 +420,7 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
     const heading = el("div");
     heading.append(el("h2", "", state.attentionSelection ? attentionTitle(state.attentionSelection) : state.plan ? titleFor(state.plan) : state.detail ? (state.detail.titleSource?.value || state.detail.identity?.displayTitle || state.detail.id) : "Detail unavailable"));
     if (state.attentionSelection) { const selector=attentionSelector(state.attentionSelection); if(selector) heading.append(chip(selector,"id")); }
-    else if (state.plan) heading.append(chip(`${state.plan.kind || "plan"}:${state.plan.id}`, "id"));
+    else if (state.plan) { const subject=subjectOf(state.plan); heading.append(chip(`${subject.kind || state.plan.kind || "plan"}:${subject.id || state.plan.id}`, "id")); }
     else if (state.detail) heading.append(chip(`${state.detail.workRef?.kind || state.detail.kind}:${state.detail.id}`, "id"));
     head.append(heading);
     const close = el("button", "", "Close"); close.type = "button"; close.addEventListener("click", () => { state.detail = null; state.detailError = null; state.plan = null; state.attentionSelection = null; renderDetail(); }); head.append(close); box.append(head);
@@ -441,14 +441,14 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
     if (state.plan) {
       const entry = state.plan;
       add("plan facts", "from the live work read; no execution record exists yet");
-      add("work", entry.beadId || entry.id);
+      add("work", subjectOf(entry).id || entry.beadId || entry.id);
       add("status", entry.plan?.status);
       add("readiness", entry.plan?.readiness);
       add("issue type", entry.plan?.issueType);
       add("priority", entry.plan?.priority ?? entry.priority);
       add("assignee", entry.plan?.assignee);
       add("parent", entry.plan?.parent);
-      add("dependencies", arr(entry.plan?.dependencies).length);
+      add("dependencies", entry.plan?.dependencyCount ?? arr(entry.plan?.dependencies).length);
       add("repository", repositoryLabel(entry.identity) || entry.repo);
       add("updated", age(entry.lastProgressAt || entry.updatedAt));
       add("next action", entry.nextAction);
@@ -472,7 +472,7 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
     if (!host.capabilities.serverTools || !target) return;
     state.detail = null; state.detailError = null; state.plan = null; state.attentionSelection = null; renderDetail();
     try {
-      const result = await request("tools/call", { name: "work_detail", arguments: { schemaVersion: 1, params: target } });
+      const result = await request("tools/call", { name: "work_detail", arguments: { schemaVersion: 1, params: {...target, detail: "full"} } });
       const envelope = envelopeFrom(result);
       if (envelope?.ok === false) throw new Error(envelope.error?.message || "Detail failed");
       const detail = envelope?.result ?? envelope;

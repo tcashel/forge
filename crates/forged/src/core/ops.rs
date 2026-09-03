@@ -4292,7 +4292,7 @@ fn operations_entry(entry: Value, detail: ProjectionDetail) -> Value {
         }
         return entry;
     }
-    json!({
+    let mut summary = json!({
         "subject": subject,
         "state": entry.get("state").cloned().unwrap_or(Value::Null),
         "executionHealth": entry.get("executionHealth").cloned().unwrap_or(Value::Null),
@@ -4304,7 +4304,23 @@ fn operations_entry(entry: Value, detail: ProjectionDetail) -> Value {
         "pr": entry.get("pr").cloned().unwrap_or(Value::Null),
         "delivery": entry.get("delivery").cloned().unwrap_or(Value::Null),
         "attention": attention,
-    })
+    });
+    if entry.get("source").and_then(Value::as_str) == Some("live-plan") {
+        let plan = entry.get("plan").unwrap_or(&Value::Null);
+        summary["plan"] = json!({
+            "status": plan.get("status"),
+            "readiness": plan.get("readiness"),
+            "issueType": plan.get("issueType"),
+            "priority": plan.get("priority"),
+            "assignee": plan.get("assignee"),
+            "parent": plan.get("parent"),
+            "dependencyCount": plan
+                .get("dependencies")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len),
+        });
+    }
+    summary
 }
 
 pub(super) fn queue_code(label: &str) -> Option<&'static str> {
@@ -5900,19 +5916,31 @@ pub async fn events_tail(ctx: &Ctx, req: &OperationRequest) -> OperationResponse
             return Err(Failure::invalid("events limit must be between 1 and 1000"));
         }
         let detail = projection_detail(req, "events")?;
-        if let Some(summary) = req.params.get("summary") {
-            if !summary.is_boolean() {
-                return Err(Failure::invalid("events summary must be a boolean"));
-            }
+        let summary_flag = req
+            .params
+            .get("summary")
+            .map(|summary| {
+                summary
+                    .as_bool()
+                    .ok_or_else(|| Failure::invalid("events summary must be a boolean"))
+            })
+            .transpose()?;
+        if summary_flag.is_some() && req.params.contains_key("detail") {
+            return Err(Failure::invalid(
+                "events summary cannot be combined with detail",
+            ));
         }
-        let summary = detail == ProjectionDetail::Summary;
+        // `events --summary` predates projection detail. Preserve its
+        // no-flag contract: payloads are complete unless summary mode was
+        // explicitly selected by either spelling.
+        let summary = summary_flag.unwrap_or_else(|| {
+            req.params.contains_key("detail") && detail == ProjectionDetail::Summary
+        });
         let (mut rows, total) = {
             let run = run.clone();
             on_ledger(&ctx.ledger, move |l| {
-                let total = l.count_events(run.as_deref(), after)?;
                 let page_limit = u32::try_from(limit.saturating_add(1)).unwrap_or(1_001);
-                let rows = l.list_events(run.as_deref(), after, page_limit)?;
-                Ok((rows, total))
+                l.list_events_with_count(run.as_deref(), after, page_limit)
             })
             .await?
         };

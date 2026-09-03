@@ -1549,7 +1549,7 @@ impl ForgedServer {
     /// Durable provider-session metadata for a run.
     #[tool(
         name = "session_list",
-        description = "List provider sessions for a run."
+        description = "List newest provider sessions for a run with bounded continuation toward older sessions."
     )]
     pub async fn session_list(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
         self.call("session_list", args.0).await

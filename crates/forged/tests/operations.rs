@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use serde_json::{json, Value};
+use support::operator_store::{operator_store_fixture, SUBJECT_TOTAL};
 use support::{fabricate_epic, fabricate_run, TestEnv};
 
 fn entries(response: &Value) -> BTreeMap<String, Value> {
@@ -17,11 +18,78 @@ fn entries(response: &Value) -> BTreeMap<String, Value> {
         .flatten()
         .flat_map(|group| group["entries"].as_array().into_iter().flatten())
         .filter_map(|entry| {
-            entry["id"]
-                .as_str()
+            entry
+                .get("id")
+                .or_else(|| entry.pointer("/subject/id"))
+                .and_then(Value::as_str)
                 .map(|id| (id.to_owned(), entry.clone()))
         })
         .collect()
+}
+
+fn normalize_v071_golden(value: &mut Value, repository: &str, label: &str) {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                normalize_v071_golden(value, repository, label);
+            }
+        }
+        Value::Object(values) => {
+            for value in values.values_mut() {
+                normalize_v071_golden(value, repository, label);
+            }
+        }
+        Value::String(value) => {
+            *value = value
+                .replace(repository, "<repo>")
+                .replace(label, "<repo-label>");
+            if value.len() >= 20
+                && value.as_bytes().get(4) == Some(&b'-')
+                && value.as_bytes().get(7) == Some(&b'-')
+                && value.as_bytes().get(10) == Some(&b'T')
+                && value.ends_with('Z')
+            {
+                *value = "<timestamp>".to_owned();
+            }
+        }
+        _ => {}
+    }
+}
+
+fn assert_v071_golden(actual: &Value, expected: &Value, path: &str) {
+    match expected {
+        Value::Object(expected) => {
+            let actual = actual
+                .as_object()
+                .unwrap_or_else(|| panic!("{path} is not an object: {actual}"));
+            for (key, expected) in expected {
+                let next = format!("{path}/{key}");
+                let actual = actual
+                    .get(key)
+                    .unwrap_or_else(|| panic!("v0.7.1 key {next} disappeared: {actual:?}"));
+                assert_v071_golden(actual, expected, &next);
+            }
+        }
+        Value::Array(expected) => {
+            let actual = actual
+                .as_array()
+                .unwrap_or_else(|| panic!("{path} is not an array: {actual}"));
+            assert_eq!(
+                actual.len(),
+                expected.len(),
+                "v0.7.1 array length at {path}"
+            );
+            for (index, expected) in expected.iter().enumerate() {
+                assert_v071_golden(&actual[index], expected, &format!("{path}/{index}"));
+            }
+        }
+        Value::Number(expected) if actual.is_number() => assert_eq!(
+            actual.as_f64(),
+            expected.as_f64(),
+            "v0.7.1 numeric value changed at {path}"
+        ),
+        _ => assert_eq!(actual, expected, "v0.7.1 value changed at {path}"),
+    }
 }
 
 fn seed_packet(env: &TestEnv, run_id: &str, seq: i64, stage: forged_types::Stage) -> String {
@@ -877,6 +945,34 @@ fn operations_joins_one_bounded_live_plan_without_duplicate_durable_work() {
         "terminal plan rows are excluded"
     );
 
+    let (code, summary) = env.forged(&[
+        "operations",
+        "overview",
+        "--repo",
+        &repository,
+        "--limit",
+        "50",
+    ]);
+    assert_eq!(code, 0, "summary operations overview: {summary}");
+    let rows = entries(&summary);
+    assert_eq!(
+        rows["plan-a"]["subject"],
+        json!({"kind": "plan", "id": "plan-a", "title": "Planned next slice"})
+    );
+    assert_eq!(
+        rows["plan-a"]["plan"],
+        json!({
+            "status": "open",
+            "readiness": "ready",
+            "issueType": "task",
+            "priority": 1,
+            "assignee": Value::Null,
+            "parent": "epic-a",
+            "dependencyCount": 2,
+        }),
+        "the bounded producer retains enough plan facts for the App drawer: {summary}"
+    );
+
     // The bounded-read contract (one claim batch, one discovery, one
     // hydrate, never a graph walk) is structural in the in-process store
     // and no longer observable as argv.
@@ -1018,25 +1114,90 @@ fn operations_filters_and_bounds_fail_closed() {
 }
 
 #[test]
+fn full_projections_preserve_every_v071_golden_key_and_value() {
+    let env = TestEnv::new("forged-v071-projection-golden");
+    env.forged(&["init"]);
+    fabricate_run(&env, "golden-run");
+
+    let (code, operations) = env.forged(&[
+        "operations",
+        "overview",
+        "--detail",
+        "full",
+        "--limit",
+        "200",
+    ]);
+    assert_eq!(code, 0, "full Operations: {operations}");
+    let (code, detail) = env.forged(&[
+        "work",
+        "detail",
+        "--subject-kind",
+        "run",
+        "--subject-id",
+        "golden-run",
+        "--detail",
+        "full",
+    ]);
+    assert_eq!(code, 0, "full Work Detail: {detail}");
+    let (code, portfolio) = env.forged(&["overview", "--detail", "full"]);
+    assert_eq!(code, 0, "full portfolio: {portfolio}");
+
+    let repository = operations["result"]["queue"]["groups"]
+        .as_array()
+        .expect("queue groups")
+        .iter()
+        .flat_map(|group| group["entries"].as_array().into_iter().flatten())
+        .next()
+        .and_then(|entry| entry.pointer("/identity/repository/path"))
+        .and_then(Value::as_str)
+        .expect("fixture repository");
+    let label = operations["result"]["queue"]["groups"]
+        .as_array()
+        .expect("queue groups")
+        .iter()
+        .flat_map(|group| group["entries"].as_array().into_iter().flatten())
+        .next()
+        .and_then(|entry| entry.pointer("/identity/repository/label"))
+        .and_then(Value::as_str)
+        .expect("fixture repository label");
+    let mut actual = json!({
+        "operations": operations["result"],
+        "work-detail": detail["result"],
+        "portfolio": portfolio["result"],
+    });
+    normalize_v071_golden(&mut actual, repository, label);
+    let expected: Value = serde_json::from_str(include_str!("fixtures/v071-full-projections.json"))
+        .expect("v0.7.1 full-projection golden");
+    assert_v071_golden(&actual, &expected, "");
+}
+
+#[test]
 fn projection_defaults_are_bounded_and_full_preserves_the_v071_keys() {
     let env = TestEnv::new("forged-bounded-projections");
     env.forged(&["init"]);
-    for index in 0..35 {
-        fabricate_run(&env, &format!("budget-{index:02}"));
+    let fixture = operator_store_fixture();
+    for subject in &fixture.subjects {
+        fabricate_run(&env, &subject.id);
     }
+    let focus = fixture
+        .subjects
+        .last()
+        .expect("fixture subject")
+        .id
+        .as_str();
     let overview_event_total = {
         let ledger = env.ledger();
         for ordinal in 0..125 {
             ledger
                 .append_event(
-                    Some("budget-34"),
+                    Some(focus),
                     "projection.fixture",
                     json!({"ordinal": ordinal}),
                 )
                 .expect("append overview event fixture");
         }
         let total = ledger
-            .count_events(Some("budget-34"), 0)
+            .count_events(Some(focus), 0)
             .expect("count overview event fixture");
         ledger.close().expect("close ledger");
         total
@@ -1046,7 +1207,10 @@ fn projection_defaults_are_bounded_and_full_preserves_the_v071_keys() {
     assert_eq!(code, 0, "operations summary: {operations}");
     assert_eq!(operations["result"]["coverage"]["limit"], json!(30));
     assert_eq!(operations["result"]["coverage"]["shown"], json!(30));
-    assert_eq!(operations["result"]["coverage"]["total"], json!(35));
+    assert_eq!(
+        operations["result"]["coverage"]["total"],
+        json!(SUBJECT_TOTAL)
+    );
     assert_eq!(operations["result"]["coverage"]["truncated"], json!(true));
     assert_eq!(operations["result"]["coverage"]["nextCursor"], Value::Null);
     let summary_entry = operations["result"]["queue"]["groups"]
@@ -1144,7 +1308,7 @@ fn projection_defaults_are_bounded_and_full_preserves_the_v071_keys() {
         "--subject-kind",
         "run",
         "--subject-id",
-        "budget-34",
+        focus,
     ];
     let (code, detail) = env.forged(&detail_args);
     assert_eq!(code, 0, "work detail summary: {detail}");
@@ -1217,7 +1381,7 @@ fn projection_defaults_are_bounded_and_full_preserves_the_v071_keys() {
         );
     }
 
-    let (code, overview) = env.forged(&["overview", "--run", "budget-34"]);
+    let (code, overview) = env.forged(&["overview", "--run", focus]);
     assert_eq!(code, 0, "run overview summary: {overview}");
     assert_eq!(
         overview["result"]["events"].as_array().map(Vec::len),
@@ -1245,7 +1409,7 @@ fn projection_defaults_are_bounded_and_full_preserves_the_v071_keys() {
             <= 8 * 1024,
         "default run overview exceeds 8 KiB"
     );
-    let (code, full_overview) = env.forged(&["overview", "--run", "budget-34", "--detail", "full"]);
+    let (code, full_overview) = env.forged(&["overview", "--run", focus, "--detail", "full"]);
     assert_eq!(code, 0, "run overview full: {full_overview}");
     assert_eq!(
         full_overview["result"]["events"]["events"]
@@ -1291,12 +1455,29 @@ fn projection_defaults_are_bounded_and_full_preserves_the_v071_keys() {
 
     for args in [
         vec!["attention", "list"],
-        vec!["session", "list", "--run", "budget-34"],
-        vec!["events", "--run", "budget-34"],
+        vec!["session", "list", "--run", focus],
+        vec!["events", "--run", focus],
         vec!["work", "history"],
     ] {
         let (code, listed) = env.forged(&args);
         assert_eq!(code, 0, "{args:?}: {listed}");
+        if args.first() == Some(&"events") {
+            assert_eq!(
+                listed["result"]["summary"],
+                json!(false),
+                "omitting both events projection flags preserves full payloads: {listed}"
+            );
+            let projected = listed["result"]["events"]
+                .as_array()
+                .expect("event rows")
+                .iter()
+                .find(|event| event["kind"] == json!("projection.fixture"))
+                .expect("fixture event");
+            assert!(
+                projected["payload"]["ordinal"].is_number(),
+                "the no-flag event body is not summarized: {projected}"
+            );
+        }
         for field in ["shown", "total", "truncated", "nextCursor"] {
             assert!(
                 listed["result"]["coverage"].get(field).is_some(),

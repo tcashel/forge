@@ -164,7 +164,7 @@ h1 { margin:0; font-size:20px; line-height:1.2; }
   async function openDetail(node){
     state.selected=key(node.workRef);state.detail=null;state.detailError=null;render();
     if(!node.detailTarget||Object.keys(node.detailTarget).length===0||!host.capabilities.serverTools)return;
-    try{const result=await request("tools/call",{name:"work_detail",arguments:{schemaVersion:1,params:node.detailTarget}});const envelope=envelopeFrom(result);if(envelope?.ok===false)throw new Error(envelope.error?.message||"Detail failed");const detail=envelope?.result??envelope;if(detail?.schema!=="forged.work-detail/1")throw new Error("Unsupported Work Detail payload");state.detail=detail;}catch(error){state.detailError={message:String(error.message||error)};}render();
+    try{const result=await request("tools/call",{name:"work_detail",arguments:{schemaVersion:1,params:{...node.detailTarget,detail:"full"}}});const envelope=envelopeFrom(result);if(envelope?.ok===false)throw new Error(envelope.error?.message||"Detail failed");const detail=envelope?.result??envelope;if(detail?.schema!=="forged.work-detail/1")throw new Error("Unsupported Work Detail payload");state.detail=detail;}catch(error){state.detailError={message:String(error.message||error)};}render();
   }
   function renderDrawer(node){
     const box=byId("drawer");box.replaceChildren();if(!node&&!state.detailError){box.hidden=true;return;}box.hidden=false;
