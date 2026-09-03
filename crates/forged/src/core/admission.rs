@@ -681,11 +681,17 @@ where
 /// counting against that same run's repository-write decision. The orphan
 /// remains capacity-bearing in the ledger until reconciliation has advanced
 /// the desired generation and atomically replaces its custody.
+///
+/// The probe is total by construction: an exemption is an affirmative absence
+/// proof, so a failure to prove absence is never an error for the pass. One
+/// subject's unreadable evidence leaves that subject counted and routed to its
+/// own per-subject reconciliation path; it never aborts admission for every
+/// other claimed subject in the tick.
 async fn orphaned_repository_exemptions(
     ctx: &Ctx,
     snapshot: &AdmissionLedgerSnapshot,
     targets: &BTreeSet<(DesiredSubjectKind, String)>,
-) -> Result<BTreeMap<(AdmissionSubjectKind, String), AdmissionReservationRow>, Failure> {
+) -> BTreeMap<(AdmissionSubjectKind, String), AdmissionReservationRow> {
     let mut exemptions = BTreeMap::new();
     for reservation in snapshot.reservations.iter().filter(|reservation| {
         reservation.subject_kind == AdmissionSubjectKind::Run
@@ -706,7 +712,7 @@ async fn orphaned_repository_exemptions(
             continue;
         }
         let run_id = reservation.subject_id.clone();
-        let evidence_holds = on_ledger(&ctx.ledger, {
+        let evidence = on_ledger(&ctx.ledger, {
             let run_id = run_id.clone();
             move |ledger| {
                 let desired = ledger.get_desired_work(DesiredSubjectKind::Run, &run_id)?;
@@ -719,17 +725,18 @@ async fn orphaned_repository_exemptions(
                 )
             }
         })
-        .await?;
-        if !evidence_holds
-            || super::handoff::recover_reserved_record(
-                ctx,
-                &run_id,
-                super::handoff::Scope::Run,
-                owner_generation,
-            )
-            .await?
-            .is_some()
-        {
+        .await;
+        if !matches!(evidence, Ok(true)) {
+            continue;
+        }
+        let record = super::handoff::recover_reserved_record(
+            ctx,
+            &run_id,
+            super::handoff::Scope::Run,
+            owner_generation,
+        )
+        .await;
+        if !matches!(record, Ok(None)) {
             continue;
         }
         exemptions.insert(
@@ -737,7 +744,7 @@ async fn orphaned_repository_exemptions(
             reservation.clone(),
         );
     }
-    Ok(exemptions)
+    exemptions
 }
 
 pub(crate) async fn admit(
@@ -765,7 +772,7 @@ async fn admit_once(
         })
         .await?
     };
-    let orphaned_exemptions = orphaned_repository_exemptions(ctx, &snapshot, &target_set).await?;
+    let orphaned_exemptions = orphaned_repository_exemptions(ctx, &snapshot, &target_set).await;
     // Only an owned effect identity can enter recovery without a new work
     // and policy decision. Ownerless reservations were released atomically
     // before this snapshot because they prove no effect transfer occurred.
