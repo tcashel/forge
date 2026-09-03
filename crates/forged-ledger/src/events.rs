@@ -646,12 +646,7 @@ mod tests {
         assert_eq!(gates[0].kind, "proto.gate");
         assert!(gates[0].payload_json.contains("\"ordinal\":1"));
         let (newest, total) = ledger
-            .list_subject_events_by_kind_desc_with_count(
-                "subject-a",
-                "proto.gate",
-                None,
-                1,
-            )
+            .list_subject_events_by_kind_desc_with_count("subject-a", "proto.gate", None, 1)
             .expect("newest gate page");
         assert_eq!(total, 2);
         assert!(newest[0].payload_json.contains("\"ordinal\":3"));
