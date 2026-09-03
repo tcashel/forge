@@ -13,7 +13,7 @@ use support::convergence::*;
 
 use forged_ledger::{
     AttemptState, DesiredReconcileOutcome, DesiredReconcileUpdate, DesiredRestartReservation,
-    DesiredState, DesiredSubjectKind,
+    DesiredSubjectKind,
 };
 use forged_types::{AdmissionOutcome, AdmissionReason, AdmissionSubjectKind};
 // The malformed-facts injection freezes the controller without the
@@ -28,17 +28,7 @@ fn exhaust_restart_budget(env: &TestEnv, run: &str) -> forged_ledger::DesiredWor
         .expect("desired query")
         .expect("desired row")
         .restart_budget;
-    for index in 0..=restart_budget {
-        ledger
-            .record_desired_outcome(
-                DesiredSubjectKind::Run,
-                run,
-                DesiredState::Running,
-                DesiredReconcileOutcome::Authorized,
-                Some("2000-01-01T00:00:00.000000000Z".to_owned()),
-                None,
-            )
-            .expect("make desired row due");
+    for index in 0..=restart_budget.saturating_add(1) {
         let token = format!("convergence-restart-{index}");
         let claimed = ledger
             .claim_desired_work(
@@ -60,7 +50,10 @@ fn exhaust_restart_budget(env: &TestEnv, run: &str) -> forged_ledger::DesiredWor
             .expect("reserve restart")
         {
             DesiredRestartReservation::Reserved(reserved) => {
-                assert!(index < restart_budget, "only the finite budget may reserve");
+                assert!(
+                    index <= restart_budget,
+                    "the initial launch plus the finite recovery budget may reserve"
+                );
                 ledger
                     .finish_desired_reconciliation(
                         DesiredSubjectKind::Run,
@@ -80,7 +73,11 @@ fn exhaust_restart_budget(env: &TestEnv, run: &str) -> forged_ledger::DesiredWor
                     .expect("finish reserved restart");
             }
             DesiredRestartReservation::Exhausted(exhausted) => {
-                assert_eq!(index, restart_budget, "exhaust at the configured bound");
+                assert_eq!(
+                    index,
+                    restart_budget.saturating_add(1),
+                    "exhaust after exactly the configured recovery count"
+                );
                 assert_eq!(exhausted.restart_used, exhausted.restart_budget);
                 assert!(exhausted.exhausted_at.is_some());
             }
@@ -954,8 +951,8 @@ fn convergence_review_and_attention_are_bounded() {
     no_live_reservations(&reviews);
 
     // Exhaust the supervisor restart budget through the real atomic ledger
-    // methods. The fourth reservation emits one attention occurrence and
-    // makes later ticks inert.
+    // methods. The first reservation is free, then the configured number of
+    // recoveries land before one attention occurrence makes later ticks inert.
     let attention = TestEnv::new("convergence-restart-attention");
     start_run(&attention, "conv-restart-attention");
     let ledger = attention.ledger();

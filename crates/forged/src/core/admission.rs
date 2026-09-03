@@ -10,7 +10,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use forged_ledger::{
     AdmissionBatchWrite, AdmissionDurableCandidate, AdmissionLedgerSnapshot,
-    AdmissionReservationRow, DesiredState, DesiredSubjectKind,
+    AdmissionReservationRow, AdmissionReservationState, DesiredState, DesiredSubjectKind,
 };
 use forged_types::{
     canonical_json_bytes, AdmissionCandidateV1, AdmissionDecisionV1, AdmissionInputsV1,
@@ -36,6 +36,7 @@ static SNAPSHOT_RETRY_JITTER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 pub(crate) struct AdmissionResult {
     pub(crate) decision: AdmissionDecisionV1,
     pub(crate) reservation: Option<AdmissionReservationRow>,
+    pub(crate) orphaned_reservation: Option<AdmissionReservationRow>,
     pub(crate) packet_provider_hints: Option<ProviderHints>,
 }
 
@@ -514,10 +515,11 @@ pub(crate) async fn preflight_shape(
     }))
 }
 
-pub(crate) fn evaluate(
+fn evaluate_with_repository_exemptions(
     mut inputs: AdmissionInputsV1,
     policy: &AdmissionPolicy,
     invalid: &BTreeMap<(AdmissionSubjectKind, String), AdmissionReason>,
+    repository_exemptions: &BTreeSet<(AdmissionSubjectKind, String)>,
 ) -> Result<(AdmissionInputsV1, Vec<AdmissionDecisionV1>), Failure> {
     let batch_id = format!("admission:{}", digest(&inputs)?);
     let mut capacity = inputs.capacity.clone();
@@ -548,7 +550,8 @@ pub(crate) fn evaluate(
             .repository_write_active
             .get(&candidate.repository)
             .copied()
-            .unwrap_or(0);
+            .unwrap_or(0)
+            .saturating_sub(u32::from(repository_exemptions.contains(&key)));
         let reason = reason
             .or_else(|| {
                 (capacity.total_active >= policy.total_active)
@@ -626,6 +629,14 @@ pub(crate) fn evaluate(
     Ok((inputs, decisions))
 }
 
+pub(crate) fn evaluate(
+    inputs: AdmissionInputsV1,
+    policy: &AdmissionPolicy,
+    invalid: &BTreeMap<(AdmissionSubjectKind, String), AdmissionReason>,
+) -> Result<(AdmissionInputsV1, Vec<AdmissionDecisionV1>), Failure> {
+    evaluate_with_repository_exemptions(inputs, policy, invalid, &BTreeSet::new())
+}
+
 fn snapshot_changed(failure: &Failure) -> bool {
     failure.code == forged_types::ErrorCode::OperationInProgress
         && failure.message.ends_with(SNAPSHOT_CHANGED_MESSAGE)
@@ -666,6 +677,76 @@ where
     unreachable!("bounded admission retry loop always returns")
 }
 
+/// Only the exact run reservation whose old controller is absent may stop
+/// counting against that same run's repository-write decision. The orphan
+/// remains capacity-bearing in the ledger until reconciliation has advanced
+/// the desired generation and atomically replaces its custody.
+///
+/// The probe is total by construction: an exemption is an affirmative absence
+/// proof, so a failure to prove absence is never an error for the pass. One
+/// subject's unreadable evidence leaves that subject counted and routed to its
+/// own per-subject reconciliation path; it never aborts admission for every
+/// other claimed subject in the tick.
+async fn orphaned_repository_exemptions(
+    ctx: &Ctx,
+    snapshot: &AdmissionLedgerSnapshot,
+    targets: &BTreeSet<(DesiredSubjectKind, String)>,
+) -> BTreeMap<(AdmissionSubjectKind, String), AdmissionReservationRow> {
+    let mut exemptions = BTreeMap::new();
+    for reservation in snapshot.reservations.iter().filter(|reservation| {
+        reservation.subject_kind == AdmissionSubjectKind::Run
+            && reservation.resource_class == AdmissionResourceClass::RepositoryWrite
+            && reservation.state == AdmissionReservationState::Orphaned
+            && reservation.owner_kind.as_deref() == Some("controller")
+            && targets.contains(&(DesiredSubjectKind::Run, reservation.subject_id.clone()))
+    }) {
+        let Some(owner) = reservation.owner_id.as_deref() else {
+            continue;
+        };
+        let Some((owner_scope, owner_id, owner_generation)) =
+            super::handoff::admission_controller_owner(owner)
+        else {
+            continue;
+        };
+        if owner_scope != "run" || owner_id != reservation.subject_id {
+            continue;
+        }
+        let run_id = reservation.subject_id.clone();
+        let evidence = on_ledger(&ctx.ledger, {
+            let run_id = run_id.clone();
+            move |ledger| {
+                let desired = ledger.get_desired_work(DesiredSubjectKind::Run, &run_id)?;
+                Ok(
+                    desired.is_some_and(|row| row.controller_generation == owner_generation)
+                        && ledger
+                            .uncontained_machine_operations(&run_id, None)?
+                            .is_empty()
+                        && ledger.list_live_attempts(Some(&run_id))?.is_empty(),
+                )
+            }
+        })
+        .await;
+        if !matches!(evidence, Ok(true)) {
+            continue;
+        }
+        let record = super::handoff::recover_reserved_record(
+            ctx,
+            &run_id,
+            super::handoff::Scope::Run,
+            owner_generation,
+        )
+        .await;
+        if !matches!(record, Ok(None)) {
+            continue;
+        }
+        exemptions.insert(
+            (AdmissionSubjectKind::Run, reservation.subject_id.clone()),
+            reservation.clone(),
+        );
+    }
+    exemptions
+}
+
 pub(crate) async fn admit(
     ctx: &Ctx,
     targets: Vec<(DesiredSubjectKind, String)>,
@@ -691,6 +772,7 @@ async fn admit_once(
         })
         .await?
     };
+    let orphaned_exemptions = orphaned_repository_exemptions(ctx, &snapshot, &target_set).await;
     // Only an owned effect identity can enter recovery without a new work
     // and policy decision. Ownerless reservations were released atomically
     // before this snapshot because they prove no effect transfer occurred.
@@ -705,6 +787,7 @@ async fn admit_once(
                 && reservation.subject_id == durable.subject_id
                 && reservation.control_revision == durable.control_revision
                 && (reservation.owner_kind.is_some() || reservation.owner_id.is_some())
+                && !orphaned_exemptions.contains_key(&(kind, durable.subject_id.clone()))
         }) {
             let decision = snapshot
                 .reservation_decisions
@@ -722,6 +805,7 @@ async fn admit_once(
             recovered.push(AdmissionResult {
                 decision,
                 reservation: Some(reservation.clone()),
+                orphaned_reservation: None,
                 packet_provider_hints: None,
             });
         }
@@ -781,7 +865,13 @@ async fn admit_once(
         spend: snapshot.spend,
         latest_rate_limits: snapshot.latest_rate_limits,
     };
-    let (inputs, decisions) = evaluate(inputs, &ctx.config.admission, &invalid)?;
+    let exemption_keys = orphaned_exemptions.keys().cloned().collect();
+    let (inputs, decisions) = evaluate_with_repository_exemptions(
+        inputs,
+        &ctx.config.admission,
+        &invalid,
+        &exemption_keys,
+    )?;
     let recovery_deadline = deadline_after(&now_iso(), RESERVATION_RECOVERY_SECONDS)?;
     let reservations = {
         let write = AdmissionBatchWrite {
@@ -811,6 +901,9 @@ async fn admit_once(
             .into_iter()
             .map(|decision| AdmissionResult {
                 reservation: by_subject
+                    .get(&(decision.subject_kind, decision.subject_id.clone()))
+                    .cloned(),
+                orphaned_reservation: orphaned_exemptions
                     .get(&(decision.subject_kind, decision.subject_id.clone()))
                     .cloned(),
                 decision,
@@ -897,6 +990,7 @@ async fn admit_packet_facts_once(
         return Ok(AdmissionResult {
             decision,
             reservation: Some(reservation.clone()),
+            orphaned_reservation: None,
             packet_provider_hints: Some(ProviderHints {
                 provider: packet_facts.provider.clone(),
                 model: packet_facts.model.clone(),
@@ -995,6 +1089,7 @@ async fn admit_packet_facts_once(
     crate::failpoint::hit("admission.batch.commit.after");
     Ok(AdmissionResult {
         reservation: reservations.into_iter().next(),
+        orphaned_reservation: None,
         decision,
         packet_provider_hints: Some(ProviderHints {
             provider: packet_facts.provider.clone(),
@@ -1424,6 +1519,47 @@ mod tests {
             assert_eq!(decisions[0].outcome, outcome, "{suffix}");
             assert_eq!(decisions[0].reason, reason, "{suffix}");
         }
+    }
+
+    #[test]
+    fn orphaned_repository_capacity_exemption_is_exactly_subject_scoped() {
+        let orphan = candidate("orphan", 0, "codex");
+        let mut neighbor = candidate("neighbor", 1, "codex");
+        neighbor.repository = orphan.repository.clone();
+        neighbor.work_repository = orphan.work_repository.clone();
+        let repository = orphan.repository.clone();
+        let inputs = AdmissionInputsV1 {
+            schema: ADMISSION_INPUTS_SCHEMA_V1.to_owned(),
+            as_of: "2030-01-01T00:00:00.000000000Z".to_owned(),
+            policy_revision: "policy".to_owned(),
+            ledger_revision: "ledger".to_owned(),
+            candidates: vec![orphan, neighbor],
+            capacity: AdmissionCapacityV1 {
+                total_active: 1,
+                provider_active: BTreeMap::from([("codex".to_owned(), 1)]),
+                model_active: BTreeMap::from([("codex/m".to_owned(), 1)]),
+                repository_write_active: BTreeMap::from([(repository, 1)]),
+            },
+            spend: Vec::new(),
+            latest_rate_limits: Vec::new(),
+        };
+        let exemptions = BTreeSet::from([(AdmissionSubjectKind::Run, "orphan".to_owned())]);
+        let (_, decisions) = evaluate_with_repository_exemptions(
+            inputs,
+            &AdmissionPolicy::default(),
+            &BTreeMap::new(),
+            &exemptions,
+        )
+        .expect("evaluate orphan exemption");
+        assert_eq!(decisions[0].subject_id, "orphan");
+        assert_eq!(decisions[0].outcome, AdmissionOutcome::Admitted);
+        assert_eq!(decisions[0].reason, AdmissionReason::CapacityAvailable);
+        assert_eq!(decisions[1].subject_id, "neighbor");
+        assert_eq!(decisions[1].outcome, AdmissionOutcome::Deferred);
+        assert_eq!(
+            decisions[1].reason,
+            AdmissionReason::RepositoryWriteCapacity
+        );
     }
 
     #[test]

@@ -1,8 +1,8 @@
 mod support;
 
 use forged_ledger::{
-    DesiredReconcileOutcome, DesiredReconcileUpdate, DesiredRestartReservation, DesiredState,
-    DesiredSubjectKind, EffectClass, RunOutcome,
+    DesiredReconcileOutcome, DesiredReconcileUpdate, DesiredRestartReservation, DesiredSubjectKind,
+    EffectClass, RunOutcome,
 };
 use forged_types::{AttentionCondition, OperationRequest, Verdict};
 use serde_json::{json, Value};
@@ -135,17 +135,9 @@ fn exhaust_restart_budget(env: &TestEnv, run: &str) {
         .expect("desired query")
         .expect("desired row")
         .restart_budget;
-    for index in 0..=restart_budget {
-        ledger
-            .record_desired_outcome(
-                DesiredSubjectKind::Run,
-                run,
-                DesiredState::Running,
-                DesiredReconcileOutcome::Authorized,
-                Some("2000-01-01T00:00:00.000000000Z".to_owned()),
-                None,
-            )
-            .expect("make desired row due");
+    // Mirrors tests/attention.rs: the first reservation after authorization
+    // is the free initial launch, so budget + 2 passes reach exhaustion.
+    for index in 0..=restart_budget.saturating_add(1) {
         let token = format!("coverage-restart-{index}");
         let claimed = ledger
             .claim_desired_work(
@@ -167,7 +159,7 @@ fn exhaust_restart_budget(env: &TestEnv, run: &str) {
             .expect("reserve restart")
         {
             DesiredRestartReservation::Reserved(reserved) => {
-                assert!(index < restart_budget);
+                assert!(index <= restart_budget);
                 ledger
                     .finish_desired_reconciliation(
                         DesiredSubjectKind::Run,
@@ -187,7 +179,8 @@ fn exhaust_restart_budget(env: &TestEnv, run: &str) {
                     .expect("finish desired reconciliation");
             }
             DesiredRestartReservation::Exhausted(exhausted) => {
-                assert_eq!(index, restart_budget);
+                assert_eq!(index, restart_budget.saturating_add(1));
+                assert_eq!(exhausted.restart_used, exhausted.restart_budget);
                 assert!(exhausted.exhausted_at.is_some());
             }
         }

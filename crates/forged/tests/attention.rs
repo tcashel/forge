@@ -60,9 +60,13 @@ fn start_run(env: &TestEnv, run: &str) {
     assert_eq!(code, 0, "start {run}: {started}");
 }
 
+/// Drive the finite recovery budget to durable exhaustion. The first
+/// reservation is the free initial launch — only a reservation that follows a
+/// non-authorized outcome charges — so exactly `restart_budget + 2` passes
+/// separate a fresh authorization from the exhaustion attention.
 fn exhaust_restart_budget(env: &TestEnv, run: &str) {
     use forged_ledger::{
-        DesiredReconcileOutcome, DesiredReconcileUpdate, DesiredRestartReservation, DesiredState,
+        DesiredReconcileOutcome, DesiredReconcileUpdate, DesiredRestartReservation,
         DesiredSubjectKind,
     };
 
@@ -72,17 +76,7 @@ fn exhaust_restart_budget(env: &TestEnv, run: &str) {
         .expect("desired query")
         .expect("desired row")
         .restart_budget;
-    for index in 0..=restart_budget {
-        ledger
-            .record_desired_outcome(
-                DesiredSubjectKind::Run,
-                run,
-                DesiredState::Running,
-                DesiredReconcileOutcome::Authorized,
-                Some("2000-01-01T00:00:00.000000000Z".to_owned()),
-                None,
-            )
-            .expect("make desired row due");
+    for index in 0..=restart_budget.saturating_add(1) {
         let token = format!("attention-restart-{index}");
         let claimed = ledger
             .claim_desired_work(
@@ -104,7 +98,10 @@ fn exhaust_restart_budget(env: &TestEnv, run: &str) {
             .expect("reserve restart")
         {
             DesiredRestartReservation::Reserved(reserved) => {
-                assert!(index < restart_budget);
+                assert!(
+                    index <= restart_budget,
+                    "the initial launch plus the finite recovery budget may reserve"
+                );
                 ledger
                     .finish_desired_reconciliation(
                         DesiredSubjectKind::Run,
@@ -124,7 +121,12 @@ fn exhaust_restart_budget(env: &TestEnv, run: &str) {
                     .expect("finish desired reconciliation");
             }
             DesiredRestartReservation::Exhausted(exhausted) => {
-                assert_eq!(index, restart_budget);
+                assert_eq!(
+                    index,
+                    restart_budget.saturating_add(1),
+                    "exhaust after exactly the configured recovery count"
+                );
+                assert_eq!(exhausted.restart_used, exhausted.restart_budget);
                 assert!(exhausted.exhausted_at.is_some());
             }
         }
