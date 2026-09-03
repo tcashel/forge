@@ -4198,6 +4198,7 @@ pub async fn epic_abandon(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
                 verb: "epic pause".to_owned(),
                 args,
                 reason: "pause scheduling before abandoning the epic".to_owned(),
+                class: forged_types::ActionClass::Repair,
             }),
         );
     }

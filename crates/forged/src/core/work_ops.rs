@@ -117,6 +117,7 @@ pub(crate) fn projection_actions(
                     } else {
                         "choose the repository before starting the run"
                     },
+                    forged_types::ActionClass::Can,
                 ),
                 (
                     "work update",
@@ -127,6 +128,7 @@ pub(crate) fn projection_actions(
                     }),
                     "supply at least one spec field or priority under the \
                      current revision guard",
+                    forged_types::ActionClass::Can,
                 ),
             ]
         }
@@ -134,12 +136,13 @@ pub(crate) fn projection_actions(
             "work reopen",
             json!({"id": snapshot.work_id}),
             "reopen the work item before scheduling it",
+            forged_types::ActionClass::Repair,
         )],
         WorkStatus::InProgress | WorkStatus::Deferred => Vec::new(),
     };
     actions
         .into_iter()
-        .map(|(verb, args, reason)| {
+        .map(|(verb, args, reason, class)| {
             let Value::Object(args) = args else {
                 unreachable!("work next-action args are objects")
             };
@@ -147,6 +150,7 @@ pub(crate) fn projection_actions(
                 verb: verb.to_owned(),
                 args,
                 reason: reason.to_owned(),
+                class,
             }
         })
         .collect()

@@ -12,6 +12,7 @@
 
 pub mod convergence;
 pub mod e2e_drive;
+pub mod operator_store;
 pub mod review_publish;
 pub mod supervise;
 

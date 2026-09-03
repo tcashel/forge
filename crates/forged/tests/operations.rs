@@ -270,6 +270,7 @@ fn run_status_next_actions_execute_after_binding_declared_placeholders() {
     assert_eq!(code, 0, "active status: {active}");
     let action = &active["result"]["run"]["nextActions"][0];
     assert_eq!(action["verb"], json!("run stop"));
+    assert_eq!(action["class"], json!("can"));
     assert_eq!(
         action["args"],
         json!({"run": run_id, "outcome": null, "reason": null})
@@ -297,6 +298,7 @@ fn run_status_next_actions_execute_after_binding_declared_placeholders() {
     assert_eq!(code, 0, "stopped status: {terminal}");
     let retry = &terminal["result"]["run"]["nextActions"][0];
     assert_eq!(retry["verb"], json!("run retry"));
+    assert_eq!(retry["class"], json!("can"));
     assert_eq!(
         retry["args"],
         json!({"id": run_id, "runId": null}),
@@ -315,6 +317,7 @@ fn run_status_next_actions_execute_after_binding_declared_placeholders() {
 
     let action = &terminal["result"]["run"]["nextActions"][1];
     assert_eq!(action["verb"], json!("work supersede"));
+    assert_eq!(action["class"], json!("can"));
     assert_eq!(
         action["args"],
         json!({"id": work_id, "successor": null}),
@@ -377,11 +380,158 @@ fn run_status_next_actions_execute_after_binding_declared_placeholders() {
     ledger.close().expect("close ledger");
     let (code, held) = env.forged(&["run", "status", "--run", held_run]);
     assert_eq!(code, 0, "input-required status: {held}");
-    let held_retry = &held["result"]["run"]["nextActions"][0];
+    let held_update = &held["result"]["run"]["nextActions"][0];
+    assert_eq!(held_update["verb"], json!("work update"));
+    assert_eq!(held_update["class"], json!("should"));
+    let update_id = held_update["args"]["id"]
+        .as_str()
+        .expect("advertised work id");
+    let (code, shown) = env.forged(&["work", "show", "--id", update_id]);
+    assert_eq!(code, 0, "advertised work update precondition: {shown}");
+    let expected_revision = shown["result"]["work"]["revision"]
+        .as_u64()
+        .expect("current work revision")
+        .to_string();
+    let (code, updated) = env.forged(&[
+        "work",
+        "update",
+        "--id",
+        update_id,
+        "--expected-revision",
+        &expected_revision,
+        "--description",
+        "Apply the operator decision before retrying",
+    ]);
+    assert_eq!(code, 0, "advertised work update succeeds: {updated}");
+    let held_retry = &held["result"]["run"]["nextActions"][1];
     assert_eq!(held_retry["verb"], json!("run retry"));
+    assert_eq!(held_retry["class"], json!("can"));
     assert!(held_retry["reason"]
         .as_str()
         .is_some_and(|reason| reason.contains("decision or amendment")));
+}
+
+#[test]
+fn run_status_classes_each_terminal_outcome_by_relevance() {
+    let env = TestEnv::new("forged-run-status-action-classes");
+    env.forged(&["init"]);
+    for (run, outcome) in [
+        ("class-clean", forged_ledger::RunOutcome::Clean),
+        (
+            "class-accepted-risk",
+            forged_ledger::RunOutcome::AcceptedRisk,
+        ),
+        ("class-blocked", forged_ledger::RunOutcome::Blocked),
+        (
+            "class-input-required",
+            forged_ledger::RunOutcome::InputRequired,
+        ),
+        ("class-cancelled", forged_ledger::RunOutcome::Cancelled),
+    ] {
+        fabricate_run(&env, run);
+        let ledger = env.ledger();
+        if outcome == forged_ledger::RunOutcome::AcceptedRisk {
+            ledger
+                .append_event(
+                    Some(run),
+                    "run.protocol-terminal",
+                    json!({
+                        "schemaVersion": 1,
+                        "terminal": {
+                            "reviewBudgetExhausted": {
+                                "reviewRounds": 2,
+                                "finalVerdict": "requestChanges",
+                            }
+                        },
+                    }),
+                )
+                .expect("record review-budget evidence");
+            ledger
+                .settle_run(
+                    run,
+                    forged_ledger::RunOutcome::Blocked,
+                    "review budget exhausted after 2 rounds with verdict requestChanges".to_owned(),
+                    None,
+                    None,
+                    None,
+                )
+                .expect("settle review-budget fixture");
+            ledger
+                .accept_review_risk(
+                    run,
+                    2,
+                    forged_types::AcceptedRisk {
+                        accepted_by: "class-operator".to_owned(),
+                        rationale: "class fixture risk".to_owned(),
+                        findings: Vec::new(),
+                    },
+                )
+                .expect("accept fixture risk");
+        } else {
+            ledger
+                .settle_run(
+                    run,
+                    outcome,
+                    format!("classify {}", outcome.as_str()),
+                    None,
+                    None,
+                    None,
+                )
+                .expect("settle class fixture");
+        }
+        ledger.close().expect("close ledger");
+
+        let (code, status) = env.forged(&["run", "status", "--run", run]);
+        assert_eq!(code, 0, "{run}: {status}");
+        let actions = status["result"]["run"]["nextActions"]
+            .as_array()
+            .expect("next actions");
+        let should = actions
+            .iter()
+            .filter(|action| action["class"] == json!("should"))
+            .collect::<Vec<_>>();
+        match outcome {
+            forged_ledger::RunOutcome::Clean | forged_ledger::RunOutcome::AcceptedRisk => {
+                assert_eq!(should.len(), 1, "{status}");
+                assert_eq!(should[0]["verb"], json!("run stop"));
+                assert_eq!(should[0]["args"]["outcome"], json!("landed"));
+            }
+            forged_ledger::RunOutcome::Blocked | forged_ledger::RunOutcome::InputRequired => {
+                assert_eq!(should.len(), 1, "{status}");
+                assert_eq!(should[0]["verb"], json!("work update"));
+            }
+            forged_ledger::RunOutcome::Cancelled => assert!(should.is_empty(), "{status}"),
+            _ => unreachable!("fixture outcomes are closed above"),
+        }
+        assert!(actions.iter().any(|action| {
+            action["verb"] == json!("run retry") && action["class"] == json!("can")
+        }));
+        if matches!(
+            outcome,
+            forged_ledger::RunOutcome::Clean | forged_ledger::RunOutcome::AcceptedRisk
+        ) {
+            let delivery = should[0];
+            let sha = "a".repeat(40);
+            let (code, landed) = env.forged(&[
+                "run",
+                "stop",
+                "--run",
+                delivery["args"]["run"].as_str().expect("advertised run"),
+                "--outcome",
+                delivery["args"]["outcome"]
+                    .as_str()
+                    .expect("advertised outcome"),
+                "--reason",
+                "reviewed pull request was merged",
+                "--pr",
+                "42",
+                "--sha",
+                &sha,
+            ]);
+            assert_eq!(code, 0, "advertised landed stop succeeds: {landed}");
+            assert_eq!(landed["result"]["outcome"], json!("landed"));
+        }
+    }
 }
 
 #[test]

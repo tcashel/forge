@@ -81,6 +81,7 @@ fn keyless_resubmit_remedy(scope: Scope, id: &str) -> forged_types::RemedyV1 {
         args,
         reason: "omit the idempotency key so forged can mint the next controller generation"
             .to_owned(),
+        class: forged_types::ActionClass::Repair,
     })
 }
 
@@ -96,6 +97,7 @@ fn action_remedy(
         verb: verb.into(),
         args,
         reason: reason.into(),
+        class: forged_types::ActionClass::Repair,
     })
 }
 

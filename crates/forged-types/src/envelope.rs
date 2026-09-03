@@ -43,6 +43,21 @@ pub struct OperationActionV1 {
     pub verb: String,
     pub args: Map<String, Value>,
     pub reason: String,
+    #[serde(default)]
+    pub class: ActionClass,
+}
+
+/// How an advertised operation relates to the subject's next decision.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ActionClass {
+    /// The one action that advances a subject parked on a decision.
+    Should,
+    /// An honest alternative that is available but not recommended first.
+    #[default]
+    Can,
+    /// Recovery from an invalid, damaged, or legacy state.
+    Repair,
 }
 
 /// The structured recovery instruction carried by a refusal detail.
@@ -149,6 +164,7 @@ mod tests {
                 _ => unreachable!("literal is an object"),
             },
             reason: "create the successor first with work create".to_owned(),
+            class: ActionClass::Repair,
         });
         assert_eq!(
             serde_json::to_value(remedy).expect("serializes"),
@@ -159,5 +175,29 @@ mod tests {
                 "reason": "create the successor first with work create",
             })
         );
+    }
+
+    #[test]
+    fn operation_action_serializes_class_and_legacy_json_defaults_to_can() {
+        let current = serde_json::from_value::<OperationActionV1>(json!({
+            "verb": "run retry",
+            "args": {"id": "run-1", "runId": null},
+            "reason": "retry after amending the work",
+            "class": "should",
+        }))
+        .expect("current action");
+        assert_eq!(current.class, ActionClass::Should);
+        assert_eq!(
+            serde_json::to_value(&current).expect("serialize")["class"],
+            json!("should")
+        );
+
+        let legacy = serde_json::from_value::<OperationActionV1>(json!({
+            "verb": "run retry",
+            "args": {"id": "run-1", "runId": null},
+            "reason": "legacy action",
+        }))
+        .expect("legacy action");
+        assert_eq!(legacy.class, ActionClass::Can);
     }
 }

@@ -761,15 +761,29 @@ async fn explain_work_item(ctx: &Ctx, work: WorkItemSnapshot) -> Result<Value, F
     let mut runs = on_ledger(&ctx.ledger, move |ledger| ledger.list_runs()).await?;
     runs.retain(|run| run.work_id == work_id);
     let latest = runs.last().cloned();
+    let work_verdict = match work.status {
+        forged_ledger::WorkStatus::Closed => Some("closed"),
+        forged_ledger::WorkStatus::Deferred => Some("parked"),
+        _ => None,
+    };
     let how = if let Some(run) = latest.as_ref() {
         let observation =
             explain_observation(ctx, forged_types::WorkIdentitySubjectKind::Run, &run.run_id)
                 .await?;
-        explain_how(observation_inputs(&observation)?)
+        let inputs = observation_inputs(&observation)?;
+        let verdict = if run.terminal_outcome == Some(RunOutcome::Landed)
+            || (run.delivery_pr.is_some() && run.delivery_sha.is_some())
+        {
+            "landed"
+        } else {
+            work_verdict.unwrap_or_else(|| super::health::execution_health(inputs))
+        };
+        explain_how_with_verdict(inputs, verdict)
     } else {
-        explain_how(super::health::HealthInputs::observation(
-            false, false, false, false, false, None, None,
-        ))
+        let inputs =
+            super::health::HealthInputs::observation(false, false, false, false, false, None, None);
+        let verdict = work_verdict.unwrap_or_else(|| super::health::execution_health(inputs));
+        explain_how_with_verdict(inputs, verdict)
     };
     let total = runs.len();
     let run_items = runs
