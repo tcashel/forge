@@ -340,7 +340,7 @@ fn roster_revision_re_admits_the_claimed_unspawned_child() {
             .expect("desired lookup")
             .expect("desired row")
             .restart_used,
-        1,
+        0,
         "re-admission must not charge a controller restart"
     );
     assert_eq!(

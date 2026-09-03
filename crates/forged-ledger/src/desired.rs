@@ -619,8 +619,9 @@ impl Ledger {
         })
     }
 
-    /// Charge the finite budget and reserve the only generation this tick
-    /// may spawn. Exhaustion is durable and emits one attention event.
+    /// Reserve the only generation this tick may spawn, charging the finite
+    /// budget only when this is a recovery. Exhaustion is durable and emits
+    /// one attention event.
     pub fn reserve_desired_restart(
         &self,
         kind: DesiredSubjectKind,
@@ -640,7 +641,9 @@ impl Ledger {
                 ));
             }
             let now = now_iso();
-            if row.restart_used >= row.restart_budget {
+            let charges_restart =
+                row.last_outcome != Some(DesiredReconcileOutcome::Authorized);
+            if charges_restart && row.restart_used >= row.restart_budget {
                 let first = row.exhausted_at.is_none();
                 tx.execute(
                     "UPDATE desired_work SET last_outcome = 'exhausted', exhausted_at = COALESCE(exhausted_at, ?1),
@@ -679,14 +682,15 @@ impl Ledger {
             // bare literal "restart budget is exhausted".
             tx.execute(
                 "UPDATE desired_work SET controller_generation = ?1,
-                   predecessor_generation = ?2, restart_used = restart_used + 1,
+                   predecessor_generation = ?2, restart_used = restart_used + ?3,
                    last_outcome = 'restarting',
                    next_wake_at = reconcile_lease_until,
-                   updated_at = ?3 WHERE subject_kind = ?4 AND subject_id = ?5
-                   AND reconcile_token = ?6",
+                   updated_at = ?4 WHERE subject_kind = ?5 AND subject_id = ?6
+                   AND reconcile_token = ?7",
                 rusqlite::params![
                     i64::from(generation),
                     i64::from(observed_generation),
+                    i64::from(charges_restart),
                     now,
                     kind.as_str(),
                     id,
@@ -938,7 +942,7 @@ mod tests {
         };
         assert_eq!(row.controller_generation, 2);
         assert_eq!(row.predecessor_generation, Some(1));
-        assert_eq!(row.restart_used, 1);
+        assert_eq!(row.restart_used, 0, "the first launch is not a restart");
         first
             .finish_desired_reconciliation(
                 DesiredSubjectKind::Epic,
@@ -956,6 +960,129 @@ mod tests {
                 },
             )
             .expect("finish");
+    }
+
+    #[test]
+    fn restart_budget_counts_recoveries_and_resets_to_a_free_first_launch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ledger = Ledger::open(&dir.path().join("state.db")).expect("ledger");
+        let run = "run-recovery-budget";
+        ledger
+            .authorize_desired_work(DesiredSubjectKind::Run, run, 0)
+            .expect("authorize");
+
+        for launch in 0..=DEFAULT_RESTART_BUDGET {
+            let token = format!("recovery-budget-{launch}");
+            let claimed = ledger
+                .claim_desired_work(
+                    DesiredSubjectKind::Run,
+                    run,
+                    &token,
+                    "2099-01-01T00:00:00.000000000Z",
+                    "2099-01-01T00:01:00.000000000Z",
+                )
+                .expect("claim")
+                .expect("due desired row");
+            let reserved = ledger
+                .reserve_desired_restart(
+                    DesiredSubjectKind::Run,
+                    run,
+                    &token,
+                    claimed.controller_generation,
+                )
+                .expect("reserve");
+            let DesiredRestartReservation::Reserved(reserved) = reserved else {
+                panic!("launch {launch} exhausted before the configured recovery count")
+            };
+            assert_eq!(
+                reserved.restart_used, launch,
+                "launch zero is free and each later launch is one recovery"
+            );
+            ledger
+                .finish_desired_reconciliation(
+                    DesiredSubjectKind::Run,
+                    run,
+                    &token,
+                    DesiredReconcileUpdate {
+                        desired_state: None,
+                        outcome: DesiredReconcileOutcome::Backoff,
+                        controller_generation: Some(reserved.controller_generation),
+                        predecessor_generation: reserved.predecessor_generation,
+                        next_wake_at: Some("2000-01-01T00:00:00.000000000Z".to_owned()),
+                        last_progress_at: None,
+                        last_error: Some("fixture controller remained dead".to_owned()),
+                        attention_condition: None,
+                    },
+                )
+                .expect("finish launch");
+        }
+
+        let token = "recovery-budget-exhausted";
+        let claimed = ledger
+            .claim_desired_work(
+                DesiredSubjectKind::Run,
+                run,
+                token,
+                "2099-01-01T00:00:00.000000000Z",
+                "2099-01-01T00:01:00.000000000Z",
+            )
+            .expect("claim exhaustion")
+            .expect("exhaustion is due");
+        let exhausted = ledger
+            .reserve_desired_restart(
+                DesiredSubjectKind::Run,
+                run,
+                token,
+                claimed.controller_generation,
+            )
+            .expect("reserve exhaustion");
+        let DesiredRestartReservation::Exhausted(exhausted) = exhausted else {
+            panic!("one more recovery exceeded the configured budget")
+        };
+        assert_eq!(exhausted.restart_used, DEFAULT_RESTART_BUDGET);
+        assert_eq!(
+            ledger
+                .list_events(Some(run), 0, 65_536)
+                .expect("events")
+                .iter()
+                .filter(|event| {
+                    event.kind == "forged.supervisor.attention"
+                        && event.payload_json.contains("restart-budget-exhausted")
+                })
+                .count(),
+            1
+        );
+
+        ledger
+            .authorize_desired_work(
+                DesiredSubjectKind::Run,
+                run,
+                exhausted.controller_generation,
+            )
+            .expect("reauthorize");
+        let token = "recovery-budget-reauthorized";
+        let claimed = ledger
+            .claim_desired_work(
+                DesiredSubjectKind::Run,
+                run,
+                token,
+                "2099-01-01T00:00:00.000000000Z",
+                "2099-01-01T00:01:00.000000000Z",
+            )
+            .expect("claim reauthorization")
+            .expect("reauthorization is due");
+        let relaunched = ledger
+            .reserve_desired_restart(
+                DesiredSubjectKind::Run,
+                run,
+                token,
+                claimed.controller_generation,
+            )
+            .expect("reserve reauthorized launch");
+        let DesiredRestartReservation::Reserved(relaunched) = relaunched else {
+            panic!("reauthorized first launch must be free")
+        };
+        assert_eq!(relaunched.restart_used, 0);
     }
 
     #[test]

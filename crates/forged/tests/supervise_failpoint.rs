@@ -7,12 +7,285 @@ mod support;
 use std::os::unix::process::CommandExt;
 use std::process::Stdio;
 
-use forged_ledger::{DesiredReconcileOutcome, DesiredState, DesiredSubjectKind};
+use forged_ledger::{
+    AdmissionBatchWrite, AdmissionReservationState, DesiredReconcileOutcome, DesiredState,
+    DesiredSubjectKind, EffectClass,
+};
+use forged_types::{
+    AdmissionCandidateV1, AdmissionDecisionV1, AdmissionInputsV1, AdmissionOutcome,
+    AdmissionReason, AdmissionResourceClass, AdmissionSubjectKind, OperationRequest,
+    ADMISSION_DECISION_SCHEMA_V1, ADMISSION_INPUTS_SCHEMA_V1,
+};
 use nix::sys::signal::{killpg, Signal};
 use nix::unistd::Pid;
 use serde_json::{json, Value};
 use support::supervise::*;
 use support::TestEnv;
+
+fn seed_identityless_orphaned_reservation(env: &TestEnv, run: &str) -> String {
+    let ledger = env.ledger();
+    let desired = ledger
+        .get_desired_work(DesiredSubjectKind::Run, run)
+        .expect("desired query")
+        .expect("desired work");
+    let snapshot = ledger
+        .admission_snapshot(Some((DesiredSubjectKind::Run, run.to_owned())))
+        .expect("admission snapshot");
+    let repository = env.repos.repo.to_string_lossy().into_owned();
+    let capacity = snapshot.capacity.clone();
+    let candidate = AdmissionCandidateV1 {
+        subject_kind: AdmissionSubjectKind::Run,
+        subject_id: run.to_owned(),
+        control_revision: desired.control_revision,
+        work_id: run.to_owned(),
+        work_revision: Some("fixture-revision".to_owned()),
+        work_status: Some("open".to_owned()),
+        priority: Some(1),
+        repository: repository.clone(),
+        work_repository: Some(repository.clone()),
+        input_error: None,
+        desired_wake_at: desired.next_wake_at,
+        provider: Some("claude".to_owned()),
+        model: Some("opus".to_owned()),
+        resource_class: AdmissionResourceClass::RepositoryWrite,
+        authorized_at: desired.created_at,
+    };
+    let batch_id = format!("identityless-orphan-{run}");
+    let decision = AdmissionDecisionV1 {
+        schema: ADMISSION_DECISION_SCHEMA_V1.to_owned(),
+        batch_id,
+        subject_kind: AdmissionSubjectKind::Run,
+        subject_id: run.to_owned(),
+        control_revision: desired.control_revision,
+        repository,
+        priority: Some(1),
+        provider: Some("claude".to_owned()),
+        model: Some("opus".to_owned()),
+        resource_class: AdmissionResourceClass::RepositoryWrite,
+        outcome: AdmissionOutcome::Admitted,
+        reason: AdmissionReason::CapacityAvailable,
+        reason_detail: None,
+        policy_revision: "identityless-orphan-policy".to_owned(),
+        evidence: capacity.clone(),
+        next_eligible_wake_at: None,
+    };
+    let reservation = ledger
+        .commit_admission_batch(AdmissionBatchWrite {
+            inputs: AdmissionInputsV1 {
+                schema: ADMISSION_INPUTS_SCHEMA_V1.to_owned(),
+                as_of: snapshot.as_of,
+                policy_revision: "identityless-orphan-policy".to_owned(),
+                ledger_revision: snapshot.ledger_revision,
+                candidates: vec![candidate],
+                capacity,
+                spend: snapshot.spend,
+                latest_rate_limits: snapshot.latest_rate_limits,
+            },
+            decisions: vec![decision],
+            recovery_deadline: "2000-01-01T00:00:00.000000000Z".to_owned(),
+        })
+        .expect("commit orphan admission")
+        .into_iter()
+        .next()
+        .expect("reservation");
+    ledger
+        .activate_admission_reservation(
+            &reservation.reservation_id,
+            "controller",
+            &format!("run:{run}:1"),
+        )
+        .expect("activate orphan owner");
+    let orphaned = ledger
+        .mark_expired_admission_orphaned("2099-01-01T00:00:00.000000000Z")
+        .expect("mark identity-less owner orphaned")
+        .into_iter()
+        .find(|row| row.reservation_id == reservation.reservation_id)
+        .expect("orphaned reservation");
+    assert_eq!(orphaned.state, AdmissionReservationState::Orphaned);
+    ledger.close().expect("close ledger");
+    reservation.reservation_id
+}
+
+#[cfg(feature = "failpoints")]
+#[test]
+fn identityless_orphan_is_relaunched_once_and_late_generation_is_fenced() {
+    if !require_serialized_runner() {
+        return;
+    }
+    let env = TestEnv::new("supervise-identityless-orphan");
+    let run = "run-identityless-orphan";
+    start_run(&env, run);
+    let ledger = env.ledger();
+    ledger
+        .authorize_desired_work(DesiredSubjectKind::Run, run, 1)
+        .expect("authorize orphan generation");
+    ledger.close().expect("close ledger");
+    let orphaned_id = seed_identityless_orphaned_reservation(&env, run);
+    let controller_dir = env.anvil.join(format!("runs/{run}/controller"));
+    assert!(
+        !controller_dir.join("controller.json").exists(),
+        "the activated owner died before publishing controller identity"
+    );
+
+    env.set_scenario("implement", "hang", 1);
+    let (code, tick) = env.forged(&["supervise", "--once"]);
+    assert_eq!(code, 0, "orphan recovery tick: {tick}");
+    assert_eq!(tick["result"]["subjects"][0]["action"], json!("restarted"));
+    wait_until("orphan replacement provider start", || {
+        implementation_starts(&env, run) == 1
+    });
+    assert_eq!(implementation_starts(&env, run), 1, "exactly one relaunch");
+    let (generation, replacement_pid) = current_controller_identity(&env, run);
+    assert_eq!(generation, 2);
+    assert!(process_group_alive(replacement_pid));
+
+    let ledger = env.ledger();
+    let desired = ledger
+        .get_desired_work(DesiredSubjectKind::Run, run)
+        .expect("desired query")
+        .expect("desired work");
+    assert_eq!(desired.controller_generation, 2);
+    assert_eq!(
+        desired.restart_used, 0,
+        "first launch after authorization is free"
+    );
+    let release: Value = ledger
+        .latest_event_of_kind(run, "forged.admission.reservation.released")
+        .expect("release event query")
+        .and_then(|event| serde_json::from_str(&event.payload_json).ok())
+        .expect("orphan release evidence");
+    assert_eq!(release["reservationId"], json!(orphaned_id));
+    assert_eq!(release["subject"], json!({"kind": "run", "id": run}));
+    assert_eq!(release["generation"], json!(2));
+    assert_eq!(release["reason"], json!("orphan-superseded-by-generation"));
+    assert_eq!(
+        release["evidence"],
+        json!({
+            "uncontainedOperations": 0,
+            "liveAttempts": 0,
+            "identity": "absent",
+        })
+    );
+    let events = ledger.list_events(Some(run), 0, 65_536).expect("events");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(
+                event.kind.as_str(),
+                "forged.attention.acknowledged"
+                    | "forged.attention.resolved"
+                    | "forged.attention.reopened"
+            ))
+            .count(),
+        0,
+        "reservation recovery must not rewrite attention custody"
+    );
+    ledger.close().expect("close ledger");
+
+    let late = env
+        .forged_cmd(&["run", "drive", "--run", run])
+        .process_group(0)
+        .env(
+            "FORGED_CONTROLLER_PID_PATH",
+            controller_dir.join("controller-1-late.pid"),
+        )
+        .env(
+            "FORGED_CONTROLLER_LSTART_PATH",
+            controller_dir.join("controller-1-late.lstart"),
+        )
+        .env("FORGED_CONTROLLER_SCOPE", "run")
+        .env("FORGED_CONTROLLER_ID", run)
+        .env("FORGED_CONTROLLER_GENERATION", "1")
+        .output()
+        .expect("late generation runs");
+    assert!(
+        !late.status.success(),
+        "late generation 1 must be refused after generation 2 is desired: {}",
+        String::from_utf8_lossy(&late.stdout)
+    );
+    assert_eq!(
+        implementation_starts(&env, run),
+        1,
+        "late generation cannot duplicate the provider effect"
+    );
+    assert!(
+        process_group_alive(replacement_pid),
+        "late predecessor cannot disturb the replacement"
+    );
+
+    stop_until_lands(
+        &env,
+        run,
+        "identity-less orphan fixture cleanup",
+        "identity-less orphan fixture stop lands",
+    );
+    wait_until("identity-less replacement death", || {
+        !process_group_alive(replacement_pid)
+    });
+}
+
+#[cfg(feature = "failpoints")]
+#[test]
+fn orphan_with_uncontained_machine_effect_retains_ambiguous_custody() {
+    if !require_serialized_runner() {
+        return;
+    }
+    let env = TestEnv::new("supervise-orphan-unsafe-residue");
+    let run = "run-orphan-unsafe-residue";
+    start_run(&env, run);
+    let ledger = env.ledger();
+    ledger
+        .authorize_desired_work(DesiredSubjectKind::Run, run, 1)
+        .expect("authorize orphan generation");
+    ledger.close().expect("close ledger");
+    let orphaned_id = seed_identityless_orphaned_reservation(&env, run);
+    let ledger = env.ledger();
+    ledger
+        .begin_operation(
+            "gate",
+            &OperationRequest {
+                schema_version: 1,
+                idempotency_key: "orphan-ambiguous-gate".to_owned(),
+                run_id: Some(run.to_owned()),
+                params: serde_json::Map::new(),
+            },
+            EffectClass::HumanAmbiguous,
+            None,
+        )
+        .expect("seed ambiguous machine operation");
+    ledger.close().expect("close ledger");
+
+    let (code, tick) = env.forged(&["supervise", "--once"]);
+    assert_eq!(code, 0, "ambiguous orphan tick: {tick}");
+    assert_eq!(tick["result"]["subjects"][0]["action"], json!("attention"));
+
+    let ledger = env.ledger();
+    let orphan = ledger
+        .admission_snapshot(None)
+        .expect("orphan snapshot")
+        .reservations
+        .into_iter()
+        .find(|row| row.reservation_id == orphaned_id)
+        .expect("orphan custody retained");
+    assert_eq!(orphan.state, AdmissionReservationState::Orphaned);
+    assert!(
+        ledger
+            .latest_event_of_kind(run, "forged.admission.reservation.released")
+            .expect("release event query")
+            .is_none(),
+        "ambiguous machine residue cannot release orphan custody"
+    );
+    let desired = ledger
+        .get_desired_work(DesiredSubjectKind::Run, run)
+        .expect("desired query")
+        .expect("desired work");
+    assert_eq!(desired.controller_generation, 1);
+    assert_eq!(
+        desired.last_outcome,
+        Some(DesiredReconcileOutcome::Attention)
+    );
+    ledger.close().expect("close ledger");
+}
 
 #[cfg(feature = "failpoints")]
 #[test]
@@ -500,7 +773,7 @@ fn stale_nonrecoverable_terminal_without_identity_takes_the_restart_path() {
         .expect("desired query")
         .expect("desired row");
     assert_eq!(desired.controller_generation, 3);
-    assert_eq!(desired.restart_used, 1);
+    assert_eq!(desired.restart_used, 0);
     assert!(desired.exhausted_at.is_none(), "stale marker never halts");
     ledger.close().expect("close");
     let (generation, pid) = current_controller_identity(&env, run);
@@ -564,7 +837,7 @@ fn stale_nonrecoverable_terminal_with_identity_takes_the_restart_path() {
             DesiredSubjectKind::Run,
             run,
             DesiredState::Running,
-            DesiredReconcileOutcome::Authorized,
+            DesiredReconcileOutcome::Restarted,
             Some("2000-01-01T00:00:00.000000000Z".to_owned()),
             None,
         )
@@ -583,7 +856,7 @@ fn stale_nonrecoverable_terminal_with_identity_takes_the_restart_path() {
         .expect("desired query")
         .expect("desired row");
     assert_eq!(desired.controller_generation, 3);
-    assert_eq!(desired.restart_used, 2);
+    assert_eq!(desired.restart_used, 1);
     assert!(desired.exhausted_at.is_none(), "stale marker never halts");
     ledger.close().expect("close");
     let (_, third_pid) = current_controller_identity(&env, run);
@@ -622,7 +895,7 @@ fn nonrecoverable_gh_error_consumes_backoff_budget_instead_of_halting() {
         implementation_starts(&env, run) == 1
     });
 
-    for generation in 1..=6 {
+    for generation in 1..=7 {
         let message = format!("transient gh outage at generation {generation}");
         kill_controller_and_make_due(&env, run, generation, "GH_ERROR", &message, false);
         let (code, tick) = env.forged(&["supervise", "--once"]);
@@ -632,16 +905,16 @@ fn nonrecoverable_gh_error_consumes_backoff_budget_instead_of_halting() {
             .get_desired_work(DesiredSubjectKind::Run, run)
             .expect("desired query")
             .expect("desired row");
-        if generation <= 5 {
+        if generation <= 6 {
             assert_eq!(
                 tick["result"]["subjects"][0]["action"],
                 json!("restarted"),
                 "GH_ERROR must never halt"
             );
-            assert_eq!(desired.restart_used, generation);
+            assert_eq!(desired.restart_used, generation - 1);
             assert_eq!(desired.controller_generation, generation + 1);
             assert!(desired.exhausted_at.is_none());
-            let expected_backoff = 5_u64.saturating_mul(2_u64.pow(generation - 1));
+            let expected_backoff = 5_u64.saturating_mul(2_u64.pow(generation.saturating_sub(2)));
             let wake = desired.next_wake_at.as_deref().expect("restart wake");
             assert!(
                 seconds_between(&desired.updated_at, wake) >= expected_backoff as f64 - 1.0,
@@ -651,7 +924,7 @@ fn nonrecoverable_gh_error_consumes_backoff_budget_instead_of_halting() {
         } else {
             assert_eq!(tick["result"]["subjects"][0]["action"], json!("exhausted"));
             assert_eq!(desired.restart_used, 5);
-            assert_eq!(desired.controller_generation, 6);
+            assert_eq!(desired.controller_generation, 7);
             assert!(desired.exhausted_at.is_some());
             assert_eq!(
                 desired.last_outcome,
@@ -670,14 +943,14 @@ fn nonrecoverable_gh_error_consumes_backoff_budget_instead_of_halting() {
         "gh-budget-resubmit",
     ]);
     assert_eq!(code, 0, "resubmit after bounded exhaustion: {resubmitted}");
-    assert_eq!(resubmitted["result"]["controller"]["generation"], json!(7));
-    let seventh_pid = controller_pid(&resubmitted);
+    assert_eq!(resubmitted["result"]["controller"]["generation"], json!(8));
+    let eighth_pid = controller_pid(&resubmitted);
     let ledger = env.ledger();
     let desired = ledger
         .get_desired_work(DesiredSubjectKind::Run, run)
         .expect("desired query")
         .expect("desired row");
-    assert_eq!(desired.controller_generation, 7);
+    assert_eq!(desired.controller_generation, 8);
     assert_eq!(desired.restart_used, 0);
     assert!(desired.exhausted_at.is_none());
     ledger.close().expect("close");
@@ -687,7 +960,7 @@ fn nonrecoverable_gh_error_consumes_backoff_budget_instead_of_halting() {
         "GH_ERROR budget fixture cleanup",
         "GH_ERROR budget fixture stop lands",
     );
-    wait_until("generation 7 controller death", || {
-        !process_group_alive(seventh_pid)
+    wait_until("generation 8 controller death", || {
+        !process_group_alive(eighth_pid)
     });
 }

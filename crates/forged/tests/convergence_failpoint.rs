@@ -784,7 +784,7 @@ fn convergence_crash_matrix_is_effect_exact() {
         .expect("desired query")
         .expect("desired row");
     assert_eq!(desired.controller_generation, 2);
-    assert_eq!(desired.restart_used, 1);
+    assert_eq!(desired.restart_used, 0);
     assert_eq!(
         ledger
             .list_events(Some("conv-controller-death"), 0, 65_536)

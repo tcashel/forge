@@ -724,7 +724,9 @@ async fn reconcile_claimed(
     ctx: &Ctx,
     row: DesiredWorkRow,
     token: String,
+    admission_decision: forged_types::AdmissionDecisionV1,
     admission_reservation: AdmissionReservationRow,
+    orphaned_reservation: Option<AdmissionReservationRow>,
 ) -> Result<Value, Failure> {
     if let Some(stop) = settle_landed_reality(ctx, &row, &token).await? {
         on_ledger(&ctx.ledger, move |ledger| {
@@ -767,46 +769,59 @@ async fn reconcile_claimed(
     // tick transfers it to a concrete controller generation. An older owned
     // reservation is recovery authority only for its exact durable identity;
     // malformed or mismatched ownership is never permission to spawn.
-    let recovery_generation = match (
-        admission_reservation.owner_kind.as_deref(),
-        admission_reservation.owner_id.as_deref(),
-    ) {
-        (None, None) => None,
-        (Some("controller"), Some(owner)) => {
-            let Some((owner_scope, owner_id, generation)) =
-                handoff::admission_controller_owner(owner)
-            else {
+    let orphaned_relaunch = orphaned_reservation.is_some();
+    if orphaned_reservation
+        .as_ref()
+        .is_some_and(|orphaned| orphaned.reservation_id != admission_reservation.reservation_id)
+    {
+        return Err(Failure::internal(
+            "orphaned admission exemption does not match its reservation",
+        ));
+    }
+    let recovery_generation = if orphaned_relaunch {
+        None
+    } else {
+        match (
+            admission_reservation.owner_kind.as_deref(),
+            admission_reservation.owner_id.as_deref(),
+        ) {
+            (None, None) => None,
+            (Some("controller"), Some(owner)) => {
+                let Some((owner_scope, owner_id, generation)) =
+                    handoff::admission_controller_owner(owner)
+                else {
+                    return finish_attention(
+                        ctx,
+                        &row,
+                        &token,
+                        "admission reservation has malformed controller identity".to_owned(),
+                    )
+                    .await;
+                };
+                if owner_scope != subject_scope.noun()
+                    || owner_id != row.subject_id
+                    || generation != row.controller_generation
+                {
+                    return finish_attention(
+                        ctx,
+                        &row,
+                        &token,
+                        "admission reservation does not match the desired controller generation"
+                            .to_owned(),
+                    )
+                    .await;
+                }
+                Some(generation)
+            }
+            _ => {
                 return finish_attention(
                     ctx,
                     &row,
                     &token,
-                    "admission reservation has malformed controller identity".to_owned(),
-                )
-                .await;
-            };
-            if owner_scope != subject_scope.noun()
-                || owner_id != row.subject_id
-                || generation != row.controller_generation
-            {
-                return finish_attention(
-                    ctx,
-                    &row,
-                    &token,
-                    "admission reservation does not match the desired controller generation"
-                        .to_owned(),
+                    "admission reservation has an unverifiable effect owner".to_owned(),
                 )
                 .await;
             }
-            Some(generation)
-        }
-        _ => {
-            return finish_attention(
-                ctx,
-                &row,
-                &token,
-                "admission reservation has an unverifiable effect owner".to_owned(),
-            )
-            .await;
         }
     };
 
@@ -956,6 +971,30 @@ async fn reconcile_claimed(
     handoff::recover_abandoned(ctx, &row.subject_id, subject_scope, observed_generation).await?;
     crate::failpoint::hit("supervisor.recover.after");
 
+    if admission_reservation.state == forged_ledger::AdmissionReservationState::Orphaned {
+        let residue_id = row.subject_id.clone();
+        let (uncontained, live_attempts) = on_ledger(&ctx.ledger, move |ledger| {
+            Ok((
+                ledger.uncontained_machine_operations(&residue_id, None)?,
+                ledger.list_live_attempts(Some(&residue_id))?,
+            ))
+        })
+        .await?;
+        if !uncontained.is_empty() || !live_attempts.is_empty() {
+            return finish_attention(
+                ctx,
+                &row,
+                &token,
+                format!(
+                    "orphaned controller still has {} uncontained machine operations and {} live attempts; reservation custody retained",
+                    uncontained.len(),
+                    live_attempts.len()
+                ),
+            )
+            .await;
+        }
+    }
+
     if recovery_generation.is_some() {
         // The exact owned effect is confirmed absent. Its old decision is no
         // longer launch authority: release capacity and make the subject due
@@ -1058,14 +1097,20 @@ async fn reconcile_claimed(
     let reserved = match restart_reservation {
         DesiredRestartReservation::Exhausted(exhausted) => {
             // Exhaustion also parks the subject with no wake; its
-            // reservation must not keep consuming capacity while parked.
-            let observed = admission_reservation.clone();
-            on_ledger(&ctx.ledger, move |ledger| {
-                ledger
-                    .release_admission_reservation(&observed, Some("restart budget exhausted"))?;
-                Ok(())
-            })
-            .await?;
+            // new reservation must not keep consuming capacity while parked.
+            // An exempted orphan remains fenced because no successor
+            // generation was minted to reject a late predecessor.
+            if !orphaned_relaunch {
+                let observed = admission_reservation.clone();
+                on_ledger(&ctx.ledger, move |ledger| {
+                    ledger.release_admission_reservation(
+                        &observed,
+                        Some("restart budget exhausted"),
+                    )?;
+                    Ok(())
+                })
+                .await?;
+            }
             return Ok(json!({
                 "action": "exhausted",
                 "desiredWork": row_json(&exhausted),
@@ -1074,6 +1119,23 @@ async fn reconcile_claimed(
         DesiredRestartReservation::Reserved(reserved) => reserved,
     };
     crate::failpoint::hit("supervisor.restart.reserved.after");
+
+    let admission_reservation = match orphaned_reservation {
+        Some(orphaned) => {
+            let generation = reserved.controller_generation;
+            let recovery_deadline = deadline_after(&now_iso(), CLAIM_LEASE_SECONDS)?;
+            on_ledger(&ctx.ledger, move |ledger| {
+                ledger.supersede_orphaned_admission_reservation(
+                    &orphaned,
+                    &admission_decision,
+                    generation,
+                    &recovery_deadline,
+                )
+            })
+            .await?
+        }
+        None => admission_reservation,
+    };
 
     let (repo, host_policy, herdr_socket) = match subject_runtime(ctx, &reserved).await {
         Ok(runtime) => runtime,
@@ -1464,7 +1526,16 @@ async fn tick_with_deferrals(
                 "admitted decision has no capacity reservation",
             ));
         };
-        match reconcile_claimed(ctx, candidate.clone(), token.clone(), reservation).await {
+        match reconcile_claimed(
+            ctx,
+            candidate.clone(),
+            token.clone(),
+            admission.decision.clone(),
+            reservation,
+            admission.orphaned_reservation.clone(),
+        )
+        .await
+        {
             Ok(report) => subjects.push(report),
             Err(error) => {
                 // Ordinary failures back off and release the claim. A crash
