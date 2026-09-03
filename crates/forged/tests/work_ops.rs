@@ -171,11 +171,13 @@ fn work_show_next_actions_execute_for_open_blocked_and_closed_states() {
                 "verb": "run start",
                 "args": {"work": "action-open", "repo": repository},
                 "reason": "start a run once the work specification is complete",
+                "class": "can",
             },
             {
                 "verb": "work update",
                 "args": {"id": "action-open", "expectedRevision": 1, "description": null},
                 "reason": "supply at least one spec field or priority under the current revision guard",
+                "class": "can",
             },
         ])
     );
@@ -272,6 +274,7 @@ fn work_show_next_actions_execute_for_open_blocked_and_closed_states() {
             "verb": "work reopen",
             "args": {"id": "action-blocked"},
             "reason": "reopen the work item before scheduling it",
+            "class": "repair",
         }])
     );
     let reopen_id = blocked["nextActions"][0]["args"]["id"]

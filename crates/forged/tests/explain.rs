@@ -108,6 +108,50 @@ fn an_open_work_item_points_to_work_show_and_existing_work_actions() {
 }
 
 #[test]
+fn closed_and_parked_epic_work_items_use_lifecycle_verdicts() {
+    let env = TestEnv::new("forged-explain-work-lifecycle-verdicts");
+    assert_eq!(env.forged(&["init"]).0, 0);
+    for (id, status, verdict) in [
+        ("explain-closed-epic", "closed", "closed"),
+        ("explain-parked-epic", "deferred", "parked"),
+    ] {
+        env.set_work_field(id, "type", "epic");
+        env.set_work_field(id, "status", status);
+        let (code, response) = env.forged(&["explain", "--id", id]);
+        assert_eq!(code, 0, "{id}: {response}");
+        assert_eq!(result(&response)["kind"], json!("work-item"));
+        assert_eq!(result(&response)["how"]["verdict"], json!(verdict));
+    }
+}
+
+#[test]
+fn landed_delivery_outranks_the_closed_work_verdict() {
+    let env = TestEnv::new("forged-explain-landed-work-verdict");
+    assert_eq!(env.forged(&["init"]).0, 0);
+    let run = "explain-landed-work";
+    let work = "bead-explain-landed-work";
+    env.set_work_field(work, "type", "epic");
+    env.set_work_field(work, "status", "closed");
+    fabricate_run(&env, run);
+    let ledger = env.ledger();
+    ledger
+        .settle_run(
+            run,
+            forged_ledger::RunOutcome::Landed,
+            "fixture delivery landed".to_owned(),
+            Some(42),
+            Some("a".repeat(40)),
+            None,
+        )
+        .expect("settle landed fixture");
+    ledger.close().expect("close ledger");
+
+    let (code, response) = env.forged(&["explain", "--id", work]);
+    assert_eq!(code, 0, "landed work explain: {response}");
+    assert_eq!(result(&response)["how"]["verdict"], json!("landed"));
+}
+
+#[test]
 fn an_exact_work_item_outranks_its_same_named_run_and_names_that_run() {
     let env = TestEnv::new("forged-explain-work-run-alias");
     assert_eq!(env.forged(&["init"]).0, 0);
