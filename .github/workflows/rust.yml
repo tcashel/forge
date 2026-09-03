@@ -171,8 +171,11 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
           # Only persist the cache from main; PR branches restore it read-only
-          # so near-duplicate multi-GB caches don't pile up in the pool.
-          cache-save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          # so near-duplicate multi-GB caches don't pile up in the pool. Every
+          # partition compiles the same workspace and test binaries (partitioning
+          # selects tests, not compilation), so one leg's save is every leg's
+          # cache and only partition 1 saves.
+          cache-save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.partition == 1 }}
 
       - uses: taiki-e/install-action@37f7c5781271959fb65b6b35224e28652ff2b63d # v2.87.0
         with:
@@ -221,8 +224,11 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
           # Only persist the cache from main; PR branches restore it read-only
-          # so near-duplicate multi-GB caches don't pile up in the pool.
-          cache-save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          # so near-duplicate multi-GB caches don't pile up in the pool. Every
+          # partition compiles the same workspace and test binaries (partitioning
+          # selects tests, not compilation), so one leg's save is every leg's
+          # cache and only partition 1 saves.
+          cache-save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.partition == 1 }}
 
       - uses: taiki-e/install-action@37f7c5781271959fb65b6b35224e28652ff2b63d # v2.87.0
         with:
@@ -233,19 +239,33 @@ jobs:
       - name: runner facts
         run: nproc; free -g | sed -n 2p
 
-      # This leg's contract is crate-gated binaries only: every test source
-      # containing `cfg(feature = "failpoints")` must gate its whole crate.
-      # The position-agnostic guard has no allow-list, so a mixed binary can
-      # never silently reintroduce duplicate non-failpoint tests here.
+      # This leg's contract is crate-gated binaries only: every test BINARY
+      # source (crates/forged/tests/*.rs, the enforced glob) that contains
+      # `cfg(feature = "failpoints")` must open with the crate gate. Files
+      # under tests/support/ are modules compiled into those binaries, not
+      # binaries, so they are outside the glob on purpose. The guard is
+      # position-agnostic and has no allow-list, so a mixed binary can never
+      # silently reintroduce duplicate non-failpoint tests here.
       - name: failpoint test binaries are crate gated
         shell: bash
         run: |
           set -euo pipefail
-          missing="$(for f in $(grep -l 'cfg(feature = "failpoints")' crates/forged/tests/*.rs); do grep -q '^#!\[cfg(feature = "failpoints")\]' "$f" || echo "$f"; done)"
-          if [[ -n "$missing" ]]; then
-            echo "$missing" >&2
+          missing=0
+          found=0
+          while IFS= read -r file; do
+            found=$((found + 1))
+            if ! grep -q '^#!\[cfg(feature = "failpoints")\]' "$file"; then
+              echo "$file has failpoint-gated tests but is not crate gated" >&2
+              missing=1
+            fi
+          done < <(grep -l 'cfg(feature = "failpoints")' crates/forged/tests/*.rs || true)
+          # Fail closed: an empty population means the glob or cwd is wrong,
+          # not that every binary is gated.
+          if [[ "$found" -eq 0 ]]; then
+            echo "the crate-gate guard found no gated test sources under crates/forged/tests" >&2
             exit 1
           fi
+          exit "$missing"
 
       - name: failpoints
         run: >-
