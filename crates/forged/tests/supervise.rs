@@ -344,7 +344,9 @@ fn once_adopts_live_work_and_concurrent_ticks_restart_once() {
             DesiredSubjectKind::Run,
             "run-supervised",
             DesiredState::Running,
-            DesiredReconcileOutcome::Authorized,
+            // A recovery, not a fresh authorization: the free first launch
+            // already happened, so this restart charges the budget.
+            DesiredReconcileOutcome::Restarted,
             Some("2000-01-01T00:00:00.000000000Z".to_owned()),
             None,
         )
