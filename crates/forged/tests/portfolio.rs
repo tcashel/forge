@@ -115,7 +115,7 @@ fn no_scope_projects_the_portfolio_and_every_combination_stays_refused() {
     env.forged(&["init"]);
     fabricate_run(&env, "pf-slice");
     fabricate_epic(&env, "pf-epic");
-    let mut mcp = McpClient::new(&env);
+    let mut mcp = McpClient::new(&env, None);
 
     let none = mcp.call_tool("overview", json!({"schemaVersion": 1, "params": {}}));
     assert_eq!(none["ok"], json!(true), "no scope is not a refusal: {none}");

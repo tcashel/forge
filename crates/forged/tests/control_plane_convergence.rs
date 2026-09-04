@@ -537,7 +537,7 @@ fn modern_projections_and_all_five_apps_converge_on_real_envelopes() {
     let fixture = ControlPlaneFixture::new("forged-control-plane-convergence");
     let repository = fixture.repository_a();
     let before = fixture.fingerprint();
-    let mut mcp = McpClient::new(&fixture.env);
+    let mut mcp = McpClient::new(&fixture.env, Some("all"));
     let mut tools = mcp.list_tools();
     tools.sort();
     assert!(tools.contains(&"epic_revise_policy".to_owned()));

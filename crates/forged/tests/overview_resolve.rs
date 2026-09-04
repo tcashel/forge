@@ -317,7 +317,7 @@ fn legacy_event_stream_selectors_stay_narrow_and_tolerate_missing_identity() {
     );
     assert_eq!(empty["error"]["code"], json!("INVALID_REQUEST"));
 
-    let mut mcp = McpClient::new(&env);
+    let mut mcp = McpClient::new(&env, None);
     for params in [json!({"id": 7}), json!({"run": ""})] {
         let malformed = mcp.call_tool("events_tail", json!({"schemaVersion": 1, "params": params}));
         assert_eq!(malformed["ok"], json!(false), "{malformed}");
@@ -512,7 +512,7 @@ fn an_exact_id_outranks_every_prefix_reading_of_it() {
 fn an_id_alongside_an_explicit_kind_is_refused() {
     let env = TestEnv::new("forged-resolve-conflict");
     env.forged(&["init"]);
-    let mut mcp = McpClient::new(&env);
+    let mut mcp = McpClient::new(&env, None);
 
     for explicit in ["run", "epic"] {
         let response = mcp.call_tool(

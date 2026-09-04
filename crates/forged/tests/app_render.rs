@@ -2433,8 +2433,8 @@ fn operations_triage_consumes_server_classes_order_actions_and_acknowledgements(
     assert_eq!(
         report["serverToolCalls"],
         json!([
-            {"name": "attention_list", "arguments": {"schemaVersion": 1, "params": {"repo": "/repo", "state": "active", "limit": 100}}},
-            {"name": "attention_list", "arguments": {"schemaVersion": 1, "params": {"repo": "/repo", "state": "all", "limit": 500}}},
+            {"name": "attention_list", "arguments": {"repo": "/repo", "state": "active", "limit": 100}},
+            {"name": "attention_list", "arguments": {"repo": "/repo", "state": "all", "limit": 500}},
             {"name": "work_map", "arguments": {"schemaVersion": 1, "params": {"scope": "repository", "repository": "/repo"}}}
         ]),
         "load separates active attention from bounded settlements and reads the scoped map: {report}"

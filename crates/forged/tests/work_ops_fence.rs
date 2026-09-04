@@ -119,10 +119,9 @@ fn keyless_links_of_distinct_kinds_share_a_pair() {
 fn malformed_params_refuse_instead_of_defaulting() {
     let env = TestEnv::new("forged-work-fence-strict");
     assert_eq!(env.forged(&["init"]).0, 0);
-    let mut mcp = McpClient::new(&env);
-    let envelope = |params: Value| json!({"schemaVersion": 1, "params": params});
+    let mut mcp = McpClient::new(&env, None);
     let refuse = |mcp: &mut McpClient, name: &str, params: Value, why: &str| {
-        let reply = mcp.call_tool(name, envelope(params));
+        let reply = mcp.call_tool(name, params);
         assert_eq!(reply["ok"], json!(false), "{why}: {reply}");
         assert_eq!(reply["error"]["code"], json!("INVALID_REQUEST"), "{reply}");
     };
