@@ -5543,8 +5543,8 @@ fn next_coverage(shown: usize, total: usize) -> Value {
 /// coverage. Decision rows have highest priority, followed by running, ready,
 /// and landed; optional symptoms are discarded first. Explicit section reads
 /// are the widening escape hatch and do not use this byte cap.
-fn bound_next_default_result(result: &mut Value) {
-    while serde_json::to_vec(result).is_ok_and(|bytes| bytes.len() > NEXT_DEFAULT_BYTE_LIMIT) {
+fn bound_next_default_result(result: &mut Value, limit: usize) {
+    while serde_json::to_vec(result).is_ok_and(|bytes| bytes.len() > limit) {
         let mut removed = None;
         for section in ["symptoms", "landed", "ready", "running", "decisions"] {
             let Some(rows) = result
@@ -5584,6 +5584,15 @@ fn bound_next_default_result(result: &mut Value) {
             result["hidden"]["symptoms"] = json!(hidden.saturating_add(1));
         }
     }
+}
+
+/// Bytes the success envelope adds around a `next` result. The byte budget
+/// is a promise about what the agent reads, so the envelope is charged
+/// against it rather than the inner object alone.
+fn next_envelope_overhead(operation_id: &str) -> usize {
+    serde_json::to_vec(&super::ok_response(operation_id, false, Value::Null))
+        .map(|bytes| bytes.len().saturating_sub("null".len()))
+        .unwrap_or(0)
 }
 
 /// `next` — the bounded decision-first lead surface.
@@ -5907,7 +5916,19 @@ pub async fn next(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
             },
         });
         if bound_default_portfolio {
-            bound_next_default_result(&mut result);
+            // The projection boundary adds compatibility twins after this
+            // returns; add them first so the bound measures the final shape
+            // (that pass is idempotent), and charge the success envelope
+            // against the same budget.
+            forged_types::add_work_twins(&mut result);
+            let operation_id = if super::key_absent(req) {
+                super::read_key("next")
+            } else {
+                req.idempotency_key.clone()
+            };
+            let budget =
+                NEXT_DEFAULT_BYTE_LIMIT.saturating_sub(next_envelope_overhead(&operation_id));
+            bound_next_default_result(&mut result, budget);
         }
         Ok(result)
     })
@@ -7125,9 +7146,46 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::{
-        next_default_limits, next_landed_row, next_spend, next_title, next_within_last_day,
-        splice_policy,
+        bound_next_default_result, next_default_limits, next_envelope_overhead, next_landed_row,
+        next_spend, next_title, next_within_last_day, splice_policy,
     };
+
+    #[test]
+    fn next_byte_budget_covers_the_whole_success_envelope() {
+        let result = json!({
+            "schema": "forged.next/1",
+            "sections": {"decisions": [{"id": "a"}, {"id": "b"}, {"id": "c"}]},
+            "coverage": {
+                "shown": 3,
+                "total": 3,
+                "truncated": false,
+                "sections": {"decisions": {"shown": 3, "total": 3, "truncated": false}}
+            },
+            "hidden": {"symptoms": 0}
+        });
+        let envelope = crate::core::ok_response("op:next:read", false, result.clone());
+        let envelope_len = serde_json::to_vec(&envelope).unwrap().len();
+        let result_len = serde_json::to_vec(&result).unwrap().len();
+        assert_eq!(
+            next_envelope_overhead("op:next:read") + result_len,
+            envelope_len
+        );
+
+        let mut bounded = result;
+        let limit = result_len - 1;
+        bound_next_default_result(&mut bounded, limit);
+        assert!(serde_json::to_vec(&bounded).unwrap().len() <= limit);
+        assert_eq!(
+            bounded["sections"]["decisions"].as_array().unwrap().len(),
+            2
+        );
+        assert_eq!(bounded["coverage"]["shown"], json!(2));
+        assert_eq!(bounded["coverage"]["truncated"], json!(true));
+        assert_eq!(
+            bounded["coverage"]["sections"]["decisions"],
+            json!({"shown": 2, "total": 3, "truncated": true})
+        );
+    }
 
     #[test]
     fn next_spend_is_known_only_when_every_matching_usage_row_is_costed() {
