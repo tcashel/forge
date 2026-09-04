@@ -269,8 +269,10 @@ where
             return Ok(false);
         }
         if remaining < interval {
+            // The final partial interval still ends with a read: a change
+            // that lands before the deadline is reported, never lost.
             tokio::time::sleep(remaining).await;
-            return Ok(false);
+            return condition().await;
         }
         tokio::time::sleep(interval).await;
         if condition().await? {
@@ -408,5 +410,24 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 3);
         assert!(started.elapsed() >= Duration::from_millis(100));
         assert_eq!(DECISION_POLL_INTERVAL, Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn the_final_partial_interval_still_reads_before_reporting_a_timeout() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let interval = Duration::from_millis(200);
+        let deadline = Instant::now() + Duration::from_millis(60);
+        let changed = wait_at_cadence(deadline, interval, || {
+            let call = observed.fetch_add(1, Ordering::SeqCst) + 1;
+            async move { Ok(call == 2) }
+        })
+        .await
+        .expect("polling succeeds");
+        assert!(
+            changed,
+            "a change that lands inside the final partial interval is reported"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 }
