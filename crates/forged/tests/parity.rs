@@ -11,13 +11,36 @@ const OPERATION_SURFACE: &str = include_str!("../../../docs/reference/operation-
 const HOST_PARITY_FIXTURES: &str =
     include_str!("../../../plugins/forged/skills/manage-work/host-parity-fixtures.json");
 
-fn manifest_mcp_tools() -> Vec<String> {
+fn manifest_mcp_tools(audience: Option<&str>) -> Vec<String> {
     let manifest: Value = serde_json::from_str(OPERATION_SURFACE).expect("surface manifest JSON");
     manifest["operations"]
         .as_array()
         .expect("surface manifest operations")
         .iter()
-        .filter(|row| row["mcp"] == json!(true))
+        .filter(|row| {
+            row["mcp"] == json!(true)
+                && audience.is_none_or(|audience| row["audience"] == json!(audience))
+        })
+        .map(|row| {
+            row["name"]
+                .as_str()
+                .expect("surface operation name")
+                .to_owned()
+        })
+        .collect()
+}
+
+fn manifest_lead_tools_by_write(is_write: bool) -> Vec<String> {
+    let manifest: Value = serde_json::from_str(OPERATION_SURFACE).expect("surface manifest JSON");
+    manifest["operations"]
+        .as_array()
+        .expect("surface manifest operations")
+        .iter()
+        .filter(|row| {
+            row["mcp"] == json!(true)
+                && row["audience"] == json!("lead")
+                && (row["class"] != json!("read_only")) == is_write
+        })
         .map(|row| {
             row["name"]
                 .as_str()
@@ -184,38 +207,55 @@ fn all_manifest_tools_match_their_cli_counterparts() {
     // the claim_next parity leg still sees an empty ready frontier (the
     // ledger frontier is a query over open unassigned items).
     env.set_work_field("bead-par-repository", "status", "blocked");
-    let mut mcp = McpClient::new(&env);
+    let mut lead_mcp = McpClient::new(&env, None);
 
-    // The server declares exactly the public operation tools.
+    // Default discovery is exactly the lead audience declared by the
+    // manifest. Hidden tools remain callable because audience is a listing
+    // filter, never an authorization boundary.
+    let mut lead_tools = lead_mcp.list_tools();
+    lead_tools.sort();
+    let mut expected_lead = manifest_mcp_tools(Some("lead"));
+    expected_lead.sort_unstable();
+    assert_eq!(
+        lead_tools, expected_lead,
+        "the manifest lead tools, exactly"
+    );
+    let hidden =
+        lead_mcp.call_tool_result("operations_overview", envelope(json!({"repo": repository})));
+    assert_eq!(hidden["isError"], json!(false), "{hidden}");
+
+    let mut mcp = McpClient::new(&env, Some("all"));
     let mut tools = mcp.list_tools();
     tools.sort();
-    let mut expected = manifest_mcp_tools();
+    let mut expected = manifest_mcp_tools(None);
     expected.sort_unstable();
-    assert_eq!(tools, expected, "the manifest MCP tools, exactly");
+    assert_eq!(tools, expected, "all manifest MCP tools, exactly");
+
+    for audience in ["machine", "operator"] {
+        let mut audience_mcp = McpClient::new(&env, Some(audience));
+        let mut listed = audience_mcp.list_tools();
+        listed.sort();
+        let mut expected = manifest_mcp_tools(Some(audience));
+        expected.sort_unstable();
+        assert_eq!(listed, expected, "the manifest {audience} tools, exactly");
+    }
 
     let host_tools = host_fixture_tools();
-    let missing = tools
+    let missing = lead_tools
         .iter()
         .filter(|name| !host_tools.contains(name))
         .cloned()
         .collect::<Vec<_>>();
     assert!(
         missing.is_empty(),
-        "host-parity fixture is missing MCP tools: {missing:?}"
+        "host-parity fixture is missing lead MCP tools: {missing:?}"
     );
 
-    // Both MCP result paths turn a failed operation envelope into a tool
+    // Both MCP result paths turn a failed operation response into a tool
     // error without changing one byte of the CLI-compatible JSON text.
     let (code, cli_text) = cli_envelope_text(&env, &["run", "status", "--run", "absent"]);
     assert_eq!(code, 1);
-    let raw = mcp.call_tool_result(
-        "run_status",
-        json!({
-            "schemaVersion": 1,
-            "runId": "absent",
-            "params": {"run": "absent"},
-        }),
-    );
+    let raw = mcp.call_tool_result("run_status", json!({"run": "absent"}));
     assert_eq!(raw["isError"], json!(true));
     assert_eq!(raw["content"][0]["text"], json!(cli_text));
 
@@ -231,7 +271,7 @@ fn all_manifest_tools_match_their_cli_counterparts() {
 
     let (code, cli_text) = cli_envelope_text(&env, &["explain", "--id", "bead-par-repository"]);
     assert_eq!(code, 0);
-    let raw = mcp.call_tool_result("explain", envelope(json!({"id": "bead-par-repository"})));
+    let raw = mcp.call_tool_result("explain", json!({"id": "bead-par-repository"}));
     assert_eq!(raw["isError"], json!(false));
     assert_eq!(raw["content"][0]["text"], json!(cli_text));
     assert_eq!(
@@ -310,13 +350,11 @@ fn all_manifest_tools_match_their_cli_counterparts() {
     );
     for param in ["repo", "status", "assignee"] {
         assert!(
-            description.contains(&format!("params.{param}")),
-            "work_list must describe params.{param}: {description}"
+            description.contains(param),
+            "work_list must describe {param}: {description}"
         );
         let schema = work_list
-            .pointer(&format!(
-                "/inputSchema/properties/params/properties/{param}"
-            ))
+            .pointer(&format!("/inputSchema/properties/{param}"))
             .cloned()
             .unwrap_or(Value::Null);
         assert!(
@@ -326,7 +364,7 @@ fn all_manifest_tools_match_their_cli_counterparts() {
     }
     let work_ready = mcp.tool("work_ready");
     let ready_schema = work_ready
-        .pointer("/inputSchema/properties/params/properties")
+        .pointer("/inputSchema/properties")
         .cloned()
         .unwrap_or(Value::Null);
     for param in ["repo", "cursor", "detail", "limit", "all"] {
@@ -342,11 +380,11 @@ fn all_manifest_tools_match_their_cli_counterparts() {
     let description = work_ready["description"].as_str().unwrap_or_default();
     for statement in [
         "summary rows by default",
-        "params.repo",
-        "params.cursor",
-        "params.detail",
-        "params.limit",
-        "params.all",
+        "repo",
+        "cursor",
+        "detail",
+        "limit",
+        "all",
         "nextCursor",
         "100",
         "500",
@@ -358,7 +396,7 @@ fn all_manifest_tools_match_their_cli_counterparts() {
     }
     let work_note_add = mcp.tool("work_note_add");
     let add_schema = work_note_add
-        .pointer("/inputSchema/properties/params/properties")
+        .pointer("/inputSchema/properties")
         .cloned()
         .unwrap_or(Value::Null);
     for param in ["id", "kind", "bodyJson", "schema", "actor"] {
@@ -404,7 +442,7 @@ fn all_manifest_tools_match_their_cli_counterparts() {
     }
     let work_note_list = mcp.tool("work_note_list");
     let list_schema = work_note_list
-        .pointer("/inputSchema/properties/params/properties")
+        .pointer("/inputSchema/properties")
         .cloned()
         .unwrap_or(Value::Null);
     for param in ["id", "kind", "limit"] {
@@ -523,9 +561,7 @@ fn all_manifest_tools_match_their_cli_counterparts() {
     }
     let explain = mcp.tool("explain");
     assert!(
-        explain
-            .pointer("/inputSchema/properties/params/properties/id")
-            .is_some(),
+        explain.pointer("/inputSchema/properties/id").is_some(),
         "explain advertises its required id: {explain}"
     );
     let work_map = mcp.tool("work_map");
@@ -555,9 +591,42 @@ fn all_manifest_tools_match_their_cli_counterparts() {
             "work_map advertises closed value or parameter {value}: {map_schema}"
         );
     }
+    for name in &lead_tools {
+        let tool = mcp.tool(name);
+        let properties = tool
+            .pointer("/inputSchema/properties")
+            .and_then(Value::as_object);
+        for field in ["schemaVersion", "runId", "params"] {
+            assert!(
+                properties.is_none_or(|properties| !properties.contains_key(field)),
+                "lead tool {name} must not advertise envelope field {field}: {tool}"
+            );
+        }
+    }
+    for name in manifest_lead_tools_by_write(false) {
+        let tool = mcp.tool(&name);
+        assert!(
+            tool.pointer("/inputSchema/properties/idempotencyKey")
+                .is_none(),
+            "lead read {name} must not advertise idempotencyKey: {tool}"
+        );
+    }
+    for name in manifest_lead_tools_by_write(true) {
+        let tool = mcp.tool(&name);
+        assert!(
+            tool.pointer("/inputSchema/properties/idempotencyKey")
+                .is_some(),
+            "lead write {name} must advertise optional idempotencyKey: {tool}"
+        );
+    }
+    for (name, tool) in [("explain", &explain), ("work_list", &work_list)] {
+        assert_eq!(
+            tool.pointer("/inputSchema/additionalProperties"),
+            Some(&json!(false)),
+            "{name} rejects unknown flat arguments"
+        );
+    }
     for (name, tool) in [
-        ("explain", &explain),
-        ("work_list", &work_list),
         ("operations_overview", &operations),
         ("work_detail", &detail),
         ("work_map", &work_map),
@@ -738,18 +807,11 @@ fn all_manifest_tools_match_their_cli_counterparts() {
     );
 
     let cli = env.forged(&["definition", "validate"]).1;
-    let tool = mcp.call_tool("definition_validate", envelope(json!({})));
+    let tool = mcp.call_tool("definition_validate", json!({}));
     assert_eq!(cli, tool, "definition_validate parity");
 
     let cli = env.forged(&["run", "status", "--run", "par-repository"]).1;
-    let tool = mcp.call_tool(
-        "run_status",
-        json!({
-            "schemaVersion": 1,
-            "runId": "par-repository",
-            "params": {"run": "par-repository"},
-        }),
-    );
+    let tool = mcp.call_tool("run_status", json!({"run": "par-repository"}));
     assert_subject_parity(&cli, &tool, "run_status subject parity");
     assert_eq!(
         normalized(cli),
@@ -765,7 +827,7 @@ fn all_manifest_tools_match_their_cli_counterparts() {
     let cli = env
         .forged(&["work", "show", "--id", "bead-par-repository"])
         .1;
-    let tool = mcp.call_tool("work_show", envelope(json!({"id": "bead-par-repository"})));
+    let tool = mcp.call_tool("work_show", json!({"id": "bead-par-repository"}));
     assert_subject_parity(&cli, &tool, "work_show subject parity");
     assert_eq!(
         normalized(cli),
@@ -779,7 +841,7 @@ fn all_manifest_tools_match_their_cli_counterparts() {
     );
 
     let cli = env.forged(&["explain", "--id", "bead-par-repository"]).1;
-    let tool = mcp.call_tool("explain", envelope(json!({"id": "bead-par-repository"})));
+    let tool = mcp.call_tool("explain", json!({"id": "bead-par-repository"}));
     assert_subject_parity(&cli, &tool, "explain subject parity");
     assert_eq!(normalized(cli), normalized(tool.clone()), "explain parity");
     assert_eq!(tool["result"]["kind"], json!("work-item"));
@@ -793,7 +855,7 @@ fn all_manifest_tools_match_their_cli_counterparts() {
         .1;
     let tool = mcp.call_tool(
         "run_start",
-        envelope(json!({"bead": "par-a", "repo": "rel/path", "spec": "nope.md"})),
+        json!({"bead": "par-a", "repo": "rel/path", "spec": "nope.md"}),
     );
     assert_eq!(normalized(cli), normalized(tool), "run_start parity");
 
@@ -801,9 +863,7 @@ fn all_manifest_tools_match_their_cli_counterparts() {
     let tool = mcp.call_tool(
         "run_retry",
         json!({
-            "schemaVersion": 1,
-            "runId": "absent",
-            "params": {"id": "absent", "runId": null, "profile": null, "roster": null}
+            "id": "absent", "runId": null, "profile": null, "roster": null
         }),
     );
     assert_eq!(normalized(cli), normalized(tool), "run_retry parity");
@@ -817,17 +877,11 @@ fn all_manifest_tools_match_their_cli_counterparts() {
     assert_eq!(normalized(cli), normalized(tool), "run_advance parity");
 
     let cli = env.forged(&["run", "submit", "--run", "absent"]).1;
-    let tool = mcp.call_tool(
-        "run_submit",
-        json!({"schemaVersion": 1, "runId": "absent", "params": {"run": "absent"}}),
-    );
+    let tool = mcp.call_tool("run_submit", json!({"run": "absent"}));
     assert_eq!(normalized(cli), normalized(tool), "run_submit parity");
 
     let cli = env.forged(&["run", "status", "--run", "absent"]).1;
-    let tool = mcp.call_tool(
-        "run_status",
-        json!({"schemaVersion": 1, "runId": "absent", "params": {"run": "absent"}}),
-    );
+    let tool = mcp.call_tool("run_status", json!({"run": "absent"}));
     assert_eq!(normalized(cli), normalized(tool), "run_status parity");
 
     let cli = env
@@ -858,13 +912,9 @@ fn all_manifest_tools_match_their_cli_counterparts() {
     let tool = mcp.call_tool(
         "run_stop",
         json!({
-            "schemaVersion": 1,
-            "runId": "absent",
-            "params": {
-                "run": "absent",
-                "outcome": "blocked",
-                "reason": "cannot proceed"
-            }
+            "run": "absent",
+            "outcome": "blocked",
+            "reason": "cannot proceed"
         }),
     );
     assert_eq!(normalized(cli), normalized(tool), "run_stop parity");
@@ -888,18 +938,14 @@ fn all_manifest_tools_match_their_cli_counterparts() {
     let tool = mcp.call_tool(
         "run_adjudicate_settlement",
         json!({
-            "schemaVersion": 1,
-            "runId": "absent",
-            "params": {
-                "run": "absent",
-                "outcome": "cancelled",
-                "pr": null,
-                "sha": null,
-                "supersededBy": null,
-                "actor": "operator",
-                "rationale": "legacy run predates durable driver identity",
-                "evidenceGap": "controller record has no /driver/pid and no lstart"
-            }
+            "run": "absent",
+            "outcome": "cancelled",
+            "pr": null,
+            "sha": null,
+            "supersededBy": null,
+            "actor": "operator",
+            "rationale": "legacy run predates durable driver identity",
+            "evidenceGap": "controller record has no /driver/pid and no lstart"
         }),
     );
     assert_eq!(
@@ -1024,10 +1070,7 @@ fn all_manifest_tools_match_their_cli_counterparts() {
     let cli = env
         .forged(&["attention", "list", "--state", "all", "--limit", "25"])
         .1;
-    let tool = mcp.call_tool(
-        "attention_list",
-        envelope(json!({"state": "all", "limit": 25})),
-    );
+    let tool = mcp.call_tool("attention_list", json!({"state": "all", "limit": 25}));
     assert_subject_parity(&cli, &tool, "attention_list subject parity");
     assert_eq!(tool["operationId"], json!("op:attention_list:read"));
     assert_eq!(
@@ -1108,13 +1151,9 @@ fn all_manifest_tools_match_their_cli_counterparts() {
     let tool = mcp.call_tool(
         "run_revise_roster",
         json!({
-            "schemaVersion": 1,
-            "runId": "absent",
-            "params": {
-                "run": "absent",
-                "roster": "default",
-                "reason": "provider access changed"
-            }
+            "run": "absent",
+            "roster": "default",
+            "reason": "provider access changed"
         }),
     );
     assert_eq!(
@@ -1138,13 +1177,9 @@ fn all_manifest_tools_match_their_cli_counterparts() {
     let tool = mcp.call_tool(
         "run_accept_risk",
         json!({
-            "schemaVersion": 1,
-            "runId": "absent",
-            "params": {
-                "run": "absent",
-                "acceptedBy": "lead-agent",
-                "rationale": "known deployment boundary"
-            }
+            "run": "absent",
+            "acceptedBy": "lead-agent",
+            "rationale": "known deployment boundary"
         }),
     );
     assert_eq!(normalized(cli), normalized(tool), "run_accept_risk parity");
@@ -1164,12 +1199,8 @@ fn all_manifest_tools_match_their_cli_counterparts() {
     let tool = mcp.call_tool(
         "epic_preflight",
         json!({
-            "schemaVersion": 1,
-            "runId": "absent-epic",
-            "params": {
-                "epic": "absent-epic", "repo": "relative",
-                "baseRef": null, "profile": null, "roster": null, "rolling": false
-            }
+            "epic": "absent-epic", "repo": "relative",
+            "baseRef": null, "profile": null, "roster": null, "rolling": false
         }),
     );
     assert_eq!(normalized(cli), normalized(tool), "epic_preflight parity");
@@ -1195,26 +1226,16 @@ fn all_manifest_tools_match_their_cli_counterparts() {
     let tool = mcp.call_tool(
         "epic_start",
         json!({
-            "schemaVersion": 1,
             "idempotencyKey": "parity-epic-start",
-            "runId": "absent-epic",
-            "params": {
-                "epic": "absent-epic", "repo": "relative", "spec": "relative",
-                "baseRef": null, "profile": null, "roster": null
-            }
+            "epic": "absent-epic", "repo": "relative", "spec": "relative",
+            "baseRef": null, "profile": null, "roster": null
         }),
     );
     assert_eq!(normalized(cli), normalized(tool), "epic_start parity");
 
     for (subcommand, tool_name) in [("submit", "epic_submit"), ("status", "epic_status")] {
         let cli = env.forged(&["epic", subcommand, "--epic", "absent-epic"]).1;
-        let tool = mcp.call_tool(
-            tool_name,
-            json!({
-                "schemaVersion": 1, "runId": "absent-epic",
-                "params": {"epic": "absent-epic"}
-            }),
-        );
+        let tool = mcp.call_tool(tool_name, json!({"epic": "absent-epic"}));
         assert_eq!(normalized(cli), normalized(tool), "{tool_name} parity");
     }
     for (subcommand, tool_name) in [("pause", "epic_pause"), ("resume", "epic_resume")] {
@@ -1231,8 +1252,7 @@ fn all_manifest_tools_match_their_cli_counterparts() {
         let tool = mcp.call_tool(
             tool_name,
             json!({
-                "schemaVersion": 1, "runId": "absent-epic",
-                "params": {"epic": "absent-epic", "reason": "operator test"}
+                "epic": "absent-epic", "reason": "operator test"
             }),
         );
         assert_eq!(normalized(cli), normalized(tool), "{tool_name} parity");
@@ -1252,8 +1272,7 @@ fn all_manifest_tools_match_their_cli_counterparts() {
     let tool = mcp.call_tool(
         "epic_resolve",
         json!({
-            "schemaVersion": 1, "runId": "absent-epic",
-            "params": {"epic": "absent-epic", "child": "child-a", "note": "resolved"}
+            "epic": "absent-epic", "child": "child-a", "note": "resolved"
         }),
     );
     assert_eq!(normalized(cli), normalized(tool), "epic_resolve parity");
@@ -1273,11 +1292,8 @@ fn all_manifest_tools_match_their_cli_counterparts() {
     let tool = mcp.call_tool(
         "epic_revise_roster",
         json!({
-            "schemaVersion": 1, "runId": "absent-epic",
-            "params": {
-                "epic": "absent-epic", "roster": "default",
-                "reason": "provider access changed"
-            }
+            "epic": "absent-epic", "roster": "default",
+            "reason": "provider access changed"
         }),
     );
     assert_eq!(
@@ -1413,13 +1429,10 @@ fn all_manifest_tools_match_their_cli_counterparts() {
 
     // Session controls: missing durable state refuses identically.
     let cli = env.forged(&["session", "list", "--run", "absent"]).1;
-    let tool = mcp.call_tool(
-        "session_list",
-        json!({"schemaVersion": 1, "runId": "absent", "params": {"run": "absent"}}),
-    );
+    let tool = mcp.call_tool("session_list", json!({"run": "absent"}));
     assert_eq!(normalized(cli), normalized(tool), "session_list parity");
     let cli = env.forged(&["session", "list", "--id", "par-repository"]).1;
-    let tool = mcp.call_tool("session_list", envelope(json!({"id": "par-repository"})));
+    let tool = mcp.call_tool("session_list", json!({"id": "par-repository"}));
     assert_subject_parity(&cli, &tool, "session_list subject parity");
     assert_eq!(normalized(cli), normalized(tool), "session_list id parity");
 
@@ -1472,10 +1485,7 @@ fn all_manifest_tools_match_their_cli_counterparts() {
     );
 
     let cli = env.forged(&["session", "read", "--attempt", "1"]).1;
-    let tool = mcp.call_tool(
-        "session_read",
-        envelope(json!({"attempt": 1, "lines": 120})),
-    );
+    let tool = mcp.call_tool("session_read", json!({"attempt": 1, "lines": 120}));
     assert_eq!(normalized(cli), normalized(tool), "session_read parity");
 
     let cli = env
@@ -1493,13 +1503,9 @@ fn all_manifest_tools_match_their_cli_counterparts() {
     let tool = mcp.call_tool(
         "session_message",
         json!({
-            "schemaVersion": 1,
             "idempotencyKey": "op:session_message:par-mcp",
-            "runId": "absent",
-            "params": {
-                "run": "absent", "attempt": null, "message": "checkpoint",
-                "requestedBy": "operator"
-            }
+            "run": "absent", "attempt": null, "message": "checkpoint",
+            "requestedBy": "operator"
         }),
     );
     assert_eq!(normalized(cli), normalized(tool), "session_message parity");
@@ -1577,7 +1583,7 @@ fn all_manifest_tools_match_their_cli_counterparts() {
 
     // usage_report and events_tail: identical read-only envelopes.
     let cli = env.forged(&["usage"]).1;
-    let tool = mcp.call_tool("usage_report", envelope(json!({})));
+    let tool = mcp.call_tool("usage_report", json!({}));
     assert_eq!(normalized(cli), normalized(tool), "usage_report parity");
 
     let cli = env.forged(&["events", "--id", "par-repository"]).1;
@@ -1588,17 +1594,14 @@ fn all_manifest_tools_match_their_cli_counterparts() {
     // work_list: no selector and the exact repository selector are the same
     // shared operation on both surfaces.
     let cli = env.forged(&["work", "list"]).1;
-    let tool = mcp.call_tool("work_list", envelope(json!({})));
+    let tool = mcp.call_tool("work_list", json!({}));
     assert_subject_parity(&cli, &tool, "work_list subject parity");
     assert_eq!(tool["operationId"], json!("op:work_list:read"));
     assert_eq!(normalized(cli), normalized(tool), "work_list parity");
     let cli = env
         .forged(&["work", "list", "--repo", &repository, "--status", "open"])
         .1;
-    let tool = mcp.call_tool(
-        "work_list",
-        envelope(json!({"repo": repository, "status": "open"})),
-    );
+    let tool = mcp.call_tool("work_list", json!({"repo": repository, "status": "open"}));
     assert_eq!(
         normalized(cli),
         normalized(tool),
@@ -1626,13 +1629,10 @@ fn all_manifest_tools_match_their_cli_counterparts() {
     let tool = mcp.call_tool(
         "work_note_add",
         json!({
-            "schemaVersion": 1,
             "idempotencyKey": "op:work_note_add:par-mcp",
-            "params": {
-                "id": "bead-par-repository",
-                "kind": "critique",
-                "bodyJson": r#"{"z":1,"a":2}"#,
-            },
+            "id": "bead-par-repository",
+            "kind": "critique",
+            "bodyJson": r#"{"z":1,"a":2}"#,
         }),
     );
     assert_eq!(normalized(cli), normalized(tool), "work_note_add parity");
@@ -1651,11 +1651,11 @@ fn all_manifest_tools_match_their_cli_counterparts() {
         .1;
     let tool = mcp.call_tool(
         "work_note_list",
-        envelope(json!({
+        json!({
             "id": "bead-par-repository",
             "kind": "critique",
             "limit": 25,
-        })),
+        }),
     );
     assert_eq!(tool["operationId"], json!("op:work_note_list:read"));
     assert_eq!(normalized(cli), normalized(tool), "work_note_list parity");
@@ -1674,11 +1674,11 @@ fn all_manifest_tools_match_their_cli_counterparts() {
         .1;
     let tool = mcp.call_tool(
         "work_update",
-        envelope(json!({
+        json!({
             "id": "absent-priority-update",
             "expectedRevision": 1,
             "priority": 2,
-        })),
+        }),
     );
     assert_eq!(
         normalized(cli),
@@ -1700,11 +1700,11 @@ fn all_manifest_tools_match_their_cli_counterparts() {
         .1;
     let tool = mcp.call_tool(
         "work_promote",
-        envelope(json!({
+        json!({
             "id": "absent-promote",
             "expectedRevision": 1,
             "description": "planned",
-        })),
+        }),
     );
     assert_eq!(normalized(cli), normalized(tool), "work_promote parity");
 
@@ -1721,7 +1721,7 @@ fn all_manifest_tools_match_their_cli_counterparts() {
         .1;
     let tool = mcp.call_tool(
         "work_ready",
-        envelope(json!({"repo": repository, "detail": "full", "limit": 25})),
+        json!({"repo": repository, "detail": "full", "limit": 25}),
     );
     assert_subject_parity(&cli, &tool, "work_ready subject parity");
     assert_eq!(tool["operationId"], json!("op:work_ready:read"));
@@ -1756,7 +1756,7 @@ fn all_manifest_tools_match_their_cli_counterparts() {
     // doctor: probe details are timing-dependent; the shape (names + ok
     // flags) must match.
     let cli = env.forged(&["doctor"]).1;
-    let tool = mcp.call_tool("doctor", envelope(json!({})));
+    let tool = mcp.call_tool("doctor", json!({}));
     assert_eq!(doctor_shape(&cli), doctor_shape(&tool), "doctor parity");
     assert_eq!(cli["operationId"], json!("op:doctor:read"));
     assert_eq!(tool["operationId"], json!("op:doctor:read"));
@@ -1781,7 +1781,7 @@ fn worktree_retire_matches_over_cli_and_mcp() {
     let mcp_env = TestEnv::new("forged-worktree-retire-mcp-parity");
     mcp_env.forged(&["init"]);
     fabricate_run(&mcp_env, RUN);
-    let mut mcp = McpClient::new(&mcp_env);
+    let mut mcp = McpClient::new(&mcp_env, Some("all"));
     let missing_key = mcp.call_tool_result(
         "worktree_retire",
         envelope(json!({"run": RUN, "force": false, "runStateTerminal": false})),
@@ -1826,7 +1826,7 @@ fn gate_run_rejects_conflicting_mcp_run_aliases_without_effects() {
     let artifacts = env.anvil.join("runs").join(TARGET).join("artifacts");
     assert!(!artifacts.exists(), "fixture starts without gate artifacts");
 
-    let mut mcp = McpClient::new(&env);
+    let mut mcp = McpClient::new(&env, Some("all"));
     let response = mcp.call_tool(
         "gate_run",
         json!({
@@ -1879,7 +1879,7 @@ fn worktree_retire_rejects_conflicting_mcp_run_aliases_without_effects() {
     let dirty = env.worktree(TARGET).join("uncommitted.txt");
     std::fs::write(&dirty, "must survive\n").expect("write dirty fixture");
 
-    let mut mcp = McpClient::new(&env);
+    let mut mcp = McpClient::new(&env, Some("all"));
     let response = mcp.call_tool(
         "worktree_retire",
         json!({
@@ -1924,7 +1924,7 @@ fn worktree_retire_rejects_conflicting_mcp_run_aliases_without_effects() {
 fn overview_refuses_wrong_typed_paging_at_the_transport() {
     let env = TestEnv::new("forged-overview-params");
     env.forged(&["init"]);
-    let mut mcp = McpClient::new(&env);
+    let mut mcp = McpClient::new(&env, Some("all"));
 
     for params in [
         json!({"run": "absent", "after": "5"}),
@@ -1985,13 +1985,12 @@ fn work_filters_refuse_present_non_string_values() {
     let env = TestEnv::new("forged-work-list-mcp-params");
     env.forged(&["init"]);
     fabricate_run(&env, "mcp-repository-widening-guard");
-    let mut mcp = McpClient::new(&env);
+    let mut mcp = McpClient::new(&env, Some("all"));
 
     for field in ["repo", "status", "assignee"] {
         for value in [Value::Null, json!(7), json!({"value": "wrong"})] {
             let params = serde_json::Map::from_iter([(field.to_owned(), value.clone())]);
-            let refusal = mcp
-                .call_tool_error_result("work_list", json!({"schemaVersion": 1, "params": params}));
+            let refusal = mcp.call_tool_error_result("work_list", Value::Object(params));
             let text = refusal
                 .pointer("/content/0/text")
                 .and_then(Value::as_str)
@@ -2009,20 +2008,13 @@ fn work_filters_refuse_present_non_string_values() {
 }
 
 #[test]
-fn split_inventory_tools_refuse_unknown_fields_at_both_schema_boundaries() {
+fn flat_and_enveloped_typed_tools_refuse_unknown_fields() {
     let env = TestEnv::new("forged-split-app-unknown-fields");
     env.forged(&["init"]);
-    let mut mcp = McpClient::new(&env);
+    let mut mcp = McpClient::new(&env, Some("all"));
 
     for (tool, arguments) in [
-        (
-            "work_list",
-            json!({"schemaVersion": 1, "unexpected": true, "params": {}}),
-        ),
-        (
-            "work_list",
-            json!({"schemaVersion": 1, "params": {"unexpected": true}}),
-        ),
+        ("work_list", json!({"unexpected": true})),
         (
             "operations_overview",
             json!({"schemaVersion": 1, "unexpected": true, "params": {}}),
@@ -2031,14 +2023,7 @@ fn split_inventory_tools_refuse_unknown_fields_at_both_schema_boundaries() {
             "operations_overview",
             json!({"schemaVersion": 1, "params": {"unexpected": true}}),
         ),
-        (
-            "attention_list",
-            json!({"schemaVersion": 1, "unexpected": true, "params": {}}),
-        ),
-        (
-            "attention_list",
-            json!({"schemaVersion": 1, "params": {"unexpected": true}}),
-        ),
+        ("attention_list", json!({"unexpected": true})),
         (
             "work_detail",
             json!({"schemaVersion": 1, "unexpected": true, "params": {"subjectKind": "run", "subjectId": "absent"}}),
@@ -2068,7 +2053,7 @@ fn split_inventory_tools_refuse_unknown_fields_at_both_schema_boundaries() {
 fn split_app_tools_refuse_malformed_typed_targets_before_dispatch() {
     let env = TestEnv::new("forged-split-app-mcp-params");
     env.forged(&["init"]);
-    let mut mcp = McpClient::new(&env);
+    let mut mcp = McpClient::new(&env, Some("all"));
 
     for params in [
         json!({"repo": null}),
@@ -2118,10 +2103,7 @@ fn split_app_tools_refuse_malformed_typed_targets_before_dispatch() {
         json!({"classification": "root-cause"}),
         json!({"limit": "25"}),
     ] {
-        let refusal = mcp.call_tool_error_result(
-            "attention_list",
-            json!({"schemaVersion": 1, "params": params.clone()}),
-        );
+        let refusal = mcp.call_tool_error_result("attention_list", params.clone());
         let text = refusal
             .pointer("/content/0/text")
             .and_then(Value::as_str)

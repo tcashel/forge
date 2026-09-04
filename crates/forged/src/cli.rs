@@ -124,7 +124,11 @@ pub enum Command {
         command: WorktreeCmd,
     },
     /// Serve MCP over stdio (prints no envelope).
-    Mcp,
+    Mcp {
+        /// Filter tools/list by intended audience; calls remain unrestricted.
+        #[arg(long, value_enum, default_value_t = McpAudienceArg::Lead)]
+        audience: McpAudienceArg,
+    },
     /// Regenerate the committed operation-surface reference artifacts.
     #[command(name = "generate-surface-manifest", hide = true)]
     GenerateSurfaceManifest,
@@ -137,6 +141,16 @@ pub enum NextSectionArg {
     Running,
     Ready,
     Landed,
+}
+
+/// MCP discovery audience. `all` is a server listing mode, not a manifest
+/// audience assignment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum McpAudienceArg {
+    Lead,
+    Machine,
+    Operator,
+    All,
 }
 
 impl NextSectionArg {
@@ -2110,7 +2124,7 @@ pub fn command_name(command: &Command) -> &'static str {
         Command::Worktree { command } => match command {
             WorktreeCmd::Retire(_) => "worktree_retire",
         },
-        Command::Mcp => "mcp",
+        Command::Mcp { .. } => "mcp",
         Command::GenerateSurfaceManifest => "generate_surface_manifest",
     }
 }
@@ -3165,7 +3179,7 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
                 ),
             ),
         },
-        Command::Mcp => unreachable!("mcp is handled before request mapping"),
+        Command::Mcp { .. } => unreachable!("mcp is handled before request mapping"),
         Command::GenerateSurfaceManifest => {
             unreachable!("surface generation is handled before runtime initialization")
         }

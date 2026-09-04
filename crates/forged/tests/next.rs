@@ -209,7 +209,7 @@ fn next_is_the_bare_piped_default_and_cli_mcp_results_match() {
         })
     );
 
-    let mut mcp = McpClient::new(&env);
+    let mut mcp = McpClient::new(&env, None);
     let next_tool = mcp.tool("next");
     assert_eq!(next_tool.pointer("/_meta/audience"), Some(&json!("lead")));
     assert_eq!(
@@ -217,7 +217,7 @@ fn next_is_the_bare_piped_default_and_cli_mcp_results_match() {
         Some(&json!(true))
     );
     assert!(next_tool.pointer("/_meta/ui/resourceUri").is_none());
-    let mut through_mcp = mcp.call_tool("next", json!({"params": {}}));
+    let mut through_mcp = mcp.call_tool("next", json!({}));
     let mut through_cli = explicit;
     through_mcp["result"]
         .as_object_mut()

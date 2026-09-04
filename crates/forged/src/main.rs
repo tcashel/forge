@@ -159,8 +159,8 @@ async fn run(mut args: cli::Cli) -> i32 {
         // The MCP surface never creates operator state: a host handshake is
         // not operator intent, so the ledger (and legacy-state migration)
         // opens lazily inside the tool-call gate, never here.
-        cli::Command::Mcp => {
-            return match mcp::serve(config).await {
+        cli::Command::Mcp { audience } => {
+            return match mcp::serve(config, audience).await {
                 Ok(()) => 0,
                 Err(message) => {
                     eprintln!("forged: {message}");

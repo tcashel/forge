@@ -221,7 +221,7 @@ fn an_ambiguous_prefix_lists_what_could_have_been_meant() {
 fn mixed_half_or_absent_addressing_is_refused_identically_everywhere() {
     let env = TestEnv::new("forged-detail-resolve-refusals");
     env.forged(&["init"]);
-    let mut mcp = McpClient::new(&env);
+    let mut mcp = McpClient::new(&env, None);
 
     for (cli_args, params) in [
         (

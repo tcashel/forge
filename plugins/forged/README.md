@@ -11,6 +11,56 @@ terminal cockpit without copying the skills or adding another state store. The
 shared router also projects the bounded operator portfolio and invokes landed,
 target-scoped controls.
 
+## Lead MCP tools
+
+The default `forged mcp` listing is the manifest's lead audience:
+
+- `attention_acknowledge`
+- `attention_list`
+- `attention_reopen`
+- `attention_resolve`
+- `definition_validate`
+- `doctor`
+- `epic_abandon`
+- `epic_pause`
+- `epic_preflight`
+- `epic_resolve`
+- `epic_resume`
+- `epic_revise_policy`
+- `epic_revise_roster`
+- `epic_start`
+- `epic_status`
+- `epic_submit`
+- `explain`
+- `next`
+- `run_accept_risk`
+- `run_adjudicate_settlement`
+- `run_retry`
+- `run_revise_policy`
+- `run_revise_roster`
+- `run_start`
+- `run_status`
+- `run_stop`
+- `run_submit`
+- `session_list`
+- `session_message`
+- `session_read`
+- `usage_report`
+- `work_close`
+- `work_create`
+- `work_link`
+- `work_list`
+- `work_note_add`
+- `work_note_list`
+- `work_promote`
+- `work_ready`
+- `work_release`
+- `work_reopen`
+- `work_revert`
+- `work_show`
+- `work_supersede`
+- `work_update`
+
 ## Ownership
 
 - **Lead agent/plugin:** conversation, planning, critique, adjudication,

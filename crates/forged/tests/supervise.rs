@@ -946,11 +946,8 @@ fn nonrecoverable_terminal_halts_without_charging_the_budget() {
             "reason": "omit the idempotency key so forged can mint the next controller generation",
         })
     );
-    let mut mcp = McpClient::new(&env);
-    let resubmitted = mcp.call_tool(
-        "run_submit",
-        json!({"schemaVersion": 1, "params": remedy["args"]}),
-    );
+    let mut mcp = McpClient::new(&env, None);
+    let resubmitted = mcp.call_tool("run_submit", remedy["args"].clone());
     assert_eq!(
         resubmitted["ok"],
         json!(true),
