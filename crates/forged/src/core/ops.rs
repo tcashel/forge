@@ -5390,6 +5390,17 @@ fn next_section_page(values: &[Value], limit: usize) -> Vec<Value> {
     values.iter().take(limit).cloned().collect()
 }
 
+fn next_default_limits(totals: [usize; 4], symptoms: Option<usize>) -> ([usize; 4], usize) {
+    let mut limits = [0usize; 4];
+    let mut remaining = NEXT_DEFAULT_LIMIT;
+    for (index, total) in totals.iter().copied().enumerate() {
+        limits[index] = total.min(remaining);
+        remaining = remaining.saturating_sub(limits[index]);
+    }
+    let symptom_limit = symptoms.map_or(0, |total| total.min(remaining));
+    (limits, symptom_limit)
+}
+
 fn next_coverage(shown: usize, total: usize) -> Value {
     json!({
         "shown": shown,
@@ -5574,11 +5585,17 @@ pub async fn next(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
                 .map(str::to_owned)
             })
             .collect::<BTreeSet<_>>();
+        let ready_total = usize::try_from(ready_page.total).unwrap_or(usize::MAX);
         let ready_items = ready_page
             .items
             .into_iter()
             .filter(|item| epic_id.is_none() || scoped_work_ids.contains(&item.work_id))
             .collect::<Vec<_>>();
+        let ready_total = if epic_id.is_some() {
+            ready_items.len()
+        } else {
+            ready_total
+        };
         let ready_ids = ready_items
             .iter()
             .map(|item| item.work_id.clone())
@@ -5626,13 +5643,9 @@ pub async fn next(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
             .collect::<Result<Vec<_>, _>>()?;
         landed.sort_by(|left, right| left["ageMin"].as_u64().cmp(&right["ageMin"].as_u64()));
 
-        let totals = [decisions.len(), running.len(), ready.len(), landed.len()];
-        let mut default_limits = [0usize; 4];
-        let mut remaining = NEXT_DEFAULT_LIMIT;
-        for (index, total) in totals.iter().copied().enumerate() {
-            default_limits[index] = total.min(remaining);
-            remaining = remaining.saturating_sub(default_limits[index]);
-        }
+        let totals = [decisions.len(), running.len(), ready_total, landed.len()];
+        let (mut default_limits, symptom_limit) =
+            next_default_limits(totals, include_symptoms.then_some(symptoms.len()));
         if let Some(section) = section {
             let index = match section {
                 NextSection::Decisions => 0,
@@ -5647,7 +5660,7 @@ pub async fn next(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
         let ready_rows = next_section_page(&ready, default_limits[2]);
         let landed_rows = next_section_page(&landed, default_limits[3]);
         let symptom_rows = if include_symptoms {
-            next_section_page(&symptoms, NEXT_DEFAULT_LIMIT)
+            next_section_page(&symptoms, symptom_limit)
         } else {
             Vec::new()
         };
@@ -5667,10 +5680,10 @@ pub async fn next(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
             sections["symptoms"] = Value::Array(symptom_rows.clone());
         }
         let mut coverage_sections = json!({
-            "decisions": next_coverage(default_limits[0], totals[0]),
-            "running": next_coverage(default_limits[1], totals[1]),
-            "ready": next_coverage(default_limits[2], totals[2]),
-            "landed": next_coverage(default_limits[3], totals[3]),
+            "decisions": next_coverage(decision_rows.len(), totals[0]),
+            "running": next_coverage(running_rows.len(), totals[1]),
+            "ready": next_coverage(ready_rows.len(), totals[2]),
+            "landed": next_coverage(landed_rows.len(), totals[3]),
         });
         if include_symptoms {
             coverage_sections["symptoms"] = next_coverage(symptom_rows.len(), symptoms.len());
@@ -6794,7 +6807,7 @@ mod tests {
     use forged_types::{ExecutionPolicyV1, HostPolicyV1, Stage};
     use serde_json::{json, Value};
 
-    use super::{next_spend, next_title, next_within_last_day, splice_policy};
+    use super::{next_default_limits, next_spend, next_title, next_within_last_day, splice_policy};
 
     #[test]
     fn next_spend_is_known_only_when_every_matching_usage_row_is_costed() {
@@ -6811,6 +6824,19 @@ mod tests {
         let mut missing = entries;
         missing[1]["rowsMissingCost"] = json!(1);
         assert_eq!(next_spend(&missing, "epic-1", "epic"), Value::Null);
+    }
+
+    #[test]
+    fn next_symptoms_share_the_default_global_row_budget() {
+        assert_eq!(
+            next_default_limits([10, 2, 0, 3], Some(47)),
+            ([10, 2, 0, 3], 15)
+        );
+        assert_eq!(
+            next_default_limits([30, 2, 0, 3], Some(47)),
+            ([30, 0, 0, 0], 0)
+        );
+        assert_eq!(next_default_limits([10, 2, 0, 3], None), ([10, 2, 0, 3], 0));
     }
 
     #[test]

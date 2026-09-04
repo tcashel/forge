@@ -161,7 +161,10 @@ fn render_next(result: &Value, now: &str) -> String {
             .unwrap_or(rows.len() as u64);
         push_line(
             &mut lines,
-            format!("\n{}  {shown}/{total}", section.to_ascii_uppercase()),
+            format!(
+                "\n{}  {shown} of {total} shown",
+                section.to_ascii_uppercase()
+            ),
         );
         if rows.is_empty() {
             lines.push("  —".to_owned());
@@ -178,7 +181,10 @@ fn render_next(result: &Value, now: &str) -> String {
             .pointer("/coverage/sections/symptoms/total")
             .and_then(Value::as_u64)
             .unwrap_or(rows.len() as u64);
-        push_line(&mut lines, format!("\nSYMPTOMS  {}/{total}", rows.len()));
+        push_line(
+            &mut lines,
+            format!("\nSYMPTOMS  {} of {total} shown", rows.len()),
+        );
         for row in rows {
             render_next_row(&mut lines, "symptoms", row);
         }
@@ -202,36 +208,79 @@ fn render_next_row(lines: &mut Vec<String>, section: &str, row: &Value) {
     let id = row.get("id").and_then(Value::as_str).unwrap_or("unknown");
     let title = row.get("title").and_then(Value::as_str).unwrap_or("");
     let state = scalar(row.get("state").unwrap_or(&Value::Null));
-    push_line(lines, format!("  {id}  {state}  {title}"));
-    let mut detail = format!(
-        "    age {}m  lifecycle {}",
-        row.get("ageMin").and_then(Value::as_u64).unwrap_or(0),
-        row.get("lifecycle")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown")
+    let should = row.get("should").filter(|value| !value.is_null());
+    let verb = should
+        .and_then(|action| action.get("verb"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    push_columns(
+        lines,
+        format!("  {id}  {state}  {title}"),
+        (!verb.is_empty()).then(|| format!("should {verb}")),
     );
-    if matches!(section, "decisions" | "running") {
-        detail.push_str("  spend ");
-        detail.push_str(
-            &row.get("spendUsd")
-                .and_then(Value::as_f64)
-                .map(|value| format!("${value:.2}"))
-                .unwrap_or_else(|| "unknown".to_owned()),
-        );
+
+    let age = row.get("ageMin").and_then(Value::as_u64).unwrap_or(0);
+    let lifecycle = row
+        .get("lifecycle")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let spend = || {
+        row.get("spendUsd")
+            .and_then(Value::as_f64)
+            .map(|value| format!("${value:.2}"))
+            .unwrap_or_else(|| "unknown".to_owned())
+    };
+    match section {
+        "running" => {
+            let stage = scalar(row.get("stage").unwrap_or(&Value::Null));
+            let seat = scalar(row.get("seat").unwrap_or(&Value::Null));
+            push_line(lines, format!("    stage {stage}  seat {seat}"));
+            push_line(
+                lines,
+                format!("    age {age}m  lifecycle {lifecycle}  spend {}", spend()),
+            );
+        }
+        "ready" => {
+            push_line(lines, format!("    age {age}m  lifecycle {lifecycle}"));
+            push_line(
+                lines,
+                format!(
+                    "    basis {}",
+                    row.get("basis")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
+                ),
+            );
+        }
+        "landed" => {
+            let pr = row.get("pr").map(scalar).unwrap_or_else(|| "—".to_owned());
+            let pr = if pr == "—" { pr } else { format!("#{pr}") };
+            push_line(
+                lines,
+                format!("    age {age}m  lifecycle {lifecycle}  pr {pr}"),
+            );
+        }
+        "decisions" => push_line(
+            lines,
+            format!("    age {age}m  lifecycle {lifecycle}  spend {}", spend()),
+        ),
+        _ => push_line(lines, format!("    age {age}m  lifecycle {lifecycle}")),
     }
-    push_line(lines, detail);
-    if let Some(should) = row.get("should").filter(|value| !value.is_null()) {
-        let verb = should.get("verb").and_then(Value::as_str).unwrap_or("");
+
+    if let Some(should) = should {
         let args = should
             .get("args")
             .and_then(Value::as_object)
             .map(format_args)
             .unwrap_or_default();
         let can = row.get("canCount").and_then(Value::as_u64).unwrap_or(0);
-        push_line(
-            lines,
-            format!("    should: forged {verb}{args}  (+{can} can)"),
-        );
+        push_line(lines, format!("    args:{args}  (+{can} can)"));
+    } else if let Some(can) = row
+        .get("canCount")
+        .and_then(Value::as_u64)
+        .filter(|can| *can > 0)
+    {
+        push_line(lines, format!("    {can} can action(s)"));
     }
 }
 
@@ -305,6 +354,31 @@ fn push_line(lines: &mut Vec<String>, line: String) {
     }
 }
 
+fn push_columns(lines: &mut Vec<String>, left: String, right: Option<String>) {
+    let Some(right) = right else {
+        push_line(lines, left);
+        return;
+    };
+    let right_width = right.chars().count();
+    if right_width + 3 >= WIDTH {
+        push_line(lines, left);
+        push_line(lines, format!("    {right}"));
+        return;
+    }
+    let left_limit = WIDTH - right_width - 2;
+    let left_was_truncated = left.chars().count() > left_limit;
+    let mut left = left.chars().take(left_limit).collect::<String>();
+    if left_was_truncated {
+        let mut chars = left.chars().collect::<Vec<_>>();
+        if let Some(last) = chars.last_mut() {
+            *last = '…';
+        }
+        left = chars.into_iter().collect();
+    }
+    let padding = WIDTH - left.chars().count() - right_width;
+    lines.push(format!("{left}{}{right}", " ".repeat(padding)));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -336,14 +410,31 @@ mod tests {
                         "should": {"verb": "epic resolve", "args": {"id": "ore-080"}},
                         "canCount": 1
                     }],
-                    "running": [], "ready": [], "landed": []
+                    "running": [{
+                        "id": "run-1", "title": "Build the bounded surface",
+                        "state": "implementation", "stage": "implementation",
+                        "seat": "codex:worker-1", "ageMin": 7,
+                        "spendUsd": 0.5, "lifecycle": "running",
+                        "should": null, "canCount": 0
+                    }],
+                    "ready": [{
+                        "id": "ore-081", "title": "Follow-up slice", "state": "open",
+                        "ageMin": 3, "lifecycle": "critiqued",
+                        "basis": "recommendation note exists; adjudicated: unknown-until-.8",
+                        "should": null, "canCount": 0
+                    }],
+                    "landed": [{
+                        "id": "run-2", "title": "Finished slice", "state": "landed",
+                        "ageMin": 60, "lifecycle": "landed", "pr": 258,
+                        "should": null, "canCount": 0
+                    }]
                 },
                 "hidden": {"symptoms": 47, "parked": 2},
                 "coverage": {"sections": {
                     "decisions": {"shown": 1, "total": 1},
-                    "running": {"shown": 0, "total": 0},
-                    "ready": {"shown": 0, "total": 0},
-                    "landed": {"shown": 0, "total": 0}
+                    "running": {"shown": 1, "total": 2},
+                    "ready": {"shown": 1, "total": 1},
+                    "landed": {"shown": 1, "total": 3}
                 }}
             })),
             false,

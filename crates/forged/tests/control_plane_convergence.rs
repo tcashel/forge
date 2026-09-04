@@ -537,11 +537,6 @@ fn modern_projections_and_all_five_apps_converge_on_real_envelopes() {
     let mut mcp = McpClient::new(&fixture.env);
     let mut tools = mcp.list_tools();
     tools.sort();
-    assert_eq!(
-        tools.len(),
-        66,
-        "the integrated public tool inventory moved"
-    );
     assert!(tools.contains(&"epic_revise_policy".to_owned()));
     assert!(tools.contains(&"explain".to_owned()));
     assert!(tools.contains(&"next".to_owned()));

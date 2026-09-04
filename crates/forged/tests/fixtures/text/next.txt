@@ -1,17 +1,22 @@
 NEXT  portfolio  2026-09-03T12:00:00Z
 
-DECISIONS  1/1
-  ore-080  awaiting_operator  Choose the release
+DECISIONS  1 of 1 shown
+  ore-080  awaiting_operator  Choose the release             should epic resolve
     age 12m  lifecycle reviewed  spend $1.25
-    should: forged epic resolve --id ore-080  (+1 can)
+    args: --id ore-080  (+1 can)
 
-RUNNING  0/0
-  —
+RUNNING  1 of 2 shown
+  run-1  implementation  Build the bounded surface
+    stage implementation  seat codex:worker-1
+    age 7m  lifecycle running  spend $0.50
 
-READY  0/0
-  —
+READY  1 of 1 shown
+  ore-081  open  Follow-up slice
+    age 3m  lifecycle critiqued
+    basis recommendation note exists; adjudicated: unknown-until-.8
 
-LANDED  0/0
-  —
+LANDED  1 of 3 shown
+  run-2  landed  Finished slice
+    age 60m  lifecycle landed  pr #258
 
 HIDDEN  symptoms 47  parked 2
