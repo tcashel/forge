@@ -10,6 +10,7 @@ use std::process::Stdio;
 use forged_ledger::{
     NewWorkItem, NewWorkNote, WorkKind, WorkNoteKind, WorkRevisionCause, WorkSpecFields, WorkStatus,
 };
+use forged_types::canonical_json_bytes;
 use serde_json::{json, Value};
 use support::TestEnv;
 
@@ -793,6 +794,10 @@ fn work_notes_round_trip_canonically_without_minting_revisions() {
     let shown = result(&env, &["work", "show", "--id", "noted-work"]);
     assert_eq!(shown["notesCount"], json!(3));
     assert_eq!(
+        shown["noteCounts"],
+        json!({"approval": 1, "comment": 1, "critique": 1})
+    );
+    assert_eq!(
         shown["work"]["revision"],
         json!(1),
         "annotations and close-time evidence never mint revisions"
@@ -887,6 +892,216 @@ fn recommendation_notes_round_trip_the_closed_v1_contract() {
     )
     .expect("listed body is JSON");
     assert_eq!(listed_body, body);
+}
+
+#[test]
+fn lifecycle_notes_round_trip_their_closed_v1_contracts() {
+    let env = TestEnv::new("forged-lifecycle-note-v1");
+    assert_eq!(env.forged(&["init"]).0, 0);
+    result(
+        &env,
+        &[
+            "work",
+            "create",
+            "--id",
+            "lifecycle-work",
+            "--title",
+            "Lifecycle work",
+        ],
+    );
+    let body_path = env.root.join("lifecycle-note.json");
+    let body_file = body_path.to_str().expect("UTF-8 body path");
+    let cases = [
+        (
+            "adjudication",
+            "forged.adjudication/1",
+            json!({
+                "schema": "forged.adjudication/1",
+                "revision": 1,
+                "workItem": "lifecycle-work",
+                "critiquedRevision": 1,
+                "recommendationNoteId": "note-recommendation",
+                "resultingRevision": 1,
+                "dispositions": [
+                    {
+                        "ref": {"noteId": "note-recommendation", "index": 0},
+                        "disposition": "adapt",
+                        "reason": "narrow the proposed change"
+                    },
+                    {
+                        "ref": {"noteId": "note-recommendation", "cruxId": "CRUX-1"},
+                        "disposition": "accept",
+                        "reason": "the operator chose option A"
+                    }
+                ],
+                "cruxes": [{
+                    "id": "CRUX-1",
+                    "choice": "option-a",
+                    "rationale": "it preserves the ledger boundary"
+                }],
+                "adjudicatedAt": "2026-09-03T12:00:00Z",
+                "actor": "operator"
+            }),
+        ),
+        (
+            "decision",
+            "forged.decision/1",
+            json!({
+                "schema": "forged.decision/1",
+                "revision": 1,
+                "kind": "approval",
+                "subject": {"kind": "work", "id": "lifecycle-work"},
+                "choice": "dispatch",
+                "rationale": "the exact execution tuple is approved",
+                "actor": "operator",
+                "at": "2026-09-03T12:01:00Z",
+                "costMicrousdAtDecision": 1200,
+                "approval": {
+                    "repository": "/tmp/lifecycle-work",
+                    "baseRef": "main",
+                    "profile": "default",
+                    "roster": "default",
+                    "observedRevision": 1
+                }
+            }),
+        ),
+        (
+            "retro",
+            "forged.retro/1",
+            json!({
+                "schema": "forged.retro/1",
+                "revision": 1,
+                "epic": "ore-epic",
+                "worked": [{"item": "bounded work", "evidenceIds": ["note-1"]}],
+                "cost": [
+                    {"item": "known", "evidenceIds": ["usage-1"], "microusd": 1200},
+                    {"item": "unknown", "evidenceIds": [], "microusd": null}
+                ],
+                "ranked": [{"rank": 1, "item": "keep", "evidenceIds": ["note-1"]}],
+                "at": "2026-09-03T12:02:00Z",
+                "actor": "lead-agent"
+            }),
+        ),
+    ];
+
+    for (kind, schema, body) in cases {
+        std::fs::write(
+            &body_path,
+            serde_json::to_vec_pretty(&body).expect("serialize lifecycle note"),
+        )
+        .expect("write lifecycle note");
+        let added = result(
+            &env,
+            &[
+                "work",
+                "note",
+                "add",
+                "--id",
+                "lifecycle-work",
+                "--kind",
+                kind,
+                "--schema",
+                schema,
+                "--body-file",
+                body_file,
+            ],
+        );
+        assert_eq!(added["note"]["kind"], json!(kind));
+        assert_eq!(added["note"]["schema"], json!(schema));
+        assert_eq!(added["note"]["revision"], json!(1));
+        let canonical = String::from_utf8(canonical_json_bytes(&body).expect("canonical body"))
+            .expect("UTF-8 canonical body");
+        assert_eq!(added["note"]["bodyJson"], json!(canonical));
+
+        let listed = result(
+            &env,
+            &[
+                "work",
+                "note",
+                "list",
+                "--id",
+                "lifecycle-work",
+                "--kind",
+                kind,
+            ],
+        );
+        assert_eq!(listed["totals"], json!({"shown": 1, "total": 1}));
+        assert_eq!(listed["notes"][0], added["note"]);
+    }
+
+    let shown = result(&env, &["work", "show", "--id", "lifecycle-work"]);
+    assert_eq!(shown["notesCount"], json!(3));
+    assert_eq!(
+        shown["noteCounts"],
+        json!({"adjudication": 1, "decision": 1, "retro": 1})
+    );
+}
+
+#[test]
+fn lifecycle_note_refusals_name_numeric_and_captured_revision_fields() {
+    let env = TestEnv::new("forged-lifecycle-note-refusals");
+    assert_eq!(env.forged(&["init"]).0, 0);
+    result(
+        &env,
+        &[
+            "work",
+            "create",
+            "--id",
+            "lifecycle-refusal",
+            "--title",
+            "Lifecycle refusal",
+        ],
+    );
+    let body = env.root.join("lifecycle-refusal.json");
+    let body_path = body.to_str().expect("UTF-8 body path");
+
+    std::fs::write(
+        &body,
+        r#"{"schema":"forged.retro/1","epic":"ore-epic","worked":[],"cost":[],"ranked":[{"rank":1.5,"item":"bad","evidenceIds":[]}],"at":"2026-09-03T12:00:00Z","actor":"operator"}"#,
+    )
+    .expect("write non-integer retro");
+    let (code, malformed) = env.forged(&[
+        "work",
+        "note",
+        "add",
+        "--id",
+        "lifecycle-refusal",
+        "--kind",
+        "retro",
+        "--body-file",
+        body_path,
+    ]);
+    assert_ne!(code, 0, "non-integer rank was accepted: {malformed}");
+    assert!(
+        malformed["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("ranked[0].rank")),
+        "numeric refusal names its field: {malformed}"
+    );
+
+    std::fs::write(
+        &body,
+        r#"{"schema":"forged.decision/1","revision":2,"kind":"park","subject":{"kind":"work","id":"lifecycle-refusal"},"choice":"park","rationale":"wait","actor":"operator","at":"2026-09-03T12:00:00Z"}"#,
+    )
+    .expect("write stale revision decision");
+    let (code, stale) = env.forged(&[
+        "work",
+        "note",
+        "add",
+        "--id",
+        "lifecycle-refusal",
+        "--kind",
+        "decision",
+        "--body-file",
+        body_path,
+    ]);
+    assert_ne!(code, 0, "stale revision was accepted: {stale}");
+    assert!(
+        stale["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("field revision")),
+        "revision refusal names its field: {stale}"
+    );
 }
 
 #[test]

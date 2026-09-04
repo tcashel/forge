@@ -15,8 +15,9 @@ use forged_ledger::{
     WORK_NOTE_DEFAULT_LIMIT, WORK_NOTE_MAX_LIMIT,
 };
 use forged_types::{
-    canonical_json_bytes, parse_canonical, request_sha256, ErrorCode, ExecutionApprovalV1,
-    OperationRequest, OperationResponse, SpecRecommendationsV1, EXECUTION_APPROVAL_SCHEMA_V1,
+    canonical_json_bytes, parse_canonical, request_sha256, AdjudicationV1, DecisionV1, ErrorCode,
+    ExecutionApprovalV1, OperationRequest, OperationResponse, RetroV1, SpecRecommendationsV1,
+    ADJUDICATION_SCHEMA_V1, DECISION_SCHEMA_V1, EXECUTION_APPROVAL_SCHEMA_V1, RETRO_SCHEMA_V1,
     SPEC_RECOMMENDATIONS_SCHEMA_V1,
 };
 use serde_json::{json, Value};
@@ -259,7 +260,8 @@ fn actor_of(params: &serde_json::Map<String, Value>) -> Result<String, Failure> 
 fn work_note_kind(value: &str) -> Result<WorkNoteKind, Failure> {
     WorkNoteKind::parse(value).ok_or_else(|| {
         Failure::invalid(format!(
-            "work note kind {value:?} is not one of comment, critique, recommendation, approval"
+            "work note kind {value:?} is not one of comment, critique, recommendation, approval, \
+             adjudication, decision, retro"
         ))
     })
 }
@@ -277,32 +279,35 @@ fn work_note_wire_string(
     }
 }
 
-fn canonical_work_note_body(
-    params: &serde_json::Map<String, Value>,
-) -> Result<(Value, String), Failure> {
+fn parse_work_note_body(params: &serde_json::Map<String, Value>) -> Result<Value, Failure> {
     let raw = work_note_wire_string(params, "bodyJson")?
         .ok_or_else(|| Failure::invalid("bodyJson is required: pass JSON from --body-file"))?;
-    let value = parse_canonical(&raw).map_err(|error| {
+    parse_canonical(&raw).map_err(|error| {
+        Failure::invalid(format!(
+            "work note bodyJson must be JSON without duplicate keys or non-integer numbers: \
+             {error}"
+        ))
+    })
+}
+
+fn canonical_work_note_body(value: &Value) -> Result<String, Failure> {
+    let bytes = canonical_json_bytes(value).map_err(|error| {
         Failure::invalid(format!(
             "work note bodyJson must be JSON without duplicate keys or non-integer numbers: \
              {error}"
         ))
     })?;
-    let bytes = canonical_json_bytes(&value).map_err(|error| {
-        Failure::invalid(format!(
-            "work note bodyJson must be JSON without duplicate keys or non-integer numbers: \
-             {error}"
-        ))
-    })?;
-    let body = String::from_utf8(bytes)
-        .map_err(|error| Failure::internal(format!("canonical bodyJson is not UTF-8: {error}")))?;
-    Ok((value, body))
+    String::from_utf8(bytes)
+        .map_err(|error| Failure::internal(format!("canonical bodyJson is not UTF-8: {error}")))
 }
 
 fn work_note_schema(kind: WorkNoteKind, supplied: Option<String>) -> Result<String, Failure> {
     let expected = match kind {
         WorkNoteKind::Recommendation => Some(SPEC_RECOMMENDATIONS_SCHEMA_V1),
         WorkNoteKind::Approval => Some(EXECUTION_APPROVAL_SCHEMA_V1),
+        WorkNoteKind::Adjudication => Some(ADJUDICATION_SCHEMA_V1),
+        WorkNoteKind::Decision => Some(DECISION_SCHEMA_V1),
+        WorkNoteKind::Retro => Some(RETRO_SCHEMA_V1),
         WorkNoteKind::Comment | WorkNoteKind::Critique => None,
     };
     match (expected, supplied) {
@@ -327,6 +332,9 @@ fn validate_work_note_contract(
             SpecRecommendationsV1::parse_value(body.clone()).map(|_| ())
         }
         WorkNoteKind::Approval => ExecutionApprovalV1::parse_value(body.clone()).map(|_| ()),
+        WorkNoteKind::Adjudication => AdjudicationV1::parse_value(body.clone()).map(|_| ()),
+        WorkNoteKind::Decision => DecisionV1::parse_value(body.clone()).map(|_| ()),
+        WorkNoteKind::Retro => RetroV1::parse_value(body.clone()).map(|_| ()),
         WorkNoteKind::Comment | WorkNoteKind::Critique => return Ok(()),
     };
     result.map_err(|error| {
@@ -640,10 +648,17 @@ pub async fn work_note_add(ctx: &Ctx, req: &mut OperationRequest) -> OperationRe
             )
         }
     };
-    let (body, body_json) = match canonical_work_note_body(&req.params) {
+    let body = match parse_work_note_body(&req.params) {
         Ok(body) => body,
         Err(error) => {
-            let error = if matches!(kind, WorkNoteKind::Recommendation | WorkNoteKind::Approval) {
+            let error = if matches!(
+                kind,
+                WorkNoteKind::Recommendation
+                    | WorkNoteKind::Approval
+                    | WorkNoteKind::Adjudication
+                    | WorkNoteKind::Decision
+                    | WorkNoteKind::Retro
+            ) {
                 Failure::invalid(format!(
                     "work note {:?} payload for schema {schema:?} violates field bodyJson: {}",
                     kind.as_str(),
@@ -664,6 +679,15 @@ pub async fn work_note_add(ctx: &Ctx, req: &mut OperationRequest) -> OperationRe
             &error,
         );
     }
+    let body_json = match canonical_work_note_body(&body) {
+        Ok(body) => body,
+        Err(error) => {
+            return err_response(
+                &derive_key("work_note_add", Some(&id), Some(kind.as_str()), None),
+                &error,
+            )
+        }
+    };
     let actor = match work_note_wire_string(&req.params, "actor") {
         Ok(actor) => actor.unwrap_or_else(|| "operator".to_owned()),
         Err(error) => {
@@ -1023,10 +1047,11 @@ pub async fn work_show(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
             let id = id.clone();
             on_ledger(&ctx.ledger, move |l| l.work_dependencies(&id)).await?
         };
-        let notes_count = {
+        let note_counts = {
             let id = id.clone();
-            on_ledger(&ctx.ledger, move |l| l.work_note_count(&id)).await?
+            on_ledger(&ctx.ledger, move |l| l.work_note_counts(&id)).await?
         };
+        let notes_count = note_counts.values().sum::<u64>();
         Ok(forged_types::with_work_twins(json!({
             "subject": {
                 "id": snapshot.work_id,
@@ -1038,6 +1063,7 @@ pub async fn work_show(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
             "work": snapshot,
             "dependencies": deps,
             "notesCount": notes_count,
+            "noteCounts": note_counts,
             "nextActions": projection_actions(&snapshot),
         })))
     })

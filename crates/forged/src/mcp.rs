@@ -537,7 +537,9 @@ pub enum WorkNoteKindParam {
     Comment,
     Critique,
     Recommendation,
-    Approval,
+    Adjudication,
+    Decision,
+    Retro,
 }
 
 /// Flat parameters for one immutable annotation.
@@ -1871,10 +1873,12 @@ impl ForgedServer {
         name = "work_note_add",
         description = "Append evidence about a work specification without changing its \
                        revision or coordination state. Arguments: id, kind (comment | critique | \
-                       recommendation | approval), bodyJson (raw JSON string); recommendation and \
-                       approval require their typed v1 payload and schema, while other omitted \
-                       schemas default to <kind>/0. actor defaults to operator. Duplicate keys and \
-                       non-integer numbers are refused. Closed work items are accepted."
+                       recommendation | adjudication | decision | retro), bodyJson (raw JSON \
+                       string); typed kinds require their v1 payload and schema, while other \
+                       omitted schemas default to <kind>/0. actor defaults to operator. Duplicate \
+                       keys and non-integer numbers are refused. The legacy approval kind remains \
+                       CLI-compatible but is deprecated and intentionally absent from this lead \
+                       surface. Closed work items are accepted."
     )]
     pub async fn work_note_add(&self, args: Parameters<WorkNoteAddArgs>) -> CallToolResult {
         self.call("work_note_add", args.0.into_envelope()).await
@@ -1960,7 +1964,7 @@ impl ForgedServer {
         name = "work_show",
         description = "One work item's current snapshot plus hydrated dependencies — the \
                        read-only bd show replacement — and honesty-tested nextActions. Argument: \
-                       id. Returns notesCount but never note bodies; retrieve those with \
+                       id. Returns notesCount and noteCounts by kind but never note bodies; retrieve those with \
                        work_note_list."
     )]
     pub async fn work_show(&self, args: Parameters<LeadReadArgs>) -> CallToolResult {
