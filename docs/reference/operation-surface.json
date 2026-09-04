@@ -68,6 +68,12 @@
     },
     {
       "schema": "forged.projection/*",
+      "key": "beadSettlement",
+      "twin": "workSettlement",
+      "removeAt": "1.0"
+    },
+    {
+      "schema": "forged.projection/*",
       "key": "beads",
       "twin": "work",
       "removeAt": "1.0"

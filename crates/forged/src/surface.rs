@@ -197,6 +197,12 @@ const DEPRECATED_KEYS: &[DeprecatedKey] = &[
     },
     DeprecatedKey {
         schema: "forged.projection/*",
+        key: "beadSettlement",
+        twin: "workSettlement",
+        remove_at: "1.0",
+    },
+    DeprecatedKey {
+        schema: "forged.projection/*",
         key: "beads",
         twin: "work",
         remove_at: "1.0",

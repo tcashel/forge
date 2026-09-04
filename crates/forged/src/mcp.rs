@@ -1010,14 +1010,14 @@ pub struct WorkDetailArgs {
     pub params: WorkDetailParams,
 }
 
-/// Addressed target for `work_detail`: EXACTLY one form — the exact
-/// `subjectKind`/`subjectId` pair, or a bare `id` resolved against the
-/// durable inventory. Sending both forms, or half the pair, is refused.
+/// Addressed target for `work_detail`: EXACTLY one form — the legacy exact
+/// `subjectKind`/`subjectId` pair, or `id` with an optional `subjectKind`
+/// disambiguator. Sending both ids, or a half legacy pair, is refused.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars", inline)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WorkDetailParams {
-    /// Exact durable subject kind; travels only with `subjectId`.
+    /// Exact legacy subject kind, or an optional `id` disambiguator.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject_kind: Option<WorkDetailKind>,
     /// Canonical run or epic id; travels only with `subjectKind`.
@@ -1027,9 +1027,8 @@ pub struct WorkDetailParams {
         skip_serializing_if = "Option::is_none"
     )]
     pub subject_id: Option<String>,
-    /// Bare run or epic id, resolved kind-blind: an exact id beats any
-    /// prefix, a unique prefix resolves, anything else answers with
-    /// `resolution` candidates instead of the detail body.
+    /// Any operator-visible id resolved by the shared resolver. An exact id
+    /// beats any prefix; unresolved ids return `resolution` candidates.
     #[serde(
         default,
         deserialize_with = "named_string_opt",

@@ -27,11 +27,13 @@ fn assert_next(response: &Value, verb: &str) {
 
 fn seed_live_attempt(env: &TestEnv, run_id: &str) -> i64 {
     let packet_id = format!("{run_id}/implement/1");
+    let ledger = env.ledger();
+    let work_id = ledger.get_run(run_id).expect("owning run").work_id;
     let packet = forged_types::WorkPacket {
         schema: "forged.packet/1".to_owned(),
         packet_id: packet_id.clone(),
         run_id: run_id.to_owned(),
-        work_id: format!("bead-{run_id}"),
+        work_id,
         stage: forged_types::Stage::Implement,
         execution: None,
         lane_seq: None,
@@ -58,7 +60,6 @@ fn seed_live_attempt(env: &TestEnv, run_id: &str) -> i64 {
         },
         field_notes: Vec::new(),
     };
-    let ledger = env.ledger();
     ledger
         .open_packet(forged_ledger::NewPacket {
             run_id: run_id.to_owned(),
@@ -296,7 +297,25 @@ fn an_epic_prefix_keeps_existing_prefix_semantics_and_attention_actions() {
 fn a_live_attempt_carries_own_state_stage_and_owning_run_actions() {
     let env = TestEnv::new("forged-explain-attempt");
     assert_eq!(env.forged(&["init"]).0, 0);
-    fabricate_run(&env, "explain-attempt-run");
+    env.seed_work_spec(
+        "explain-attempt-run",
+        "Explain a live attempt.",
+        "The attempt retains its run's starting revision.",
+    );
+    env.seed_frontier("explain-attempt-run");
+    let repository = env.repos.repo.to_string_lossy().into_owned();
+    let (code, started) = env.forged(&[
+        "run",
+        "start",
+        "--work",
+        "explain-attempt-run",
+        "--repo",
+        &repository,
+        "--base-ref",
+        "main",
+    ]);
+    assert_eq!(code, 0, "run start: {started}");
+    let started_revision = env.work_revision("explain-attempt-run");
     let attempt_id = seed_live_attempt(&env, "explain-attempt-run");
 
     let (code, response) = env.forged(&["explain", "--id", &attempt_id.to_string()]);
@@ -307,10 +326,16 @@ fn a_live_attempt_carries_own_state_stage_and_owning_run_actions() {
         result(&response)["how"]["attempt"],
         json!({"state": "running", "stage": "implement"})
     );
+    assert_eq!(
+        result(&response)["subject"]["revision"],
+        json!(started_revision),
+        "the attempt subject uses its owning run's started-from revision"
+    );
     assert_next(&response, "run stop");
 
     let attempt_id = attempt_id.to_string();
     for command in [
+        vec!["overview", "--id", &attempt_id],
         vec!["work", "detail", "--id", &attempt_id],
         vec!["events", "--id", &attempt_id],
         vec!["session", "list", "--id", &attempt_id],
@@ -320,6 +345,12 @@ fn a_live_attempt_carries_own_state_stage_and_owning_run_actions() {
         assert_eq!(
             routed["result"]["subject"]["id"],
             json!("explain-attempt-run")
+        );
+        assert_eq!(
+            routed["result"]["subject"]["revision"],
+            json!(started_revision),
+            "{} routes through the owning run's frozen revision",
+            command.join(" ")
         );
     }
 }

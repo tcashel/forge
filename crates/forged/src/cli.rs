@@ -1704,19 +1704,20 @@ pub struct WorkHistoryArgs {
     pub idempotency_key: Option<String>,
 }
 
-/// `work detail` flags. Exactly one addressing form: the exact
-/// `--subject-kind`/`--subject-id` pair, or a bare `--id`. The core owns
+/// `work detail` flags. Exactly one addressing form: the legacy exact
+/// `--subject-kind`/`--subject-id` pair, or `--id` with an optional
+/// `--subject-kind` disambiguator. The core owns
 /// that refusal — a clap conflict rule here would emit a usage error and
 /// diverge from the MCP envelope.
 #[derive(Debug, Args)]
 pub struct WorkDetailArgs {
-    /// Exact durable subject kind; travels only with --subject-id.
+    /// Exact legacy subject kind, or an optional --id disambiguator.
     #[arg(long, value_enum)]
     pub subject_kind: Option<WorkDetailKind>,
     /// Canonical run or epic id; travels only with --subject-kind.
     #[arg(long)]
     pub subject_id: Option<String>,
-    /// Bare run or epic id, resolved against the durable inventory.
+    /// Any operator-visible id, resolved by the shared resolver.
     #[arg(long)]
     pub id: Option<String>,
     /// Return event rows after this event id.

@@ -41,12 +41,15 @@ fn a_work_id_routes_read_verbs_to_its_latest_run() {
     assert_eq!(result(&by_work), result(&by_run));
     assert_eq!(by_work["result"]["subject"]["id"], json!("work-target"));
 
-    let (code, events) = env.forged(&["events", "--id", "bead-work-target"]);
-    assert_eq!(code, 0, "events by work id: {events}");
-    assert_eq!(events["result"]["subject"]["id"], json!("work-target"));
-    let (code, sessions) = env.forged(&["session", "list", "--id", "bead-work-target"]);
-    assert_eq!(code, 0, "sessions by work id: {sessions}");
-    assert_eq!(sessions["result"]["subject"]["id"], json!("work-target"));
+    for command in [
+        vec!["work", "detail", "--id", "bead-work-target"],
+        vec!["events", "--id", "bead-work-target"],
+        vec!["session", "list", "--id", "bead-work-target"],
+    ] {
+        let (code, routed) = env.forged(&command);
+        assert_eq!(code, 0, "{} by work id: {routed}", command.join(" "));
+        assert_eq!(routed["result"]["subject"]["id"], json!("work-target"));
+    }
 }
 
 #[test]
@@ -79,13 +82,20 @@ fn an_exact_run_and_epic_collision_returns_candidates_and_can_be_disambiguated()
     fabricate_run(&env, "same-id");
     fabricate_epic(&env, "same-id");
 
-    let (code, bare) = env.forged(&["overview", "--id", "same-id"]);
-    assert_eq!(code, 0, "bare collision: {bare}");
-    assert_eq!(resolution(&bare)["reason"], json!("ambiguous"));
-    assert_eq!(candidates(&bare).len(), 2);
-    assert!(resolution(&bare)["remedy"]["reason"]
-        .as_str()
-        .is_some_and(|reason| reason.contains("--subject-kind")));
+    for command in [
+        vec!["overview", "--id", "same-id"],
+        vec!["work", "detail", "--id", "same-id"],
+        vec!["events", "--id", "same-id"],
+        vec!["session", "list", "--id", "same-id"],
+    ] {
+        let (code, bare) = env.forged(&command);
+        assert_eq!(code, 0, "bare collision for {}: {bare}", command.join(" "));
+        assert_eq!(resolution(&bare)["reason"], json!("ambiguous"));
+        assert_eq!(candidates(&bare).len(), 2);
+        assert!(resolution(&bare)["remedy"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("--subject-kind")));
+    }
 
     let (code, run) = env.forged(&["overview", "--id", "same-id", "--subject-kind", "run"]);
     assert_eq!(code, 0, "run-disambiguated collision: {run}");
@@ -168,6 +178,10 @@ fn an_epic_session_id_lists_every_child_run() {
         .collect::<Vec<_>>();
     run_ids.sort_unstable();
     assert_eq!(run_ids, ["session-child-a", "session-child-b"]);
+
+    let (code, events) = env.forged(&["events", "--id", "session-epic", "--subject-kind", "epic"]);
+    assert_eq!(code, 0, "epic events: {events}");
+    assert_eq!(events["result"]["subject"]["kind"], json!("epic"));
 }
 
 /// The whole point: an agent that guessed the kind wrong, and one that never

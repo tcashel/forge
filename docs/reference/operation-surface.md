@@ -101,6 +101,7 @@ Legacy keys remain present with same-value provider-neutral twins until 1.0.
 | `forged.projection/*` | `beadId` | `workId` | `1.0` |
 | `forged.projection/*` | `beadTitle` | `workTitle` | `1.0` |
 | `forged.projection/*` | `beadRevision` | `workRevision` | `1.0` |
+| `forged.projection/*` | `beadSettlement` | `workSettlement` | `1.0` |
 | `forged.projection/*` | `beads` | `work` | `1.0` |
 | `forged.projection/*` | `beadsStatus` | `workStatus` | `1.0` |
 | `forged.projection/*` | `beadsInventory` | `workInventory` | `1.0` |
