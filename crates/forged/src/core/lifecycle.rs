@@ -535,10 +535,21 @@ pub(crate) async fn project(
                     && row.desired_state == DesiredState::Running
             })
             .map(|row| row.updated_at.clone());
+        // Only the terminal PR (the one opened against the default branch)
+        // means the epic is under review; a rolling epic's assurance PRs carry
+        // `terminal: false` and must not mask `dispatched` or `deciding`.
         let epic_reviewed_at = epic_prs
             .iter()
             .rev()
-            .find(|event| event.run_id.as_deref() == Some(item.work_id.as_str()))
+            .filter(|event| event.run_id.as_deref() == Some(item.work_id.as_str()))
+            .find(|event| {
+                serde_json::from_str::<serde_json::Value>(&event.payload_json)
+                    .ok()
+                    .and_then(|payload| {
+                        payload.get("terminal").and_then(serde_json::Value::as_bool)
+                    })
+                    == Some(true)
+            })
             .map(|event| event.ts.clone());
         Facts {
             work_id: item.work_id.clone(),

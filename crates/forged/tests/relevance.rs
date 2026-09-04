@@ -123,6 +123,7 @@ fn the_shared_registry_names_every_emitter_and_direct_remedy_builder() {
     assert_eq!(
         constructors,
         [
+            "fn work_remedy(",
             "pub(crate) fn retry_action_with_class(",
             "fn classified_action(",
             "pub(crate) fn work_supersede_action(",

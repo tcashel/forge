@@ -46,12 +46,14 @@ The Claude plugin registers the server with `--audience all` so the host can off
 - `session_message`
 - `session_read`
 - `usage_report`
+- `work_adjudicate`
 - `work_close`
 - `work_create`
 - `work_link`
 - `work_list`
 - `work_note_add`
 - `work_note_list`
+- `work_park`
 - `work_promote`
 - `work_ready`
 - `work_release`
