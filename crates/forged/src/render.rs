@@ -27,6 +27,7 @@ pub fn supports(operation: &str) -> bool {
         operation,
         "next"
             | "explain"
+            | "wait"
             | "run_status"
             | "epic_status"
             | "usage_report"
@@ -78,6 +79,7 @@ impl Render for ResponseRender<'_> {
             "usage_report" => render_usage(result, now),
             "work_history" => render_work_history(result, now),
             "explain" => render_explain(result, now),
+            "wait" => render_explain(result.get("explain").unwrap_or(&Value::Null), now),
             _ => unreachable!("unsupported successful response reached the renderer"),
         }
     }
@@ -90,11 +92,15 @@ fn refusal(error: &forged_types::OpError) -> String {
         .unwrap_or_else(|| "ERROR".to_owned());
     let mut lines = Vec::new();
     push_line(&mut lines, format!("✗ {code} {}", error.message));
-    if let Some(remedy) = error
-        .detail
-        .as_ref()
-        .and_then(|value| serde_json::from_value::<RemedyV1>(value.clone()).ok())
-    {
+    if let Some(remedy) = error.detail.as_ref().and_then(|value| {
+        serde_json::from_value::<RemedyV1>(
+            value
+                .get("remedy")
+                .cloned()
+                .unwrap_or_else(|| value.clone()),
+        )
+        .ok()
+    }) {
         push_line(
             &mut lines,
             format!(

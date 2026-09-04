@@ -91,6 +91,8 @@ pub enum Command {
     Overview(OverviewArgs),
     /// Explain any durable id without guessing its kind (read-only).
     Explain(ExplainArgs),
+    /// Block until one durable subject reaches a requested condition (read-only).
+    Wait(WaitArgs),
     /// Bounded operator-facing operations projection.
     Operations {
         /// Operations subcommand.
@@ -1149,6 +1151,38 @@ pub struct ExplainArgs {
     pub idempotency_key: Option<String>,
 }
 
+/// Condition that releases `wait`.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum WaitUntilArg {
+    Decision,
+    Stage,
+    Terminal,
+}
+
+impl WaitUntilArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Decision => "decision",
+            Self::Stage => "stage",
+            Self::Terminal => "terminal",
+        }
+    }
+}
+
+/// `wait` flags.
+#[derive(Debug, Args)]
+pub struct WaitArgs {
+    /// Exact work-item, run, or epic id; run and epic ids retain unique-prefix behavior.
+    #[arg(long)]
+    pub id: String,
+    /// Condition that releases the wait (default stage).
+    #[arg(long, value_enum, default_value_t = WaitUntilArg::Stage)]
+    pub until: WaitUntilArg,
+    /// Maximum seconds to wait, 1..=3600 (default 240).
+    #[arg(long, default_value_t = 240, allow_hyphen_values = true)]
+    pub timeout: i64,
+}
+
 /// `operations` subcommands.
 #[derive(Debug, Subcommand)]
 pub enum OperationsCmd {
@@ -2088,6 +2122,7 @@ pub fn command_name(command: &Command) -> &'static str {
         Command::Events(_) => "events_tail",
         Command::Overview(_) => "overview",
         Command::Explain(_) => "explain",
+        Command::Wait(_) => "wait",
         Command::Operations { command } => match command {
             OperationsCmd::Overview(_) => "operations_overview",
         },
@@ -2676,6 +2711,18 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
                 request(a.idempotency_key, Some(a.id.clone()), Value::Object(params)),
             )
         }
+        Command::Wait(a) => (
+            "wait",
+            request(
+                None,
+                Some(a.id.clone()),
+                json!({
+                    "id": a.id,
+                    "until": a.until.as_str(),
+                    "timeout": a.timeout,
+                }),
+            ),
+        ),
         Command::Operations { command } => match command {
             OperationsCmd::Overview(a) => {
                 let mut params = Map::new();

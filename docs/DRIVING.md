@@ -155,9 +155,7 @@ forged wait --id <id> --until decision|stage|terminal --timeout 240
 
 Blocks on the event cursor; returns `explain` for the id when something
 changed, or `changed: false` at the timeout. One call replaces a
-polling loop. **Today:** re-read `run status --run <id>` at a cadence
-no faster than the stage budget suggests; use your host's monitor
-primitive on CI, not on forged.
+polling loop.
 
 ## Cost discipline
 

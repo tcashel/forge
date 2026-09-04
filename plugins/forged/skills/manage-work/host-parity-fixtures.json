@@ -149,6 +149,7 @@
     "session_message",
     "session_read",
     "usage_report",
+    "wait",
     "work_close",
     "work_create",
     "work_link",
