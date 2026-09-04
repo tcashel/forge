@@ -1192,6 +1192,19 @@ fn work_adjudicate_and_park_refusals_carry_recovery_verbs() {
     for id in ["adj-held", "park-held"] {
         result(&env, &["work", "create", "--id", id, "--title", id]);
     }
+    result(
+        &env,
+        &[
+            "work",
+            "create",
+            "--id",
+            "park-running-epic",
+            "--title",
+            "Running epic",
+            "--kind",
+            "epic",
+        ],
+    );
     let recommendation = add_recommendation(&env, "adj-held", "adj-held-recommendation.json");
     let body = write_adjudication(
         &env,
@@ -1207,6 +1220,13 @@ fn work_adjudicate_and_park_refusals_carry_recovery_verbs() {
     ledger
         .claim_specific_work("park-held", "holder", 300)
         .expect("claim parking fixture");
+    ledger
+        .authorize_desired_work(
+            forged_ledger::DesiredSubjectKind::Epic,
+            "park-running-epic",
+            0,
+        )
+        .expect("authorize running epic fixture");
     ledger.close().expect("close fixture ledger");
 
     let (code, held) = env.forged(&[
@@ -1232,6 +1252,22 @@ fn work_adjudicate_and_park_refusals_carry_recovery_verbs() {
     ]);
     assert_ne!(code, 0, "held park accepted: {held}");
     assert_eq!(held["error"]["detail"]["verb"], json!("run stop"));
+
+    let (code, running_epic) = env.forged(&[
+        "work",
+        "park",
+        "--id",
+        "park-running-epic",
+        "--reason",
+        "cannot hide an executing epic",
+    ]);
+    assert_ne!(code, 0, "running epic parked: {running_epic}");
+    assert!(running_epic["error"]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("running epic controller")));
+    assert_eq!(running_epic["error"]["detail"]["verb"], json!("epic pause"));
+    let shown = result(&env, &["work", "show", "--id", "park-running-epic"]);
+    assert_eq!(shown["work"]["status"], json!("open"));
 
     result(
         &env,
@@ -1371,6 +1407,62 @@ fn parking_blocked_beads_stubs_hides_every_rail_and_resume_records_decision() {
         })
         .collect::<Vec<_>>();
     assert_eq!(choices, vec!["park", "resume"]);
+}
+
+#[test]
+fn run_start_refuses_parked_work_with_the_reopen_reason_remedy() {
+    let env = TestEnv::new("forged-run-start-parked-remedy");
+    assert_eq!(env.forged(&["init"]).0, 0);
+    let repository = env.repos.repo.to_string_lossy().into_owned();
+    result(
+        &env,
+        &[
+            "work",
+            "create",
+            "--id",
+            "parked-start",
+            "--title",
+            "Parked start",
+            "--description",
+            "A complete parked slice",
+            "--acceptance",
+            "The slice remains parked",
+            "--repository",
+            &repository,
+        ],
+    );
+    result(
+        &env,
+        &[
+            "work",
+            "park",
+            "--id",
+            "parked-start",
+            "--reason",
+            "defer this slice",
+        ],
+    );
+
+    let (code, refused) = env.forged(&[
+        "run",
+        "start",
+        "--work",
+        "parked-start",
+        "--repo",
+        &repository,
+        "--base-ref",
+        "main",
+    ]);
+    assert_ne!(code, 0, "parked work started: {refused}");
+    assert_eq!(
+        refused["error"]["detail"]["schema"],
+        json!("forged.remedy/1")
+    );
+    assert_eq!(refused["error"]["detail"]["verb"], json!("work reopen"));
+    assert_eq!(
+        refused["error"]["detail"]["args"],
+        json!({"id": "parked-start", "reason": null})
+    );
 }
 
 #[test]

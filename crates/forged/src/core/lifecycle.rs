@@ -80,6 +80,7 @@ struct RunFact {
     active: bool,
     landed: bool,
     delivered: bool,
+    pinned_revision: Option<i64>,
     created_at: String,
     updated_at: String,
     reviewed_at: Option<String>,
@@ -96,6 +97,7 @@ struct AttentionFact {
 struct ChildFact {
     status: WorkStatus,
     lifecycle: Lifecycle,
+    run_ids: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -255,17 +257,6 @@ fn derive(facts: &Facts) -> Lifecycle {
             None,
         );
     }
-    if facts.status == WorkStatus::Blocked || unchecked_notes(&facts.notes_text) {
-        return lifecycle(
-            facts,
-            LifecycleStage::Blocked,
-            &facts.updated_at,
-            [],
-            None,
-            None,
-        );
-    }
-
     if facts.kind == WorkKind::Epic {
         if let Some(since) = &facts.epic_landed_at {
             return lifecycle(facts, LifecycleStage::Landed, since, [], None, None);
@@ -285,6 +276,16 @@ fn derive(facts: &Facts) -> Lifecycle {
         }
         if let Some(since) = &facts.epic_dispatched_at {
             return lifecycle(facts, LifecycleStage::Dispatched, since, [], None, None);
+        }
+        if facts.status == WorkStatus::Blocked || unchecked_notes(&facts.notes_text) {
+            return lifecycle(
+                facts,
+                LifecycleStage::Blocked,
+                &facts.updated_at,
+                [],
+                None,
+                None,
+            );
         }
         let open_children = facts
             .children
@@ -323,11 +324,10 @@ fn derive(facts: &Facts) -> Lifecycle {
     }
 
     let current_run = facts.runs.last();
-    if let Some(run) = facts
-        .runs
-        .iter()
-        .rev()
-        .find(|run| run.landed || run.delivered)
+    if let Some(run) =
+        facts.runs.iter().rev().find(|run| {
+            (run.landed || run.delivered) && run.pinned_revision == Some(facts.revision)
+        })
     {
         return lifecycle(
             facts,
@@ -338,7 +338,9 @@ fn derive(facts: &Facts) -> Lifecycle {
             None,
         );
     }
-    if let Some(run) = current_run.filter(|run| run.reviewed_at.is_some()) {
+    if let Some(run) = current_run
+        .filter(|run| run.reviewed_at.is_some() && run.pinned_revision == Some(facts.revision))
+    {
         return lifecycle(
             facts,
             LifecycleStage::Reviewed,
@@ -365,6 +367,16 @@ fn derive(facts: &Facts) -> Lifecycle {
             &run.created_at,
             [],
             Some(run.run_id.clone()),
+            None,
+        );
+    }
+    if facts.status == WorkStatus::Blocked || unchecked_notes(&facts.notes_text) {
+        return lifecycle(
+            facts,
+            LifecycleStage::Blocked,
+            &facts.updated_at,
+            [],
+            None,
             None,
         );
     }
@@ -417,16 +429,29 @@ pub(crate) async fn project(
     items: &[WorkItemSnapshot],
     attention: &[AttentionItemV1],
 ) -> Result<BTreeMap<String, Lifecycle>, Failure> {
+    let item_ids = items
+        .iter()
+        .map(|item| item.work_id.clone())
+        .collect::<Vec<_>>();
     let epic_ids = items
         .iter()
         .filter(|item| item.kind == WorkKind::Epic)
         .map(|item| item.work_id.clone())
         .collect::<Vec<_>>();
-    let children = on_ledger(&ctx.ledger, {
+    let snapshot = on_ledger(&ctx.ledger, {
+        let item_ids = item_ids.clone();
         let epic_ids = epic_ids.clone();
-        move |ledger| ledger.work_epic_children_for(&epic_ids)
+        move |ledger| {
+            ledger.work_lifecycle_snapshot(
+                &item_ids,
+                &epic_ids,
+                "run.protocol-terminal",
+                super::epic::EPIC_PR,
+            )
+        }
     })
     .await?;
+    let children = snapshot.children;
     let mut all_items = items
         .iter()
         .map(|item| (item.work_id.clone(), item.clone()))
@@ -436,58 +461,51 @@ pub(crate) async fn project(
             .entry(child.work_id.clone())
             .or_insert_with(|| child.clone());
     }
-    let all_ids = all_items.keys().cloned().collect::<Vec<_>>();
-    let notes = on_ledger(&ctx.ledger, {
-        let all_ids = all_ids.clone();
-        move |ledger| ledger.work_lifecycle_notes(&all_ids)
-    })
-    .await?;
-    let runs = on_ledger(&ctx.ledger, |ledger| ledger.list_runs()).await?;
-    let terminals = on_ledger(&ctx.ledger, |ledger| {
-        ledger.list_events_by_kind("run.protocol-terminal")
-    })
-    .await?;
-    let epic_prs = on_ledger(&ctx.ledger, |ledger| {
-        ledger.list_events_by_kind(super::epic::EPIC_PR)
-    })
-    .await?;
-    let desired = on_ledger(&ctx.ledger, |ledger| ledger.list_desired_work()).await?;
-    let ready = on_ledger(&ctx.ledger, |ledger| ledger.ready_work_items()).await?;
-    let ready_ids = ready
-        .into_iter()
-        .map(|item| item.work_id)
-        .collect::<BTreeSet<_>>();
+    let notes = snapshot.notes;
+    let runs = snapshot.runs;
+    let packets = snapshot.packets;
+    let desired = snapshot.desired_work;
+    let epic_prs = snapshot.epic_pr_events;
+    let ready_ids = snapshot.ready_work_ids;
+    let mut reviewed_at_by_run = BTreeMap::new();
+    for event in snapshot.terminal_events {
+        let delivered = serde_json::from_str::<serde_json::Value>(&event.payload_json)
+            .ok()
+            .and_then(|payload| payload.pointer("/delivery/pr").cloned())
+            .is_some_and(|pr| !pr.is_null());
+        if delivered {
+            if let Some(run_id) = event.run_id {
+                reviewed_at_by_run.insert(run_id, event.ts);
+            }
+        }
+    }
 
     let make_facts = |item: &WorkItemSnapshot, child_facts: Vec<ChildFact>| {
         let item_runs = runs
             .iter()
             .filter(|run| run.work_id == item.work_id)
             .map(|run| {
-                let reviewed_at = terminals
+                let pinned_revision = packets
                     .iter()
                     .rev()
-                    .find(|event| {
-                        event.run_id.as_deref() == Some(run.run_id.as_str())
-                            && serde_json::from_str::<serde_json::Value>(&event.payload_json)
-                                .ok()
-                                .and_then(|payload| payload.pointer("/delivery/pr").cloned())
-                                .is_some_and(|pr| !pr.is_null())
-                    })
-                    .map(|event| event.ts.clone());
+                    .find(|packet| packet.run_id == run.run_id)
+                    .and_then(|packet| packet.spec_revision.as_deref())
+                    .and_then(|revision| revision.parse::<i64>().ok());
                 RunFact {
                     run_id: run.run_id.clone(),
                     active: run.state == RunState::Active,
                     landed: run.terminal_outcome == Some(RunOutcome::Landed),
                     delivered: run.delivery_pr.is_some() && run.delivery_sha.is_some(),
+                    pinned_revision,
                     created_at: run.created_at.clone(),
                     updated_at: run.updated_at.clone(),
-                    reviewed_at,
+                    reviewed_at: reviewed_at_by_run.get(&run.run_id).cloned(),
                 }
             })
             .collect::<Vec<_>>();
         let child_subjects = child_facts
             .iter()
-            .flat_map(|child| child.lifecycle.basis.run_id.clone())
+            .flat_map(|child| child.run_ids.iter().cloned())
             .collect::<BTreeSet<_>>();
         let current_run_id = item_runs.last().map(|run| run.run_id.as_str());
         let item_attention = attention
@@ -507,7 +525,7 @@ pub(crate) async fn project(
         let epic_landed_at = item_runs
             .iter()
             .rev()
-            .find(|run| run.landed)
+            .find(|run| run.landed && run.pinned_revision == Some(item.revision))
             .map(|run| run.updated_at.clone());
         let epic_dispatched_at = desired
             .iter()
@@ -569,6 +587,11 @@ pub(crate) async fn project(
                     .map(|lifecycle| ChildFact {
                         status: child.status,
                         lifecycle,
+                        run_ids: runs
+                            .iter()
+                            .filter(|run| run.work_id == child.work_id)
+                            .map(|run| run.run_id.clone())
+                            .collect(),
                     })
             })
             .collect();
@@ -692,6 +715,7 @@ mod tests {
             active: true,
             landed: false,
             delivered: false,
+            pinned_revision: Some(1),
             created_at: dispatched.updated_at.clone(),
             updated_at: dispatched.updated_at.clone(),
             reviewed_at: None,
@@ -712,6 +736,7 @@ mod tests {
             active: false,
             landed: false,
             delivered: false,
+            pinned_revision: Some(1),
             created_at: reviewed.updated_at.clone(),
             updated_at: reviewed.updated_at.clone(),
             reviewed_at: Some(reviewed.updated_at.clone()),
@@ -724,6 +749,7 @@ mod tests {
             active: false,
             landed: true,
             delivered: true,
+            pinned_revision: Some(1),
             created_at: landed.updated_at.clone(),
             updated_at: landed.updated_at.clone(),
             reviewed_at: None,
@@ -740,6 +766,7 @@ mod tests {
         epic.children.push(ChildFact {
             status: WorkStatus::Open,
             lifecycle: child_lifecycle,
+            run_ids: BTreeSet::new(),
         });
         cases.push((epic, LifecycleStage::Adjudicated));
 
@@ -756,5 +783,56 @@ mod tests {
         let mut revised = adjudicated;
         revised.revision = 2;
         assert_eq!(derive(&revised).stage, LifecycleStage::Drafted);
+    }
+
+    #[test]
+    fn execution_and_decision_evidence_precede_a_blocked_hold() {
+        let mut running = facts();
+        running.status = WorkStatus::Blocked;
+        running.notes_text = "- [ ] stale planning hold".to_owned();
+        running.runs.push(RunFact {
+            run_id: "run-active".to_owned(),
+            active: true,
+            landed: false,
+            delivered: false,
+            pinned_revision: Some(1),
+            created_at: running.updated_at.clone(),
+            updated_at: running.updated_at.clone(),
+            reviewed_at: None,
+        });
+        let projected = derive(&running);
+        assert_eq!(projected.stage, LifecycleStage::Dispatched);
+        assert_eq!(projected.basis.run_id.as_deref(), Some("run-active"));
+
+        running.runs[0].active = false;
+        running.attention.push(AttentionFact {
+            attention_id: "decision".to_owned(),
+            open_decision: true,
+            updated_at: running.updated_at.clone(),
+        });
+        let projected = derive(&running);
+        assert_eq!(projected.stage, LifecycleStage::Deciding);
+        assert_eq!(projected.basis.run_id.as_deref(), Some("run-active"));
+        assert_eq!(projected.basis.attention_id.as_deref(), Some("decision"));
+    }
+
+    #[test]
+    fn landed_evidence_is_bound_to_the_current_work_revision() {
+        let mut landed = facts();
+        landed.runs.push(RunFact {
+            run_id: "run-landed".to_owned(),
+            active: false,
+            landed: true,
+            delivered: true,
+            pinned_revision: Some(1),
+            created_at: landed.updated_at.clone(),
+            updated_at: landed.updated_at.clone(),
+            reviewed_at: None,
+        });
+        assert_eq!(derive(&landed).stage, LifecycleStage::Landed);
+
+        landed.revision = 2;
+        assert_eq!(derive(&landed).stage, LifecycleStage::Drafted);
+        assert_eq!(derive(&landed).basis.revision, 2);
     }
 }

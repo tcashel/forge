@@ -286,12 +286,22 @@ pub async fn release_unresolved_issue(
     Ok(issue_of(&snapshot))
 }
 
-/// Reopen: status `Open` from any status, custody untouched (the bd-era
-/// `update --status open`).
-pub async fn reopen_issue(ledger: &Ledger, id: &str, actor: &str) -> Result<IssueSummary, Failure> {
+/// Reopen: status `Open` from any status, custody untouched. Deferred work
+/// requires the operator's resume reason so the matching typed decision can
+/// land in the same coordination transaction.
+pub async fn reopen_issue(
+    ledger: &Ledger,
+    id: &str,
+    actor: &str,
+    reason: Option<&str>,
+) -> Result<IssueSummary, Failure> {
     let id = id.to_owned();
     let actor = actor.to_owned();
-    let snapshot = on_ledger(ledger, move |l| l.reopen_work_item(&id, &actor, None)).await?;
+    let reason = reason.map(str::to_owned);
+    let snapshot = on_ledger(ledger, move |l| {
+        l.reopen_work_item(&id, &actor, reason.as_deref())
+    })
+    .await?;
     Ok(issue_of(&snapshot))
 }
 

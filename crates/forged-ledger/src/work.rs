@@ -24,11 +24,15 @@ use forged_types::{
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use serde_json::json;
 
+use crate::desired::{desired_row, COLUMNS as DESIRED_COLUMNS};
 use crate::error::{column_decode_error, internal, refused, LedgerError};
-use crate::events::append_event_tx;
+use crate::events::{append_event_tx, event_row};
 use crate::ledger::Ledger;
 use crate::operations::{replay_ledger_operation_tx, settle_operation};
+use crate::packets::{packet_row, PACKET_COLUMNS};
+use crate::runs::{run_row, RUN_COLUMNS};
 use crate::time::now_iso;
+use crate::types::{DesiredWorkRow, EventRow, PacketRow, RunRow};
 
 /// The stable refusal prefix for a claim refused on mechanism (not
 /// contention) — the bd-era spelling VERBATIM, because durable retry rows
@@ -300,6 +304,21 @@ pub struct WorkNotePage {
     pub notes: Vec<WorkNoteRow>,
     /// All rows matching the work id and optional kind.
     pub total: u64,
+}
+
+/// One transaction-consistent, exact-id evidence set for lifecycle
+/// derivation. Every collection is restricted to the requested work items,
+/// their direct epic children, or the runs belonging to those items.
+#[derive(Debug, Clone)]
+pub struct WorkLifecycleSnapshot {
+    pub children: BTreeMap<String, Vec<WorkItemSnapshot>>,
+    pub notes: Vec<WorkNoteRow>,
+    pub runs: Vec<RunRow>,
+    pub packets: Vec<PacketRow>,
+    pub terminal_events: Vec<EventRow>,
+    pub epic_pr_events: Vec<EventRow>,
+    pub desired_work: Vec<DesiredWorkRow>,
+    pub ready_work_ids: BTreeSet<String>,
 }
 
 /// The rendered-body inputs — the append-only half of a work item.
@@ -988,6 +1007,15 @@ fn active_work_run_tx(conn: &Connection, work_id: &str) -> Result<Option<String>
             |row| row.get(0),
         )
         .optional()?)
+}
+
+fn running_epic_desired_work_tx(conn: &Connection, work_id: &str) -> Result<bool, LedgerError> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM desired_work \
+         WHERE subject_kind = 'epic' AND subject_id = ?1 AND desired_state = 'running')",
+        [work_id],
+        |row| row.get(0),
+    )?)
 }
 
 fn unchecked_checkbox(line: &str) -> bool {
@@ -2109,6 +2137,12 @@ impl Ledger {
             }
             let before = require_snapshot_tx(&tx, &work_id)?;
             let active_run = active_work_run_tx(&tx, &work_id)?;
+            if running_epic_desired_work_tx(&tx, &work_id)? {
+                return Err(refused(
+                    ErrorCode::WorkLeaseHeld,
+                    format!("work item {work_id:?} has a running epic controller; use epic pause"),
+                ));
+            }
             if active_run.is_some()
                 || before.assignee.is_some()
                 || work_has_lease_tx(&tx, &work_id)?
@@ -2801,6 +2835,156 @@ impl Ledger {
                 children.entry(epic_id).or_default().push(snapshot);
             }
             Ok(children)
+        })
+    }
+
+    /// Hydrate every ledger fact used by lifecycle derivation in one read
+    /// transaction. Selection is bounded by exact work ids, their direct
+    /// epic children, and those items' run ids; unrelated ledger history is
+    /// never loaded.
+    pub fn work_lifecycle_snapshot(
+        &self,
+        item_ids: &[String],
+        epic_ids: &[String],
+        terminal_event_kind: &str,
+        epic_pr_event_kind: &str,
+    ) -> Result<WorkLifecycleSnapshot, LedgerError> {
+        let item_ids = item_ids.to_vec();
+        let epic_ids = epic_ids.to_vec();
+        let terminal_event_kind = terminal_event_kind.to_owned();
+        let epic_pr_event_kind = epic_pr_event_kind.to_owned();
+        self.submit(move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+            let children = if epic_ids.is_empty() {
+                BTreeMap::new()
+            } else {
+                let epic_ids_json = serde_json::to_string(&epic_ids)?;
+                let mut statement = tx.prepare(&format!(
+                    "SELECT d.to_id, {} FROM work_deps d \
+                     JOIN work_items wi ON wi.work_id = d.from_id \
+                     JOIN work_revisions wr \
+                       ON wr.work_id = wi.work_id AND wr.revision = wi.current_revision \
+                     WHERE d.kind = 'parent-child' \
+                       AND d.to_id IN (SELECT value FROM json_each(?1)) \
+                     ORDER BY d.to_id, wi.priority IS NULL, wi.priority, wi.work_id",
+                    SNAPSHOT_SQL
+                        .strip_prefix("SELECT ")
+                        .and_then(|sql| sql.split_once(" FROM work_items wi "))
+                        .map(|(columns, _)| columns)
+                        .expect("snapshot SQL has its stable SELECT prefix")
+                ))?;
+                let rows = statement.query_map([epic_ids_json], |row| {
+                    let epic_id: String = row.get(0)?;
+                    let snapshot = snapshot_from_row_offset(row, 1)?;
+                    Ok((epic_id, snapshot))
+                })?;
+                let mut children = BTreeMap::<String, Vec<WorkItemSnapshot>>::new();
+                for row in rows {
+                    let (epic_id, snapshot) = row?;
+                    children.entry(epic_id).or_default().push(snapshot);
+                }
+                children
+            };
+
+            let mut all_ids = item_ids.iter().cloned().collect::<BTreeSet<_>>();
+            all_ids.extend(
+                children
+                    .values()
+                    .flatten()
+                    .map(|child| child.work_id.clone()),
+            );
+            let all_ids = all_ids.into_iter().collect::<Vec<_>>();
+            let all_ids_json = serde_json::to_string(&all_ids)?;
+
+            let notes = work_lifecycle_notes_tx(&tx, &all_ids)?;
+            let runs = {
+                let mut statement = tx.prepare(&format!(
+                    "SELECT {RUN_COLUMNS} FROM runs \
+                     WHERE bead_id IN (SELECT value FROM json_each(?1)) \
+                     ORDER BY created_at, rowid"
+                ))?;
+                let rows = statement.query_map([&all_ids_json], run_row)?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            };
+            let run_ids = runs
+                .iter()
+                .map(|run| run.run_id.clone())
+                .collect::<Vec<_>>();
+            let run_ids_json = serde_json::to_string(&run_ids)?;
+            let packets = {
+                let mut statement = tx.prepare(&format!(
+                    "SELECT {PACKET_COLUMNS} FROM packets \
+                     WHERE run_id IN (SELECT value FROM json_each(?1)) \
+                     ORDER BY created_at, rowid"
+                ))?;
+                let rows = statement.query_map([&run_ids_json], packet_row)?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            };
+            let terminal_events = {
+                let mut statement = tx.prepare(
+                    "SELECT event_id, ts, run_id, kind, payload_json FROM events \
+                     WHERE kind = ?1 \
+                       AND run_id IN (SELECT value FROM json_each(?2)) \
+                     ORDER BY event_id",
+                )?;
+                let rows = statement.query_map(
+                    rusqlite::params![terminal_event_kind, run_ids_json],
+                    event_row,
+                )?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            };
+            let epic_ids_json = serde_json::to_string(&epic_ids)?;
+            let epic_pr_events = {
+                let mut statement = tx.prepare(
+                    "SELECT event_id, ts, run_id, kind, payload_json FROM events \
+                     WHERE kind = ?1 \
+                       AND run_id IN (SELECT value FROM json_each(?2)) \
+                     ORDER BY event_id",
+                )?;
+                let rows = statement.query_map(
+                    rusqlite::params![epic_pr_event_kind, epic_ids_json],
+                    event_row,
+                )?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            };
+            let desired_work = {
+                let mut statement = tx.prepare(&format!(
+                    "SELECT {DESIRED_COLUMNS} FROM desired_work \
+                     WHERE subject_kind = 'epic' \
+                       AND subject_id IN (SELECT value FROM json_each(?1)) \
+                     ORDER BY subject_id"
+                ))?;
+                let rows = statement.query_map([&epic_ids_json], desired_row)?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            };
+            let ready_work_ids = {
+                let mut statement = tx.prepare(
+                    "SELECT wi.work_id FROM work_items wi \
+                     WHERE wi.work_id IN (SELECT value FROM json_each(?1)) \
+                       AND wi.status = 'open' AND wi.assignee IS NULL \
+                       AND NOT EXISTS (SELECT 1 FROM work_leases wl \
+                                       WHERE wl.work_id = wi.work_id) \
+                       AND NOT EXISTS (SELECT 1 FROM work_deps d \
+                                       JOIN work_items b ON b.work_id = d.to_id \
+                                       WHERE d.from_id = wi.work_id \
+                                         AND d.kind = 'blocks' \
+                                         AND b.status <> 'closed') \
+                     ORDER BY wi.work_id",
+                )?;
+                let rows = statement.query_map([&all_ids_json], |row| row.get::<_, String>(0))?;
+                rows.collect::<Result<BTreeSet<_>, _>>()?
+            };
+            tx.commit()?;
+            Ok(WorkLifecycleSnapshot {
+                children,
+                notes,
+                runs,
+                packets,
+                terminal_events,
+                epic_pr_events,
+                desired_work,
+                ready_work_ids,
+            })
         })
     }
 
@@ -3740,6 +3924,95 @@ mod tests {
             .add_work_dep("beads-c2", "beads-missing", WorkDepKind::Blocks)
             .unwrap_err();
         assert!(err.to_string().contains("does not exist"), "{err}");
+    }
+
+    #[test]
+    fn lifecycle_snapshot_is_transactional_and_exact_id_scoped() {
+        let (_dir, ledger) = ledger();
+        let mut epic = item("lifecycle-epic", WorkStatus::Open);
+        epic.kind = WorkKind::Epic;
+        ledger.create_work_item(epic).unwrap();
+        ledger
+            .create_work_item(item("lifecycle-child", WorkStatus::Open))
+            .unwrap();
+        ledger
+            .create_work_item(item("lifecycle-outsider", WorkStatus::Open))
+            .unwrap();
+        ledger
+            .add_work_dep(
+                "lifecycle-child",
+                "lifecycle-epic",
+                WorkDepKind::ParentChild,
+            )
+            .unwrap();
+        for (run_id, work_id) in [
+            ("lifecycle-child-run", "lifecycle-child"),
+            ("lifecycle-outsider-run", "lifecycle-outsider"),
+        ] {
+            ledger
+                .create_run(crate::NewRun {
+                    run_id: forged_types::RunId::new(run_id.to_owned()).unwrap(),
+                    work_id: work_id.to_owned(),
+                    repo: "/repo".to_owned(),
+                    base_ref: "main".to_owned(),
+                    branch: format!("forged/{run_id}"),
+                })
+                .unwrap();
+            ledger
+                .append_event(
+                    Some(run_id),
+                    "run.protocol-terminal",
+                    json!({"delivery": {"pr": 1}}),
+                )
+                .unwrap();
+        }
+        ledger
+            .authorize_desired_work(crate::DesiredSubjectKind::Epic, "lifecycle-epic", 0)
+            .unwrap();
+        ledger
+            .authorize_desired_work(crate::DesiredSubjectKind::Epic, "lifecycle-outsider", 0)
+            .unwrap();
+        ledger
+            .append_event(Some("lifecycle-epic"), "forged.epic.pr", json!({"pr": 1}))
+            .unwrap();
+        ledger
+            .append_event(
+                Some("lifecycle-outsider"),
+                "forged.epic.pr",
+                json!({"pr": 2}),
+            )
+            .unwrap();
+
+        let snapshot = ledger
+            .work_lifecycle_snapshot(
+                &["lifecycle-epic".to_owned()],
+                &["lifecycle-epic".to_owned()],
+                "run.protocol-terminal",
+                "forged.epic.pr",
+            )
+            .unwrap();
+        assert_eq!(
+            snapshot.children["lifecycle-epic"]
+                .iter()
+                .map(|child| child.work_id.as_str())
+                .collect::<Vec<_>>(),
+            ["lifecycle-child"]
+        );
+        assert_eq!(
+            snapshot
+                .runs
+                .iter()
+                .map(|run| run.run_id.as_str())
+                .collect::<Vec<_>>(),
+            ["lifecycle-child-run"]
+        );
+        assert_eq!(snapshot.terminal_events.len(), 1);
+        assert_eq!(snapshot.epic_pr_events.len(), 1);
+        assert_eq!(snapshot.desired_work.len(), 1);
+        assert_eq!(snapshot.desired_work[0].subject_id, "lifecycle-epic");
+        assert!(snapshot.ready_work_ids.contains("lifecycle-epic"));
+        assert!(snapshot.ready_work_ids.contains("lifecycle-child"));
+        assert!(!snapshot.ready_work_ids.contains("lifecycle-outsider"));
     }
 
     /// The no-dead-state contract: every coordination state the store's own

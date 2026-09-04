@@ -1395,7 +1395,8 @@ where
         }
         Err(f) => {
             release_if(ctx, OnEffectError::for_class(class), &operation_id).await;
-            err_response(&operation_id, &f)
+            ops::run_start_failure_response(name, &request, &operation_id, &f)
+                .unwrap_or_else(|| err_response(&operation_id, &f))
         }
     }
 }

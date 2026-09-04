@@ -828,6 +828,15 @@ pub async fn work_park(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespon
     .await
     {
         Ok(response) => response,
+        Err(error) if error.message.contains("has a running epic controller") => remedy_response(
+            &key,
+            &error,
+            work_remedy(
+                "epic pause",
+                json!({"epic": id, "reason": Value::Null}),
+                "pause the epic controller at its durable boundary before parking",
+            ),
+        ),
         Err(error) if error.code == ErrorCode::WorkLeaseHeld => remedy_response(
             &key,
             &error,

@@ -330,6 +330,9 @@ async fn ready_slice_work(
     work: &str,
 ) -> Result<crate::core::work_types::IssueSummary, Failure> {
     let issue = super::spec::read_work(ctx, work).await?;
+    if issue.status == "deferred" {
+        return Err(parked_run_start_failure(work));
+    }
     let frontier_claimed = issue.status == "in_progress"
         && issue.assignee.as_deref() == Some(crate::core::FRONTIER_HOLDER);
     if issue.status != "open" && !frontier_claimed {
@@ -376,6 +379,37 @@ async fn ready_slice_work(
         }
     }
     Ok(issue)
+}
+
+fn parked_run_start_failure(work: &str) -> Failure {
+    Failure::invalid(format!(
+        "work {work} is parked and cannot admit a run start"
+    ))
+}
+
+/// Add the structured recovery contract to effect-time run-start refusals.
+/// The exact failure comparison keeps unrelated invalid requests on their
+/// ordinary error path while preserving the operation fence's race check.
+pub(super) fn run_start_failure_response(
+    operation: &str,
+    request: &OperationRequest,
+    operation_id: &str,
+    failure: &Failure,
+) -> Option<OperationResponse> {
+    let work = request.params.get("bead")?.as_str()?;
+    if operation != "run_start" || failure.message != parked_run_start_failure(work).message {
+        return None;
+    }
+    Some(remedy_response(
+        operation_id,
+        failure,
+        forged_types::RemedyV1::from(classified_action(
+            "work reopen",
+            json!({"id": work, "reason": Value::Null}),
+            "record why the parked work is resuming before starting a run",
+            forged_types::ActionClass::Repair,
+        )),
+    ))
 }
 
 /// `run start` — mint the RunId from the work id (or the epic pass's
