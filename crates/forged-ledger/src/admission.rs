@@ -3149,7 +3149,7 @@ mod tests {
                     ledger
                         .revoke_attempt_scoped(
                             attempt.attempt_id,
-                            "transport: stage deadline exceeded: test",
+                            "deadline: stage deadline exceeded: test",
                             RevokeScope::Deadline,
                         )
                         .expect("revoke");

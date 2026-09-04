@@ -425,6 +425,19 @@ pub fn terminal_json(terminal: &Terminal) -> Value {
                 "attempts": attempts,
             }
         }),
+        Terminal::DeadlineExhausted {
+            stage_id,
+            kills,
+            commits_ahead,
+            uncommitted,
+        } => json!({
+            "deadlineExhausted": {
+                "stage": stage_id,
+                "kills": kills,
+                "commitsAhead": commits_ahead,
+                "uncommitted": uncommitted,
+            }
+        }),
         Terminal::ExternallyStopped { reason } => {
             json!({"externallyStopped": {"reason": reason}})
         }
@@ -560,6 +573,17 @@ fn automatic_settlement(terminal: &Terminal) -> Option<super::settlement::Settle
             forged_ledger::RunOutcome::Blocked,
             format!("provider unavailable for {stage_id} after {attempts} attempts"),
         ),
+        Terminal::DeadlineExhausted {
+            stage_id,
+            kills,
+            commits_ahead,
+            uncommitted,
+        } => (
+            forged_ledger::RunOutcome::Blocked,
+            format!(
+                "stage deadline exceeded {kills} times in {stage_id}; worktree: {commits_ahead} commits ahead, {uncommitted} uncommitted file(s)"
+            ),
+        ),
         // This is already a ledger stop (including one settled explicitly by
         // `run stop`), so it must not invent or rewrite an outcome.
         Terminal::ExternallyStopped { .. } => return None,
@@ -582,7 +606,41 @@ fn synthetic_verdict_reason(
     })
 }
 
+/// Fill a deadline stop's worktree facts from the tree the seat left; the
+/// engine never reads the tree, so it reports zeros the driver overwrites.
+async fn with_worktree_facts(ctx: &Ctx, run_id: &str, terminal: &Terminal) -> Terminal {
+    let Terminal::DeadlineExhausted {
+        stage_id, kills, ..
+    } = terminal
+    else {
+        return terminal.clone();
+    };
+    let worktree = ctx.config.worktree(run_id);
+    let base_ref = {
+        let run_id = run_id.to_owned();
+        on_ledger(&ctx.ledger, move |ledger| ledger.get_run(&run_id))
+            .await
+            .map(|run| run.base_ref)
+            .unwrap_or_default()
+    };
+    let commits_ahead = crate::adapters::ports::worktree_commits_ahead(&worktree, &base_ref)
+        .await
+        .map(|(count, _)| count)
+        .unwrap_or(0);
+    let uncommitted = crate::adapters::ports::worktree_uncommitted_paths(&worktree)
+        .await
+        .unwrap_or(0);
+    Terminal::DeadlineExhausted {
+        stage_id: stage_id.clone(),
+        kills: *kills,
+        commits_ahead,
+        uncommitted,
+    }
+}
+
 async fn settle_terminal(ctx: &Ctx, run_id: &str, terminal: &Terminal) -> Result<(), Failure> {
+    let enriched = with_worktree_facts(ctx, run_id, terminal).await;
+    let terminal = &enriched;
     if let Some(settlement) = automatic_settlement(terminal) {
         // `settle_run` deliberately makes the protocol project as externally
         // stopped. Preserve the terminal that caused automatic settlement so
@@ -861,6 +919,7 @@ fn after_outcome(outcome: PacketOutcome) {
         PacketOutcome::Landed(_) => tracing::info!("packet landed"),
         PacketOutcome::Quarantined => tracing::warn!("packet result quarantined"),
         PacketOutcome::Transport(note) => tracing::warn!(note, "transport failure recorded"),
+        PacketOutcome::Deadline(note) => tracing::warn!(note, "stage deadline kill recorded"),
         PacketOutcome::Unspawned(note) => {
             tracing::warn!(note, "attempt retired before any provider ran")
         }
@@ -1352,6 +1411,82 @@ async fn rev_parse_head(worktree: &PathBuf) -> Result<String, Failure> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
 }
 
+/// Prefix of the recoverable refusal a machine gate raises when every gate
+/// slot on this daemon is held; the drive loop parks on it.
+pub(crate) const GATE_CAPACITY_PREFIX: &str = "gate-capacity:";
+
+/// One held gate slot; released on drop.
+struct GateSlotGuard {
+    ledger: forged_ledger::Ledger,
+    slot: String,
+    holder: String,
+}
+
+impl Drop for GateSlotGuard {
+    fn drop(&mut self) {
+        let _ = self.ledger.release_merge_slot(&self.slot, &self.holder);
+    }
+}
+
+/// Take one of the daemon's `gate_active` gate slots (live admission config)
+/// or refuse recoverably. A slot whose holder pid is dead is stale: it is
+/// released and taken over, which is how a crashed controller's gate frees
+/// the daemon without an operator.
+async fn acquire_gate_slot(ctx: &Ctx, run_id: &str) -> Result<GateSlotGuard, Failure> {
+    let capacity = ctx.config.admission.gate_active.max(1);
+    let holder = format!(
+        "forged-gate:{}:{}:{}",
+        std::process::id(),
+        run_id,
+        uuid::Uuid::new_v4()
+    );
+    for index in 0..capacity {
+        let slot = format!("gate-slot:{index}");
+        for _ in 0..2 {
+            let outcome = {
+                let slot = slot.clone();
+                let holder = holder.clone();
+                on_ledger(&ctx.ledger, move |ledger| {
+                    ledger.acquire_merge_slot(&slot, &holder)
+                })
+                .await?
+            };
+            match outcome {
+                forged_ledger::SlotOutcome::Acquired(_) => {
+                    return Ok(GateSlotGuard {
+                        ledger: ctx.ledger.clone(),
+                        slot,
+                        holder,
+                    });
+                }
+                forged_ledger::SlotOutcome::Held(row) => {
+                    let held_pid = row
+                        .holder
+                        .strip_prefix("forged-gate:")
+                        .and_then(|rest| rest.split(':').next())
+                        .and_then(|pid| pid.parse::<i32>().ok());
+                    let stale = held_pid.is_none_or(|pid| !pid_alive(pid));
+                    if !stale {
+                        break;
+                    }
+                    let (slot, stale_holder) = (slot.clone(), row.holder.clone());
+                    on_ledger(&ctx.ledger, move |ledger| {
+                        ledger.release_merge_slot(&slot, &stale_holder)
+                    })
+                    .await?;
+                }
+            }
+        }
+    }
+    Err(Failure {
+        code: forged_types::ErrorCode::OperationInProgress,
+        message: format!(
+            "{GATE_CAPACITY_PREFIX} all {capacity} gate slot(s) on this daemon are held; the gate for {run_id} waits for the next admission wake"
+        ),
+        recoverable: true,
+    })
+}
+
 /// The machine-step effect bodies.
 async fn machine_effect(
     ctx: &Ctx,
@@ -1432,6 +1567,10 @@ async fn machine_effect(
                 ctx.config.worktree(&run.run_id),
                 artifacts,
             );
+            // One machine gate at a time on this daemon: the slot is held
+            // for the whole suite and released on drop, so a crashed
+            // controller frees it through its dead pid on the next try.
+            let _gate_slot = acquire_gate_slot(ctx, &run.run_id).await?;
             let outcome = forged_gate::run_gates(&request).await?;
             if let Some(expected) = head_before.as_deref() {
                 let observed = rev_parse_head(&ctx.config.worktree(&run.run_id)).await?;
@@ -1757,8 +1896,11 @@ async fn run_drive_loop(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
                 if failure.code == forged_types::ErrorCode::OperationInProgress
                     && failure.recoverable =>
             {
-                let packet_id = match classify_deferral(ctx, &action).await {
+                let packet_id = match classify_deferral(ctx, &action, &failure.message).await {
                     Ok(DeferralClass::Parked { packet_id }) => packet_id,
+                    // A machine gate waiting for this daemon's gate slot
+                    // parks under the run's own gate key.
+                    Ok(DeferralClass::Gate) => format!("{run_id}/gate"),
                     // A concurrent admission can land between the refusal
                     // and this read; the packet is ours to drive now, so
                     // re-project immediately instead of exiting.
@@ -1794,6 +1936,8 @@ enum DeferralClass {
     /// The LATEST durable decision defers on a wait-clearing reason
     /// (capacity or rate limit): park and retry on the wake.
     Parked { packet_id: String },
+    /// A machine gate found every gate slot on this daemon held.
+    Gate,
     /// The latest decision is an admit — a concurrent admission landed
     /// between the refusal and this read. Re-project, never exit.
     AdmittedMeanwhile,
@@ -1809,7 +1953,18 @@ enum DeferralClass {
 /// alone cannot authorize a park. Rate-limit deferrals are pure waits too
 /// (their visibility stays ProviderDegraded); anything that is not
 /// awaiting a packet has no decision to join and never parks.
-async fn classify_deferral(ctx: &Ctx, action: &NextAction) -> Result<DeferralClass, Failure> {
+async fn classify_deferral(
+    ctx: &Ctx,
+    action: &NextAction,
+    failure_message: &str,
+) -> Result<DeferralClass, Failure> {
+    if matches!(
+        action,
+        NextAction::RunMachine(MachineStage::Gate | MachineStage::ReGate)
+    ) && failure_message.starts_with(GATE_CAPACITY_PREFIX)
+    {
+        return Ok(DeferralClass::Gate);
+    }
     let NextAction::AwaitPacket { packet_id, .. } = action else {
         return Ok(DeferralClass::NotCapacity);
     };

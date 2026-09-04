@@ -2644,7 +2644,7 @@ fn real_provider_timeout_falls_back_to_the_next_candidate() {
     assert!(first
         .fail_note
         .as_deref()
-        .is_some_and(|note| note.starts_with("transport: stage deadline exceeded")));
+        .is_some_and(|note| note.starts_with("deadline: stage deadline exceeded")));
     assert!(second.claimant.starts_with("codex:"), "{second:?}");
     assert_eq!(second.state, forged_ledger::AttemptState::Completed);
     assert_eq!(

@@ -299,6 +299,12 @@ fn running_attempt_for(
     Ok(attempt)
 }
 
+/// Whether a revoke reason is a stage-deadline note, current or legacy.
+fn is_deadline_note(note: &str) -> bool {
+    note.starts_with("deadline: stage deadline exceeded")
+        || note.starts_with("transport: stage deadline exceeded")
+}
+
 impl Ledger {
     /// Claim a packet: insert a `running` attempt with a fresh fencing token.
     ///
@@ -834,16 +840,16 @@ impl Ledger {
     /// Settle a kill-confirmed deadline marker as one retryable transport
     /// failure. The marker's stored reason is the durable timeout evidence;
     /// reservation release and the terminal event commit with the state.
+    ///
+    /// The reason must be a deadline note. Rows revoked before the deadline
+    /// class existed carry the legacy `transport:` prefix and still settle.
     pub fn mark_timed_out(&self, attempt_id: i64) -> Result<(), LedgerError> {
         self.submit(move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let attempt = get_attempt_tx(&tx, attempt_id)?;
             if attempt.state == AttemptState::Failed
                 && attempt.revoke_scope == Some(RevokeScope::Deadline)
-                && attempt
-                    .fail_note
-                    .as_deref()
-                    .is_some_and(|note| note.starts_with("transport: stage deadline exceeded"))
+                && attempt.fail_note.as_deref().is_some_and(is_deadline_note)
             {
                 tx.commit()?;
                 return Ok(());
@@ -862,7 +868,7 @@ impl Ledger {
                     format!("deadline attempt {attempt_id} has no reason"),
                 )
             })?;
-            if !note.starts_with("transport: stage deadline exceeded") {
+            if !is_deadline_note(&note) {
                 return Err(refused(
                     ErrorCode::InvalidRequest,
                     format!("deadline attempt {attempt_id} has an invalid reason"),

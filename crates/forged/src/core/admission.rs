@@ -1000,7 +1000,6 @@ async fn admit_packet_facts_once(
                     AdmissionResourceClass::RepositoryWrite => Sandbox::WorkspaceWrite,
 
                     // A gate reservation never launches a packet; the read-only sandbox
-
                     // is the conservative shape for a class that has no seat.
                     AdmissionResourceClass::Gate => Sandbox::ReadOnly,
                 },
@@ -1106,7 +1105,6 @@ async fn admit_packet_facts_once(
                 AdmissionResourceClass::RepositoryWrite => Sandbox::WorkspaceWrite,
 
                 // A gate reservation never launches a packet; the read-only sandbox
-
                 // is the conservative shape for a class that has no seat.
                 AdmissionResourceClass::Gate => Sandbox::ReadOnly,
             },

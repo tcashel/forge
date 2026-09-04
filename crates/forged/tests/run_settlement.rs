@@ -443,7 +443,7 @@ fn settlement_refreshes_siblings_after_whole_run_deadline_reconciliation() {
     ledger
         .revoke_attempt_scoped(
             attempts[0],
-            "transport: stage deadline exceeded: seeded marker",
+            "deadline: stage deadline exceeded: seeded marker",
             forged_ledger::RevokeScope::Deadline,
         )
         .expect("seed first deadline marker");

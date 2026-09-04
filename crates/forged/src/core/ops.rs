@@ -2780,6 +2780,7 @@ pub async fn packet_fail(ctx: &Ctx, req: &mut OperationRequest) -> OperationResp
                 forged_proto::FailureKind::Unspawned => "unspawned",
                 forged_proto::FailureKind::Readmit => "readmit",
                 forged_proto::FailureKind::Semantic => "semantic",
+                forged_proto::FailureKind::Deadline => "deadline",
             };
             Ok(json!({"classification": classification, "note": note}))
         }

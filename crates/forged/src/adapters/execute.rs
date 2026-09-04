@@ -90,6 +90,9 @@ pub enum PacketOutcome {
     Quarantined,
     /// A transport failure was recorded (free retry within the budget).
     Transport(String),
+    /// The attempt was killed at its stage deadline; relaunched under the
+    /// deadline budget with the worktree intact.
+    Deadline(String),
     /// A claimed attempt was retired before any provider ran, and charged to
     /// the same bounded budget. Distinct from `Transport` because nothing
     /// was transported: no seat spoke, so there is no stage result to read.
@@ -119,7 +122,7 @@ fn deadline_reason(
         return Ok(None);
     }
     Ok(Some(format!(
-        "transport: stage deadline exceeded: attemptId={attempt_id} stage={} startedAt={} budgetS={} deadlineAt={} asOf={as_of}",
+        "deadline: stage deadline exceeded: attemptId={attempt_id} stage={} startedAt={} budgetS={} deadlineAt={} asOf={as_of}",
         stage_str(packet.stage),
         started_at,
         budget_s,
@@ -137,33 +140,18 @@ async fn settle_deadline_retry(
     let current = on_ledger(&ctx.ledger, move |ledger| ledger.get_attempt(attempt_id)).await?;
     if current.state == AttemptState::Failed && current.revoke_scope == Some(RevokeScope::Deadline)
     {
-        return Ok(PacketOutcome::Transport(note));
+        return Ok(PacketOutcome::Deadline(note));
     }
     if current.state != AttemptState::Revoking
         || current.revoke_scope != Some(RevokeScope::Deadline)
     {
         return Ok(PacketOutcome::Revoked);
     }
-    let since = current.updated_at;
-    let started_at = current.started_at;
-    let run_id = run_id.to_owned();
-    let packet_id = packet_id.to_owned();
-    on_ledger(&ctx.ledger, move |ledger| {
-        forged_proto::grant_retry_for_attempt_under_active_policy(
-            ledger,
-            &run_id,
-            &packet_id,
-            attempt_id,
-            &since,
-            &started_at,
-        )
-        .map_err(|error| forged_ledger::LedgerError::Internal {
-            message: error.to_string(),
-        })
-    })
-    .await?;
+    // A deadline kill earns no retry grant: the engine counts it from the
+    // attempt rows under `deadline_retry_budget`, apart from transport.
+    let _ = (run_id, packet_id);
     on_ledger(&ctx.ledger, move |ledger| ledger.mark_timed_out(attempt_id)).await?;
-    Ok(PacketOutcome::Transport(note))
+    Ok(PacketOutcome::Deadline(note))
 }
 
 async fn deadline_marker(ctx: &Ctx, attempt_id: i64, note: &str) -> Result<AttemptRow, Failure> {
@@ -3851,7 +3839,7 @@ mod settle_tests {
         )
         .await
         .expect("overdue adoption settles");
-        assert!(matches!(outcome, PacketOutcome::Transport(_)));
+        assert!(matches!(outcome, PacketOutcome::Deadline(_)));
         assert!(
             fixture
                 .ledger
@@ -3871,7 +3859,7 @@ mod settle_tests {
         assert!(attempt
             .fail_note
             .as_deref()
-            .is_some_and(|note| note.starts_with("transport: stage deadline exceeded")));
+            .is_some_and(|note| note.starts_with("deadline: stage deadline exceeded")));
         let events = fixture
             .ledger
             .list_events(Some(RUN_ID), 0, 1_000)
@@ -3881,8 +3869,8 @@ mod settle_tests {
                 .iter()
                 .filter(|event| event.kind == "proto.retry")
                 .count(),
-            1,
-            "the overdue attempt earns exactly one attempt-addressed successor grant"
+            0,
+            "a deadline kill earns no retry grant; the engine counts it from the attempt rows"
         );
         let attempt_owner = fixture.attempt_id.to_string();
         assert!(fixture
@@ -3929,7 +3917,7 @@ mod settle_tests {
         .await
         .expect("expired preparation settles through the deadline path");
 
-        assert!(matches!(outcome, PacketOutcome::Transport(_)));
+        assert!(matches!(outcome, PacketOutcome::Deadline(_)));
         let methods = seen.lock().expect("method log").clone();
         assert!(
             !methods.iter().any(|method| method == "pane.send_input"),
@@ -3948,7 +3936,7 @@ mod settle_tests {
         assert!(attempt
             .fail_note
             .as_deref()
-            .is_some_and(|note| note.starts_with("transport: stage deadline exceeded")));
+            .is_some_and(|note| note.starts_with("deadline: stage deadline exceeded")));
         let dirs = PacketDirs::new(&fixture.packet_dir, fixture.attempt_id);
         let session: Value = serde_json::from_slice(
             &std::fs::read(dirs.session()).expect("deadline session evidence"),
@@ -3990,10 +3978,10 @@ mod settle_tests {
             started.elapsed() < Duration::from_secs(3),
             "the five-second pid identity window outlived the stage budget"
         );
-        let PacketOutcome::Transport(note) = outcome else {
-            panic!("deadline must settle as transport")
+        let PacketOutcome::Deadline(note) = outcome else {
+            panic!("deadline must settle as a deadline kill")
         };
-        assert!(note.starts_with("transport: stage deadline exceeded"));
+        assert!(note.starts_with("deadline: stage deadline exceeded"));
         assert!(!note.contains("pid file never appeared"));
         let attempt = fixture
             .ledger
@@ -4108,7 +4096,7 @@ mod settle_tests {
         )
         .await
         .expect("late terminal output settles as a timeout");
-        assert!(matches!(outcome, PacketOutcome::Transport(_)));
+        assert!(matches!(outcome, PacketOutcome::Deadline(_)));
 
         let attempt = fixture
             .ledger
@@ -4124,8 +4112,8 @@ mod settle_tests {
                 .iter()
                 .filter(|event| event.kind == "proto.retry")
                 .count(),
-            1,
-            "the late terminal observation earns exactly one retry"
+            0,
+            "a deadline kill earns no retry grant"
         );
         let methods = seen.lock().expect("method log").clone();
         assert_eq!(
@@ -4217,7 +4205,7 @@ mod settle_tests {
             .ledger
             .revoke_attempt_scoped(
                 settle.attempt_id,
-                "transport: stage deadline exceeded: pre-cutoff settle fixture",
+                "deadline: stage deadline exceeded: pre-cutoff settle fixture",
                 RevokeScope::Deadline,
             )
             .expect("deadline marker");
@@ -4227,11 +4215,11 @@ mod settle_tests {
             RUN_ID,
             &settle.packet_id,
             settle.attempt_id,
-            "transport: stage deadline exceeded: pre-cutoff settle fixture".to_owned(),
+            "deadline: stage deadline exceeded: pre-cutoff settle fixture".to_owned(),
         )
         .await
         .expect("settle pre-cutoff deadline");
-        assert!(matches!(outcome, PacketOutcome::Transport(_)));
+        assert!(matches!(outcome, PacketOutcome::Deadline(_)));
         assert_eq!(retry_state(&settle.ledger, &settle.packet_id), before);
         assert_eq!(
             settle
@@ -4275,7 +4263,7 @@ mod settle_tests {
             .ledger
             .revoke_attempt_scoped(
                 reconcile_fixture.attempt_id,
-                "transport: stage deadline exceeded: pre-cutoff reconcile fixture",
+                "deadline: stage deadline exceeded: pre-cutoff reconcile fixture",
                 RevokeScope::Deadline,
             )
             .expect("reconcile deadline marker");
