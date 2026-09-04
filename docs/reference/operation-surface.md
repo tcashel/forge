@@ -65,6 +65,7 @@ Generated from the dispatch table, clap tree, MCP router, and fenced-call audit.
 | `supervise` | `forged supervise` | yes | no | — | machine-fenced | no | yes |
 | `usage_ingest` | `forged usage ingest` | yes | yes | operator | unfenced_write | no | yes |
 | `usage_report` | `forged usage` | yes | yes | lead | read_only | no | yes |
+| `work_adjudicate` | `forged work adjudicate` | yes | yes | lead | fenced | no | yes |
 | `work_close` | `forged work close` | yes | yes | lead | fenced | no | yes |
 | `work_create` | `forged work create` | yes | yes | lead | fenced | no | yes |
 | `work_detail` | `forged work detail` | yes | yes | operator | read_only | no | yes |
@@ -75,6 +76,7 @@ Generated from the dispatch table, clap tree, MCP router, and fenced-call audit.
 | `work_map` | `forged work map` | yes | yes | operator | read_only | no | yes |
 | `work_note_add` | `forged work note add` | yes | yes | lead | fenced | no | yes |
 | `work_note_list` | `forged work note list` | yes | yes | lead | read_only | no | yes |
+| `work_park` | `forged work park` | yes | yes | lead | fenced | no | yes |
 | `work_promote` | `forged work promote` | yes | yes | lead | fenced | no | yes |
 | `work_ready` | `forged work ready` | yes | yes | lead | read_only | no | yes |
 | `work_release` | `forged work release` | yes | yes | lead | fenced | no | yes |

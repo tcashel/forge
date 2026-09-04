@@ -2083,6 +2083,12 @@ fn project(input: ProjectionInput<'_>) -> Result<Vec<AttentionItemV1>, Failure> 
         .filter(|issue| issue.status == "blocked")
         .map(|issue| issue.id.as_str())
         .collect();
+    let parked_work: BTreeSet<&str> = input
+        .work
+        .iter()
+        .filter(|issue| issue.status == "deferred")
+        .map(|issue| issue.id.as_str())
+        .collect();
     let work_by_subject: BTreeMap<&str, &str> = input
         .entries
         .iter()
@@ -2092,9 +2098,17 @@ fn project(input: ProjectionInput<'_>) -> Result<Vec<AttentionItemV1>, Failure> 
                 .get("workId")
                 .or_else(|| entry.get("beadId"))?
                 .as_str()?;
-            blocked_work.contains(work_id).then_some((subject, work_id))
+            Some((subject, work_id))
         })
         .collect();
+    let blocked_work_by_subject = work_by_subject
+        .iter()
+        .filter_map(|(subject, work_id)| {
+            blocked_work
+                .contains(work_id)
+                .then_some((*subject, *work_id))
+        })
+        .collect::<BTreeMap<_, _>>();
     let mut buckets: BTreeMap<(String, AttentionCondition), Vec<RawAttention>> = BTreeMap::new();
     for source in raw {
         buckets
@@ -2104,6 +2118,12 @@ fn project(input: ProjectionInput<'_>) -> Result<Vec<AttentionItemV1>, Failure> 
     }
     let mut projected = Vec::new();
     for ((subject_id, condition), mut sources) in buckets {
+        if work_by_subject
+            .get(subject_id.as_str())
+            .is_some_and(|work_id| parked_work.contains(work_id))
+        {
+            continue;
+        }
         let Some(subject) = subject_metadata(&input, &subject_id) else {
             continue;
         };
@@ -2195,7 +2215,7 @@ fn project(input: ProjectionInput<'_>) -> Result<Vec<AttentionItemV1>, Failure> 
             subject_kind,
             run,
             desired_state,
-            work_by_subject.get(subject_id.as_str()).copied(),
+            blocked_work_by_subject.get(subject_id.as_str()).copied(),
             occurrence_resolution_allowed,
             persisted_risk_acceptance_allowed(&input, &subject_id),
             Some(&latest.evidence),

@@ -291,7 +291,7 @@ pub async fn release_unresolved_issue(
 pub async fn reopen_issue(ledger: &Ledger, id: &str, actor: &str) -> Result<IssueSummary, Failure> {
     let id = id.to_owned();
     let actor = actor.to_owned();
-    let snapshot = on_ledger(ledger, move |l| l.reopen_work_item(&id, &actor)).await?;
+    let snapshot = on_ledger(ledger, move |l| l.reopen_work_item(&id, &actor, None)).await?;
     Ok(issue_of(&snapshot))
 }
 

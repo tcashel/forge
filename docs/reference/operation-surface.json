@@ -684,6 +684,16 @@
       "audience": "lead",
       "class": "fenced",
       "cli": true,
+      "cliVerb": "work adjudicate",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": true,
+      "name": "work_adjudicate"
+    },
+    {
+      "audience": "lead",
+      "class": "fenced",
+      "cli": true,
       "cliVerb": "work close",
       "dispatch": true,
       "explicitKey": false,
@@ -778,6 +788,16 @@
       "explicitKey": false,
       "mcp": true,
       "name": "work_note_list"
+    },
+    {
+      "audience": "lead",
+      "class": "fenced",
+      "cli": true,
+      "cliVerb": "work park",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": true,
+      "name": "work_park"
     },
     {
       "audience": "lead",

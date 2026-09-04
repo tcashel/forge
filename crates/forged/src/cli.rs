@@ -1209,14 +1209,18 @@ pub enum WorkCmd {
     /// CAS-fenced spec/priority update; priority alone keeps the revision.
     /// Use promote for blocked/deferred stubs and reopen for closed items.
     Update(WorkUpdateArgs),
-    /// Atomically write a stub spec revision and promote it to open.
+    /// Stub-only compatibility alias for atomic promotion (one release).
     Promote(WorkPromoteArgs),
+    /// Atomically apply spec dispositions and bind adjudication evidence.
+    Adjudicate(WorkAdjudicateArgs),
+    /// Park an idle work item outside scheduling and attention rails.
+    Park(WorkParkArgs),
     /// Add one typed dependency edge.
     Link(WorkLinkArgs),
     /// Close a work item with a recorded reason.
     Close(WorkCloseArgs),
-    /// Reopen: status open from any state, custody untouched.
-    Reopen(WorkActorArgs),
+    /// Reopen an item; parked work requires a recorded resume reason.
+    Reopen(WorkReopenArgs),
     /// Release custody under the actor CAS.
     Release(WorkActorArgs),
     /// Supersede: link a successor and close the superseded item.
@@ -1411,7 +1415,7 @@ pub struct WorkUpdateArgs {
     pub idempotency_key: Option<String>,
 }
 
-/// `work promote` arguments.
+/// `work promote` stub-only compatibility alias arguments.
 #[derive(Debug, Args)]
 pub struct WorkPromoteArgs {
     /// The blocked or deferred stub id.
@@ -1444,6 +1448,67 @@ pub struct WorkPromoteArgs {
     /// Read new agent instructions verbatim from one UTF-8 file.
     #[arg(long)]
     pub notes_file: Option<PathBuf>,
+    /// Acting identity (default operator).
+    #[arg(long)]
+    pub actor: Option<String>,
+    /// Override the derived idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+/// `work adjudicate` arguments.
+#[derive(Debug, Args)]
+pub struct WorkAdjudicateArgs {
+    /// The work item id.
+    #[arg(long)]
+    pub id: String,
+    /// The revision you read — the CAS guard.
+    #[arg(long)]
+    pub expected_revision: i64,
+    /// New title; omitted preserves the current bytes.
+    #[arg(long)]
+    pub title: Option<String>,
+    /// New description; omitted preserves the current bytes.
+    #[arg(long, allow_hyphen_values = true, conflicts_with = "description_file")]
+    pub description: Option<String>,
+    /// Read the new description verbatim from one UTF-8 file.
+    #[arg(long)]
+    pub description_file: Option<PathBuf>,
+    /// New acceptance criteria; omitted preserves the current bytes.
+    #[arg(long, allow_hyphen_values = true, conflicts_with = "acceptance_file")]
+    pub acceptance: Option<String>,
+    /// Read the new acceptance criteria verbatim from one UTF-8 file.
+    #[arg(long)]
+    pub acceptance_file: Option<PathBuf>,
+    /// New design notes; omitted preserves the current bytes.
+    #[arg(long, allow_hyphen_values = true, conflicts_with = "design_file")]
+    pub design: Option<String>,
+    /// Read the new design notes verbatim from one UTF-8 file.
+    #[arg(long)]
+    pub design_file: Option<PathBuf>,
+    /// New agent instructions; omitted preserves the current bytes.
+    #[arg(long, allow_hyphen_values = true, conflicts_with = "notes_file")]
+    pub notes: Option<String>,
+    /// Read the new agent instructions verbatim from one UTF-8 file.
+    #[arg(long)]
+    pub notes_file: Option<PathBuf>,
+    /// Read the forged.adjudication/1 payload from a UTF-8 file; `-` reads stdin.
+    #[arg(long)]
+    pub dispositions_file: PathBuf,
+    /// Override the derived idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+/// `work park` arguments.
+#[derive(Debug, Args)]
+pub struct WorkParkArgs {
+    /// The idle work item id.
+    #[arg(long)]
+    pub id: String,
+    /// Why this work is being removed from active planning rails.
+    #[arg(long)]
+    pub reason: String,
     /// Acting identity (default operator).
     #[arg(long)]
     pub actor: Option<String>,
@@ -1492,6 +1557,23 @@ pub struct WorkActorArgs {
     /// The work item id.
     #[arg(long)]
     pub id: String,
+    /// Acting identity (default operator).
+    #[arg(long)]
+    pub actor: Option<String>,
+    /// Override the derived idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+/// `work reopen` arguments.
+#[derive(Debug, Args)]
+pub struct WorkReopenArgs {
+    /// The work item id.
+    #[arg(long)]
+    pub id: String,
+    /// Required when resuming a parked item; recorded as a decision.
+    #[arg(long)]
+    pub reason: Option<String>,
     /// Acting identity (default operator).
     #[arg(long)]
     pub actor: Option<String>,
@@ -2108,6 +2190,8 @@ pub fn command_name(command: &Command) -> &'static str {
             WorkCmd::Create(_) => "work_create",
             WorkCmd::Update(_) => "work_update",
             WorkCmd::Promote(_) => "work_promote",
+            WorkCmd::Adjudicate(_) => "work_adjudicate",
+            WorkCmd::Park(_) => "work_park",
             WorkCmd::Link(_) => "work_link",
             WorkCmd::Close(_) => "work_close",
             WorkCmd::Reopen(_) => "work_reopen",
@@ -3032,6 +3116,65 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
                     request(a.idempotency_key, None, Value::Object(params)),
                 )
             }
+            WorkCmd::Adjudicate(a) => {
+                let description = spec_field_input(
+                    a.description,
+                    a.description_file.as_deref(),
+                    "--description",
+                    "--description-file",
+                )?;
+                let acceptance = spec_field_input(
+                    a.acceptance,
+                    a.acceptance_file.as_deref(),
+                    "--acceptance",
+                    "--acceptance-file",
+                )?;
+                let design = spec_field_input(
+                    a.design,
+                    a.design_file.as_deref(),
+                    "--design",
+                    "--design-file",
+                )?;
+                let notes =
+                    spec_field_input(a.notes, a.notes_file.as_deref(), "--notes", "--notes-file")?;
+                let mut params = Map::new();
+                params.insert("id".to_owned(), json!(a.id));
+                params.insert("expectedRevision".to_owned(), json!(a.expected_revision));
+                params.insert(
+                    "bodyJson".to_owned(),
+                    json!(read_utf8_file_or_stdin(
+                        &a.dispositions_file,
+                        "--dispositions-file",
+                    )?),
+                );
+                for (name, value) in [
+                    ("title", a.title),
+                    ("description", description),
+                    ("acceptanceCriteria", acceptance),
+                    ("design", design),
+                    ("notes", notes),
+                ] {
+                    if let Some(value) = value {
+                        params.insert(name.to_owned(), json!(value));
+                    }
+                }
+                (
+                    "work_adjudicate",
+                    request(a.idempotency_key, None, Value::Object(params)),
+                )
+            }
+            WorkCmd::Park(a) => {
+                let mut params = Map::new();
+                params.insert("id".to_owned(), json!(a.id));
+                params.insert("reason".to_owned(), json!(a.reason));
+                if let Some(actor) = a.actor {
+                    params.insert("actor".to_owned(), json!(actor));
+                }
+                (
+                    "work_park",
+                    request(a.idempotency_key, None, Value::Object(params)),
+                )
+            }
             WorkCmd::Link(a) => {
                 let mut params = Map::new();
                 params.insert("fromId".to_owned(), json!(a.from));
@@ -3059,6 +3202,9 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
             WorkCmd::Reopen(a) => {
                 let mut params = Map::new();
                 params.insert("id".to_owned(), json!(a.id));
+                if let Some(reason) = a.reason {
+                    params.insert("reason".to_owned(), json!(reason));
+                }
                 if let Some(actor) = a.actor {
                     params.insert("actor".to_owned(), json!(actor));
                 }

@@ -16,8 +16,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use forged_types::{
-    canonical_json_bytes, parse_canonical, request_sha256, ErrorCode, OperationRequest,
-    OperationResponse,
+    canonical_json_bytes, parse_canonical, request_sha256, AdjudicationRefV1, AdjudicationV1,
+    DecisionKind, DecisionSubjectV1, DecisionV1, ErrorCode, OperationRequest, OperationResponse,
+    SpecRecommendationsV1, ADJUDICATION_SCHEMA_V1, DECISION_SCHEMA_V1,
+    SPEC_RECOMMENDATIONS_SCHEMA_V1,
 };
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use serde_json::json;
@@ -726,26 +728,33 @@ fn work_plan_snapshot_tx(
 }
 
 fn snapshot_from_row(row: &rusqlite::Row<'_>) -> Result<WorkItemSnapshot, rusqlite::Error> {
-    let kind: String = row.get(1)?;
-    let status: String = row.get(2)?;
-    let metadata: String = row.get(5)?;
+    snapshot_from_row_offset(row, 0)
+}
+
+fn snapshot_from_row_offset(
+    row: &rusqlite::Row<'_>,
+    offset: usize,
+) -> Result<WorkItemSnapshot, rusqlite::Error> {
+    let kind: String = row.get(offset + 1)?;
+    let status: String = row.get(offset + 2)?;
+    let metadata: String = row.get(offset + 5)?;
     Ok(WorkItemSnapshot {
-        work_id: row.get(0)?,
-        kind: WorkKind::decode(1, &kind)?,
-        status: WorkStatus::decode(2, &status)?,
-        priority: row.get(3)?,
-        assignee: row.get(4)?,
-        metadata: decode_metadata(5, &metadata)?,
-        revision: row.get(6)?,
+        work_id: row.get(offset)?,
+        kind: WorkKind::decode(offset + 1, &kind)?,
+        status: WorkStatus::decode(offset + 2, &status)?,
+        priority: row.get(offset + 3)?,
+        assignee: row.get(offset + 4)?,
+        metadata: decode_metadata(offset + 5, &metadata)?,
+        revision: row.get(offset + 6)?,
         spec: WorkSpecFields {
-            title: row.get(7)?,
-            description: row.get(8)?,
-            acceptance_criteria: row.get(9)?,
-            design: row.get(10)?,
-            notes: row.get(11)?,
+            title: row.get(offset + 7)?,
+            description: row.get(offset + 8)?,
+            acceptance_criteria: row.get(offset + 9)?,
+            design: row.get(offset + 10)?,
+            notes: row.get(offset + 11)?,
         },
-        created_at: row.get(12)?,
-        updated_at: row.get(13)?,
+        created_at: row.get(offset + 12)?,
+        updated_at: row.get(offset + 13)?,
     })
 }
 
@@ -916,6 +925,25 @@ fn list_work_notes_tx(
     })
 }
 
+fn work_lifecycle_notes_tx(
+    conn: &Connection,
+    work_ids: &[String],
+) -> Result<Vec<WorkNoteRow>, LedgerError> {
+    if work_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ids_json = serde_json::to_string(work_ids)?;
+    let mut statement = conn.prepare(
+        "SELECT note_id, work_id, revision, kind, schema, actor, body_json, written_at \
+         FROM work_notes \
+         WHERE work_id IN (SELECT value FROM json_each(?1)) \
+           AND kind IN ('recommendation', 'adjudication', 'decision') \
+         ORDER BY written_at, note_id",
+    )?;
+    let rows = statement.query_map([ids_json], work_note_from_row)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
 fn insert_revision_tx(
     conn: &Connection,
     work_id: &str,
@@ -940,6 +968,227 @@ fn insert_revision_tx(
             now_iso(),
         ],
     )?;
+    Ok(())
+}
+
+fn work_has_lease_tx(conn: &Connection, work_id: &str) -> Result<bool, LedgerError> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM work_leases WHERE work_id = ?1)",
+        [work_id],
+        |row| row.get(0),
+    )?)
+}
+
+fn active_work_run_tx(conn: &Connection, work_id: &str) -> Result<Option<String>, LedgerError> {
+    Ok(conn
+        .query_row(
+            "SELECT run_id FROM runs WHERE bead_id = ?1 AND state = 'active' \
+             ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            [work_id],
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
+fn unchecked_checkbox(line: &str) -> bool {
+    line.trim_start().starts_with("- [ ]")
+}
+
+fn validate_adjudication_tx(
+    conn: &Connection,
+    current: &WorkItemSnapshot,
+    resulting_revision: i64,
+    note: &NewWorkNote,
+) -> Result<(), LedgerError> {
+    if note.kind != WorkNoteKind::Adjudication || note.schema != ADJUDICATION_SCHEMA_V1 {
+        return Err(refused(
+            ErrorCode::InvalidRequest,
+            "work adjudicate requires a forged.adjudication/1 note",
+        ));
+    }
+    let body: serde_json::Value = serde_json::from_str(&note.body_json).map_err(|error| {
+        internal(format!(
+            "canonical adjudication body did not decode: {error}"
+        ))
+    })?;
+    let adjudication = AdjudicationV1::parse_value(body).map_err(|error| {
+        refused(
+            ErrorCode::InvalidRequest,
+            format!("work adjudication payload violates {error}"),
+        )
+    })?;
+    if adjudication.work_item != current.work_id {
+        return Err(refused(
+            ErrorCode::InvalidRequest,
+            format!(
+                "adjudication workItem {:?} does not match {:?}",
+                adjudication.work_item, current.work_id
+            ),
+        ));
+    }
+    let current_revision = u64::try_from(current.revision)
+        .map_err(|_| internal(format!("negative work revision for {:?}", current.work_id)))?;
+    let resulting_revision_u64 = u64::try_from(resulting_revision).map_err(|_| {
+        internal(format!(
+            "negative resulting revision for {:?}",
+            current.work_id
+        ))
+    })?;
+    if adjudication.critiqued_revision != current_revision {
+        return Err(refused(
+            ErrorCode::WorkContention,
+            format!(
+                "adjudication critiquedRevision is {}, but the current work item revision is {}; re-read the item and recommendation",
+                adjudication.critiqued_revision, current.revision
+            ),
+        ));
+    }
+    if adjudication.resulting_revision != resulting_revision_u64 {
+        return Err(refused(
+            ErrorCode::InvalidRequest,
+            format!(
+                "adjudication resultingRevision is {}, but this write results in revision {resulting_revision}",
+                adjudication.resulting_revision
+            ),
+        ));
+    }
+    if adjudication.actor != note.actor {
+        return Err(refused(
+            ErrorCode::InvalidRequest,
+            format!(
+                "adjudication actor {:?} does not match operation actor {:?}",
+                adjudication.actor, note.actor
+            ),
+        ));
+    }
+
+    let recommendation = conn
+        .query_row(
+            "SELECT note_id, work_id, revision, kind, schema, actor, body_json, written_at \
+             FROM work_notes WHERE note_id = ?1 AND work_id = ?2 AND kind = 'recommendation'",
+            rusqlite::params![adjudication.recommendation_note_id, current.work_id],
+            work_note_from_row,
+        )
+        .optional()?
+        .ok_or_else(|| {
+            refused(
+                ErrorCode::InvalidRequest,
+                format!(
+                    "recommendation note {:?} does not exist on work item {:?}",
+                    adjudication.recommendation_note_id, current.work_id
+                ),
+            )
+        })?;
+    if recommendation.revision != current.revision
+        || recommendation.schema != SPEC_RECOMMENDATIONS_SCHEMA_V1
+    {
+        return Err(refused(
+            ErrorCode::InvalidRequest,
+            format!(
+                "recommendation note {:?} is not forged.spec-recommendations/1 evidence at current revision {}",
+                recommendation.note_id, current.revision
+            ),
+        ));
+    }
+    let recommendation_body: serde_json::Value = serde_json::from_str(&recommendation.body_json)
+        .map_err(|error| {
+            internal(format!(
+                "stored recommendation body did not decode: {error}"
+            ))
+        })?;
+    let recommendation_contract =
+        SpecRecommendationsV1::parse_value(recommendation_body).map_err(|error| {
+            internal(format!(
+                "stored recommendation note {:?} violates {error}",
+                recommendation.note_id
+            ))
+        })?;
+    if recommendation_contract.work_item != current.work_id {
+        return Err(refused(
+            ErrorCode::InvalidRequest,
+            format!(
+                "recommendation note {:?} names work item {:?}, not {:?}",
+                recommendation.note_id, recommendation_contract.work_item, current.work_id
+            ),
+        ));
+    }
+
+    let mut findings = BTreeSet::new();
+    let mut cruxes = BTreeSet::new();
+    for disposition in &adjudication.dispositions {
+        match &disposition.reference {
+            AdjudicationRefV1::Finding(reference) => {
+                if reference.note_id != recommendation.note_id
+                    || reference.index
+                        >= u64::try_from(recommendation_contract.recommendations.len())
+                            .unwrap_or(u64::MAX)
+                {
+                    return Err(refused(
+                        ErrorCode::InvalidRequest,
+                        format!(
+                            "adjudication disposition references unknown recommendation {}:{}",
+                            reference.note_id, reference.index
+                        ),
+                    ));
+                }
+                if !findings.insert(reference.index) {
+                    return Err(refused(
+                        ErrorCode::InvalidRequest,
+                        format!(
+                            "recommendation index {} is dispositioned more than once",
+                            reference.index
+                        ),
+                    ));
+                }
+            }
+            AdjudicationRefV1::Crux(reference) => {
+                if reference.note_id != recommendation.note_id
+                    || !recommendation_contract
+                        .cruxes
+                        .iter()
+                        .any(|crux| crux.id == reference.crux_id)
+                {
+                    return Err(refused(
+                        ErrorCode::InvalidRequest,
+                        format!(
+                            "adjudication disposition references unknown crux {}:{}",
+                            reference.note_id, reference.crux_id
+                        ),
+                    ));
+                }
+                if !cruxes.insert(reference.crux_id.clone()) {
+                    return Err(refused(
+                        ErrorCode::InvalidRequest,
+                        format!(
+                            "crux {:?} is dispositioned more than once",
+                            reference.crux_id
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+    let expected_findings =
+        u64::try_from(recommendation_contract.recommendations.len()).unwrap_or(u64::MAX);
+    if u64::try_from(findings.len()).unwrap_or(u64::MAX) != expected_findings {
+        return Err(refused(
+            ErrorCode::InvalidRequest,
+            format!(
+                "adjudication dispositions cover {} of {expected_findings} recommendations",
+                findings.len()
+            ),
+        ));
+    }
+    if cruxes.len() != recommendation_contract.cruxes.len() {
+        return Err(refused(
+            ErrorCode::InvalidRequest,
+            format!(
+                "adjudication dispositions cover {} of {} cruxes",
+                cruxes.len(),
+                recommendation_contract.cruxes.len()
+            ),
+        ));
+    }
     Ok(())
 }
 
@@ -1132,6 +1381,17 @@ impl Ledger {
     ) -> Result<WorkNotePage, LedgerError> {
         let work_id = work_id.to_owned();
         self.submit(move |conn| list_work_notes_tx(conn, &work_id, kind, limit))
+    }
+
+    /// Load the typed evidence needed for lifecycle derivation for an exact
+    /// set of work ids. Bodies stay inside the core and are never projected
+    /// by this read.
+    pub fn work_lifecycle_notes(
+        &self,
+        work_ids: &[String],
+    ) -> Result<Vec<WorkNoteRow>, LedgerError> {
+        let work_ids = work_ids.to_vec();
+        self.submit(move |conn| work_lifecycle_notes_tx(conn, &work_ids))
     }
 
     /// Count annotations without loading their bodies.
@@ -1665,6 +1925,285 @@ impl Ledger {
         })
     }
 
+    /// Atomically apply one adjudication: revision-CAS the optional spec
+    /// replacement, insert its revision-bound typed note, and move the
+    /// accepted coordination status. The callback is the kill-matrix seam
+    /// after a changed revision is inserted and before the note is inserted;
+    /// a crash there rolls the whole SQLite transaction back.
+    pub fn apply_work_adjudicate_operation<F>(
+        &self,
+        request: &OperationRequest,
+        work_id: &str,
+        expected_revision: i64,
+        spec: WorkSpecFields,
+        note: NewWorkNote,
+        after_revision: F,
+    ) -> Result<OperationResponse, LedgerError>
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        let request = request.clone();
+        let work_id = work_id.to_owned();
+        self.submit(move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if let Some(response) = replay_ledger_operation_tx(&tx, "work_adjudicate", &request)? {
+                tx.commit()?;
+                return Ok(response);
+            }
+            let current = require_snapshot_tx(&tx, &work_id)?;
+            if current.revision != expected_revision {
+                return Err(refused(
+                    ErrorCode::WorkContention,
+                    format!(
+                        "work item {work_id:?} revision moved: expected {expected_revision}, current {}",
+                        current.revision
+                    ),
+                ));
+            }
+            if current.status == WorkStatus::Closed {
+                return Err(refused(
+                    ErrorCode::InvalidRequest,
+                    format!("work item {work_id:?} is closed; use work reopen"),
+                ));
+            }
+            if current.status == WorkStatus::InProgress
+                || current.assignee.is_some()
+                || work_has_lease_tx(&tx, &work_id)?
+            {
+                return Err(refused(
+                    ErrorCode::WorkLeaseHeld,
+                    format!(
+                        "work item {work_id:?} is in progress or held by custody; use run status"
+                    ),
+                ));
+            }
+            if !matches!(
+                current.status,
+                WorkStatus::Open | WorkStatus::Blocked | WorkStatus::Deferred
+            ) {
+                return Err(refused(
+                    ErrorCode::InvalidRequest,
+                    format!(
+                        "work adjudicate does not accept status {}",
+                        current.status.as_str()
+                    ),
+                ));
+            }
+
+            let changed = spec != current.spec;
+            let resulting_revision = if changed {
+                current.revision + 1
+            } else {
+                current.revision
+            };
+            validate_adjudication_tx(&tx, &current, resulting_revision, &note)?;
+
+            let hash = request_sha256(&request).map_err(|error| {
+                refused(
+                    ErrorCode::InvalidRequest,
+                    format!("params cannot be canonicalized: {error}"),
+                )
+            })?;
+            let operation_id = uuid::Uuid::now_v7().to_string();
+            let operation_written_at = now_iso();
+            tx.execute(
+                "INSERT INTO operations (operation_id, name, idempotency_key, \
+                 request_sha256, effect_class, run_id, claim_token, state, \
+                 created_at, updated_at) \
+                 VALUES (?1, 'work_adjudicate', ?2, ?3, 'safe-retry', ?4, NULL, \
+                 'in_progress', ?5, ?5)",
+                rusqlite::params![
+                    operation_id,
+                    request.idempotency_key,
+                    hash,
+                    request.run_id,
+                    operation_written_at,
+                ],
+            )?;
+
+            if changed {
+                insert_revision_tx(
+                    &tx,
+                    &work_id,
+                    resulting_revision,
+                    &spec,
+                    WorkRevisionCause::Authored,
+                )?;
+                tx.execute(
+                    "UPDATE work_items SET current_revision = ?2, updated_at = ?3 WHERE work_id = ?1",
+                    rusqlite::params![work_id, resulting_revision, now_iso()],
+                )?;
+            }
+            after_revision();
+
+            let note = insert_work_note_tx(
+                &tx,
+                &note,
+                uuid::Uuid::now_v7().to_string(),
+                now_iso(),
+            )?;
+            let next_status = match current.status {
+                WorkStatus::Blocked if spec.notes.lines().any(unchecked_checkbox) => {
+                    WorkStatus::Blocked
+                }
+                WorkStatus::Open | WorkStatus::Blocked | WorkStatus::Deferred => WorkStatus::Open,
+                WorkStatus::InProgress | WorkStatus::Closed => unreachable!("refused above"),
+            };
+            set_coordination_tx(&tx, &work_id, next_status, None)?;
+            clear_lease_tx(&tx, &work_id)?;
+            append_event_tx(
+                &tx,
+                None,
+                "work.updated",
+                &json!({
+                    "workId": work_id,
+                    "verb": "adjudicate",
+                    "actor": note.actor,
+                    "status": {"from": current.status, "to": next_status},
+                    "revision": {"from": current.revision, "to": resulting_revision},
+                    "noteId": note.note_id,
+                }),
+            )?;
+            let snapshot = require_snapshot_tx(&tx, &work_id)?;
+            let response = OperationResponse {
+                operation_id: operation_id.clone(),
+                reused: false,
+                ok: true,
+                result: Some(json!({
+                    "work": snapshot,
+                    "note": note,
+                    "nextSteps": [
+                        if next_status == WorkStatus::Blocked {
+                            "resolve the unchecked notes item, then adjudicate the next revision"
+                        } else {
+                            "the adjudication is bound to the resulting revision"
+                        }
+                    ],
+                })),
+                error: None,
+            };
+            settle_operation(&tx, &operation_id, &response, true)?;
+            tx.commit()?;
+            Ok(response)
+        })
+    }
+
+    /// Atomically park one idle work item with its typed decision evidence.
+    /// Parking is coordination only: no spec revision is minted.
+    pub fn apply_work_park_operation(
+        &self,
+        request: &OperationRequest,
+        work_id: &str,
+        actor: &str,
+        reason: &str,
+    ) -> Result<OperationResponse, LedgerError> {
+        let request = request.clone();
+        let work_id = work_id.to_owned();
+        let actor = actor.to_owned();
+        let reason = reason.to_owned();
+        self.submit(move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if let Some(response) = replay_ledger_operation_tx(&tx, "work_park", &request)? {
+                tx.commit()?;
+                return Ok(response);
+            }
+            let before = require_snapshot_tx(&tx, &work_id)?;
+            let active_run = active_work_run_tx(&tx, &work_id)?;
+            if active_run.is_some()
+                || before.assignee.is_some()
+                || work_has_lease_tx(&tx, &work_id)?
+            {
+                return Err(refused(
+                    ErrorCode::WorkLeaseHeld,
+                    format!("work item {work_id:?} has a nonterminal run or custody; use run stop"),
+                ));
+            }
+            if before.status == WorkStatus::Closed {
+                return Err(refused(
+                    ErrorCode::InvalidRequest,
+                    format!("work item {work_id:?} is closed; use work reopen"),
+                ));
+            }
+
+            let hash = request_sha256(&request).map_err(|error| {
+                refused(
+                    ErrorCode::InvalidRequest,
+                    format!("params cannot be canonicalized: {error}"),
+                )
+            })?;
+            let operation_id = uuid::Uuid::now_v7().to_string();
+            let written_at = now_iso();
+            tx.execute(
+                "INSERT INTO operations (operation_id, name, idempotency_key, \
+                 request_sha256, effect_class, run_id, claim_token, state, \
+                 created_at, updated_at) \
+                 VALUES (?1, 'work_park', ?2, ?3, 'safe-retry', ?4, NULL, \
+                 'in_progress', ?5, ?5)",
+                rusqlite::params![
+                    operation_id,
+                    request.idempotency_key,
+                    hash,
+                    request.run_id,
+                    written_at,
+                ],
+            )?;
+            let decision = DecisionV1 {
+                schema: DECISION_SCHEMA_V1.to_owned(),
+                revision: Some(
+                    u64::try_from(before.revision)
+                        .map_err(|_| internal(format!("negative work revision for {work_id:?}")))?,
+                ),
+                kind: DecisionKind::Park,
+                subject: DecisionSubjectV1 {
+                    kind: "work".to_owned(),
+                    id: work_id.clone(),
+                },
+                choice: "park".to_owned(),
+                rationale: reason.clone(),
+                actor: actor.clone(),
+                at: written_at.clone(),
+                cost_microusd_at_decision: None,
+                approval: None,
+            };
+            let decision_json = serde_json::to_string(&decision)?;
+            let note = NewWorkNote {
+                work_id: work_id.clone(),
+                kind: WorkNoteKind::Decision,
+                schema: DECISION_SCHEMA_V1.to_owned(),
+                actor: actor.clone(),
+                body_json: canonical_work_note_body(&decision_json)?,
+            };
+            let note =
+                insert_work_note_tx(&tx, &note, uuid::Uuid::now_v7().to_string(), written_at)?;
+            set_coordination_tx(&tx, &work_id, WorkStatus::Deferred, None)?;
+            clear_lease_tx(&tx, &work_id)?;
+            coordination_event_tx(
+                &tx,
+                &work_id,
+                "park",
+                &before,
+                WorkStatus::Deferred,
+                None,
+                &actor,
+            )?;
+            let snapshot = require_snapshot_tx(&tx, &work_id)?;
+            let response = OperationResponse {
+                operation_id: operation_id.clone(),
+                reused: false,
+                ok: true,
+                result: Some(json!({
+                    "work": snapshot,
+                    "note": note,
+                    "nextSteps": ["resume with work reopen --reason <reason>"],
+                })),
+                error: None,
+            };
+            settle_operation(&tx, &operation_id, &response, true)?;
+            tx.commit()?;
+            Ok(response)
+        })
+    }
+
     /// Close a work item with a recorded reason: any non-closed status
     /// closes; custody and lease clear. Closing a closed item is an
     /// idempotent no-op returning the current snapshot.
@@ -1860,22 +2399,63 @@ impl Ledger {
         })
     }
 
-    /// Reopen: set status `Open` from ANY status (the bd-era
-    /// `update --status open`), custody untouched. Already-open is an
-    /// idempotent no-op.
+    /// Reopen: set status `Open` from any state. Deferred work requires a
+    /// reason and records the matching resume decision in the same
+    /// coordination transaction; no revision is minted.
     pub fn reopen_work_item(
         &self,
         work_id: &str,
         actor: &str,
+        reason: Option<&str>,
     ) -> Result<WorkItemSnapshot, LedgerError> {
         let work_id = work_id.to_owned();
         let actor = actor.to_owned();
+        let reason = reason.map(str::to_owned);
         self.submit(move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let before = require_snapshot_tx(&tx, &work_id)?;
             if before.status == WorkStatus::Open {
                 tx.commit()?;
                 return Ok(before);
+            }
+            if before.status == WorkStatus::Deferred {
+                let rationale = reason
+                    .as_deref()
+                    .filter(|reason| !reason.trim().is_empty())
+                    .ok_or_else(|| {
+                        refused(
+                            ErrorCode::InvalidRequest,
+                            format!(
+                                "work item {work_id:?} is parked; use work reopen --reason <reason>"
+                            ),
+                        )
+                    })?;
+                let written_at = now_iso();
+                let decision = DecisionV1 {
+                    schema: DECISION_SCHEMA_V1.to_owned(),
+                    revision: Some(u64::try_from(before.revision).map_err(|_| {
+                        internal(format!("negative work revision for {work_id:?}"))
+                    })?),
+                    kind: DecisionKind::Park,
+                    subject: DecisionSubjectV1 {
+                        kind: "work".to_owned(),
+                        id: work_id.clone(),
+                    },
+                    choice: "resume".to_owned(),
+                    rationale: rationale.to_owned(),
+                    actor: actor.clone(),
+                    at: written_at.clone(),
+                    cost_microusd_at_decision: None,
+                    approval: None,
+                };
+                let note = NewWorkNote {
+                    work_id: work_id.clone(),
+                    kind: WorkNoteKind::Decision,
+                    schema: DECISION_SCHEMA_V1.to_owned(),
+                    actor: actor.clone(),
+                    body_json: canonical_work_note_body(&serde_json::to_string(&decision)?)?,
+                };
+                insert_work_note_tx(&tx, &note, uuid::Uuid::now_v7().to_string(), written_at)?;
             }
             set_coordination_tx(&tx, &work_id, WorkStatus::Open, before.assignee.as_deref())?;
             coordination_event_tx(
@@ -2181,6 +2761,46 @@ impl Ledger {
                 out.push(row?);
             }
             Ok(out)
+        })
+    }
+
+    /// Direct native children for an exact set of epic ids, loaded in one
+    /// read for lifecycle projections.
+    pub fn work_epic_children_for(
+        &self,
+        epic_ids: &[String],
+    ) -> Result<BTreeMap<String, Vec<WorkItemSnapshot>>, LedgerError> {
+        let epic_ids = epic_ids.to_vec();
+        self.submit(move |conn| {
+            if epic_ids.is_empty() {
+                return Ok(BTreeMap::new());
+            }
+            let ids_json = serde_json::to_string(&epic_ids)?;
+            let mut statement = conn.prepare(&format!(
+                "SELECT d.to_id, {} FROM work_deps d \
+                 JOIN work_items wi ON wi.work_id = d.from_id \
+                 JOIN work_revisions wr \
+                   ON wr.work_id = wi.work_id AND wr.revision = wi.current_revision \
+                 WHERE d.kind = 'parent-child' \
+                   AND d.to_id IN (SELECT value FROM json_each(?1)) \
+                 ORDER BY d.to_id, wi.priority IS NULL, wi.priority, wi.work_id",
+                SNAPSHOT_SQL
+                    .strip_prefix("SELECT ")
+                    .and_then(|sql| sql.split_once(" FROM work_items wi "))
+                    .map(|(columns, _)| columns)
+                    .expect("snapshot SQL has its stable SELECT prefix")
+            ))?;
+            let rows = statement.query_map([ids_json], |row| {
+                let epic_id: String = row.get(0)?;
+                let snapshot = snapshot_from_row_offset(row, 1)?;
+                Ok((epic_id, snapshot))
+            })?;
+            let mut children = BTreeMap::<String, Vec<WorkItemSnapshot>>::new();
+            for row in rows {
+                let (epic_id, snapshot) = row?;
+                children.entry(epic_id).or_default().push(snapshot);
+            }
+            Ok(children)
         })
     }
 
@@ -2543,7 +3163,7 @@ mod tests {
             .unwrap();
         l.release_work_item("beads-churn", "holder-a").unwrap();
         l.close_work_item("beads-churn", "op", "test").unwrap();
-        l.reopen_work_item("beads-churn", "op").unwrap();
+        l.reopen_work_item("beads-churn", "op", None).unwrap();
         assert_eq!(l.work_item("beads-churn").unwrap().unwrap().revision, 1);
     }
 
@@ -2841,7 +3461,7 @@ mod tests {
             "{err}"
         );
         // The deliberate exit still works.
-        l.reopen_work_item("beads-done", "op").unwrap();
+        l.reopen_work_item("beads-done", "op", None).unwrap();
         let released = l
             .release_unresolved_work_item("beads-done", "settler", true)
             .unwrap();
@@ -3153,7 +3773,7 @@ mod tests {
 
         // closed: reopen_work_item.
         assert_eq!(
-            l.reopen_work_item("beads-s1", "op").unwrap().status,
+            l.reopen_work_item("beads-s1", "op", None).unwrap().status,
             WorkStatus::Open
         );
 

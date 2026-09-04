@@ -16,6 +16,7 @@ pub(crate) mod herdr_layout;
 pub(crate) mod herdr_ownership;
 pub(crate) mod herdr_projection;
 mod history;
+pub(crate) mod lifecycle;
 mod observe;
 mod ops;
 mod ore;
@@ -1509,6 +1510,8 @@ pub async fn dispatch(ctx: &Ctx, name: &str, mut req: OperationRequest) -> Opera
         "work_create" => work_ops::work_create(ctx, &mut req).await,
         "work_update" => work_ops::work_update(ctx, &mut req).await,
         "work_promote" => work_ops::work_promote(ctx, &mut req).await,
+        "work_adjudicate" => work_ops::work_adjudicate(ctx, &mut req).await,
+        "work_park" => work_ops::work_park(ctx, &mut req).await,
         "work_note_add" => work_ops::work_note_add(ctx, &mut req).await,
         "work_note_list" => work_ops::work_note_list(ctx, &req).await,
         "work_link" => work_ops::work_link(ctx, &mut req).await,
