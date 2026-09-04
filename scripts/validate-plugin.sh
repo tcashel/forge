@@ -494,7 +494,7 @@ function loadHost(host) {
     exactKeys(manifest.mcpServers.forged, ['args', 'command'], 'Claude manifest forged MCP server');
     invariant(manifest.mcpServers.forged.command === 'forged', 'Claude manifest forged MCP server command moved');
     invariant(
-      stableJson(manifest.mcpServers.forged.args) === stableJson(['mcp']),
+      stableJson(manifest.mcpServers.forged.args) === stableJson(['mcp', '--audience', 'all']),
       'Claude manifest forged MCP server args moved',
     );
   }
