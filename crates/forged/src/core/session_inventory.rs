@@ -1137,6 +1137,7 @@ mod tests {
                 gate_commands: Vec::new(),
                 deliverable: Deliverable::CommitsInWorktree,
                 budget_s: 10,
+                seat_commands: Vec::new(),
             },
             result_schema: "forged.result.implement/1".to_owned(),
             provider_hints: ProviderHints {

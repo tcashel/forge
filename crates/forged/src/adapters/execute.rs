@@ -473,6 +473,7 @@ pub fn build_packet(
             },
             deliverable,
             budget_s: u32::try_from(budget_s).unwrap_or(u32::MAX),
+            seat_commands: Vec::new(),
         },
         result_schema: prompt_stage.result_schema().to_owned(),
         provider_hints: intent.hints.clone(),
@@ -1701,6 +1702,8 @@ async fn run_attempt(
                         forged_types::AdmissionResourceClass::RepositoryWrite => {
                             "repository-write"
                         }
+
+                        forged_types::AdmissionResourceClass::Gate => "gate",
                     },
                     facts.control_revision
                 ),
@@ -3005,6 +3008,7 @@ mod tests {
                     Deliverable::ReviewBlock
                 },
                 budget_s: 600,
+                seat_commands: Vec::new(),
             },
             result_schema: if purpose == SeatPurpose::Fix {
                 "forged.result.fix/1".to_owned()
@@ -3543,6 +3547,9 @@ mod settle_tests {
             gate_commands: Vec::new(),
             stage_budget_s: HashMap::new(),
             transport_retry_budget: 3,
+            seat_commands: Vec::new(),
+            deadline_retry_budget: 1,
+            seat_env: Default::default(),
             transport_patterns: Vec::new(),
             provider_transport_patterns: Default::default(),
             bd_path: root.join("bd"),

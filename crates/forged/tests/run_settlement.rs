@@ -394,6 +394,7 @@ fn settlement_refreshes_siblings_after_whole_run_deadline_reconciliation() {
                 gate_commands: Vec::new(),
                 deliverable: forged_types::Deliverable::CommitsInWorktree,
                 budget_s: 1_800,
+                seat_commands: Vec::new(),
             },
             result_schema: "forged.result/1".to_owned(),
             provider_hints: forged_types::ProviderHints {

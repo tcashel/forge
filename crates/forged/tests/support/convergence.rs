@@ -92,6 +92,7 @@ pub(crate) fn fabricate_live_attempt(env: &TestEnv, run: &str) {
             gate_commands: Vec::new(),
             deliverable: forged_types::Deliverable::CommitsInWorktree,
             budget_s: 60,
+            seat_commands: Vec::new(),
         },
         result_schema: "forged.result/1".to_owned(),
         provider_hints: forged_types::ProviderHints {

@@ -36,6 +36,7 @@ pub fn sample_packet() -> WorkPacket {
             gate_commands: vec!["cargo test --workspace".to_owned()],
             deliverable: Deliverable::CommitsInWorktree,
             budget_s: 3600,
+            seat_commands: Vec::new(),
         },
         result_schema: "forged.result/1".to_owned(),
         provider_hints: ProviderHints {

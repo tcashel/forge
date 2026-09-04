@@ -1901,6 +1901,9 @@ pub(crate) fn splice_policy(
         gate_commands: current.gate_commands,
         stage_budget_s: current.stage_budget_s,
         transport_retry_budget: current.transport_retry_budget,
+        seat_commands: current.seat_commands,
+        deadline_retry_budget: current.deadline_retry_budget,
+        seat_env: current.seat_env,
         termination_grace_s: standing.termination_grace_s,
         host_policy: standing.host_policy,
         herdr_socket: standing.herdr_socket.clone(),
@@ -4626,6 +4629,8 @@ fn reservation_fact(row: &forged_ledger::AdmissionReservationRow) -> Value {
         "resourceClass": match row.resource_class {
             forged_types::AdmissionResourceClass::Read => "read",
             forged_types::AdmissionResourceClass::RepositoryWrite => "repository-write",
+
+            forged_types::AdmissionResourceClass::Gate => "gate",
         },
         "state": row.state.as_str(),
         "ownerKind": row.owner_kind,
@@ -7259,6 +7264,9 @@ mod tests {
             ]),
             termination_grace_s: 17,
             transport_retry_budget: 1,
+            seat_commands: Vec::new(),
+            deadline_retry_budget: 1,
+            seat_env: Default::default(),
             host_policy: HostPolicyV1::Preferred,
             herdr_socket: Some(PathBuf::from("/standing/herdr.sock")),
         };
@@ -7272,6 +7280,9 @@ mod tests {
             ]),
             termination_grace_s: 99,
             transport_retry_budget: 5,
+            seat_commands: Vec::new(),
+            deadline_retry_budget: 1,
+            seat_env: Default::default(),
             host_policy: HostPolicyV1::Off,
             herdr_socket: Some(PathBuf::from("/drifted/herdr.sock")),
         };

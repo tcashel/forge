@@ -66,6 +66,9 @@ pub async fn project(ctx: &Ctx, run_id: &str) -> Result<RunView, Failure> {
             .collect(),
         termination_grace_s: forged_types::DEFAULT_TERMINATION_GRACE_S,
         transport_retry_budget: ctx.config.transport_retry_budget,
+        seat_commands: Vec::new(),
+        deadline_retry_budget: 1,
+        seat_env: Default::default(),
         host_policy: ctx.config.host_policy,
         herdr_socket: ctx.config.herdr_sock.clone(),
     };

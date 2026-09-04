@@ -265,6 +265,7 @@ fn validate_packet_admission_tx(
         && match packet_facts.resource_class {
             forged_types::AdmissionResourceClass::Read => "read",
             forged_types::AdmissionResourceClass::RepositoryWrite => "repository-write",
+            forged_types::AdmissionResourceClass::Gate => "gate",
         } == facts.5
         && facts.6 == "reserved"
         && facts.7.is_none()
@@ -981,6 +982,7 @@ impl Ledger {
                             "repository-write" => {
                                 forged_types::AdmissionResourceClass::RepositoryWrite
                             }
+                            "gate" => forged_types::AdmissionResourceClass::Gate,
                             other => {
                                 return Err(internal(format!(
                                     "unknown admission reservation resource class: {other:?}"
@@ -1017,6 +1019,7 @@ impl Ledger {
             let resource_class = match reservation.4.as_str() {
                 "read" => forged_types::AdmissionResourceClass::Read,
                 "repository-write" => forged_types::AdmissionResourceClass::RepositoryWrite,
+                "gate" => forged_types::AdmissionResourceClass::Gate,
                 other => {
                     return Err(internal(format!(
                         "unknown admission reservation resource class: {other:?}"

@@ -51,6 +51,12 @@ pub struct StageContract {
     pub gate_commands: Vec<String>,
     pub deliverable: Deliverable,
     pub budget_s: u32,
+    /// Checks the seat runs before each commit. Distinct from
+    /// `gate_commands`, which the controller runs after the seat returns.
+    /// Omitted when empty so packet bodies stored before the field existed
+    /// keep their bytes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub seat_commands: Vec<String>,
 }
 
 /// Filesystem access granted to the provider process.
@@ -344,6 +350,7 @@ mod tests {
                 gate_commands: vec!["cargo test --workspace".to_owned()],
                 deliverable: Deliverable::CommitsInWorktree,
                 budget_s: 3600,
+                seat_commands: Vec::new(),
             },
             result_schema: "forged.result/1".to_owned(),
             provider_hints: ProviderHints {
@@ -429,11 +436,16 @@ mod tests {
             gate_commands: vec!["cargo build".to_owned()],
             deliverable: Deliverable::ReviewBlock,
             budget_s: 900,
+            seat_commands: vec!["cargo fmt --all -- --check".to_owned()],
         };
         round_trip(&contract);
         let value = serde_json::to_value(&contract).expect("serializes");
         assert_eq!(value["gateCommands"][0], json!("cargo build"));
         assert_eq!(value["budgetS"], json!(900));
+        assert_eq!(
+            value["seatCommands"][0],
+            json!("cargo fmt --all -- --check")
+        );
     }
 
     #[test]

@@ -258,12 +258,31 @@ pub struct ExecutionPolicyV1 {
     #[serde(default = "default_termination_grace_s")]
     pub termination_grace_s: u64,
     pub transport_retry_budget: u32,
+    /// Checks a seat runs before each commit; the gate stays the
+    /// controller's. Packages stored before the field existed read as empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub seat_commands: Vec<String>,
+    /// Relaunches allowed after stage-deadline kills, counted apart from
+    /// transport failures. Older packages receive one.
+    #[serde(default = "default_deadline_retry_budget")]
+    pub deadline_retry_budget: u32,
+    /// Environment applied to every provider process the controller spawns;
+    /// an operator value overrides the provider's own entry.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub seat_env: BTreeMap<String, String>,
     pub host_policy: HostPolicyV1,
     pub herdr_socket: Option<PathBuf>,
 }
 
 const fn default_termination_grace_s() -> u64 {
     DEFAULT_TERMINATION_GRACE_S
+}
+
+/// Relaunches a stage-deadline kill may earn before the run stops.
+pub const DEFAULT_DEADLINE_RETRY_BUDGET: u32 = 1;
+
+const fn default_deadline_retry_budget() -> u32 {
+    DEFAULT_DEADLINE_RETRY_BUDGET
 }
 
 /// Durable runtime truth for one run.
@@ -923,6 +942,9 @@ mod tests {
             .collect(),
             termination_grace_s,
             transport_retry_budget: 1,
+            seat_commands: Vec::new(),
+            deadline_retry_budget: 1,
+            seat_env: BTreeMap::new(),
             host_policy: HostPolicyV1::Off,
             herdr_socket: None,
         }

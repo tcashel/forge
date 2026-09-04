@@ -186,6 +186,12 @@ pub(crate) fn policy(
             Action::ReviseRoster,
             "Revise provider policy or explicitly adjudicate exhaustion",
         ),
+        Condition::DeadlineExhausted => (
+            Severity::High,
+            Owner::LeadAgent,
+            Action::ResumeSeat,
+            "Resume the deadline-killed stage from the worktree the seat left",
+        ),
         Condition::ProviderDegraded => (
             Severity::Medium,
             Owner::LeadAgent,
@@ -244,6 +250,7 @@ pub(crate) fn recommendation_actions(
     work_id: Option<&str>,
     occurrence_resolution_allowed: bool,
     risk_acceptance_allowed: bool,
+    evidence: Option<&Value>,
 ) -> Vec<OperationActionV1> {
     use AttentionActionCode as Action;
     let classified_action =
@@ -351,6 +358,37 @@ pub(crate) fn recommendation_actions(
                 "bind a configured roster name and the reason for revising provider policy",
                 forged_types::ActionClass::Should,
             )],
+        },
+        Action::ResumeSeat => match subject_kind {
+            AttentionSubjectKind::Run => {
+                let uncommitted = evidence
+                    .and_then(|value| value.pointer("/terminal/deadlineExhausted/uncommitted"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                if uncommitted > 0 {
+                    // The seat's work is still in the worktree and a retry
+                    // would discard it: steer the next attempt instead and
+                    // leave the landing to the lead until retry keeps the
+                    // branch (ore-080.9). No `should` is honest here.
+                    vec![classified_action(
+                        "session message",
+                        json!({"run": subject_id, "attempt": Value::Null, "message": Value::Null}),
+                        &format!(
+                            "{uncommitted} uncommitted file(s) remain in the worktree; queue guidance for the next attempt or land the worktree by hand, since run retry would discard the work"
+                        ),
+                        forged_types::ActionClass::Can,
+                    )]
+                } else {
+                    retryable.map_or_else(Vec::new, |run| {
+                        vec![super::ops::retry_action_with_class(
+                            subject_id,
+                            super::ops::retry_reason(run),
+                            forged_types::ActionClass::Should,
+                        )]
+                    })
+                }
+            }
+            AttentionSubjectKind::Epic => Vec::new(),
         },
         Action::AdjudicateReview => {
             if subject_kind == AttentionSubjectKind::Run && risk_acceptance_allowed {
@@ -1409,18 +1447,28 @@ fn collect_domain_sources(input: &ProjectionInput<'_>) -> Result<Vec<RawAttentio
         } else {
             event_value(&event.payload_json)
         };
-        if payload.pointer("/terminal/providerUnavailable").is_none() {
+        let (condition, detail) = if payload.pointer("/terminal/providerUnavailable").is_some() {
+            (
+                AttentionCondition::RetryExhausted,
+                "provider retry budget is exhausted",
+            )
+        } else if payload.pointer("/terminal/deadlineExhausted").is_some() {
+            (
+                AttentionCondition::DeadlineExhausted,
+                "stage deadline relaunch budget is exhausted",
+            )
+        } else {
             continue;
-        }
+        };
         add_raw(
             &mut raw,
             &id,
-            AttentionCondition::RetryExhausted,
+            condition,
             &event.ts,
             &event.ts,
             event.event_id,
             format!("event:{}", event.event_id),
-            "provider retry budget is exhausted",
+            detail,
             payload,
             AttentionEvidenceKind::Event,
             event.event_id.to_string(),
@@ -1995,6 +2043,7 @@ pub(crate) fn classification(condition: AttentionCondition) -> AttentionClass {
         | Condition::Quarantined
         | Condition::MissingCost
         | Condition::RetryExhausted
+        | Condition::DeadlineExhausted
         | Condition::ReviewerDisagreement
         | Condition::AmbiguousEffect
         | Condition::RestartBudgetExhausted
@@ -2135,6 +2184,7 @@ fn project(input: ProjectionInput<'_>) -> Result<Vec<AttentionItemV1>, Failure> 
             work_by_subject.get(subject_id.as_str()).copied(),
             occurrence_resolution_allowed,
             persisted_risk_acceptance_allowed(&input, &subject_id),
+            Some(&latest.evidence),
         );
         projected.push(Projected {
             source_cursor: latest.source_cursor,
@@ -2410,6 +2460,7 @@ mod tests {
             None,
             resolution_allowed,
             risk_allowed,
+            None,
         )
         .into_iter()
         .map(|action| action.verb)
@@ -2437,6 +2488,7 @@ mod tests {
             Some("bead-subject-1"),
             resolution_allowed,
             risk_allowed,
+            None,
         );
         let should = actions
             .iter()
@@ -2459,6 +2511,7 @@ mod tests {
             None,
             true,
             false,
+            None,
         );
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].verb, "attention resolve");
@@ -2763,6 +2816,7 @@ mod tests {
             Some("bead-subject-1"),
             true,
             true,
+            None,
         );
         assert!(review_actions.iter().any(|action| {
             action.verb == "run retry" && action.class == forged_types::ActionClass::Can
@@ -2788,6 +2842,7 @@ mod tests {
                 Some("bead-subject-1"),
                 resolution_allowed,
                 false,
+                None,
             );
             assert!(
                 actions

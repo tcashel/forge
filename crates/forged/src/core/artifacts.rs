@@ -1369,6 +1369,7 @@ mod tests {
                 gate_commands: Vec::new(),
                 deliverable: Deliverable::CommitsInWorktree,
                 budget_s: 1,
+                seat_commands: Vec::new(),
             },
             result_schema: "forged.result.implement/1".to_owned(),
             provider_hints: ProviderHints {
@@ -1728,6 +1729,9 @@ mod tests {
             gate_commands: Vec::new(),
             stage_budget_s: HashMap::new(),
             transport_retry_budget: 3,
+            seat_commands: Vec::new(),
+            deadline_retry_budget: 1,
+            seat_env: Default::default(),
             transport_patterns: Vec::new(),
             provider_transport_patterns: Default::default(),
             bd_path: root.join("bd"),
