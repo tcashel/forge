@@ -1857,9 +1857,8 @@ fn attention_list_repo_scope_matches_the_durable_item_repository() {
     assert_eq!(foreign["groups"], json!([]), "{foreign}");
 }
 
-/// The subject id travels as the envelope `runId` (the CLI's `--subject`),
-/// and `params.subjectId` — the name `attention_list` hands back — is an
-/// accepted alias. Absence names both forms; disagreement refuses.
+/// The subject id travels as the top-level `subjectId` field that
+/// `attention_list` hands back. Absence names that field.
 #[test]
 fn attention_controls_accept_the_subject_id_alias() {
     let env = TestEnv::new("forged-attention-subject-alias");
@@ -1886,7 +1885,7 @@ fn attention_controls_accept_the_subject_id_alias() {
         "actor": "operator",
     });
 
-    let refused = mcp.call_tool("attention_acknowledge", json!({"params": base}));
+    let refused = mcp.call_tool("attention_acknowledge", base.clone());
     assert_eq!(refused["ok"], json!(false), "{refused}");
     let message = refused["error"]["message"].as_str().expect("message");
     assert!(message.contains("subjectId"), "{message}");

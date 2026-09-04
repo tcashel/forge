@@ -2050,6 +2050,63 @@ fn flat_and_enveloped_typed_tools_refuse_unknown_fields() {
 }
 
 #[test]
+fn free_form_lead_tools_refuse_legacy_envelopes_and_malformed_selectors() {
+    let env = TestEnv::new("forged-flat-lead-arguments");
+    let mut mcp = McpClient::new(&env, Some("all"));
+
+    for (tool, arguments, flat_field) in [
+        (
+            "usage_report",
+            json!({"schemaVersion": 1, "params": {"run": "run-a"}}),
+            "run",
+        ),
+        (
+            "definition_validate",
+            json!({"params": {"profile": "default"}}),
+            "profile",
+        ),
+        (
+            "run_start",
+            json!({"schemaVersion": 1, "params": {"bead": "ore-a"}}),
+            "bead",
+        ),
+    ] {
+        let refusal = mcp.call_tool(tool, arguments);
+        assert_eq!(refusal["ok"], json!(false), "{tool}: {refusal}");
+        let message = refusal
+            .pointer("/error/message")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            message.contains("flat arguments")
+                && message.contains("top level")
+                && message.contains(flat_field),
+            "{tool} names the flat field in its legacy-envelope remedy: {refusal}"
+        );
+    }
+
+    for (tool, arguments, selector) in [
+        ("usage_report", json!({"run": {"id": "run-a"}}), "run"),
+        (
+            "definition_validate",
+            json!({"profile": ["default"]}),
+            "profile",
+        ),
+        ("run_retry", json!({"id": "run-a", "runId": 7}), "runId"),
+    ] {
+        let refusal = mcp.call_tool(tool, arguments);
+        assert_eq!(refusal["ok"], json!(false), "{tool}: {refusal}");
+        assert!(
+            refusal
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .is_some_and(|message| message.contains(selector)),
+            "{tool} names the malformed flat selector: {refusal}"
+        );
+    }
+}
+
+#[test]
 fn split_app_tools_refuse_malformed_typed_targets_before_dispatch() {
     let env = TestEnv::new("forged-split-app-mcp-params");
     env.forged(&["init"]);

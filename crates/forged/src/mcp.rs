@@ -203,23 +203,72 @@ fn flat_envelope(
     name: &str,
     idempotency_key: Option<String>,
     params: serde_json::Map<String, Value>,
-) -> EnvelopeArgs {
-    EnvelopeArgs {
+) -> Result<EnvelopeArgs, Failure> {
+    if params.contains_key("schemaVersion") || params.contains_key("params") {
+        let flat_fields = params
+            .get("params")
+            .and_then(Value::as_object)
+            .map(|nested| {
+                nested
+                    .keys()
+                    .map(|field| format!("{field:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .filter(|fields| !fields.is_empty())
+            .unwrap_or_else(|| "the tool's argument fields".to_owned());
+        return Err(Failure::invalid(format!(
+            "{name} takes flat arguments; omit legacy envelope fields \"schemaVersion\" and \
+             \"params\", and pass {flat_fields} directly at the top level"
+        )));
+    }
+
+    for key in [
+        "run",
+        "epic",
+        "id",
+        "subjectId",
+        "subjectKind",
+        "bead",
+        "repo",
+    ] {
+        match params.get(key) {
+            None => {}
+            Some(Value::String(value)) if !value.is_empty() => {}
+            Some(_) => {
+                return Err(Failure::invalid(format!(
+                    "{name} flat selector {key:?} must be a non-empty string"
+                )))
+            }
+        }
+    }
+    for key in ["profile", "roster", "runId", "baseRef"] {
+        match params.get(key) {
+            None | Some(Value::Null | Value::String(_)) => {}
+            Some(other) => {
+                return Err(Failure::invalid(format!(
+                    "{name} flat argument {key:?} must be a string when present, got {other}"
+                )))
+            }
+        }
+    }
+
+    Ok(EnvelopeArgs {
         schema_version: 1,
         idempotency_key,
         run_id: flat_run_id(name, &params),
         params,
-    }
+    })
 }
 
 impl LeadReadArgs {
-    fn into_envelope(self, name: &str) -> EnvelopeArgs {
+    fn into_envelope(self, name: &str) -> Result<EnvelopeArgs, Failure> {
         flat_envelope(name, None, self.params)
     }
 }
 
 impl LeadWriteArgs {
-    fn into_envelope(self, name: &str) -> EnvelopeArgs {
+    fn into_envelope(self, name: &str) -> Result<EnvelopeArgs, Failure> {
         flat_envelope(name, self.idempotency_key, self.params)
     }
 }
@@ -1339,11 +1388,26 @@ impl ForgedServer {
     }
 
     async fn call_lead_read(&self, name: &str, args: LeadReadArgs) -> CallToolResult {
-        self.call(name, args.into_envelope(name)).await
+        match args.into_envelope(name) {
+            Ok(args) => self.call(name, args).await,
+            Err(failure) => {
+                Self::tool_result(err_response(&crate::core::read_key(name), &failure), false)
+            }
+        }
     }
 
     async fn call_lead_write(&self, name: &str, args: LeadWriteArgs) -> CallToolResult {
-        self.call(name, args.into_envelope(name)).await
+        let refusal_key = args
+            .idempotency_key
+            .clone()
+            .filter(|key| !key.is_empty())
+            .unwrap_or_else(|| {
+                derive_key(name, flat_run_id(name, &args.params).as_deref(), None, None)
+            });
+        match args.into_envelope(name) {
+            Ok(args) => self.call(name, args).await,
+            Err(failure) => Self::tool_result(err_response(&refusal_key, &failure), false),
+        }
     }
 
     fn tool_result(

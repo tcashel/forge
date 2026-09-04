@@ -629,8 +629,8 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
     }
     try {
       const [activeResult, settlementResult, mapResult] = await Promise.all([
-        request("tools/call", { name: "attention_list", arguments: { schemaVersion: 1, params: activeParams } }),
-        request("tools/call", { name: "attention_list", arguments: { schemaVersion: 1, params: settlementParams } }),
+        request("tools/call", { name: "attention_list", arguments: activeParams }),
+        request("tools/call", { name: "attention_list", arguments: settlementParams }),
         request("tools/call", { name: "work_map", arguments: { schemaVersion: 1, params: mapParams } }),
       ]);
       const active = triageResult(activeResult, "forged.attention-list/1", "attention_list active");
