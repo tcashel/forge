@@ -58,6 +58,7 @@ const OPERATION_CLASSES: &[(&str, OperationClass)] = &[
     ("explain", OperationClass::ReadOnly),
     ("gate_run", OperationClass::Fenced),
     ("init", OperationClass::Fenced),
+    ("next", OperationClass::ReadOnly),
     ("operations_overview", OperationClass::ReadOnly),
     ("overview", OperationClass::ReadOnly),
     ("packet_claim", OperationClass::Fenced),

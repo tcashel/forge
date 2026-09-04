@@ -25,6 +25,8 @@ id from a response you just read.
 forged            # bare: next for the current repository, text form
 forged next --repo "$(git rev-parse --show-toplevel)"
 forged next --json | jq …
+forged next --text                       # deterministic text, even when piped
+forged next --follow                     # terminal only; refreshes every 5s
 ```
 
 Every lead-audience read renders a fixed text form when stdout is a
@@ -38,18 +40,23 @@ Sections, in fixed order, capped to one tool result:
 
 1. **decisions** — what is waiting on you or the human, each with its
    `should` verb and pre-bound args, spend so far, and the estimated
-   cost of each option;
+   spend so far;
 2. **running** — id, stage, seat, minutes in stage, total age, spend;
 3. **ready** — the frontier with each item's lifecycle stage
-   (`drafted`, `critiqued`, `adjudicated`), so you know which need a
-   skill before dispatch;
+   (`drafted`, `critiqued`, `held`), with the stored evidence for that
+   classification and adjudication reported as unknown until ore-080.8;
 4. **landed** — recent deliveries with PR numbers;
 5. **hidden** — counts of symptoms and parked items not shown.
 
-**Today:** `forged operations overview --group needs-me --limit 20`,
-`forged attention list --classification decision --limit 20`, and
-`forged work ready --repo <root>`; expect the overview to be large and
-the rail to carry `blocked` symptoms you should ignore.
+Use `--symptoms` only when diagnosing hidden operational trouble. Use
+`--section <name> --limit <n>` to widen exactly one section; widening
+`decisions` also includes its full `next` alternatives. The ordinary read
+keeps only `should` plus `canCount` and remains capped at 30 rows.
+
+The same terminal rule applies to `explain`, `run status`, `epic status`,
+`usage`, `work history`, and `work show`. `work show` omits specification
+bodies in text unless `--full` is explicit. Service and MCP responses remain
+JSON-only.
 
 ## Decide
 

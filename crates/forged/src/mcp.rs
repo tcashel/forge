@@ -71,6 +71,12 @@ fn agent_sessions_tool_meta() -> MetaObject {
     app_tool_meta(AGENT_SESSIONS_URI)
 }
 
+fn lead_tool_meta() -> MetaObject {
+    let mut meta = MetaObject::new();
+    meta.insert("audience".to_owned(), Value::String("lead".to_owned()));
+    meta
+}
+
 fn app_resource_meta() -> MetaObject {
     let mut meta = MetaObject::new();
     meta.insert(
@@ -741,6 +747,77 @@ pub struct OperationsOverviewParams {
 }
 
 impl OperationsOverviewArgs {
+    fn into_envelope(self) -> EnvelopeArgs {
+        let params = match serde_json::to_value(&self.params) {
+            Ok(Value::Object(map)) => map,
+            _ => serde_json::Map::new(),
+        };
+        EnvelopeArgs {
+            schema_version: self.schema_version,
+            idempotency_key: self.idempotency_key,
+            run_id: None,
+            params,
+        }
+    }
+}
+
+/// Typed envelope for the decision-first lead driver surface.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NextArgs {
+    /// Envelope schema version; always 1.
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
+    /// The idempotency key; defaulted to `op:next:read`.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+    /// Driver projection parameters.
+    #[serde(default)]
+    pub params: NextParams,
+}
+
+/// Scope and bounded expansion accepted by `next`.
+#[derive(Debug, Default, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars", inline)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NextParams {
+    /// Exact canonical repository root. Mutually exclusive with `id`.
+    #[serde(
+        default,
+        deserialize_with = "present_means_named",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub repo: Option<String>,
+    /// Exact epic id. Mutually exclusive with `repo`.
+    #[serde(
+        default,
+        deserialize_with = "present_means_named",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub id: Option<String>,
+    /// Include bounded symptom rows; omission retains only their hidden count.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub symptoms: bool,
+    /// Widen one section; decisions also includes full next-action arrays.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub section: Option<NextSectionParam>,
+    /// Widened section limit, 1..=500. Requires `section`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(rename_all = "lowercase")]
+pub enum NextSectionParam {
+    Decisions,
+    Running,
+    Ready,
+    Landed,
+}
+
+impl NextArgs {
     fn into_envelope(self) -> EnvelopeArgs {
         let params = match serde_json::to_value(&self.params) {
             Ok(Value::Object(map)) => map,
@@ -1476,6 +1553,17 @@ impl ForgedServer {
     pub async fn explain(&self, args: Parameters<ExplainArgs>) -> CallToolResult {
         self.call_structured("explain", args.0.into_envelope())
             .await
+    }
+
+    /// Bounded decision-first lead driver surface.
+    #[tool(
+        name = "next",
+        description = "Orient the lead with one bounded read-only projection: open decisions first, then currently running work, the ready planning frontier, and work landed in the last 24 hours. Defaults to 30 rows and hides symptoms unless params.symptoms is true. Scope with exact params.repo or epic params.id; params.section plus params.limit widens only that section. Returns forged.next/1 JSON and no App resource.",
+        annotations(read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false),
+        meta = lead_tool_meta()
+    )]
+    pub async fn next(&self, args: Parameters<NextArgs>) -> CallToolResult {
+        self.call_structured("next", args.0.into_envelope()).await
     }
 
     /// Bounded operator queue and live-plan projection.

@@ -8,14 +8,15 @@ use std::path::{Component, Path, PathBuf};
 use forged_gate::GateRequest;
 use forged_ledger::{
     EffectClass, InventorySnapshot, InventoryUsage, InventoryUsageSelection, NewRun,
-    NewRunDefinition, OperationState, RevokeScope, RunState, WorkItemFilters, WorkStatus,
+    NewRunDefinition, OperationState, RevokeScope, RunState, WorkItemFilters, WorkNoteKind,
+    WorkStatus,
 };
 use forged_provider::{CodexDriver, PiDriver, ProviderDriver};
 use forged_types::{
     request_sha256, AttentionCondition, AttentionItemV1, AttentionResolutionDisposition,
-    AttentionState, ErrorCode, ExecutionPackageV1, ExecutionPolicyV1, OperationRequest,
-    OperationResponse, RunId, WorkIdentityContextV1, WorkIdentitySubjectKind, WorkPacket,
-    WorkRefKind, WorkRefV1,
+    AttentionState, AttentionSubjectKind, ErrorCode, ExecutionPackageV1, ExecutionPolicyV1,
+    OperationRequest, OperationResponse, RunId, WorkIdentityContextV1, WorkIdentitySubjectKind,
+    WorkPacket, WorkRefKind, WorkRefV1,
 };
 use serde_json::{json, Value};
 
@@ -5038,6 +5039,833 @@ async fn collect_operations_universe(
     })
 }
 
+const NEXT_DEFAULT_LIMIT: usize = 30;
+const NEXT_MAX_LIMIT: u64 = 500;
+const NEXT_DEFAULT_BYTE_LIMIT: usize = 4096;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NextSection {
+    Decisions,
+    Running,
+    Ready,
+    Landed,
+}
+
+impl NextSection {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "decisions" => Some(Self::Decisions),
+            "running" => Some(Self::Running),
+            "ready" => Some(Self::Ready),
+            "landed" => Some(Self::Landed),
+            _ => None,
+        }
+    }
+}
+
+fn next_section(req: &OperationRequest) -> Result<Option<NextSection>, Failure> {
+    let Some(value) = req.params.get("section") else {
+        return Ok(None);
+    };
+    let value = value.as_str().ok_or_else(|| {
+        Failure::invalid("next section must be decisions, running, ready, or landed")
+    })?;
+    NextSection::parse(value).map(Some).ok_or_else(|| {
+        Failure::invalid(format!(
+            "next section {value:?} is not decisions, running, ready, or landed"
+        ))
+    })
+}
+
+fn next_bool(req: &OperationRequest, name: &str) -> Result<bool, Failure> {
+    match req.params.get(name) {
+        None => Ok(false),
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(_) => Err(Failure::invalid(format!("next {name} must be a boolean"))),
+    }
+}
+
+fn next_age_min(captured_at: &str, since: Option<&str>) -> u64 {
+    let Some(since) = since else { return 0 };
+    let (Ok(now), Ok(then)) = (
+        captured_at.parse::<jiff::Timestamp>(),
+        since.parse::<jiff::Timestamp>(),
+    ) else {
+        return 0;
+    };
+    let nanos = now.as_nanosecond().saturating_sub(then.as_nanosecond());
+    u64::try_from(nanos / 60_000_000_000).unwrap_or(u64::MAX)
+}
+
+fn next_within_last_day(captured_at: &str, updated_at: Option<&str>) -> bool {
+    let Some(updated_at) = updated_at else {
+        return false;
+    };
+    let (Ok(now), Ok(updated)) = (
+        captured_at.parse::<jiff::Timestamp>(),
+        updated_at.parse::<jiff::Timestamp>(),
+    ) else {
+        return false;
+    };
+    let age = now.as_nanosecond() - updated.as_nanosecond();
+    (0..=86_400_000_000_000).contains(&age)
+}
+
+fn next_title(value: &str) -> String {
+    if value.chars().count() <= 60 {
+        return value.to_owned();
+    }
+    let mut title = value.chars().take(59).collect::<String>();
+    title.push('…');
+    title
+}
+
+fn next_entry_title(entry: &Value) -> String {
+    let id = entry.get("id").and_then(Value::as_str).unwrap_or("unknown");
+    let title = entry
+        .pointer("/titleSource/value")
+        .and_then(Value::as_str)
+        .or_else(|| entry.get("title").and_then(Value::as_str))
+        .or_else(|| {
+            entry
+                .pointer("/identity/displayTitle")
+                .and_then(Value::as_str)
+        })
+        .unwrap_or(id);
+    next_title(title)
+}
+
+fn next_entry_kind(entry: &Value) -> &'static str {
+    if entry.get("kind").and_then(Value::as_str) == Some("epic") {
+        "epic"
+    } else if entry.get("source").and_then(Value::as_str) == Some("live-plan") {
+        "plan"
+    } else {
+        "run"
+    }
+}
+
+fn next_entry_revision(entry: &Value) -> Value {
+    entry
+        .pointer("/identity/bead/revision")
+        .or_else(|| entry.pointer("/plan/revision"))
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+fn next_subject(revision: Value) -> Value {
+    json!({"revision": revision})
+}
+
+fn next_entry_lifecycle(entry: &Value) -> String {
+    entry
+        .get("outcome")
+        .and_then(Value::as_str)
+        .or_else(|| entry.pointer("/plan/status").and_then(Value::as_str))
+        .or_else(|| entry.get("state").and_then(Value::as_str))
+        .unwrap_or("unknown")
+        .to_owned()
+}
+
+fn next_entry_health(entry: Option<&Value>, fallback: &str) -> Value {
+    entry
+        .and_then(|entry| entry.get("executionHealth"))
+        .cloned()
+        .unwrap_or_else(|| json!(fallback))
+}
+
+fn next_actions(value: &Value) -> Vec<Value> {
+    value.as_array().into_iter().flatten().cloned().collect()
+}
+
+fn next_should(actions: &[Value]) -> Value {
+    actions
+        .iter()
+        .find(|action| action.get("class").and_then(Value::as_str) == Some("should"))
+        .map(|action| {
+            json!({
+                "verb": action.get("verb").cloned().unwrap_or(Value::Null),
+                "args": action.get("args").cloned().unwrap_or_else(|| json!({})),
+            })
+        })
+        .unwrap_or(Value::Null)
+}
+
+fn next_can_count(actions: &[Value]) -> usize {
+    actions
+        .iter()
+        .filter(|action| action.get("class").and_then(Value::as_str) == Some("can"))
+        .count()
+}
+
+fn next_entry_spend(entry: &Value) -> (f64, u64) {
+    (
+        entry
+            .get("costUsdKnown")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0),
+        entry
+            .get("rowsMissingCost")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+    )
+}
+
+fn next_is_epic_member(entry: &Value, epic_id: &str) -> bool {
+    entry.get("id").and_then(Value::as_str) == Some(epic_id)
+        || entry.pointer("/identity/epic/id").and_then(Value::as_str) == Some(epic_id)
+        || entry.pointer("/plan/parent").and_then(Value::as_str) == Some(epic_id)
+}
+
+fn attach_plan_to_entry(entry: &mut Value, plan: &crate::core::work_types::PlanIssue) {
+    let Some(object) = entry.as_object_mut() else {
+        return;
+    };
+    object.insert("priority".to_owned(), json!(plan.issue.priority));
+    object.insert(
+        "plan".to_owned(),
+        json!({
+            "source": "beads",
+            "status": plan.issue.status,
+            "readiness": plan.readiness(),
+            "priority": plan.issue.priority,
+            "assignee": plan.issue.assignee,
+            "issueType": plan.issue.issue_type,
+            "revision": plan.issue.revision,
+            "parent": plan.parent,
+            "dependencies": plan.dependencies,
+        }),
+    );
+}
+
+/// Hydrate an exact epic scope before any portfolio presentation bound is
+/// applied. The root and both native and legacy children come from exact
+/// ledger identities, so an epic ordered after the 500-row live-plan window
+/// remains addressable and its ready children remain selectable.
+async fn hydrate_next_epic_scope(
+    ctx: &Ctx,
+    epic_id: &str,
+    captured_at: &str,
+    entries: &mut Vec<Value>,
+    work_summaries: &mut Vec<crate::core::work_types::IssueSummary>,
+) -> Result<BTreeSet<String>, Failure> {
+    let root = super::workstore::show_issue(&ctx.ledger, epic_id).await?;
+    if root.issue_type != "epic" {
+        return Err(Failure::invalid(format!(
+            "next id {epic_id:?} does not name an epic"
+        )));
+    }
+    let (children, _) = super::workstore::epic_children_with_legacy(&ctx.ledger, epic_id).await?;
+    let mut ids = Vec::with_capacity(children.len().saturating_add(1));
+    ids.push(root.id.clone());
+    ids.extend(children.iter().map(|child| child.id.clone()));
+    let plans = super::workstore::plan_issues(&ctx.ledger, &ids).await?;
+    let scope_ids = ids.into_iter().collect::<BTreeSet<_>>();
+
+    let plans_by_id = plans
+        .iter()
+        .map(|plan| (plan.issue.id.as_str(), plan))
+        .collect::<BTreeMap<_, _>>();
+    for entry in entries.iter_mut() {
+        let work_id = entry
+            .get("beadId")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        if let Some(plan) = work_id.as_deref().and_then(|id| plans_by_id.get(id)) {
+            attach_plan_to_entry(entry, plan);
+        }
+    }
+    let represented = entry_work_ids(entries).into_iter().collect::<BTreeSet<_>>();
+    for plan in plans
+        .iter()
+        .filter(|plan| plan.issue.status != "closed")
+        .filter(|plan| !represented.contains(&plan.issue.id))
+    {
+        entries.push(live_plan_entry(plan, captured_at)?);
+    }
+
+    let mut known = work_summaries
+        .iter()
+        .map(|issue| issue.id.clone())
+        .collect::<BTreeSet<_>>();
+    for plan in plans {
+        if known.insert(plan.issue.id.clone()) {
+            work_summaries.push(plan.issue);
+        }
+    }
+    decorate_titles(entries, work_summaries)?;
+    Ok(scope_ids)
+}
+
+fn next_spend(entries: &[Value], subject_id: &str, kind: &str) -> Value {
+    let mut known = 0.0;
+    let mut missing = 0u64;
+    let mut matched = false;
+    for entry in entries.iter().filter(|entry| {
+        entry.get("id").and_then(Value::as_str) == Some(subject_id)
+            || (kind == "epic" && next_is_epic_member(entry, subject_id))
+    }) {
+        matched = true;
+        let (entry_known, entry_missing) = next_entry_spend(entry);
+        known += entry_known;
+        missing = missing.saturating_add(entry_missing);
+    }
+    if !matched || missing == 0 {
+        json!(known)
+    } else {
+        Value::Null
+    }
+}
+
+struct NextRow<'a> {
+    id: &'a str,
+    kind: &'a str,
+    title: String,
+    state: Value,
+    age_min: u64,
+    spend_usd: Value,
+    actions: &'a [Value],
+    lifecycle: String,
+    health: Value,
+    revision: Value,
+}
+
+fn next_row(row: NextRow<'_>) -> Value {
+    json!({
+        "id": row.id,
+        "kind": row.kind,
+        // id and kind above are the compact subject identity. Keep the
+        // frozen work revision nested where identity-bearing consumers
+        // already look for it without repeating those strings per row.
+        "subject": next_subject(row.revision),
+        "title": row.title,
+        "state": row.state,
+        "ageMin": row.age_min,
+        "spendUsd": row.spend_usd,
+        "should": next_should(row.actions),
+        "canCount": next_can_count(row.actions),
+        "lifecycle": row.lifecycle,
+        "health": row.health,
+    })
+}
+
+fn next_attention_row(
+    item: &AttentionItemV1,
+    entry: Option<&Value>,
+    entries: &[Value],
+    captured_at: &str,
+    expand_next: bool,
+) -> Result<Value, Failure> {
+    let kind = match item.subject_kind {
+        AttentionSubjectKind::Run => "run",
+        AttentionSubjectKind::Epic => "epic",
+    };
+    let title = item
+        .subject_title
+        .as_ref()
+        .filter(|title| title.known)
+        .map(|title| title.value.as_str())
+        .or_else(|| {
+            entry.and_then(|entry| entry.pointer("/titleSource/value").and_then(Value::as_str))
+        })
+        .unwrap_or(&item.subject_id);
+    let actions = serde_json::to_value(&item.next_actions)
+        .map_err(|error| Failure::internal(format!("serializing next actions: {error}")))?;
+    let actions = next_actions(&actions);
+    let mut row = next_row(NextRow {
+        id: &item.subject_id,
+        kind,
+        title: next_title(title),
+        state: serde_json::to_value(item.condition)
+            .map_err(|error| Failure::internal(format!("serializing attention: {error}")))?,
+        age_min: next_age_min(captured_at, Some(&item.updated_at)),
+        spend_usd: next_spend(entries, &item.subject_id, kind),
+        actions: &actions,
+        lifecycle: entry.map_or_else(|| "unknown".to_owned(), next_entry_lifecycle),
+        health: next_entry_health(entry, "unknown"),
+        revision: entry.map_or(Value::Null, next_entry_revision),
+    });
+    if expand_next {
+        row["next"] = Value::Array(actions);
+    }
+    Ok(row)
+}
+
+fn next_running_row(
+    entry: &Value,
+    snapshot: &InventorySnapshot,
+    entries: &[Value],
+    captured_at: &str,
+) -> Result<Value, Failure> {
+    let id = entry
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Failure::internal("running next row has no id"))?;
+    let attempt = snapshot
+        .live_attempts
+        .iter()
+        .filter(|attempt| {
+            split_packet_key(&attempt.packet_id).is_ok_and(|(run_id, _, _)| run_id == id)
+        })
+        .max_by_key(|attempt| attempt.attempt_id);
+    let stage = attempt
+        .and_then(|attempt| split_packet_key(&attempt.packet_id).ok())
+        .map(|(_, stage, _)| stage)
+        .or_else(|| {
+            entry
+                .get("currentStage")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        });
+    let actions = next_actions(&operations_next_actions(entry));
+    let kind = next_entry_kind(entry);
+    let mut row = next_row(NextRow {
+        id,
+        kind,
+        title: next_entry_title(entry),
+        state: stage.clone().map_or(Value::Null, Value::String),
+        age_min: next_age_min(
+            captured_at,
+            attempt.map(|attempt| attempt.started_at.as_str()),
+        ),
+        spend_usd: next_spend(entries, id, kind),
+        actions: &actions,
+        lifecycle: "running".to_owned(),
+        health: next_entry_health(Some(entry), "running"),
+        revision: next_entry_revision(entry),
+    });
+    row["stage"] = stage.map_or(Value::Null, Value::String);
+    row["seat"] = attempt
+        .map(|attempt| Value::String(attempt.claimant.clone()))
+        .unwrap_or(Value::Null);
+    Ok(row)
+}
+
+fn next_landed_row(entry: &Value, entries: &[Value], captured_at: &str) -> Result<Value, Failure> {
+    let id = entry
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Failure::internal("landed next row has no id"))?;
+    let kind = next_entry_kind(entry);
+    let mut row = next_row(NextRow {
+        id,
+        kind,
+        title: next_entry_title(entry),
+        state: json!("landed"),
+        age_min: next_age_min(captured_at, entry.get("updatedAt").and_then(Value::as_str)),
+        spend_usd: next_spend(entries, id, kind),
+        actions: &[],
+        lifecycle: "landed".to_owned(),
+        health: next_entry_health(Some(entry), "terminal"),
+        revision: next_entry_revision(entry),
+    });
+    row["pr"] = entry
+        .pointer("/delivery/pr")
+        .filter(|value| !value.is_null())
+        .or_else(|| entry.pointer("/pr/number"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    Ok(row)
+}
+
+fn next_section_page(values: &[Value], limit: usize) -> Vec<Value> {
+    values.iter().take(limit).cloned().collect()
+}
+
+fn next_default_limits(totals: [usize; 4], symptoms: Option<usize>) -> ([usize; 4], usize) {
+    let mut limits = [0usize; 4];
+    let mut remaining = NEXT_DEFAULT_LIMIT;
+    for (index, total) in totals.iter().copied().enumerate() {
+        limits[index] = total.min(remaining);
+        remaining = remaining.saturating_sub(limits[index]);
+    }
+    let symptom_limit = symptoms.map_or(0, |total| total.min(remaining));
+    (limits, symptom_limit)
+}
+
+fn next_coverage(shown: usize, total: usize) -> Value {
+    json!({
+        "shown": shown,
+        "total": total,
+        "truncated": shown < total,
+    })
+}
+
+/// Keep the default driver read inside its byte contract without lying about
+/// coverage. Decision rows have highest priority, followed by running, ready,
+/// and landed; optional symptoms are discarded first. Explicit section reads
+/// are the widening escape hatch and do not use this byte cap.
+fn bound_next_default_result(result: &mut Value) {
+    while serde_json::to_vec(result).is_ok_and(|bytes| bytes.len() > NEXT_DEFAULT_BYTE_LIMIT) {
+        let mut removed = None;
+        for section in ["symptoms", "landed", "ready", "running", "decisions"] {
+            let Some(rows) = result
+                .pointer_mut(&format!("/sections/{section}"))
+                .and_then(Value::as_array_mut)
+            else {
+                continue;
+            };
+            if rows.pop().is_some() {
+                removed = Some((section, rows.len()));
+                break;
+            }
+        }
+        let Some((section, shown)) = removed else {
+            break;
+        };
+        if let Some(coverage) = result
+            .pointer_mut(&format!("/coverage/sections/{section}"))
+            .and_then(Value::as_object_mut)
+        {
+            let total = coverage
+                .get("total")
+                .and_then(Value::as_u64)
+                .unwrap_or(shown as u64);
+            coverage.insert("shown".to_owned(), json!(shown));
+            coverage.insert("truncated".to_owned(), json!((shown as u64) < total));
+        }
+        if let Some(shown_total) = result.pointer("/coverage/shown").and_then(Value::as_u64) {
+            result["coverage"]["shown"] = json!(shown_total.saturating_sub(1));
+        }
+        result["coverage"]["truncated"] = json!(true);
+        if section == "symptoms" {
+            let hidden = result
+                .pointer("/hidden/symptoms")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            result["hidden"]["symptoms"] = json!(hidden.saturating_add(1));
+        }
+    }
+}
+
+/// `next` — the bounded decision-first lead surface.
+///
+/// Audience: lead. One operations universe read supplies attention, running,
+/// landed, spend, and identity; one ready-frontier read and one note-presence
+/// read supply the wave-1 planning lifecycle. It never calls the Operations
+/// response facade and never loads specification bodies into its result.
+pub async fn next(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
+    read_only("next", req, || async {
+        let repository = repository_selector(req, "next")?;
+        let epic_id = req
+            .params
+            .get("id")
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned)
+                    .ok_or_else(|| Failure::invalid("next id must name one epic"))
+            })
+            .transpose()?;
+        if repository.is_some() && epic_id.is_some() {
+            return Err(Failure::invalid("next accepts --repo or --id, not both"));
+        }
+        let section = next_section(req)?;
+        let section_limit = req
+            .params
+            .get("limit")
+            .map(|value| {
+                value
+                    .as_u64()
+                    .ok_or_else(|| Failure::invalid("next limit must be an unsigned integer"))
+            })
+            .transpose()?;
+        if section_limit.is_some() && section.is_none() {
+            return Err(Failure::invalid("next limit requires a section"));
+        }
+        let section_limit = section_limit.unwrap_or(NEXT_DEFAULT_LIMIT as u64);
+        if !(1..=NEXT_MAX_LIMIT).contains(&section_limit) {
+            return Err(Failure::invalid(format!(
+                "next limit must be between 1 and {NEXT_MAX_LIMIT}"
+            )));
+        }
+        let include_symptoms = next_bool(req, "symptoms")?;
+
+        let universe = collect_operations_universe(
+            ctx,
+            WorkItemFilters {
+                repository: repository.clone(),
+                ..WorkItemFilters::default()
+            },
+        )
+        .await?;
+        let mut source_health = universe.source_health();
+        if repository.is_some()
+            && source_health
+                .pointer("/beads/state")
+                .and_then(Value::as_str)
+                != Some("available")
+        {
+            return Err(Failure::refused(
+                ErrorCode::WorkError,
+                "next repository membership is unavailable",
+            ));
+        }
+        let OperationsUniverse {
+            snapshot,
+            work_captured_at,
+            mut entries,
+            mut work_summaries,
+            claim_error,
+            plan_truncated,
+            ..
+        } = universe;
+        let captured_at = work_captured_at;
+        let epic_scope_work_ids = match epic_id.as_deref() {
+            Some(epic_id) => {
+                let ids = hydrate_next_epic_scope(
+                    ctx,
+                    epic_id,
+                    &captured_at,
+                    &mut entries,
+                    &mut work_summaries,
+                )
+                .await?;
+                source_health["plan"] = json!({
+                    "state": "available",
+                    "error": Value::Null,
+                    "discovered": ids.len(),
+                    "limit": ids.len(),
+                    "truncated": false,
+                });
+                Some(ids)
+            }
+            None => None,
+        };
+        let attention_items =
+            super::attention::project_active(&snapshot, &entries, &work_summaries)?;
+        let attention_json = attention_items
+            .iter()
+            .map(|item| {
+                serde_json::to_value(item).map_err(|error| {
+                    Failure::internal(format!("serializing attention item: {error}"))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        enrich_operations_facts(&snapshot, &attention_json, &mut entries)?;
+        let work_read = match claim_error {
+            Some(error) => Err(error),
+            None => Ok(work_summaries),
+        };
+        let _queue = operator_queue(&snapshot, &mut entries, &attention_json, work_read);
+
+        if let (Some(epic_id), Some(scope_ids)) = (epic_id.as_deref(), epic_scope_work_ids.as_ref())
+        {
+            entries.retain(|entry| {
+                next_is_epic_member(entry, epic_id)
+                    || entry
+                        .get("beadId")
+                        .and_then(Value::as_str)
+                        .is_some_and(|id| scope_ids.contains(id))
+            });
+        }
+        let scoped_ids = entries
+            .iter()
+            .filter_map(|entry| entry.get("id").and_then(Value::as_str))
+            .collect::<BTreeSet<_>>();
+        let parked_ids = entries
+            .iter()
+            .filter(|entry| {
+                entry.pointer("/plan/status").and_then(Value::as_str) == Some("deferred")
+                    || entry.pointer("/claimHealth/status").and_then(Value::as_str)
+                        == Some("deferred")
+            })
+            .filter_map(|entry| entry.get("id").and_then(Value::as_str))
+            .collect::<BTreeSet<_>>();
+        let entry_by_id = entries
+            .iter()
+            .filter_map(|entry| Some((entry.get("id")?.as_str()?, entry)))
+            .collect::<BTreeMap<_, _>>();
+
+        let expand_decisions = section == Some(NextSection::Decisions);
+        let mut decisions = Vec::new();
+        let mut symptoms = Vec::new();
+        for item in attention_items.iter().filter(|item| {
+            item.state == AttentionState::Open
+                && scoped_ids.contains(item.subject_id.as_str())
+                && !parked_ids.contains(item.subject_id.as_str())
+        }) {
+            let row = next_attention_row(
+                item,
+                entry_by_id.get(item.subject_id.as_str()).copied(),
+                &entries,
+                &captured_at,
+                expand_decisions,
+            )?;
+            match super::attention::classification(item.condition) {
+                super::attention::AttentionClass::Decision => decisions.push(row),
+                super::attention::AttentionClass::Symptom => symptoms.push(row),
+            }
+        }
+
+        let mut running = entries
+            .iter()
+            .filter(|entry| entry.get("liveSeats").and_then(Value::as_u64).unwrap_or(0) > 0)
+            .map(|entry| next_running_row(entry, &snapshot, &entries, &captured_at))
+            .collect::<Result<Vec<_>, _>>()?;
+        running.sort_by(|left, right| left["id"].as_str().cmp(&right["id"].as_str()));
+
+        let (ready_items, ready_total, ready_has_more) =
+            if let Some(scope_ids) = epic_scope_work_ids.as_ref() {
+                let items = on_ledger(&ctx.ledger, |ledger| ledger.ready_work_items()).await?;
+                let items = items
+                    .into_iter()
+                    .filter(|item| scope_ids.contains(&item.work_id))
+                    .collect::<Vec<_>>();
+                let total = items.len();
+                (items, total, false)
+            } else {
+                let page = on_ledger(&ctx.ledger, {
+                    let repository = repository.clone();
+                    move |ledger| {
+                        ledger.ready_work_items_page_filtered(
+                            WorkItemFilters {
+                                repository,
+                                ..WorkItemFilters::default()
+                            },
+                            None,
+                            NEXT_MAX_LIMIT as usize,
+                        )
+                    }
+                })
+                .await?;
+                let total = usize::try_from(page.total).unwrap_or(usize::MAX);
+                (page.items, total, page.has_more)
+            };
+        let scope_plan_truncated = if epic_id.is_some() {
+            false
+        } else {
+            plan_truncated
+        };
+        let ready_ids = ready_items
+            .iter()
+            .map(|item| item.work_id.clone())
+            .collect::<Vec<_>>();
+        let critiqued = on_ledger(&ctx.ledger, move |ledger| {
+            ledger.work_items_with_note_kind(&ready_ids, WorkNoteKind::Recommendation)
+        })
+        .await?;
+        let ready = ready_items
+            .into_iter()
+            .map(|item| {
+                let (lifecycle, evidence) = if item.status == WorkStatus::Blocked {
+                    ("held", "status: blocked")
+                } else if item.spec.notes.contains("[ ]") {
+                    ("held", "notes: unchecked checkbox")
+                } else if critiqued.contains(&item.work_id) {
+                    ("critiqued", "recommendation note exists")
+                } else {
+                    ("drafted", "no recommendation note")
+                };
+                let mut row = next_row(NextRow {
+                    id: &item.work_id,
+                    kind: item.kind.as_str(),
+                    title: next_title(&item.spec.title),
+                    state: json!(item.status.as_str()),
+                    age_min: next_age_min(&captured_at, Some(&item.updated_at)),
+                    spend_usd: json!(0.0),
+                    actions: &[],
+                    lifecycle: lifecycle.to_owned(),
+                    health: json!("unsubmitted"),
+                    revision: json!(item.revision),
+                });
+                row["basis"] = json!(format!("{evidence}; adjudicated: unknown-until-.8"));
+                row
+            })
+            .collect::<Vec<_>>();
+
+        let mut landed = entries
+            .iter()
+            .filter(|entry| entry.get("outcome").and_then(Value::as_str) == Some("landed"))
+            .filter(|entry| {
+                next_within_last_day(&captured_at, entry.get("updatedAt").and_then(Value::as_str))
+            })
+            .map(|entry| next_landed_row(entry, &entries, &captured_at))
+            .collect::<Result<Vec<_>, _>>()?;
+        landed.sort_by(|left, right| left["ageMin"].as_u64().cmp(&right["ageMin"].as_u64()));
+
+        let totals = [decisions.len(), running.len(), ready_total, landed.len()];
+        let (mut default_limits, symptom_limit) =
+            next_default_limits(totals, include_symptoms.then_some(symptoms.len()));
+        if let Some(section) = section {
+            let index = match section {
+                NextSection::Decisions => 0,
+                NextSection::Running => 1,
+                NextSection::Ready => 2,
+                NextSection::Landed => 3,
+            };
+            default_limits[index] = totals[index].min(section_limit as usize);
+        }
+        let decision_rows = next_section_page(&decisions, default_limits[0]);
+        let running_rows = next_section_page(&running, default_limits[1]);
+        let ready_rows = next_section_page(&ready, default_limits[2]);
+        let landed_rows = next_section_page(&landed, default_limits[3]);
+        let symptom_rows = if include_symptoms {
+            next_section_page(&symptoms, symptom_limit)
+        } else {
+            Vec::new()
+        };
+        let shown = decision_rows.len()
+            + running_rows.len()
+            + ready_rows.len()
+            + landed_rows.len()
+            + symptom_rows.len();
+        let total = totals.iter().sum::<usize>() + usize::from(include_symptoms) * symptoms.len();
+        let mut sections = json!({
+            "decisions": decision_rows,
+            "running": running_rows,
+            "ready": ready_rows,
+            "landed": landed_rows,
+        });
+        if include_symptoms {
+            sections["symptoms"] = Value::Array(symptom_rows.clone());
+        }
+        let mut coverage_sections = json!({
+            "decisions": next_coverage(decision_rows.len(), totals[0]),
+            "running": next_coverage(running_rows.len(), totals[1]),
+            "ready": next_coverage(ready_rows.len(), totals[2]),
+            "landed": next_coverage(landed_rows.len(), totals[3]),
+        });
+        if include_symptoms {
+            coverage_sections["symptoms"] = next_coverage(symptom_rows.len(), symptoms.len());
+        }
+        let bound_default_portfolio =
+            section.is_none() && repository.is_none() && epic_id.is_none();
+        let scope = if let Some(repository) = repository {
+            json!({"repository": repository})
+        } else if let Some(epic_id) = epic_id {
+            json!({"epic": epic_id})
+        } else {
+            json!({"portfolio": true})
+        };
+        let mut result = json!({
+            "schema": "forged.next/1",
+            "capturedAt": captured_at,
+            "scope": scope,
+            "sections": sections,
+            "hidden": {
+                "symptoms": symptoms.len().saturating_sub(symptom_rows.len()),
+                "parked": parked_ids.len(),
+            },
+            "coverage": {
+                "limit": NEXT_DEFAULT_LIMIT,
+                "shown": shown,
+                "total": total,
+                "truncated": shown < total || ready_has_more || scope_plan_truncated,
+                "sourceHealth": source_health,
+                "sections": coverage_sections,
+            },
+        });
+        if bound_default_portfolio {
+            bound_next_default_result(&mut result);
+        }
+        Ok(result)
+    })
+    .await
+}
+
 /// `operations overview` — the bounded, read-only operator surface.
 ///
 /// One ledger snapshot supplies every durable fact. The work store contributes one
@@ -6126,8 +6954,72 @@ mod tests {
     use std::path::PathBuf;
 
     use forged_types::{ExecutionPolicyV1, HostPolicyV1, Stage};
+    use serde_json::{json, Value};
 
-    use super::splice_policy;
+    use super::{
+        next_default_limits, next_landed_row, next_spend, next_title, next_within_last_day,
+        splice_policy,
+    };
+
+    #[test]
+    fn next_spend_is_known_only_when_every_matching_usage_row_is_costed() {
+        let entries = vec![
+            json!({"id": "epic-1", "costUsdKnown": 1.25, "rowsMissingCost": 0}),
+            json!({
+                "id": "run-1", "identity": {"epic": {"id": "epic-1"}},
+                "costUsdKnown": 2.75, "rowsMissingCost": 0
+            }),
+        ];
+        assert_eq!(next_spend(&entries, "epic-1", "epic"), json!(4.0));
+        assert_eq!(next_spend(&entries, "never-used", "run"), json!(0.0));
+
+        let mut missing = entries;
+        missing[1]["rowsMissingCost"] = json!(1);
+        assert_eq!(next_spend(&missing, "epic-1", "epic"), Value::Null);
+    }
+
+    #[test]
+    fn next_symptoms_share_the_default_global_row_budget() {
+        assert_eq!(
+            next_default_limits([10, 2, 0, 3], Some(47)),
+            ([10, 2, 0, 3], 15)
+        );
+        assert_eq!(
+            next_default_limits([30, 2, 0, 3], Some(47)),
+            ([30, 0, 0, 0], 0)
+        );
+        assert_eq!(next_default_limits([10, 2, 0, 3], None), ([10, 2, 0, 3], 0));
+    }
+
+    #[test]
+    fn next_string_and_recent_delivery_bounds_are_exact() {
+        assert_eq!(next_title(&"x".repeat(61)).chars().count(), 60);
+        assert!(next_within_last_day(
+            "2026-09-03T12:00:00Z",
+            Some("2026-09-02T12:00:00Z")
+        ));
+        assert!(!next_within_last_day(
+            "2026-09-03T12:00:00Z",
+            Some("2026-09-02T11:59:59Z")
+        ));
+        assert!(!next_within_last_day("2026-09-03T12:00:00Z", None));
+
+        let legacy = json!({
+            "id": "legacy-landed",
+            "delivery": {"pr": Value::Null},
+            "pr": {"number": 260},
+            "updatedAt": "2026-09-03T11:00:00Z",
+            "costUsdKnown": 0.0,
+            "rowsMissingCost": 0,
+        });
+        let row = next_landed_row(
+            &legacy,
+            std::slice::from_ref(&legacy),
+            "2026-09-03T12:00:00Z",
+        )
+        .expect("legacy landed row");
+        assert_eq!(row["pr"], json!(260));
+    }
 
     #[test]
     fn policy_splice_changes_only_the_revisable_trio() {

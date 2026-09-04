@@ -140,6 +140,7 @@
     "events_tail",
     "explain",
     "gate_run",
+    "next",
     "operations_overview",
     "overview",
     "packet_claim",
