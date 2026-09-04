@@ -433,13 +433,35 @@ fn all_manifest_tools_match_their_cli_counterparts() {
             "work_promote description states {statement:?}: {promote_description}"
         );
     }
-    for kind in ["comment", "critique", "recommendation", "approval"] {
+    for kind in [
+        "comment",
+        "critique",
+        "recommendation",
+        "adjudication",
+        "decision",
+        "retro",
+    ] {
         assert!(
             work_note_add["inputSchema"].to_string().contains(kind),
             "work_note_add advertises kind {kind}: {}",
             work_note_add["inputSchema"]
         );
     }
+    assert!(
+        !work_note_add["inputSchema"]
+            .to_string()
+            .contains("approval"),
+        "deprecated approval kind is hidden from MCP: {}",
+        work_note_add["inputSchema"]
+    );
+    assert!(
+        work_note_add["description"]
+            .as_str()
+            .is_some_and(|description| description.contains("approval")
+                && description.contains("deprecated")),
+        "work_note_add manifest marks legacy approval deprecated: {}",
+        work_note_add["description"]
+    );
     let work_note_list = mcp.tool("work_note_list");
     let list_schema = work_note_list
         .pointer("/inputSchema/properties")

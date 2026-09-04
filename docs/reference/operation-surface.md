@@ -106,3 +106,11 @@ Legacy keys remain present with same-value provider-neutral twins until 1.0.
 | `forged.projection/*` | `beads` | `work` | `1.0` |
 | `forged.projection/*` | `beadsStatus` | `workStatus` | `1.0` |
 | `forged.projection/*` | `beadsInventory` | `workInventory` | `1.0` |
+
+## Deprecated inputs
+
+Legacy inputs remain accepted by the CLI until their named replacement lands.
+
+| Operation | Parameter | Value | Replacement | Remove at |
+| --- | --- | --- | --- | --- |
+| `work_note_add` | `kind` | `approval` | `run_dispatch` | `ore-080.11` |

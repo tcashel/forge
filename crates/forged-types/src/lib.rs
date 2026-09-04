@@ -106,8 +106,12 @@ pub use work_map::{
     WORK_MAP_SCHEMA_V1,
 };
 pub use work_note_contract::{
-    ExecutionApprovalAction, ExecutionApprovalSubjectKind, ExecutionApprovalV1,
-    SpecRecommendationCruxV1, SpecRecommendationV1, SpecRecommendationsV1, SpecRejectedFindingV1,
-    WorkNoteContractError, EXECUTION_APPROVAL_SCHEMA_V1, SPEC_RECOMMENDATIONS_SCHEMA_V1,
+    AdjudicationCruxRefV1, AdjudicationCruxV1, AdjudicationDispositionKind,
+    AdjudicationDispositionV1, AdjudicationFindingRefV1, AdjudicationRefV1, AdjudicationV1,
+    DecisionApprovalV1, DecisionKind, DecisionSubjectV1, DecisionV1, ExecutionApprovalAction,
+    ExecutionApprovalSubjectKind, ExecutionApprovalV1, RetroCostV1, RetroEvidenceV1, RetroRankedV1,
+    RetroV1, SpecRecommendationCruxV1, SpecRecommendationV1, SpecRecommendationsV1,
+    SpecRejectedFindingV1, WorkNoteContractError, ADJUDICATION_SCHEMA_V1, DECISION_SCHEMA_V1,
+    EXECUTION_APPROVAL_SCHEMA_V1, RETRO_SCHEMA_V1, SPEC_RECOMMENDATIONS_SCHEMA_V1,
 };
 pub use work_ref::{WorkRefKind, WorkRefV1, WorkRefValidationError, WORK_REF_SCHEMA_V1};

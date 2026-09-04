@@ -3046,9 +3046,9 @@ mod tests {
         connection
             .execute(
                 "INSERT INTO work_notes \
-                 (note_id, work_id, kind, schema, actor, body_json, written_at) \
+                 (note_id, work_id, kind, schema, actor, body_json, revision, written_at) \
                  VALUES ('uncovered-note', 'uncovered-work', 'comment', 'comment/1', \
-                         'operator', '{}', '2030-01-01T00:00:00Z')",
+                         'operator', '{}', 1, '2030-01-01T00:00:00Z')",
                 [],
             )
             .expect("write genuinely uncovered table");

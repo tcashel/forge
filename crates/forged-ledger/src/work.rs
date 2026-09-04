@@ -211,6 +211,12 @@ pub enum WorkNoteKind {
     Recommendation,
     /// Durable operator approval evidence.
     Approval,
+    /// Durable dispositions against one critique/recommendation revision.
+    Adjudication,
+    /// Durable operator or lead-agent lifecycle decision.
+    Decision,
+    /// Durable evidence-backed retrospective.
+    Retro,
 }
 
 impl WorkNoteKind {
@@ -221,6 +227,9 @@ impl WorkNoteKind {
             Self::Critique => "critique",
             Self::Recommendation => "recommendation",
             Self::Approval => "approval",
+            Self::Adjudication => "adjudication",
+            Self::Decision => "decision",
+            Self::Retro => "retro",
         }
     }
 
@@ -231,6 +240,9 @@ impl WorkNoteKind {
             "critique" => Some(Self::Critique),
             "recommendation" => Some(Self::Recommendation),
             "approval" => Some(Self::Approval),
+            "adjudication" => Some(Self::Adjudication),
+            "decision" => Some(Self::Decision),
+            "retro" => Some(Self::Retro),
             _ => None,
         }
     }
@@ -265,6 +277,8 @@ pub struct WorkNoteRow {
     pub note_id: String,
     /// Work item the evidence describes.
     pub work_id: String,
+    /// Work specification revision current when the kernel inserted the note.
+    pub revision: i64,
     /// Closed annotation kind.
     pub kind: WorkNoteKind,
     /// Append-never-rename payload schema wire name.
@@ -767,6 +781,7 @@ fn canonical_work_note_body(raw: &str) -> Result<String, LedgerError> {
             ),
         )
     })?;
+    work_note_body_revision(&value)?;
     let bytes = canonical_json_bytes(&value).map_err(|error| {
         refused(
             ErrorCode::InvalidRequest,
@@ -780,13 +795,25 @@ fn canonical_work_note_body(raw: &str) -> Result<String, LedgerError> {
         .map_err(|error| internal(format!("canonical work note body is not UTF-8: {error}")))
 }
 
+fn work_note_body_revision(value: &serde_json::Value) -> Result<Option<i64>, LedgerError> {
+    let Some(value) = value.as_object().and_then(|object| object.get("revision")) else {
+        return Ok(None);
+    };
+    value.as_i64().map(Some).ok_or_else(|| {
+        refused(
+            ErrorCode::InvalidRequest,
+            "work note body field revision must be an integer matching the current work item revision",
+        )
+    })
+}
+
 fn insert_work_note_tx(
     conn: &Connection,
     new: &NewWorkNote,
     note_id: String,
     written_at: String,
 ) -> Result<WorkNoteRow, LedgerError> {
-    require_snapshot_tx(conn, &new.work_id).map_err(|error| match error {
+    let snapshot = require_snapshot_tx(conn, &new.work_id).map_err(|error| match error {
         LedgerError::Refused { code, .. } if code == ErrorCode::InvalidRequest => refused(
             code,
             format!(
@@ -796,10 +823,24 @@ fn insert_work_note_tx(
         ),
         other => other,
     })?;
+    let body: serde_json::Value = serde_json::from_str(&new.body_json)
+        .map_err(|error| internal(format!("canonical work note body did not decode: {error}")))?;
+    match work_note_body_revision(&body)? {
+        Some(revision) if revision != snapshot.revision => {
+            return Err(refused(
+                ErrorCode::InvalidRequest,
+                format!(
+                    "work note body field revision is {revision}, but the current work item revision is {}; update revision or omit it before retrying work_note_add",
+                    snapshot.revision
+                ),
+            ));
+        }
+        _ => {}
+    }
     conn.execute(
         "INSERT INTO work_notes \
-         (note_id, work_id, kind, schema, actor, body_json, written_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+         (note_id, work_id, kind, schema, actor, body_json, revision, written_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         rusqlite::params![
             note_id,
             new.work_id,
@@ -807,12 +848,14 @@ fn insert_work_note_tx(
             new.schema,
             new.actor,
             new.body_json,
+            snapshot.revision,
             written_at,
         ],
     )?;
     Ok(WorkNoteRow {
         note_id,
         work_id: new.work_id.clone(),
+        revision: snapshot.revision,
         kind: new.kind,
         schema: new.schema.clone(),
         actor: new.actor.clone(),
@@ -822,15 +865,16 @@ fn insert_work_note_tx(
 }
 
 fn work_note_from_row(row: &rusqlite::Row<'_>) -> Result<WorkNoteRow, rusqlite::Error> {
-    let kind: String = row.get(2)?;
+    let kind: String = row.get(3)?;
     Ok(WorkNoteRow {
         note_id: row.get(0)?,
         work_id: row.get(1)?,
-        kind: WorkNoteKind::decode(2, &kind)?,
-        schema: row.get(3)?,
-        actor: row.get(4)?,
-        body_json: row.get(5)?,
-        written_at: row.get(6)?,
+        revision: row.get(2)?,
+        kind: WorkNoteKind::decode(3, &kind)?,
+        schema: row.get(4)?,
+        actor: row.get(5)?,
+        body_json: row.get(6)?,
+        written_at: row.get(7)?,
     })
 }
 
@@ -855,7 +899,7 @@ fn list_work_notes_tx(
         |row| row.get(0),
     )?;
     let mut statement = conn.prepare(
-        "SELECT note_id, work_id, kind, schema, actor, body_json, written_at \
+        "SELECT note_id, work_id, revision, kind, schema, actor, body_json, written_at \
          FROM work_notes \
          WHERE work_id = ?1 AND (?2 IS NULL OR kind = ?2) \
          ORDER BY written_at, note_id LIMIT ?3",
@@ -1102,6 +1146,36 @@ impl Ledger {
             )?;
             u64::try_from(count)
                 .map_err(|_| internal(format!("negative work note count for {work_id:?}")))
+        })
+    }
+
+    /// Count annotations by their closed kind without loading note bodies.
+    pub fn work_note_counts(&self, work_id: &str) -> Result<BTreeMap<String, u64>, LedgerError> {
+        let work_id = work_id.to_owned();
+        self.submit(move |conn| {
+            require_snapshot_tx(conn, &work_id)?;
+            let mut statement = conn.prepare(
+                "SELECT kind, COUNT(*) FROM work_notes \
+                 WHERE work_id = ?1 GROUP BY kind ORDER BY kind",
+            )?;
+            let rows = statement.query_map([&work_id], |row| {
+                let stored: String = row.get(0)?;
+                let kind = WorkNoteKind::decode(0, &stored)?;
+                let count: i64 = row.get(1)?;
+                Ok((kind, count))
+            })?;
+            let mut counts = BTreeMap::new();
+            for row in rows {
+                let (kind, count) = row?;
+                let count = u64::try_from(count).map_err(|_| {
+                    internal(format!(
+                        "negative {:?} work note count for {work_id:?}",
+                        kind.as_str()
+                    ))
+                })?;
+                counts.insert(kind.as_str().to_owned(), count);
+            }
+            Ok(counts)
         })
     }
 
@@ -2488,6 +2562,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(first.body_json, r#"{"a":{"b":2,"d":4},"z":1}"#);
+        assert_eq!(first.revision, 1);
         assert_eq!(l.work_item("beads-noted").unwrap().unwrap().revision, 1);
         assert_eq!(l.work_note_count("beads-noted").unwrap(), 1);
         l.close().expect("close ledger before raw tie fixture");
@@ -2496,10 +2571,10 @@ mod tests {
         let conn = rusqlite::Connection::open(path).expect("raw database");
         conn.execute_batch(
             "INSERT INTO work_notes \
-               (note_id, work_id, kind, schema, actor, body_json, written_at) VALUES \
-             ('note-z','beads-noted','recommendation','recommendation/0','critic','{}',
+               (note_id, work_id, kind, schema, actor, body_json, revision, written_at) VALUES \
+             ('note-z','beads-noted','recommendation','recommendation/0','critic','{}',1,
               '9999-01-01T00:00:00.000000000Z'), \
-             ('note-a','beads-noted','recommendation','recommendation/0','critic','{}',
+             ('note-a','beads-noted','recommendation','recommendation/0','critic','{}',1,
               '9999-01-01T00:00:00.000000000Z');",
         )
         .expect("seed tied notes");
@@ -2519,9 +2594,9 @@ mod tests {
             "WITH RECURSIVE seq(value) AS \
                (VALUES(0) UNION ALL SELECT value + 1 FROM seq WHERE value < 100) \
              INSERT INTO work_notes \
-               (note_id, work_id, kind, schema, actor, body_json, written_at) \
+               (note_id, work_id, kind, schema, actor, body_json, revision, written_at) \
              SELECT printf('bulk-%03d', value), 'beads-noted', 'comment', 'comment/0', \
-                    'operator', '{}', '9998-01-01T00:00:00.000000000Z' FROM seq;",
+                    'operator', '{}', 1, '9998-01-01T00:00:00.000000000Z' FROM seq;",
         )
         .expect("seed bounded listing");
         let bounded = list_work_notes_tx(
@@ -2533,6 +2608,44 @@ mod tests {
         .expect("bounded notes");
         assert_eq!(bounded.notes.len(), 100);
         assert_eq!(bounded.total, 101);
+    }
+
+    #[test]
+    fn work_note_revision_is_captured_and_body_revision_is_fenced() {
+        let (_dir, l) = ledger();
+        l.create_work_item(item("beads-note-revision", WorkStatus::Open))
+            .unwrap();
+        l.update_work_spec(
+            "beads-note-revision",
+            1,
+            spec("revision two"),
+            WorkRevisionCause::Authored,
+        )
+        .unwrap();
+
+        let captured = l
+            .add_work_note(NewWorkNote {
+                work_id: "beads-note-revision".to_owned(),
+                kind: WorkNoteKind::Decision,
+                schema: "forged.decision/1".to_owned(),
+                actor: "operator".to_owned(),
+                body_json: r#"{"revision":2}"#.to_owned(),
+            })
+            .expect("matching revision");
+        assert_eq!(captured.revision, 2);
+
+        let error = l
+            .add_work_note(NewWorkNote {
+                work_id: "beads-note-revision".to_owned(),
+                kind: WorkNoteKind::Comment,
+                schema: "comment/0".to_owned(),
+                actor: "operator".to_owned(),
+                body_json: r#"{"revision":1}"#.to_owned(),
+            })
+            .expect_err("stale body revision must refuse");
+        assert!(error.to_string().contains("field revision"), "{error}");
+        assert!(error.to_string().contains("work_note_add"), "{error}");
+        assert_eq!(l.work_note_count("beads-note-revision").unwrap(), 1);
     }
 
     #[test]

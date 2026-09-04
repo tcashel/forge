@@ -479,7 +479,7 @@ DROP TRIGGER admission_revision_desired_work_insert;
         .expect("seed v14");
     }
     let ledger = Ledger::open(&path).expect("migrate 015");
-    assert_eq!(ledger.pragmas().expect("pragmas").user_version, 27);
+    assert_eq!(ledger.pragmas().expect("pragmas").user_version, 28);
     let epic = ledger
         .get_work_identity(WorkIdentitySubjectKind::Epic, "epic-one")
         .expect("read")

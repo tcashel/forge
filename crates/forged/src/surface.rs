@@ -261,6 +261,24 @@ struct DeprecatedKey {
     remove_at: &'static str,
 }
 
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeprecatedInput {
+    operation: &'static str,
+    parameter: &'static str,
+    value: &'static str,
+    replacement: &'static str,
+    remove_at: &'static str,
+}
+
+const DEPRECATED_INPUTS: &[DeprecatedInput] = &[DeprecatedInput {
+    operation: "work_note_add",
+    parameter: "kind",
+    value: "approval",
+    replacement: "run_dispatch",
+    remove_at: "ore-080.11",
+}];
+
 const DEPRECATED_KEYS: &[DeprecatedKey] = &[
     DeprecatedKey {
         schema: "forged.work-identity/1",
@@ -358,6 +376,8 @@ const DEPRECATED_KEYS: &[DeprecatedKey] = &[
 struct SurfaceManifest {
     #[serde(rename = "deprecatedKeys")]
     deprecated_keys: Vec<DeprecatedKey>,
+    #[serde(rename = "deprecatedInputs")]
+    deprecated_inputs: Vec<DeprecatedInput>,
     operations: Vec<SurfaceRow>,
     schema: &'static str,
 }
@@ -723,6 +743,7 @@ fn manifest_rows() -> Result<Vec<SurfaceRow>, String> {
 fn render_json(rows: &[SurfaceRow]) -> Result<String, String> {
     let manifest = SurfaceManifest {
         deprecated_keys: DEPRECATED_KEYS.to_vec(),
+        deprecated_inputs: DEPRECATED_INPUTS.to_vec(),
         operations: rows.to_vec(),
         schema: "forged.operation-surface/1",
     };
@@ -773,6 +794,18 @@ fn render_markdown(rows: &[SurfaceRow]) -> String {
         output.push_str(&format!(
             "| `{}` | `{}` | `{}` | `{}` |\n",
             key.schema, key.key, key.twin, key.remove_at,
+        ));
+    }
+    output.push_str("\n## Deprecated inputs\n\n");
+    output.push_str(
+        "Legacy inputs remain accepted by the CLI until their named replacement lands.\n\n",
+    );
+    output.push_str("| Operation | Parameter | Value | Replacement | Remove at |\n");
+    output.push_str("| --- | --- | --- | --- | --- |\n");
+    for input in DEPRECATED_INPUTS {
+        output.push_str(&format!(
+            "| `{}` | `{}` | `{}` | `{}` | `{}` |\n",
+            input.operation, input.parameter, input.value, input.replacement, input.remove_at,
         ));
     }
     output

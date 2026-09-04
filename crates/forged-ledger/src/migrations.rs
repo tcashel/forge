@@ -1423,6 +1423,49 @@ CREATE UNIQUE INDEX policy_revision_operation
 ALTER TABLE packets ADD COLUMN policy_revision INTEGER;
 ";
 
+/// Migration 028: widen the work-note vocabulary in Rust and bind every
+/// existing and future note to the specification revision it describes.
+const MIGRATION_028: &str = "
+CREATE TABLE work_notes_v28 (
+  note_id    TEXT PRIMARY KEY,
+  work_id    TEXT NOT NULL REFERENCES work_items(work_id),
+  kind       TEXT NOT NULL,
+  schema     TEXT NOT NULL,
+  actor      TEXT NOT NULL,
+  body_json  TEXT NOT NULL,
+  revision   INTEGER NOT NULL,
+  written_at TEXT NOT NULL
+);
+INSERT INTO work_notes_v28
+  (note_id, work_id, kind, schema, actor, body_json, revision, written_at)
+SELECT note_id, work_id, kind, schema, actor, body_json,
+       COALESCE(
+         (SELECT wr.revision
+            FROM work_revisions AS wr
+           WHERE wr.work_id = work_notes.work_id
+             AND wr.written_at <= work_notes.written_at
+           ORDER BY wr.revision DESC
+           LIMIT 1),
+         1
+       ),
+       written_at
+  FROM work_notes;
+DROP TABLE work_notes;
+ALTER TABLE work_notes_v28 RENAME TO work_notes;
+CREATE INDEX work_notes_work_kind_written_at
+  ON work_notes(work_id, kind, written_at);
+CREATE TRIGGER work_notes_append_only_update
+BEFORE UPDATE ON work_notes
+BEGIN
+  SELECT RAISE(ABORT, 'work notes are append-only');
+END;
+CREATE TRIGGER work_notes_append_only_delete
+BEFORE DELETE ON work_notes
+BEGIN
+  SELECT RAISE(ABORT, 'work notes are append-only');
+END;
+";
+
 /// Embedded ordered migrations; `user_version` records the last applied index.
 const MIGRATIONS: &[&str] = &[
     MIGRATION_001,
@@ -1452,6 +1495,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_025,
     MIGRATION_026,
     MIGRATION_027,
+    MIGRATION_028,
 ];
 
 /// Configure pragmas and apply pending migrations on a fresh connection.
@@ -1628,8 +1672,8 @@ mod tests {
              INSERT INTO work_revisions (work_id, revision, title, cause, written_at) \
              VALUES ('w1',1,'title','authored','t'); \
              INSERT INTO work_notes \
-               (note_id, work_id, kind, schema, actor, body_json, written_at) \
-             VALUES ('n1','w1','comment','comment/0','operator','{}','t');",
+               (note_id, work_id, kind, schema, actor, body_json, revision, written_at) \
+             VALUES ('n1','w1','comment','comment/0','operator','{}',1,'t');",
         )
         .expect("seed");
         let update = conn.execute(
@@ -1647,8 +1691,8 @@ mod tests {
         );
         let missing = conn.execute(
             "INSERT INTO work_notes \
-             (note_id, work_id, kind, schema, actor, body_json, written_at) \
-             VALUES ('n-missing','missing','comment','comment/0','operator','{}','t')",
+             (note_id, work_id, kind, schema, actor, body_json, revision, written_at) \
+             VALUES ('n-missing','missing','comment','comment/0','operator','{}',1,'t')",
             [],
         );
         assert!(
@@ -1657,6 +1701,97 @@ mod tests {
                 .to_string()
                 .contains("FOREIGN KEY constraint failed"),
             "the work_id foreign key must back the handler refusal"
+        );
+    }
+
+    #[test]
+    fn migration_028_binds_existing_notes_to_their_historical_revision() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state-v27.db");
+        {
+            let conn = rusqlite::Connection::open(&path).expect("raw database");
+            for migration in MIGRATIONS.iter().take(27) {
+                conn.execute_batch(migration).expect("seed migration");
+            }
+            conn.execute_batch(
+                "INSERT INTO work_items
+                   (work_id, kind, status, priority, assignee, metadata_json,
+                    current_revision, created_at, updated_at)
+                 VALUES ('noted-work','task','open',NULL,NULL,'{}',2,'t0','t3');
+                 INSERT INTO work_revisions
+                   (work_id, revision, title, description, acceptance_criteria,
+                    design, notes, cause, written_at)
+                 VALUES
+                   ('noted-work',1,'v1','','','','','authored','t1'),
+                   ('noted-work',2,'v2','','','','','authored','t3');
+                 INSERT INTO work_notes
+                   (note_id, work_id, kind, schema, actor, body_json, written_at)
+                 VALUES
+                   ('approval-before-first','noted-work','approval','approval/0','operator',
+                    '{ \"legacy\": true }','t0'),
+                   ('recommendation-v1','noted-work','recommendation','recommendation/0','critic',
+                    '{\"revision\":1}','t2'),
+                   ('recommendation-v2','noted-work','recommendation','recommendation/0','critic',
+                    '{\"revision\":2}','t4');
+                 PRAGMA user_version=27;",
+            )
+            .expect("seed v27 notes");
+        }
+
+        let ledger = Ledger::open(&path).expect("upgrade v27 database");
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 28);
+        let approval = ledger
+            .list_work_notes("noted-work", Some(crate::work::WorkNoteKind::Approval), 10)
+            .expect("list migrated approval");
+        assert_eq!(
+            approval.notes[0].revision, 1,
+            "pre-revision fallback is one"
+        );
+        assert_eq!(approval.notes[0].body_json, "{ \"legacy\": true }");
+        let recommendations = ledger
+            .list_work_notes(
+                "noted-work",
+                Some(crate::work::WorkNoteKind::Recommendation),
+                10,
+            )
+            .expect("list migrated recommendations");
+        assert_eq!(
+            recommendations
+                .notes
+                .iter()
+                .map(|note| note.revision)
+                .collect::<Vec<_>>(),
+            [1, 2]
+        );
+        ledger.close().expect("close");
+
+        let conn = rusqlite::Connection::open(path).expect("raw migrated database");
+        let table_sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='work_notes'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("work_notes DDL");
+        assert!(
+            !table_sql.contains("CHECK"),
+            "kind CHECK survived: {table_sql}"
+        );
+        let update = conn.execute(
+            "UPDATE work_notes SET body_json='{}' WHERE note_id='recommendation-v1'",
+            [],
+        );
+        assert!(
+            update.unwrap_err().to_string().contains("append-only"),
+            "UPDATE trigger must survive migration"
+        );
+        let delete = conn.execute(
+            "DELETE FROM work_notes WHERE note_id='recommendation-v1'",
+            [],
+        );
+        assert!(
+            delete.unwrap_err().to_string().contains("append-only"),
+            "DELETE trigger must survive migration"
         );
     }
 
@@ -1675,7 +1810,7 @@ mod tests {
         assert_eq!(pragmas.synchronous, 2);
         assert!(pragmas.foreign_keys);
         assert_eq!(pragmas.busy_timeout_ms, 5000);
-        assert_eq!(pragmas.user_version, 27);
+        assert_eq!(pragmas.user_version, 28);
         ledger.close().expect("close");
 
         // Table names via a separate connection: sqlite_master is data, and
@@ -1846,7 +1981,7 @@ mod tests {
         }
 
         let ledger = Ledger::open(&path).expect("upgrade v23 database");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 27);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 28);
         ledger.close().expect("close");
 
         let conn = rusqlite::Connection::open(&path).expect("raw migrated database");
@@ -1895,7 +2030,7 @@ mod tests {
         }
 
         let ledger = Ledger::open(&path).expect("upgrade v24 database");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 27);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 28);
         ledger.close().expect("close");
 
         let conn = rusqlite::Connection::open(path).expect("raw migrated database");
@@ -1963,7 +2098,7 @@ mod tests {
         }
 
         let ledger = Ledger::open(&path).expect("open migration-013 database");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 27);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 28);
         ledger.close().expect("close");
 
         let conn = rusqlite::Connection::open(&path).expect("open upgraded database");
@@ -2023,7 +2158,7 @@ mod tests {
 
             let ledger = Ledger::open(&path)
                 .unwrap_or_else(|error| panic!("upgrade from v{version} failed: {error}"));
-            assert_eq!(ledger.pragmas().expect("pragmas").user_version, 27);
+            assert_eq!(ledger.pragmas().expect("pragmas").user_version, 28);
             assert_eq!(
                 ledger
                     .list_events_by_kind("legacy.progress")
@@ -2123,7 +2258,7 @@ mod tests {
         }
 
         let ledger = Ledger::open(&path).expect("upgrade owned v20 database");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 27);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 28);
         assert!(ledger
             .get_owned_herdr_session("migration-owned")
             .expect("owned row")
@@ -2167,7 +2302,7 @@ mod tests {
             .close()
             .expect("close");
         let ledger = Ledger::open(&path).expect("second open");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 27);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 28);
         ledger.close().expect("close");
     }
 
@@ -2228,7 +2363,7 @@ mod tests {
                 .expect("mark v0");
         }
         let ledger = Ledger::open(&path).expect("migrate");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 27);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 28);
         let old = ledger.get_run("old-run").expect("old run");
         assert_eq!(old.work_id, "old-bead");
         assert_eq!(old.stop_reason.as_deref(), Some("legacy stop"));
@@ -2271,7 +2406,7 @@ mod tests {
         }
 
         let ledger = Ledger::open(&path).expect("migrate");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 27);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 28);
         let first = ledger.get_attempt(1).expect("attempt 1 survived");
         assert_eq!(first.claim_token, "tok-1");
         assert_eq!(first.state, crate::AttemptState::Reclaimed);

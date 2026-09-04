@@ -91,6 +91,15 @@
       "removeAt": "1.0"
     }
   ],
+  "deprecatedInputs": [
+    {
+      "operation": "work_note_add",
+      "parameter": "kind",
+      "value": "approval",
+      "replacement": "run_dispatch",
+      "removeAt": "ore-080.11"
+    }
+  ],
   "operations": [
     {
       "audience": "machine",
