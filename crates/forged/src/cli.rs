@@ -1179,7 +1179,7 @@ pub struct WaitArgs {
     #[arg(long, value_enum, default_value_t = WaitUntilArg::Stage)]
     pub until: WaitUntilArg,
     /// Maximum seconds to wait, 1..=3600 (default 240).
-    #[arg(long, default_value_t = 240)]
+    #[arg(long, default_value_t = 240, allow_hyphen_values = true)]
     pub timeout: i64,
 }
 

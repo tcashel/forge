@@ -45,6 +45,9 @@ use serde_json::{Map, Value};
 use crate::config::ForgedConfig;
 use crate::failpoint;
 
+/// Durable cursor marker emitted when a run or epic enters a new packet stage.
+pub(crate) const PACKET_STAGE_CHANGED_EVENT: &str = "forged.packet.stage.changed";
+
 /// Everything a core function needs: the once-read config and the open
 /// ledger.
 pub struct Ctx {

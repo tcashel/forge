@@ -596,17 +596,31 @@ pub async fn open_packet_op(
         },
     };
     let OpenTarget {
+        stage_key,
+        logical_seq,
         new_packet,
         semantic_id,
-        ..
     } = target;
     let resp = crate::core::fenced(ctx, "packet_open", EffectClass::SafeRetry, &req, None, {
         let ledger = ctx.ledger.clone();
+        let event_run = run_id.clone();
         move |_op_id| async move {
-            let packet_id =
-                tokio::task::spawn_blocking(move || apply_open(&ledger, new_packet, semantic_id))
-                    .await
-                    .map_err(|e| Failure::internal(format!("join failure: {e}")))??;
+            let packet_id = tokio::task::spawn_blocking(move || {
+                let packet_id = apply_open(&ledger, new_packet, semantic_id)?;
+                ledger.append_event_once(
+                    &event_run,
+                    crate::core::PACKET_STAGE_CHANGED_EVENT,
+                    json!({
+                        "schema": "forged.packet-stage-change/1",
+                        "packetId": packet_id,
+                        "stage": stage_key,
+                        "seq": logical_seq,
+                    }),
+                )?;
+                Ok::<_, forged_ledger::LedgerError>(packet_id)
+            })
+            .await
+            .map_err(|e| Failure::internal(format!("join failure: {e}")))??;
             Ok(json!({"packetId": packet_id}))
         }
     })

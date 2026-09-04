@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use forged_ledger::{RunState, WorkKind, WorkStatus};
+use forged_ledger::{DesiredState, DesiredSubjectKind, RunState, WorkKind, WorkStatus};
 use forged_types::{AttentionState, AttentionSubjectKind, ErrorCode, OpError, OperationRequest};
 use serde_json::{json, Value};
 use tokio::time::Instant;
@@ -90,7 +90,7 @@ struct WorkStage {
     status: WorkStatus,
     updated_at: String,
     note_count: u64,
-    latest_run_event_cursor: i64,
+    latest_run_stage_cursor: i64,
 }
 
 fn response_key(req: &OperationRequest) -> String {
@@ -163,17 +163,11 @@ async fn resolve_subject(
 
 async fn event_cursor(ctx: &Ctx, id: &str) -> Result<i64, Failure> {
     let id = id.to_owned();
-    let latest = on_ledger(&ctx.ledger, move |ledger| ledger.latest_event_per_run()).await?;
-    Ok(latest.get(&id).map_or(0, |event| event.event_id))
-}
-
-async fn event_after(ctx: &Ctx, id: &str, cursor: i64) -> Result<Option<i64>, Failure> {
-    let id = id.to_owned();
-    let rows = on_ledger(&ctx.ledger, move |ledger| {
-        ledger.list_events(Some(&id), cursor, 1)
+    let latest = on_ledger(&ctx.ledger, move |ledger| {
+        ledger.latest_event_of_kind(&id, super::PACKET_STAGE_CHANGED_EVENT)
     })
     .await?;
-    Ok(rows.first().map(|event| event.event_id))
+    Ok(latest.map_or(0, |event| event.event_id))
 }
 
 async fn latest_run_for_work(ctx: &Ctx, work_id: &str) -> Result<Option<String>, Failure> {
@@ -192,7 +186,7 @@ async fn work_stage(ctx: &Ctx, work_id: &str) -> Result<WorkStage, Failure> {
         .ok_or_else(|| Failure::internal("resolved work item disappeared"))?;
     let id = work_id.to_owned();
     let note_count = on_ledger(&ctx.ledger, move |ledger| ledger.work_note_count(&id)).await?;
-    let latest_run_event_cursor = match latest_run_for_work(ctx, work_id).await? {
+    let latest_run_stage_cursor = match latest_run_for_work(ctx, work_id).await? {
         Some(run) => event_cursor(ctx, &run).await?,
         None => 0,
     };
@@ -201,7 +195,7 @@ async fn work_stage(ctx: &Ctx, work_id: &str) -> Result<WorkStage, Failure> {
         status: work.status,
         updated_at: work.updated_at,
         note_count,
-        latest_run_event_cursor,
+        latest_run_stage_cursor,
     })
 }
 
@@ -212,10 +206,33 @@ async fn is_terminal(ctx: &Ctx, subject: &WaitSubject) -> Result<bool, Failure> 
             let run = on_ledger(&ctx.ledger, move |ledger| ledger.get_run(&id)).await?;
             Ok(run.state == RunState::Stopped)
         }
-        WaitSubject::Work { id, .. } | WaitSubject::Epic(id) => {
+        WaitSubject::Work { id, kind } => {
+            let work_id = id.clone();
+            let work = on_ledger(&ctx.ledger, move |ledger| ledger.work_item(&work_id)).await?;
+            if work.is_some_and(|work| work.status == WorkStatus::Closed) {
+                return Ok(true);
+            }
+            if *kind == WorkKind::Epic {
+                let desired_id = id.clone();
+                let desired = on_ledger(&ctx.ledger, move |ledger| {
+                    ledger.get_desired_work(DesiredSubjectKind::Epic, &desired_id)
+                })
+                .await?;
+                return Ok(desired.is_some_and(|row| row.desired_state == DesiredState::Stopped));
+            }
+            let Some(run_id) = latest_run_for_work(ctx, id).await? else {
+                return Ok(false);
+            };
+            let run = on_ledger(&ctx.ledger, move |ledger| ledger.get_run(&run_id)).await?;
+            Ok(run.state == RunState::Stopped)
+        }
+        WaitSubject::Epic(id) => {
             let id = id.clone();
-            let work = on_ledger(&ctx.ledger, move |ledger| ledger.work_item(&id)).await?;
-            Ok(work.is_some_and(|work| work.status == WorkStatus::Closed))
+            let desired = on_ledger(&ctx.ledger, move |ledger| {
+                ledger.get_desired_work(DesiredSubjectKind::Epic, &id)
+            })
+            .await?;
+            Ok(desired.is_some_and(|row| row.desired_state == DesiredState::Stopped))
         }
     }
 }
@@ -271,11 +288,16 @@ async fn wait_for_stage(
     deadline: Instant,
 ) -> Result<bool, Failure> {
     match subject {
-        WaitSubject::Run(id) | WaitSubject::Epic(id) => {
+        WaitSubject::Run(id)
+        | WaitSubject::Epic(id)
+        | WaitSubject::Work {
+            id,
+            kind: WorkKind::Epic,
+        } => {
             let cursor = event_cursor(ctx, id).await?;
             wait_at_cadence(deadline, SUBJECT_POLL_INTERVAL, || {
                 let id = id.clone();
-                async move { Ok(event_after(ctx, &id, cursor).await?.is_some()) }
+                async move { Ok(event_cursor(ctx, &id).await? > cursor) }
             })
             .await
         }

@@ -3,9 +3,9 @@ mod support;
 use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
 
-use forged_ledger::RunOutcome;
+use forged_ledger::{NewRun, RunOutcome};
 use serde_json::{json, Value};
-use support::{fabricate_run, McpClient, TestEnv};
+use support::{fabricate_epic, fabricate_run, McpClient, TestEnv};
 
 fn spawn_wait(env: &TestEnv, args: &[&str]) -> Child {
     env.forged_cmd(args)
@@ -34,11 +34,16 @@ fn stage_waits_use_the_run_cursor_and_work_tuple() {
     env.forged(&["init"]);
     fabricate_run(&env, "wait-quiet");
     fabricate_run(&env, "wait-event");
+    fabricate_run(&env, "wait-unrelated");
+    fabricate_epic(&env, "wait-epic");
+    env.set_work_field("wait-epic", "type", "epic");
     env.ensure_work_item("wait-revision");
     env.ensure_work_item("wait-status");
 
     let quiet = spawn_wait(&env, &["wait", "--id", "wait-quiet", "--timeout", "1"]);
     let event = spawn_wait(&env, &["wait", "--id", "wait-event", "--timeout", "5"]);
+    let unrelated = spawn_wait(&env, &["wait", "--id", "wait-unrelated", "--timeout", "3"]);
+    let epic = spawn_wait(&env, &["wait", "--id", "wait-epic", "--timeout", "5"]);
     let revision = spawn_wait(&env, &["wait", "--id", "wait-revision", "--timeout", "5"]);
     let status = spawn_wait(&env, &["wait", "--id", "wait-status", "--timeout", "5"]);
 
@@ -51,6 +56,20 @@ fn stage_waits_use_the_run_cursor_and_work_tuple() {
             json!({"stage": "review"}),
         )
         .expect("append stage event");
+    ledger
+        .append_event(
+            Some("wait-unrelated"),
+            "attempt.state",
+            json!({"state": "running"}),
+        )
+        .expect("append unrelated event");
+    ledger
+        .append_event(
+            Some("wait-epic"),
+            "forged.packet.stage.changed",
+            json!({"stage": "dispatch"}),
+        )
+        .expect("append epic stage event");
     ledger.close().expect("close event writer");
     env.set_work_field("wait-revision", "description", "revision two");
     env.set_work_field("wait-status", "status", "blocked");
@@ -60,7 +79,16 @@ fn stage_waits_use_the_run_cursor_and_work_tuple() {
     assert_eq!(quiet["result"]["changed"], json!(false), "{quiet}");
     assert_eq!(quiet["result"]["explain"]["kind"], json!("run"));
 
-    for (label, child) in [("event", event), ("revision", revision), ("status", status)] {
+    let (code, unrelated) = finish_wait(unrelated);
+    assert_eq!(code, 0, "unrelated wait: {unrelated}");
+    assert_eq!(unrelated["result"]["changed"], json!(false), "{unrelated}");
+
+    for (label, child) in [
+        ("event", event),
+        ("epic", epic),
+        ("revision", revision),
+        ("status", status),
+    ] {
         let (code, response) = finish_wait(child);
         assert_eq!(code, 0, "{label} wait: {response}");
         assert_eq!(response["result"]["changed"], json!(true), "{response}");
@@ -70,6 +98,43 @@ fn stage_waits_use_the_run_cursor_and_work_tuple() {
             json!("forged.explain/1")
         );
     }
+}
+
+#[test]
+fn decision_wait_pages_complete_subject_evidence() {
+    let env = TestEnv::new("forged-wait-decision-page");
+    env.forged(&["init"]);
+    fabricate_run(&env, "wait-decision-page");
+    let ledger = env.ledger();
+    for ordinal in 0..forged_ledger::WORK_OBSERVATION_MAX_EVENT_LIMIT {
+        ledger
+            .append_event(
+                Some("wait-decision-page"),
+                "fixture.noise",
+                json!({"ordinal": ordinal}),
+            )
+            .expect("append noise event");
+    }
+    ledger
+        .append_event(
+            Some("wait-decision-page"),
+            "forged.epic.input.required",
+            json!({"code": "choice", "detail": "pick one"}),
+        )
+        .expect("append decision beyond first page");
+    ledger.close().expect("close decision page writer");
+
+    let (code, response) = env.forged(&[
+        "wait",
+        "--id",
+        "wait-decision-page",
+        "--until",
+        "decision",
+        "--timeout",
+        "1",
+    ]);
+    assert_eq!(code, 0, "{response}");
+    assert_eq!(response["result"]["changed"], json!(true), "{response}");
 }
 
 #[test]
@@ -159,7 +224,17 @@ fn terminal_wait_and_mcp_return_the_same_shape_and_text_reuses_explain() {
     let env = TestEnv::new("forged-wait-terminal");
     env.forged(&["init"]);
     fabricate_run(&env, "wait-terminal");
+    env.ensure_work_item("wait-terminal-work");
     let ledger = env.ledger();
+    ledger
+        .create_run(NewRun {
+            run_id: forged_types::RunId::new("wait-terminal-work").expect("run id"),
+            work_id: "wait-terminal-work".to_owned(),
+            repo: env.repos.repo.to_string_lossy().into_owned(),
+            base_ref: env.repos.base.clone(),
+            branch: "forged/wait-terminal-work".to_owned(),
+        })
+        .expect("create production-shaped run");
     ledger
         .settle_run(
             "wait-terminal",
@@ -170,6 +245,16 @@ fn terminal_wait_and_mcp_return_the_same_shape_and_text_reuses_explain() {
             None,
         )
         .expect("settle terminal run");
+    ledger
+        .settle_run(
+            "wait-terminal-work",
+            RunOutcome::InputRequired,
+            "terminal work fixture".to_owned(),
+            None,
+            None,
+            None,
+        )
+        .expect("settle production-shaped run");
     ledger.close().expect("close terminal writer");
 
     let (code, cli) = env.forged(&[
@@ -183,6 +268,18 @@ fn terminal_wait_and_mcp_return_the_same_shape_and_text_reuses_explain() {
     ]);
     assert_eq!(code, 0, "{cli}");
     assert_eq!(cli["result"]["changed"], json!(true));
+
+    let (code, work) = env.forged(&[
+        "wait",
+        "--id",
+        "wait-terminal-work",
+        "--until",
+        "terminal",
+        "--timeout",
+        "1",
+    ]);
+    assert_eq!(code, 0, "{work}");
+    assert_eq!(work["result"]["changed"], json!(true), "{work}");
 
     let mut mcp = McpClient::new(&env, None);
     let tool = mcp.tool("wait");
