@@ -264,6 +264,9 @@ pub enum Terminal {
         commits_ahead: u32,
         /// Uncommitted paths in the worktree.
         uncommitted: u32,
+        /// Whether the driver could read the tree. Unknown facts never
+        /// license a retry that could discard work.
+        facts_known: bool,
     },
     /// The run's lifecycle column left `Active` outside the protocol — an
     /// operator stop or an external halt.
@@ -1566,6 +1569,7 @@ fn deadline_terminal(stage_id: &str, kills: u32) -> Terminal {
         kills,
         commits_ahead: 0,
         uncommitted: 0,
+        facts_known: false,
     }
 }
 

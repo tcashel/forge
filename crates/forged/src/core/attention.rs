@@ -361,11 +361,25 @@ pub(crate) fn recommendation_actions(
         },
         Action::ResumeSeat => match subject_kind {
             AttentionSubjectKind::Run => {
-                let uncommitted = evidence
-                    .and_then(|value| value.pointer("/terminal/deadlineExhausted/uncommitted"))
+                let facts = evidence.and_then(|value| value.pointer("/terminal/deadlineExhausted"));
+                let facts_known = facts
+                    .and_then(|value| value.get("factsKnown"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let uncommitted = facts
+                    .and_then(|value| value.get("uncommitted"))
                     .and_then(Value::as_u64)
                     .unwrap_or(0);
-                if uncommitted > 0 {
+                if !facts_known {
+                    // Unknown facts never license a retry that could discard
+                    // work: steer or inspect instead.
+                    vec![classified_action(
+                        "session message",
+                        json!({"run": subject_id, "attempt": Value::Null, "message": Value::Null}),
+                        "the worktree state could not be read at settlement; inspect it before any retry, since run retry would discard uncommitted work",
+                        forged_types::ActionClass::Can,
+                    )]
+                } else if uncommitted > 0 {
                     // The seat's work is still in the worktree and a retry
                     // would discard it: steer the next attempt instead and
                     // leave the landing to the lead until retry keeps the
@@ -3321,7 +3335,8 @@ mod tests {
     fn deadline_exhaustion_offers_retry_only_when_the_worktree_is_clean() {
         let stopped = run_row("subject-1", RunState::Stopped, Some(RunOutcome::Blocked));
         let dirty = json!({"terminal": {"deadlineExhausted": {
-            "stage": "remediation", "kills": 2, "commitsAhead": 1, "uncommitted": 9
+            "stage": "remediation", "kills": 2, "commitsAhead": 1, "uncommitted": 9,
+            "factsKnown": true
         }}});
         let actions = recommendation_actions(
             &policy(AttentionCondition::DeadlineExhausted).2,
@@ -3342,7 +3357,8 @@ mod tests {
         assert!(actions[0].reason.contains("9 uncommitted file(s)"));
 
         let clean = json!({"terminal": {"deadlineExhausted": {
-            "stage": "remediation", "kills": 2, "commitsAhead": 2, "uncommitted": 0
+            "stage": "remediation", "kills": 2, "commitsAhead": 2, "uncommitted": 0,
+            "factsKnown": true
         }}});
         let actions = recommendation_actions(
             &policy(AttentionCondition::DeadlineExhausted).2,
@@ -3364,5 +3380,26 @@ mod tests {
             classification(AttentionCondition::DeadlineExhausted),
             AttentionClass::Decision
         );
+
+        let unknown = json!({"terminal": {"deadlineExhausted": {
+            "stage": "remediation", "kills": 2, "commitsAhead": 0, "uncommitted": 0,
+            "factsKnown": false
+        }}});
+        let actions = recommendation_actions(
+            &policy(AttentionCondition::DeadlineExhausted).2,
+            "subject-1",
+            "attention-1",
+            "occurrence-1",
+            AttentionSubjectKind::Run,
+            Some(&stopped),
+            None,
+            Some("bead-subject-1"),
+            false,
+            false,
+            Some(&unknown),
+        );
+        assert_eq!(actions.len(), 1, "{actions:?}");
+        assert_eq!(actions[0].verb, "session message");
+        assert_eq!(actions[0].class, forged_types::ActionClass::Can);
     }
 }

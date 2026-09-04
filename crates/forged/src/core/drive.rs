@@ -66,9 +66,9 @@ pub async fn project(ctx: &Ctx, run_id: &str) -> Result<RunView, Failure> {
             .collect(),
         termination_grace_s: forged_types::DEFAULT_TERMINATION_GRACE_S,
         transport_retry_budget: ctx.config.transport_retry_budget,
-        seat_commands: Vec::new(),
-        deadline_retry_budget: 1,
-        seat_env: Default::default(),
+        seat_commands: ctx.config.seat_commands.clone(),
+        deadline_retry_budget: ctx.config.deadline_retry_budget,
+        seat_env: ctx.config.seat_env.clone(),
         host_policy: ctx.config.host_policy,
         herdr_socket: ctx.config.herdr_sock.clone(),
     };
@@ -430,12 +430,14 @@ pub fn terminal_json(terminal: &Terminal) -> Value {
             kills,
             commits_ahead,
             uncommitted,
+            facts_known,
         } => json!({
             "deadlineExhausted": {
                 "stage": stage_id,
                 "kills": kills,
                 "commitsAhead": commits_ahead,
                 "uncommitted": uncommitted,
+                "factsKnown": facts_known,
             }
         }),
         Terminal::ExternallyStopped { reason } => {
@@ -578,11 +580,18 @@ fn automatic_settlement(terminal: &Terminal) -> Option<super::settlement::Settle
             kills,
             commits_ahead,
             uncommitted,
+            facts_known,
         } => (
             forged_ledger::RunOutcome::Blocked,
-            format!(
-                "stage deadline exceeded {kills} times in {stage_id}; worktree: {commits_ahead} commits ahead, {uncommitted} uncommitted file(s)"
-            ),
+            if *facts_known {
+                format!(
+                    "stage deadline exceeded {kills} times in {stage_id}; worktree: {commits_ahead} commits ahead, {uncommitted} uncommitted file(s)"
+                )
+            } else {
+                format!(
+                    "stage deadline exceeded {kills} times in {stage_id}; worktree state unknown"
+                )
+            },
         ),
         // This is already a ledger stop (including one settled explicitly by
         // `run stop`), so it must not invent or rewrite an outcome.
@@ -623,18 +632,20 @@ async fn with_worktree_facts(ctx: &Ctx, run_id: &str, terminal: &Terminal) -> Te
             .map(|run| run.base_ref)
             .unwrap_or_default()
     };
-    let commits_ahead = crate::adapters::ports::worktree_commits_ahead(&worktree, &base_ref)
-        .await
-        .map(|(count, _)| count)
-        .unwrap_or(0);
-    let uncommitted = crate::adapters::ports::worktree_uncommitted_paths(&worktree)
-        .await
-        .unwrap_or(0);
+    let commits = crate::adapters::ports::worktree_commits_ahead(&worktree, &base_ref).await;
+    let paths = crate::adapters::ports::worktree_uncommitted_paths(&worktree).await;
+    // Both reads must succeed for the facts to count; a tree that cannot be
+    // read is reported unknown, never clean.
+    let (commits_ahead, uncommitted, facts_known) = match (commits, paths) {
+        (Ok((count, _)), Ok(paths)) if !base_ref.is_empty() => (count, paths, true),
+        _ => (0, 0, false),
+    };
     Terminal::DeadlineExhausted {
         stage_id: stage_id.clone(),
         kills: *kills,
         commits_ahead,
         uncommitted,
+        facts_known,
     }
 }
 
@@ -1014,12 +1025,15 @@ pub(crate) fn stored_packet_for_attempt(
                 execution.role_id.as_str()
             ))
         })?;
+        // The roster decides the seat; the operator's environment stays
+        // with the stored packet through every rebinding.
+        let env = std::mem::take(&mut packet.provider_hints.env);
         packet.provider_hints = forged_types::ProviderHints {
             provider: candidate.provider.clone(),
             model: candidate.model.clone(),
             effort: candidate.effort.clone(),
             sandbox: candidate.sandbox,
-            env: Default::default(),
+            env,
         };
     }
     Ok(packet)

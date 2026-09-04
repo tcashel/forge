@@ -265,6 +265,29 @@ fn epic_assurance_fix_carries_exact_sha_and_failed_gate_evidence() {
 }
 
 #[test]
+fn empty_seat_commands_fall_back_to_the_changed_files_sentence() {
+    let templates = PromptTemplates::load().expect("loads");
+    let mut context = implement_context();
+    context["seat_commands"] = json!([]);
+    let implement = templates
+        .render(PromptStage::Implement, &context)
+        .expect("implement renders");
+    let flattened = implement.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(flattened.contains("the tests that cover the files you changed"));
+    assert!(!implement.contains("cargo fmt --all -- --check"));
+    assert!(!implement.contains("cargo test --workspace"));
+    assert!(flattened.contains("forged runs the gate commands after you return"));
+    let mut fix = fix_context(&[]);
+    fix["seat_commands"] = json!([]);
+    let fix = templates
+        .render(PromptStage::Fix, &fix)
+        .expect("fix renders");
+    let flattened = fix.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(flattened.contains("the tests that cover the files you changed"));
+    assert!(!fix.contains("cargo test --workspace"));
+}
+
+#[test]
 fn implement_render_names_the_closed_gate_state_contract() {
     let rendered = PromptTemplates::load()
         .expect("loads")

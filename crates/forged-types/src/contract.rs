@@ -264,7 +264,10 @@ pub struct ExecutionPolicyV1 {
     pub seat_commands: Vec<String>,
     /// Relaunches allowed after stage-deadline kills, counted apart from
     /// transport failures. Older packages receive one.
-    #[serde(default = "default_deadline_retry_budget")]
+    #[serde(
+        default = "default_deadline_retry_budget",
+        skip_serializing_if = "is_default_deadline_retry_budget"
+    )]
     pub deadline_retry_budget: u32,
     /// Environment applied to every provider process the controller spawns;
     /// an operator value overrides the provider's own entry.
@@ -283,6 +286,12 @@ pub const DEFAULT_DEADLINE_RETRY_BUDGET: u32 = 1;
 
 const fn default_deadline_retry_budget() -> u32 {
     DEFAULT_DEADLINE_RETRY_BUDGET
+}
+
+/// Omit the default so packages stored before the field existed keep their
+/// bytes and digests through a deserialize/serialize round trip.
+fn is_default_deadline_retry_budget(value: &u32) -> bool {
+    *value == DEFAULT_DEADLINE_RETRY_BUDGET
 }
 
 /// Durable runtime truth for one run.
