@@ -2552,4 +2552,65 @@ mod tests {
         let error = snapshot.refreshed().expect_err("malformed gate");
         assert!(error.contains("does not parse"), "{error}");
     }
+
+    #[test]
+    fn seat_contract_knobs_parse_and_reach_the_execution_policy() {
+        let file: ConfigFile = serde_yaml::from_str(
+            "seat_commands:\n  - cargo fmt --all -- --check\n  - cargo clippy --workspace\ndeadline_retry_budget: 2\nseat_env:\n  RUSTC_WRAPPER: \"\"\nadmission:\n  totalActive: 8\n  providerActive: 4\n  repositoryWriteActive: 1\n  gateActive: 2\n  deferSeconds: 60\n",
+        )
+        .expect("seat knobs parse");
+        assert_eq!(
+            file.seat_commands.as_deref(),
+            Some(
+                &[
+                    "cargo fmt --all -- --check".to_owned(),
+                    "cargo clippy --workspace".to_owned()
+                ][..]
+            )
+        );
+        assert_eq!(file.deadline_retry_budget, Some(2));
+        assert_eq!(
+            file.seat_env
+                .as_ref()
+                .and_then(|env| env.get("RUSTC_WRAPPER"))
+                .map(String::as_str),
+            Some("")
+        );
+        assert_eq!(
+            file.admission.as_ref().map(|policy| policy.gate_active),
+            Some(2)
+        );
+
+        let mut cfg = config();
+        cfg.seat_commands = file.seat_commands.clone().unwrap_or_default();
+        cfg.deadline_retry_budget = file.deadline_retry_budget.unwrap_or(1);
+        cfg.seat_env = file.seat_env.clone().unwrap_or_default();
+        let policy = cfg.execution_policy().expect("policy compiles");
+        assert_eq!(policy.seat_commands, cfg.seat_commands);
+        assert_eq!(policy.deadline_retry_budget, 2);
+        assert_eq!(
+            policy.seat_env.get("RUSTC_WRAPPER").map(String::as_str),
+            Some("")
+        );
+
+        // Absent knobs keep their defaults, and a stored policy without the
+        // fields still deserializes.
+        let bare: ConfigFile = serde_yaml::from_str("gate_commands: []\n").expect("bare");
+        assert!(bare.seat_commands.is_none() && bare.deadline_retry_budget.is_none());
+        let legacy: forged_types::ExecutionPolicyV1 = serde_json::from_value(serde_json::json!({
+            "gateCommands": [],
+            "stageBudgetS": {"implement": 60, "reviewclaude": 60, "reviewcodex": 60, "fix": 60},
+            "transportRetryBudget": 3,
+            "hostPolicy": "off",
+            "herdrSocket": null
+        }))
+        .expect("legacy policy reads");
+        assert!(legacy.seat_commands.is_empty());
+        assert_eq!(
+            legacy.deadline_retry_budget,
+            forged_types::DEFAULT_DEADLINE_RETRY_BUDGET
+        );
+        assert!(legacy.seat_env.is_empty());
+        assert_eq!(AdmissionPolicy::default().gate_active, 1);
+    }
 }

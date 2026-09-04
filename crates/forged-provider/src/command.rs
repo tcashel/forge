@@ -327,4 +327,50 @@ mod tests {
             assert!(!emitted.contains(&"claude-sonnet-4m"));
         }
     }
+
+    #[test]
+    fn seat_env_reaches_every_provider_and_overrides_the_providers_own_entry() {
+        let mut seat_env = std::collections::BTreeMap::new();
+        seat_env.insert("RUSTC_WRAPPER".to_owned(), String::new());
+        seat_env.insert("FORGED_PI_WORKER".to_owned(), "operator".to_owned());
+        for (provider, session, last) in [
+            (ProviderKindV1::Claude, Some("session-1"), None),
+            (
+                ProviderKindV1::Codex,
+                None,
+                Some(Path::new("/tmp/last.txt")),
+            ),
+            (ProviderKindV1::Pi, None, None),
+        ] {
+            let argv = provider_argv(
+                provider,
+                Sandbox::WorkspaceWrite,
+                "model-1",
+                None,
+                session,
+                last,
+                &seat_env,
+            );
+            let wrapper = argv
+                .env
+                .iter()
+                .filter(|(key, _)| key == "RUSTC_WRAPPER")
+                .collect::<Vec<_>>();
+            assert_eq!(
+                wrapper,
+                vec![&("RUSTC_WRAPPER".to_owned(), String::new())],
+                "{provider:?}"
+            );
+            let worker = argv
+                .env
+                .iter()
+                .filter(|(key, _)| key == "FORGED_PI_WORKER")
+                .collect::<Vec<_>>();
+            assert_eq!(
+                worker,
+                vec![&("FORGED_PI_WORKER".to_owned(), "operator".to_owned())],
+                "the operator value replaces the provider's own entry once: {provider:?}"
+            );
+        }
+    }
 }

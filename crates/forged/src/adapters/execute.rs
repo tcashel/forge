@@ -378,12 +378,11 @@ async fn relaunch_note(
         })
         .await?
     };
+    // A worktree that does not exist yet has nothing to report.
     let (commits_ahead, shas) =
-        match super::ports::worktree_commits_ahead(&packet.worktree, &packet.base_ref).await {
-            Ok(value) => value,
-            // A worktree that does not exist yet has nothing to report.
-            Err(_) => (0, Vec::new()),
-        };
+        super::ports::worktree_commits_ahead(&packet.worktree, &packet.base_ref)
+            .await
+            .unwrap_or_default();
     match (prior, commits_ahead) {
         (None, 0) => Ok(None),
         (prior, commits_ahead) => {

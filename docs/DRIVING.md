@@ -131,6 +131,22 @@ Refusals carry `error.detail.remedy`. Run the remedy, not a guess.
 | `SPEC_DRIFT` | the packet's pinned body no longer matches | re-read `work show`; the next packet re-pins |
 | `INVALID_REQUEST` with field names | admission preflight refused | fix the named fields (priority, repository) and dispatch again |
 
+### Seats, gates, and deadlines
+
+A seat runs the repository's **seat checks** (`seat_commands` in the operator
+config) before each commit and never the full gate: the controller runs the
+gate commands after every seat returns and again after each fix round, one
+machine gate at a time per daemon (`admission.gate_active`). A relaunched
+attempt reads one field note naming the prior attempt and the commits its
+worktree already carries, so it continues instead of re-verifying. A stage
+deadline kill is its own failure class (`deadline:` note, counted against
+`deadline_retry_budget`, never transport). Past that budget the run stops
+with `deadlineExhausted` naming the stage, the kill count, and the
+worktree's commits ahead and uncommitted paths; `next` offers `run retry`
+on a clean tree and `session message` while the seat's work is still
+uncommitted. The seat's `gateState` result field is the seat-check outcome
+and projects as `seatChecks`; the gate verdict lives in the gate stage.
+
 ## Wait
 
 ```sh

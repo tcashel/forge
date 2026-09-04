@@ -2743,6 +2743,9 @@ fn policy_revision_between_deadline_retries_stays_projectable_and_stoppable() {
             .expect("retry config JSON");
     config["stage_budget_s"]["implement"] = json!(1);
     config["transport_retry_budget"] = json!(3);
+    // One relaunch per deadline kill: the second kill in a row exhausts the
+    // budget unless a policy revision resets the count in between.
+    config["deadline_retry_budget"] = json!(1);
     std::fs::write(
         &config_path,
         serde_json::to_vec_pretty(&config).expect("retry config JSON"),
@@ -2784,7 +2787,24 @@ fn policy_revision_between_deadline_retries_stays_projectable_and_stoppable() {
             .iter()
             .filter(|event| event.kind == "proto.retry")
             .count(),
-        1
+        0,
+        "a deadline kill earns no transport grant"
+    );
+    let first_kills = env
+        .ledger()
+        .list_attempts_in_state(Some(run), forged_ledger::AttemptState::Failed)
+        .expect("failed attempts")
+        .into_iter()
+        .filter(|attempt| {
+            attempt
+                .fail_note
+                .as_deref()
+                .is_some_and(|note| note.starts_with("deadline: stage deadline exceeded"))
+        })
+        .count();
+    assert_eq!(
+        first_kills, 1,
+        "the first deadline kill is a deadline-class failure"
     );
 
     config["transport_retry_budget"] = json!(4);
@@ -2812,26 +2832,27 @@ fn policy_revision_between_deadline_retries_stays_projectable_and_stoppable() {
 
     let ledger = env.ledger();
     let rows = ledger.list_events(Some(run), 0, 1_000).expect("events");
-    let raw_retries = rows
-        .iter()
-        .filter(|event| event.kind == "proto.retry")
-        .map(|event| serde_json::from_str::<Value>(&event.payload_json).expect("retry payload"))
-        .collect::<Vec<_>>();
-    assert_eq!(raw_retries.len(), 2, "both deadline grants are durable");
-    assert_eq!(raw_retries[0]["transportFailures"], json!(1));
-    assert_eq!(raw_retries[1]["transportFailures"], json!(1));
-    assert_ne!(raw_retries[0]["attemptId"], raw_retries[1]["attemptId"]);
-    assert_ne!(raw_retries[0]["retryAfter"], raw_retries[1]["retryAfter"]);
-    let parsed_retries = forged_proto::parse_proto_events(&rows)
-        .expect("the run remains projectable")
+    assert!(
+        rows.iter().all(|event| event.kind != "proto.retry"),
+        "deadline kills never write retry grants"
+    );
+    let kills = ledger
+        .list_attempts_in_state(Some(run), forged_ledger::AttemptState::Failed)
+        .expect("failed attempts")
         .into_iter()
-        .filter(|event| matches!(event, forged_proto::ProtoEvent::Retry { .. }))
+        .filter(|attempt| {
+            attempt
+                .fail_note
+                .as_deref()
+                .is_some_and(|note| note.starts_with("deadline: stage deadline exceeded"))
+        })
         .count();
-    assert_eq!(parsed_retries, 2, "both grants survive strict replay");
+    assert_eq!(kills, 2, "both kills are durable deadline-class failures");
+    forged_proto::parse_proto_events(&rows).expect("the run remains projectable");
     assert_eq!(
         status["result"]["run"]["nextAction"]["awaitPacket"]["notBefore"],
-        raw_retries[1]["retryAfter"],
-        "transport retry state selects the post-cutoff count/deadline"
+        json!(null),
+        "a deadline relaunch waits for no backoff; the revision reset the kill count"
     );
     ledger.close().expect("close ledger");
 

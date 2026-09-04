@@ -1825,4 +1825,43 @@ mod tests {
         assert!(severity(Verdict::Block) > severity(Verdict::RequestChanges));
         assert!(severity(Verdict::RequestChanges) > severity(Verdict::Approve));
     }
+
+    #[test]
+    fn deadline_notes_are_their_own_class_and_stand_on_their_own_budget() {
+        assert_eq!(
+            classify_failure("deadline: stage deadline exceeded: attemptId=7"),
+            FailureKind::Deadline
+        );
+        assert_eq!(
+            classify_failure("transport: stage deadline exceeded: attemptId=7"),
+            FailureKind::Transport,
+            "legacy rows keep their legacy class"
+        );
+        let kill = |id: i64| TerminalAttempt {
+            attempt_id: id,
+            state: AttemptState::Failed,
+            outcome: None,
+            fail_note: Some("deadline: stage deadline exceeded: attemptId=1".to_owned()),
+            started_at: format!("2026-09-04T00:0{id}:00.000000000Z"),
+        };
+        let transport = TerminalAttempt {
+            attempt_id: 9,
+            state: AttemptState::Failed,
+            outcome: None,
+            fail_note: Some("transport: rate limit".to_owned()),
+            started_at: "2026-09-04T00:09:00.000000000Z".to_owned(),
+        };
+        let history = vec![kill(1), transport.clone(), kill(2)];
+        assert_eq!(deadline_failures(&history, None), 2);
+        assert_eq!(
+            deadline_failures(&history, Some("2026-09-04T00:02:00.000000000Z")),
+            1,
+            "a policy revision cutoff resets the count"
+        );
+        assert_eq!(
+            transport_failures(&history, None),
+            1,
+            "deadline kills never count as transport"
+        );
+    }
 }

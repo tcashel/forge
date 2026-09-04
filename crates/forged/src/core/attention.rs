@@ -3316,4 +3316,53 @@ mod tests {
         };
         assert!(error.message.contains("transition event 9"), "{error:?}");
     }
+
+    #[test]
+    fn deadline_exhaustion_offers_retry_only_when_the_worktree_is_clean() {
+        let stopped = run_row("subject-1", RunState::Stopped, Some(RunOutcome::Blocked));
+        let dirty = json!({"terminal": {"deadlineExhausted": {
+            "stage": "remediation", "kills": 2, "commitsAhead": 1, "uncommitted": 9
+        }}});
+        let actions = recommendation_actions(
+            &policy(AttentionCondition::DeadlineExhausted).2,
+            "subject-1",
+            "attention-1",
+            "occurrence-1",
+            AttentionSubjectKind::Run,
+            Some(&stopped),
+            None,
+            Some("bead-subject-1"),
+            false,
+            false,
+            Some(&dirty),
+        );
+        assert_eq!(actions.len(), 1, "{actions:?}");
+        assert_eq!(actions[0].verb, "session message");
+        assert_eq!(actions[0].class, forged_types::ActionClass::Can);
+        assert!(actions[0].reason.contains("9 uncommitted file(s)"));
+
+        let clean = json!({"terminal": {"deadlineExhausted": {
+            "stage": "remediation", "kills": 2, "commitsAhead": 2, "uncommitted": 0
+        }}});
+        let actions = recommendation_actions(
+            &policy(AttentionCondition::DeadlineExhausted).2,
+            "subject-1",
+            "attention-1",
+            "occurrence-1",
+            AttentionSubjectKind::Run,
+            Some(&stopped),
+            None,
+            Some("bead-subject-1"),
+            false,
+            false,
+            Some(&clean),
+        );
+        assert_eq!(actions.len(), 1, "{actions:?}");
+        assert_eq!(actions[0].verb, "run retry");
+        assert_eq!(actions[0].class, forged_types::ActionClass::Should);
+        assert_eq!(
+            classification(AttentionCondition::DeadlineExhausted),
+            AttentionClass::Decision
+        );
+    }
 }
