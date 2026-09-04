@@ -479,6 +479,7 @@ fn normalized(mut envelope: Value) -> Value {
         "/result/queue/asOf",
         "/result/capturedAt/ledger",
         "/result/capturedAt/beads",
+        "/result/capturedAt/work",
         "/result/capturedAt/history",
     ] {
         if envelope.pointer(pointer).is_some_and(Value::is_string) {

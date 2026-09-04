@@ -14,6 +14,7 @@ pub mod herdr_ownership;
 pub mod herdr_projection;
 pub mod ids;
 pub mod packet;
+pub mod projection;
 pub mod provider_session_inventory;
 pub mod review_publication;
 pub mod work_history;
@@ -71,6 +72,7 @@ pub use packet::{
     PacketResult, PlanTraceabilityV1, ProviderHints, Sandbox, Severity, SpecAmendment, SpecRef,
     Stage, StageContract, Verdict, WorkPacket,
 };
+pub use projection::{add_work_twins, with_work_twins, ProjectionSubjectKind, ProjectionSubjectV1};
 pub use provider_session_inventory::{
     ProviderSessionActivity, ProviderSessionAttemptV1, ProviderSessionDesiredWorkV1,
     ProviderSessionDiagnosticAction, ProviderSessionEvidenceV1, ProviderSessionHostMode,

@@ -195,6 +195,9 @@ pub struct OverviewParams {
         skip_serializing_if = "Option::is_none"
     )]
     pub id: Option<String>,
+    /// Optional namespace disambiguator for `id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_kind: Option<WorkDetailKind>,
     /// Return only event rows with an eventId greater than this
     /// (default 0).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -279,6 +282,9 @@ pub struct ExplainArgs {
 pub struct ExplainParams {
     #[serde(deserialize_with = "named_string")]
     pub id: String,
+    /// Optional namespace disambiguator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_kind: Option<WorkDetailKind>,
 }
 
 impl ExplainArgs {
@@ -1054,10 +1060,16 @@ impl WorkMapArgs {
 #[schemars(crate = "rmcp::schemars")]
 #[serde(rename_all = "lowercase")]
 pub enum WorkDetailKind {
+    /// One authoritative work item.
+    Work,
     /// One slice run.
     Run,
     /// One epic.
     Epic,
+    /// One provider attempt.
+    Attempt,
+    /// One operator-attention item.
+    Attention,
 }
 
 /// Typed envelope for the Work Detail App.
@@ -1075,14 +1087,14 @@ pub struct WorkDetailArgs {
     pub params: WorkDetailParams,
 }
 
-/// Addressed target for `work_detail`: EXACTLY one form — the exact
-/// `subjectKind`/`subjectId` pair, or a bare `id` resolved against the
-/// durable inventory. Sending both forms, or half the pair, is refused.
+/// Addressed target for `work_detail`: EXACTLY one form — the legacy exact
+/// `subjectKind`/`subjectId` pair, or `id` with an optional `subjectKind`
+/// disambiguator. Sending both ids, or a half legacy pair, is refused.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars", inline)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WorkDetailParams {
-    /// Exact durable subject kind; travels only with `subjectId`.
+    /// Exact legacy subject kind, or an optional `id` disambiguator.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject_kind: Option<WorkDetailKind>,
     /// Canonical run or epic id; travels only with `subjectKind`.
@@ -1092,9 +1104,8 @@ pub struct WorkDetailParams {
         skip_serializing_if = "Option::is_none"
     )]
     pub subject_id: Option<String>,
-    /// Bare run or epic id, resolved kind-blind: an exact id beats any
-    /// prefix, a unique prefix resolves, anything else answers with
-    /// `resolution` candidates instead of the detail body.
+    /// Any operator-visible id resolved by the shared resolver. An exact id
+    /// beats any prefix; unresolved ids return `resolution` candidates.
     #[serde(
         default,
         deserialize_with = "named_string_opt",
@@ -1535,7 +1546,8 @@ impl ForgedServer {
                        Run status and mapped attention items carry nextActions. \
                        At most one of params.run, params.epic, or params.id is accepted, and \
                        omitting all three projects the portfolio: 30 newest summary rows by \
-                       default, with coverage and an attention rail. params.id resolves either kind and \
+                       default, with coverage and an attention rail. params.id resolves every \
+                       operator-visible id and accepts optional params.subjectKind; it \
                        answers with candidates when it cannot; use work_list to enumerate \
                        every id.",
         meta = overview_tool_meta()
@@ -1548,7 +1560,7 @@ impl ForgedServer {
     /// Kind-blind reconnect explanation for any durable id.
     #[tool(
         name = "explain",
-        description = "Explain one work item, run, epic, attempt, or attention id without a kind guess: bounded identity and lifecycle position, one centralized health verdict with its observed inputs, and existing honesty-tested nextActions. Exact precedence is work item, run or epic, attempt, then attention; only run and epic ids accept a unique prefix."
+        description = "Explain one work item, run, epic, attempt, or attention id without a kind guess, or disambiguate with params.subjectKind: bounded identity and lifecycle position, one centralized health verdict with its observed inputs, and existing honesty-tested nextActions. Exact precedence is work item, run or epic, attempt, then attention; only run and epic ids accept a unique prefix."
     )]
     pub async fn explain(&self, args: Parameters<ExplainArgs>) -> CallToolResult {
         self.call_structured("explain", args.0.into_envelope())
@@ -1634,10 +1646,10 @@ impl ForgedServer {
         self.call("artifact_compact", args.0).await
     }
 
-    /// Durable provider-session metadata for a run.
+    /// Durable provider-session metadata for any resolved id.
     #[tool(
         name = "session_list",
-        description = "List newest provider sessions for a run with bounded continuation toward older sessions."
+        description = "List newest provider sessions by params.run or any params.id; an epic id includes every child run. params.subjectKind optionally disambiguates params.id."
     )]
     pub async fn session_list(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
         self.call("session_list", args.0).await
@@ -1723,7 +1735,10 @@ impl ForgedServer {
     }
 
     /// Paged event listing (the `_tail` name is historical).
-    #[tool(name = "events_tail", description = "List ledger events, paged.")]
+    #[tool(
+        name = "events_tail",
+        description = "List ledger events, paged. Use params.id for any operator-visible id and optional params.subjectKind to disambiguate; params.run remains compatible."
+    )]
     pub async fn events_tail(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
         self.call("events_tail", args.0).await
     }
@@ -1939,7 +1954,7 @@ impl ForgedServer {
     /// Durable subject projection for the Work Detail App.
     #[tool(
         name = "work_detail",
-        description = "Project one durable run or epic as a bounded summary, including mapped attention nextActions; params.detail=\"full\" restores attempts, artifacts, findings, and the event tail. Address it with EXACTLY one form: the exact params.subjectKind + params.subjectId pair, or a bare params.id resolved against the durable inventory (an exact id beats any prefix, a unique prefix resolves, anything else answers with resolution candidates). params.after and params.limit page the full-detail event tail.",
+        description = "Project one durable run or epic as a bounded summary, including mapped attention nextActions; params.detail=\"full\" restores attempts, artifacts, findings, and the event tail. Address it with the legacy exact params.subjectKind + params.subjectId pair, or params.id with optional params.subjectKind resolved across work, run, epic, attempt, and attention namespaces. params.after and params.limit page the full-detail event tail.",
         meta = work_detail_tool_meta()
     )]
     pub async fn work_detail(&self, args: Parameters<WorkDetailArgs>) -> CallToolResult {

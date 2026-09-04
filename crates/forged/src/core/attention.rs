@@ -470,6 +470,7 @@ struct SubjectMetadata {
     kind: AttentionSubjectKind,
     title: Option<WorkTitleV1>,
     repository: Option<String>,
+    revision: Option<String>,
 }
 
 fn subject_metadata(input: &ProjectionInput<'_>, id: &str) -> Option<SubjectMetadata> {
@@ -487,6 +488,11 @@ fn subject_metadata(input: &ProjectionInput<'_>, id: &str) -> Option<SubjectMeta
             kind: subject_kind(entry),
             title: subject_title(entry),
             repository: repository(entry),
+            revision: entry
+                .pointer("/identity/bead/revision")
+                .or_else(|| entry.pointer("/identity/work/revision"))
+                .and_then(Value::as_str)
+                .map(str::to_owned),
         });
     };
     if let Some(run) = snapshot.runs.iter().find(|run| run.run_id == id) {
@@ -504,6 +510,12 @@ fn subject_metadata(input: &ProjectionInput<'_>, id: &str) -> Option<SubjectMeta
             kind: AttentionSubjectKind::Run,
             title,
             repository: Some(run.repo.clone()),
+            revision: snapshot
+                .child_identities
+                .iter()
+                .find(|identity| identity.subject.id == id)
+                .or_else(|| (snapshot.identity.subject.id == id).then_some(&snapshot.identity))
+                .and_then(|identity| identity.work.revision.clone()),
         });
     }
     (snapshot.subject.id == id).then(|| SubjectMetadata {
@@ -517,6 +529,7 @@ fn subject_metadata(input: &ProjectionInput<'_>, id: &str) -> Option<SubjectMeta
             .repository
             .as_ref()
             .map(|repository| repository.path.clone()),
+        revision: snapshot.identity.work.revision.clone(),
     })
 }
 
@@ -719,7 +732,8 @@ fn collect_domain_sources(input: &ProjectionInput<'_>) -> Result<Vec<RawAttentio
         match outcome {
             Some("blocked") => {
                 let live_status = entry
-                    .get("beadId")
+                    .get("workId")
+                    .or_else(|| entry.get("beadId"))
                     .and_then(Value::as_str)
                     .and_then(|work_id| work_by_id.get(work_id))
                     .map(|issue| issue.status.as_str());
@@ -857,7 +871,15 @@ fn collect_domain_sources(input: &ProjectionInput<'_>) -> Result<Vec<RawAttentio
         // it as a guard rather than minting a second causal source.
         let by_work: BTreeMap<&str, &str> = entries_slice
             .iter()
-            .filter_map(|entry| Some((entry.get("beadId")?.as_str()?, entry.get("id")?.as_str()?)))
+            .filter_map(|entry| {
+                Some((
+                    entry
+                        .get("workId")
+                        .or_else(|| entry.get("beadId"))?
+                        .as_str()?,
+                    entry.get("id")?.as_str()?,
+                ))
+            })
             .collect();
         for issue in work.iter().filter(|issue| issue.status == "blocked") {
             let Some(id) = by_work.get(issue.id.as_str()) else {
@@ -2003,7 +2025,10 @@ fn project(input: ProjectionInput<'_>) -> Result<Vec<AttentionItemV1>, Failure> 
         .iter()
         .filter_map(|entry| {
             let subject = entry.get("id")?.as_str()?;
-            let work_id = entry.get("beadId")?.as_str()?;
+            let work_id = entry
+                .get("workId")
+                .or_else(|| entry.get("beadId"))?
+                .as_str()?;
             blocked_work.contains(work_id).then_some((subject, work_id))
         })
         .collect();
@@ -2124,7 +2149,17 @@ fn project(input: ProjectionInput<'_>) -> Result<Vec<AttentionItemV1>, Failure> 
                 attention_id: stable_id,
                 occurrence_id,
                 subject_kind,
-                subject_id,
+                subject_id: subject_id.clone(),
+                subject: Some(forged_types::ProjectionSubjectV1 {
+                    id: subject_id,
+                    kind: match subject_kind {
+                        AttentionSubjectKind::Run => forged_types::ProjectionSubjectKind::Run,
+                        AttentionSubjectKind::Epic => forged_types::ProjectionSubjectKind::Epic,
+                    },
+                    title: subject.title.as_ref().map(|title| title.value.clone()),
+                    repository: subject.repository.clone(),
+                    revision: subject.revision,
+                }),
                 subject_title: subject.title,
                 repository: subject.repository,
                 condition,

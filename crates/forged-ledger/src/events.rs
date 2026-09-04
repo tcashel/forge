@@ -11,6 +11,21 @@ use crate::runs::latest_policy_revision_tx;
 use crate::time::now_iso;
 use crate::types::{EventRow, PolicyRevisionRow};
 
+/// Complete and cursor-eligible counts for one subject in a multi-subject
+/// event page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubjectEventCount {
+    pub total: u64,
+    pub eligible: u64,
+}
+
+/// One globally ordered event page across an exact set of subject ids.
+#[derive(Debug, Clone)]
+pub struct SubjectEventPage {
+    pub rows: Vec<EventRow>,
+    pub counts: BTreeMap<String, SubjectEventCount>,
+}
+
 /// Insert one event row inside the caller's transaction. The payload is a
 /// [`serde_json::Value`], so it is well-formed by construction; the ledger
 /// serializes it and performs no parsing or validation of its own.
@@ -403,6 +418,73 @@ impl Ledger {
         })
     }
 
+    /// One globally bounded newest-first page for an exact set of subjects,
+    /// plus each subject's complete count. The event-id cursor is global, so
+    /// callers can page an epic's child streams without a composite token or
+    /// applying the requested limit once per child.
+    pub fn list_subjects_events_by_kind_desc_with_counts(
+        &self,
+        run_ids: Vec<String>,
+        kind: &str,
+        before: Option<i64>,
+        limit: u32,
+    ) -> Result<SubjectEventPage, LedgerError> {
+        if run_ids.is_empty() {
+            return Ok(SubjectEventPage {
+                rows: Vec::new(),
+                counts: BTreeMap::new(),
+            });
+        }
+        let run_scope = serde_json::to_string(&run_ids)?;
+        let kind = kind.to_owned();
+        self.submit(move |conn| {
+            let mut count_statement = conn.prepare(
+                "SELECT run_id, COUNT(*),
+                        SUM(CASE WHEN (?3 IS NULL OR event_id < ?3) THEN 1 ELSE 0 END)
+                 FROM events
+                 WHERE run_id IN (SELECT CAST(value AS TEXT) FROM json_each(?1))
+                   AND kind = ?2
+                 GROUP BY run_id",
+            )?;
+            let count_rows =
+                count_statement.query_map(rusqlite::params![run_scope, kind, before], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })?;
+            let mut counts = BTreeMap::new();
+            for row in count_rows {
+                let (run_id, total, eligible) = row?;
+                let total = u64::try_from(total).map_err(|_| LedgerError::Internal {
+                    message: "event count was negative".to_owned(),
+                })?;
+                let eligible = u64::try_from(eligible).map_err(|_| LedgerError::Internal {
+                    message: "event count was negative".to_owned(),
+                })?;
+                counts.insert(run_id, SubjectEventCount { total, eligible });
+            }
+            drop(count_statement);
+
+            let mut statement = conn.prepare(
+                "SELECT event_id, ts, run_id, kind, payload_json FROM events
+                 WHERE run_id IN (SELECT CAST(value AS TEXT) FROM json_each(?1))
+                   AND kind = ?2
+                   AND (?3 IS NULL OR event_id < ?3)
+                 ORDER BY event_id DESC LIMIT ?4",
+            )?;
+            let rows = statement.query_map(
+                rusqlite::params![run_scope, kind, before, i64::from(limit)],
+                event_row,
+            )?;
+            Ok(SubjectEventPage {
+                rows: rows.collect::<Result<Vec<_>, _>>()?,
+                counts,
+            })
+        })
+    }
+
     /// Bounded rows for one subject whose event kind begins with `prefix`.
     pub fn list_subject_events_by_kind_prefix(
         &self,
@@ -660,6 +742,42 @@ mod tests {
             .expect("older gate page");
         assert_eq!(total, 2);
         assert!(older[0].payload_json.contains("\"ordinal\":1"));
+
+        let scoped = ledger
+            .list_subjects_events_by_kind_desc_with_counts(
+                vec!["subject-a".to_owned(), "subject-b".to_owned()],
+                "proto.gate",
+                None,
+                2,
+            )
+            .expect("globally bounded subject page");
+        assert_eq!(scoped.rows.len(), 2);
+        assert!(scoped.rows[0].payload_json.contains("\"ordinal\":5"));
+        assert!(scoped.rows[1].payload_json.contains("\"ordinal\":3"));
+        assert_eq!(
+            scoped.counts.get("subject-a"),
+            Some(&SubjectEventCount {
+                total: 2,
+                eligible: 2,
+            })
+        );
+        assert_eq!(
+            scoped.counts.get("subject-b"),
+            Some(&SubjectEventCount {
+                total: 1,
+                eligible: 1,
+            })
+        );
+        let scoped_older = ledger
+            .list_subjects_events_by_kind_desc_with_counts(
+                vec!["subject-a".to_owned(), "subject-b".to_owned()],
+                "proto.gate",
+                Some(scoped.rows[1].event_id),
+                2,
+            )
+            .expect("global subject cursor");
+        assert_eq!(scoped_older.rows.len(), 1);
+        assert!(scoped_older.rows[0].payload_json.contains("\"ordinal\":1"));
 
         let interventions = ledger
             .list_subject_events_by_kind_prefix("subject-a", "forged.intervention.", 8)

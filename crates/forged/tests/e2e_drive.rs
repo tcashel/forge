@@ -4677,8 +4677,51 @@ fn an_origin_prefixed_base_ref_start_replays_identically() {
     let (code, started) = env.forged(&args);
     assert_eq!(code, 0, "first start: {started}");
     assert_eq!(started["result"]["baseRef"], json!("main"));
+
+    let status_args = [
+        "epic",
+        "start",
+        "--epic",
+        "epic-replay",
+        "--repo",
+        &repo,
+        "--spec",
+        &spec,
+        "--base-ref",
+        "origin/main",
+        "--idempotency-key",
+        "epic-replay-status",
+    ];
+    let (code, status) = env.forged(&status_args);
+    assert_eq!(code, 0, "already-started status response: {status}");
+    assert!(status["result"]["identity"]["bead"].is_object());
+    assert_eq!(
+        status["result"]["identity"]["work"],
+        status["result"]["identity"]["bead"]
+    );
+
+    let connection =
+        rusqlite::Connection::open(env.anvil.join("state.db")).expect("open fixture db");
+    let stored: String = connection
+        .query_row(
+            "SELECT response_json FROM operations
+             WHERE name = 'epic_start' AND idempotency_key = ?1",
+            ["epic-replay-status"],
+            |row| row.get(0),
+        )
+        .expect("stored already-started status response");
+    drop(connection);
+    let stored: Value = serde_json::from_str(&stored).expect("stored response JSON");
+    assert!(stored["result"]["identity"]["bead"].is_object());
+    assert_eq!(
+        stored["result"]["identity"].get("work"),
+        None,
+        "projection twins must never enter the persisted safe-effect response: {stored}"
+    );
+
     let (code, replayed) = env.forged(&args);
     assert_eq!(code, 0, "identical replay: {replayed}");
+    assert_eq!(replayed["result"], started["result"]);
 }
 
 /// One derived epic/slice execution-health verdict on every operator surface,
@@ -4803,7 +4846,14 @@ fn epic_and_slice_execution_health_and_deferrals_read_from_every_surface() {
     );
 
     // And the work-detail status block.
-    let (code, detail) = env.forged(&["work", "detail", "--id", "epic-defer"]);
+    let (code, detail) = env.forged(&[
+        "work",
+        "detail",
+        "--id",
+        "epic-defer",
+        "--subject-kind",
+        "epic",
+    ]);
     assert_eq!(code, 0, "{detail}");
     assert!(
         detail["result"]["status"]["executionHealth"].is_string(),

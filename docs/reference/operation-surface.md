@@ -84,3 +84,25 @@ Generated from the dispatch table, clap tree, MCP router, and fenced-call audit.
 | `work_supersede` | `forged work supersede` | yes | yes | fenced | no | yes |
 | `work_update` | `forged work update` | yes | yes | fenced | no | yes |
 | `worktree_retire` | `forged worktree retire` | yes | yes | fenced | yes | yes |
+
+## Deprecated projection keys
+
+Legacy keys remain present with same-value provider-neutral twins until 1.0.
+
+| Schema | Legacy key | Twin | Remove at |
+| --- | --- | --- | --- |
+| `forged.work-identity/1` | `bead` | `work` | `1.0` |
+| `forged.packet/1` | `beadId` | `workId` | `1.0` |
+| `forged.admission-inputs/1` | `beadId` | `workId` | `1.0` |
+| `forged.admission-inputs/1` | `beadRevision` | `workRevision` | `1.0` |
+| `forged.admission-inputs/1` | `beadStatus` | `workStatus` | `1.0` |
+| `forged.admission-inputs/1` | `beadRepository` | `workRepository` | `1.0` |
+| `forged.projection/*` | `bead` | `work` | `1.0` |
+| `forged.projection/*` | `bead_id` | `work_id` | `1.0` |
+| `forged.projection/*` | `beadId` | `workId` | `1.0` |
+| `forged.projection/*` | `beadTitle` | `workTitle` | `1.0` |
+| `forged.projection/*` | `beadRevision` | `workRevision` | `1.0` |
+| `forged.projection/*` | `beadSettlement` | `workSettlement` | `1.0` |
+| `forged.projection/*` | `beads` | `work` | `1.0` |
+| `forged.projection/*` | `beadsStatus` | `workStatus` | `1.0` |
+| `forged.projection/*` | `beadsInventory` | `workInventory` | `1.0` |

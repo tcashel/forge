@@ -233,7 +233,8 @@ async fn reconcile_run(ctx: &Ctx, pending: &PendingWorkSettlementRow) -> Result<
     let run_id = pending.run_id.clone();
     let payload: Value = serde_json::from_str(&pending.payload_json).unwrap_or(Value::Null);
     let Some(work_id) = payload
-        .get("beadId")
+        .get("workId")
+        .or_else(|| payload.get("beadId"))
         .and_then(Value::as_str)
         .map(str::to_owned)
     else {

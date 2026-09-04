@@ -80,6 +80,17 @@ fn run_identity_survives_rename_and_outage_and_is_shared_without_extra_work_read
     let (code, sessions) = env.forged(&["session", "list", "--run", "identity-run"]);
     assert_eq!(code, 0, "session list: {sessions}");
     assert_eq!(sessions["result"]["identity"], identity);
+    for (name, projection) in [
+        ("run status", &status),
+        ("overview", &overview),
+        ("session list", &sessions),
+    ] {
+        assert_eq!(
+            projection["result"]["subject"]["revision"],
+            json!(launch_revision),
+            "{name} uses the work revision captured when the run started"
+        );
+    }
 
     // The captured identity is immutable even as the live store keeps
     // changing under it (the outage mode this replaced cannot occur: the

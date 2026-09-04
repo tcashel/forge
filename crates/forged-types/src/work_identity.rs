@@ -323,6 +323,10 @@ pub struct WorkTitleV1 {
     pub source: WorkTitleSource,
     #[serde(rename = "beadId")]
     pub work_id: String,
+    /// Additive provider-neutral spelling; always equals `work_id` in a new
+    /// projection and defaults only when decoding a pre-twin value.
+    #[serde(default, rename = "workId")]
+    pub work_twin_id: String,
 }
 
 /// Resolve one display title for an operator row without rewriting identity.
@@ -344,6 +348,7 @@ pub fn resolve_work_title(identity: &WorkIdentityV1, live: Option<&str>) -> Work
             value: identity.display_title.clone(),
             source: WorkTitleSource::Identity,
             work_id: identity.work.id.clone(),
+            work_twin_id: identity.work.id.clone(),
         };
     }
     match live.map(str::trim).filter(|title| !title.is_empty()) {
@@ -361,12 +366,14 @@ pub fn resolve_work_title(identity: &WorkIdentityV1, live: Option<&str>) -> Work
             ),
             source: WorkTitleSource::WorkLive,
             work_id: identity.work.id.clone(),
+            work_twin_id: identity.work.id.clone(),
         },
         None => WorkTitleV1 {
             known: false,
             value: identity.display_title.clone(),
             source: WorkTitleSource::Unknown,
             work_id: identity.work.id.clone(),
+            work_twin_id: identity.work.id.clone(),
         },
     }
 }
@@ -434,6 +441,22 @@ mod tests {
             "Identity"
         );
         assert_eq!(work_display_title("run-1", None, None, None, None), "run-1");
+    }
+
+    #[test]
+    fn projection_twins_do_not_change_identity_storage_bytes() {
+        let identity = titleless_identity();
+        let before = serde_json::to_string(&identity).expect("identity bytes");
+        assert!(before.contains("\"bead\":"));
+        assert!(!before.contains("\"work\":"));
+
+        let projected =
+            crate::with_work_twins(serde_json::from_str(&before).expect("stored identity is JSON"));
+        assert_eq!(projected["bead"], projected["work"]);
+        assert_eq!(
+            serde_json::to_string(&identity).expect("identity bytes again"),
+            before
+        );
     }
 
     fn titleless_identity() -> WorkIdentityV1 {

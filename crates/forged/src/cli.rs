@@ -845,9 +845,15 @@ pub enum SessionCmd {
 /// Bounded `session list` flags.
 #[derive(Debug, Args)]
 pub struct SessionListArgs {
-    /// The run id.
-    #[arg(long)]
-    pub run: String,
+    /// The run id (legacy exact selector).
+    #[arg(long, conflicts_with = "id")]
+    pub run: Option<String>,
+    /// Any operator-visible id.
+    #[arg(long, conflicts_with = "run")]
+    pub id: Option<String>,
+    /// Optional namespace disambiguator for --id.
+    #[arg(long, value_enum)]
+    pub subject_kind: Option<WorkDetailKind>,
     /// Maximum sessions, 1..=500 (default 100).
     #[arg(long)]
     pub limit: Option<u64>,
@@ -1043,6 +1049,12 @@ pub struct EventsArgs {
     /// Scope to one run.
     #[arg(long)]
     pub run: Option<String>,
+    /// Scope by any operator-visible id.
+    #[arg(long, conflicts_with = "run")]
+    pub id: Option<String>,
+    /// Optional namespace disambiguator for --id.
+    #[arg(long, value_enum)]
+    pub subject_kind: Option<WorkDetailKind>,
     /// Return rows with event_id greater than this.
     #[arg(long)]
     pub after: Option<i64>,
@@ -1088,6 +1100,9 @@ pub struct OverviewArgs {
     /// Project whichever of the two this id names, or list the candidates.
     #[arg(long, conflicts_with_all = ["run", "epic"])]
     pub id: Option<String>,
+    /// Optional namespace disambiguator for --id.
+    #[arg(long, value_enum)]
+    pub subject_kind: Option<WorkDetailKind>,
     /// Return event rows with event_id greater than this.
     #[arg(long)]
     pub after: Option<i64>,
@@ -1112,6 +1127,9 @@ pub struct ExplainArgs {
     /// also retain their established unique-prefix behavior.
     #[arg(long)]
     pub id: String,
+    /// Optional namespace disambiguator.
+    #[arg(long, value_enum)]
+    pub subject_kind: Option<WorkDetailKind>,
     /// Override the read-only idempotency key.
     #[arg(long)]
     pub idempotency_key: Option<String>,
@@ -1683,17 +1701,26 @@ impl WorkHistoryGroupArg {
 /// Exact durable work kind.
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum WorkDetailKind {
+    /// One authoritative work item.
+    Work,
     /// One slice run.
     Run,
     /// One epic.
     Epic,
+    /// One provider attempt.
+    Attempt,
+    /// One operator-attention item.
+    Attention,
 }
 
 impl WorkDetailKind {
     fn as_str(self) -> &'static str {
         match self {
+            Self::Work => "work",
             Self::Run => "run",
             Self::Epic => "epic",
+            Self::Attempt => "attempt",
+            Self::Attention => "attention",
         }
     }
 }
@@ -1734,19 +1761,20 @@ pub struct WorkHistoryArgs {
     pub idempotency_key: Option<String>,
 }
 
-/// `work detail` flags. Exactly one addressing form: the exact
-/// `--subject-kind`/`--subject-id` pair, or a bare `--id`. The core owns
+/// `work detail` flags. Exactly one addressing form: the legacy exact
+/// `--subject-kind`/`--subject-id` pair, or `--id` with an optional
+/// `--subject-kind` disambiguator. The core owns
 /// that refusal — a clap conflict rule here would emit a usage error and
 /// diverge from the MCP envelope.
 #[derive(Debug, Args)]
 pub struct WorkDetailArgs {
-    /// Exact durable subject kind; travels only with --subject-id.
+    /// Exact legacy subject kind, or an optional --id disambiguator.
     #[arg(long, value_enum)]
     pub subject_kind: Option<WorkDetailKind>,
     /// Canonical run or epic id; travels only with --subject-kind.
     #[arg(long)]
     pub subject_id: Option<String>,
-    /// Bare run or epic id, resolved against the durable inventory.
+    /// Any operator-visible id, resolved by the shared resolver.
     #[arg(long)]
     pub id: Option<String>,
     /// Return event rows after this event id.
@@ -2430,8 +2458,15 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
         Command::Session { command } => match command {
             SessionCmd::List(a) => {
                 let mut params = Map::new();
-                let run = a.run;
-                params.insert("run".to_owned(), json!(run.clone()));
+                if let Some(run) = &a.run {
+                    params.insert("run".to_owned(), json!(run));
+                }
+                if let Some(id) = &a.id {
+                    params.insert("id".to_owned(), json!(id));
+                }
+                if let Some(kind) = a.subject_kind {
+                    params.insert("subjectKind".to_owned(), json!(kind.as_str()));
+                }
                 if let Some(limit) = a.limit {
                     params.insert("limit".to_owned(), json!(limit));
                 }
@@ -2440,7 +2475,11 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
                 }
                 (
                     "session_list",
-                    request(a.idempotency_key, Some(run), Value::Object(params)),
+                    request(
+                        a.idempotency_key,
+                        a.run.clone().or_else(|| a.id.clone()),
+                        Value::Object(params),
+                    ),
                 )
             }
             SessionCmd::Inventory(a) => {
@@ -2550,6 +2589,12 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
             if let Some(run) = &a.run {
                 params.insert("run".to_owned(), json!(run));
             }
+            if let Some(id) = &a.id {
+                params.insert("id".to_owned(), json!(id));
+            }
+            if let Some(kind) = a.subject_kind {
+                params.insert("subjectKind".to_owned(), json!(kind.as_str()));
+            }
             if let Some(after) = a.after {
                 params.insert("after".to_owned(), json!(after));
             }
@@ -2562,7 +2607,11 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
             if let Some(detail) = a.detail {
                 params.insert("detail".to_owned(), json!(detail.as_str()));
             }
-            request(a.idempotency_key, a.run.clone(), Value::Object(params))
+            request(
+                a.idempotency_key,
+                a.run.clone().or_else(|| a.id.clone()),
+                Value::Object(params),
+            )
         }),
         Command::Overview(a) => {
             let scope = a
@@ -2583,6 +2632,9 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
                     params.insert(key.to_owned(), json!(value));
                 }
             }
+            if let Some(kind) = a.subject_kind {
+                params.insert("subjectKind".to_owned(), json!(kind.as_str()));
+            }
             if let Some(after) = a.after {
                 params.insert("after".to_owned(), json!(after));
             }
@@ -2600,10 +2652,16 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
                 request(a.idempotency_key, scope, Value::Object(params)),
             )
         }
-        Command::Explain(a) => (
-            "explain",
-            request(a.idempotency_key, Some(a.id.clone()), json!({"id": a.id})),
-        ),
+        Command::Explain(a) => {
+            let mut params = Map::from_iter([("id".to_owned(), json!(a.id))]);
+            if let Some(kind) = a.subject_kind {
+                params.insert("subjectKind".to_owned(), json!(kind.as_str()));
+            }
+            (
+                "explain",
+                request(a.idempotency_key, Some(a.id.clone()), Value::Object(params)),
+            )
+        }
         Command::Operations { command } => match command {
             OperationsCmd::Overview(a) => {
                 let mut params = Map::new();

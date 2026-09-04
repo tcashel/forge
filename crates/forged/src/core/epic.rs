@@ -2159,8 +2159,14 @@ async fn status_json(ctx: &Ctx, view: EpicView) -> Result<Value, Failure> {
         epic_desired,
         Some(pass_or_children_live),
     ));
+    let subject = super::work_identity::projection_subject(
+        &identity,
+        forged_types::ProjectionSubjectKind::Epic,
+        &view.config.epic_id,
+    );
     let mut status = json!({
         "schema": "forged.epic.status/1",
+        "subject": subject,
         "epicId": view.config.epic_id,
         "executionHealth": epic_health,
         "desired": desired_json(epic_desired),
@@ -2565,7 +2571,8 @@ pub async fn epic_preflight(ctx: &Ctx, req: &OperationRequest) -> OperationRespo
 pub async fn epic_status(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
     read_only("epic_status", req, || async {
         let epic = param_str(&req.params, "epic")?;
-        status_json(ctx, project(ctx, epic).await?).await
+        let status = status_json(ctx, project(ctx, epic).await?).await?;
+        Ok(forged_types::with_work_twins(status))
     })
     .await
 }

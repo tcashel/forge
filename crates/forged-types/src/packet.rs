@@ -494,7 +494,21 @@ mod tests {
     }
 
     #[test]
-    fn a_body_written_before_the_projection_still_rehydrates_from_its_columns() {
+    fn projection_twins_do_not_change_packet_storage_bytes() {
+        let packet = sample_packet();
+        let before = packet.stored_body().expect("stored body");
+        assert!(before.contains("\"beadId\":\"bead-1\""));
+        assert!(!before.contains("\"workId\""));
+
+        let projected = crate::with_work_twins(
+            serde_json::from_str(&before).expect("stored packet body is JSON"),
+        );
+        assert_eq!(projected["beadId"], projected["workId"]);
+        assert_eq!(packet.stored_body().expect("stored body again"), before);
+    }
+
+    #[test]
+    fn a_previous_binary_body_still_reopens_from_its_columns() {
         // Legacy rows carry the whole packet, every projected-out key
         // included. The columns are what the claim fence and the projection
         // read, so they win and no row is migrated.

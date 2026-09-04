@@ -1165,7 +1165,8 @@ pub async fn run_retry(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespon
             let spec_payload: Value = serde_json::from_str(&spec_event.payload_json)
                 .map_err(|error| Failure::internal(format!("stored retry spec event: {error}")))?;
             let revision = spec_payload
-                .get("beadRevision")
+                .get("workRevision")
+                .or_else(|| spec_payload.get("beadRevision"))
                 .cloned()
                 .ok_or_else(|| Failure::internal("retry successor spec has no revision"))?;
             let (submitted, authorization) = super::handoff::authorize_retry_successor(
@@ -1847,7 +1848,15 @@ pub async fn run_status(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
                 Value::String(started_at.to_owned()),
             );
         }
-        Ok(json!({"run": run}))
+        let subject = super::work_identity::projection_subject(
+            &identity,
+            forged_types::ProjectionSubjectKind::Run,
+            run_id,
+        );
+        Ok(forged_types::with_work_twins(json!({
+            "subject": subject,
+            "run": run,
+        })))
     })
     .await
 }
@@ -2465,6 +2474,13 @@ pub async fn packet_show(ctx: &Ctx, req: &OperationRequest) -> OperationResponse
             })?)
             .map_err(|e| Failure::internal(format!("cannot serialize packet: {e}")))?;
         let view = super::drive::project(ctx, &row.run_id).await?;
+        let identity =
+            super::work_identity::load(ctx, WorkIdentitySubjectKind::Run, &row.run_id).await?;
+        let subject = super::work_identity::projection_subject(
+            &identity,
+            forged_types::ProjectionSubjectKind::Run,
+            &row.run_id,
+        );
         let mut attempts: Vec<Value> = Vec::new();
         if let Some(history) = view.terminal_attempts.get(&packet_id) {
             for t in history {
@@ -2486,11 +2502,12 @@ pub async fn packet_show(ctx: &Ctx, req: &OperationRequest) -> OperationResponse
                 "claimant": a.claimant,
             }));
         }
-        Ok(json!({
+        Ok(forged_types::with_work_twins(json!({
+            "subject": subject,
             "packet": packet,
             "policyRevision": row.policy_revision,
             "attempts": attempts,
-        }))
+        })))
     })
     .await
 }
@@ -3708,7 +3725,12 @@ pub(super) fn operator_queue(
 
     for entry in entries.iter_mut() {
         let id = entry["id"].as_str().unwrap_or_default().to_owned();
-        let work_id = entry["beadId"].as_str().unwrap_or_default().to_owned();
+        let work_id = entry
+            .get("workId")
+            .or_else(|| entry.get("beadId"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
         let record = controller_records.remove(&id).map(|(_, record)| record);
         let controller = durable_controller_status(snapshot, &id, record);
         let issue = work.get(&work_id);
@@ -4122,7 +4144,10 @@ pub async fn work_list(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
         if ["repo", "status", "assignee"]
             .iter()
             .any(|key| req.params.contains_key(*key))
-            && projection.pointer("/sourceHealth/beads/state").and_then(Value::as_str)
+            && projection
+                .pointer("/sourceHealth/work/state")
+                .or_else(|| projection.pointer("/sourceHealth/beads/state"))
+                .and_then(Value::as_str)
                 != Some("available")
         {
             return Err(Failure {
@@ -4146,7 +4171,14 @@ pub async fn work_list(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
             .pointer("/counts/durable")
             .and_then(Value::as_u64)
             .unwrap_or(total as u64);
-        Ok(json!({
+        Ok(forged_types::with_work_twins(json!({
+            "subject": {
+                "id": "portfolio",
+                "kind": "portfolio",
+                "title": "Forged work inventory",
+                "repository": req.params.get("repo"),
+                "revision": Value::Null,
+            },
             "runs": runs,
             "queue": {
                 "groups": groups,
@@ -4158,7 +4190,7 @@ pub async fn work_list(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
             "attentionTotal": projection.pointer("/counts/attention").cloned().unwrap_or(json!(0)),
             "attention": attention,
             "sourceHealth": projection.get("sourceHealth").cloned().unwrap_or(Value::Null),
-        }))
+        })))
     })
     .await
 }
@@ -4335,7 +4367,11 @@ fn operations_subject(entry: &Value) -> Value {
         });
     json!({
         "kind": if entry.get("source").and_then(Value::as_str) == Some("live-plan") {
-            json!("plan")
+            if entry.get("kind").and_then(Value::as_str) == Some("epic") {
+                json!("epic")
+            } else {
+                json!("work")
+            }
         } else {
             identity.pointer("/subject/kind").cloned().unwrap_or_else(|| {
                 if entry.get("kind").and_then(Value::as_str) == Some("epic") {
@@ -4347,6 +4383,14 @@ fn operations_subject(entry: &Value) -> Value {
         },
         "id": entry.get("id").cloned().unwrap_or(Value::Null),
         "title": title,
+        "repository": identity.pointer("/repository/path")
+            .cloned()
+            .or_else(|| entry.get("repo").cloned())
+            .unwrap_or(Value::Null),
+        "revision": identity.pointer("/bead/revision")
+            .or_else(|| identity.pointer("/work/revision"))
+            .cloned()
+            .unwrap_or(Value::Null),
     })
 }
 
@@ -4786,7 +4830,8 @@ pub(super) fn entry_work_ids(entries: &[Value]) -> Vec<String> {
         .iter()
         .filter_map(|entry| {
             entry
-                .get("beadId")
+                .get("workId")
+                .or_else(|| entry.get("beadId"))
                 .and_then(Value::as_str)
                 .map(str::to_owned)
         })
@@ -4942,7 +4987,8 @@ async fn collect_operations_universe(
             .collect::<BTreeSet<_>>();
         entries.retain(|entry| {
             entry
-                .get("beadId")
+                .get("workId")
+                .or_else(|| entry.get("beadId"))
                 .and_then(Value::as_str)
                 .is_some_and(|id| matching_work.contains(id))
         });
@@ -4951,7 +4997,8 @@ async fn collect_operations_universe(
         .iter()
         .filter_map(|entry| {
             entry
-                .get("beadId")
+                .get("workId")
+                .or_else(|| entry.get("beadId"))
                 .and_then(Value::as_str)
                 .map(str::to_owned)
         })
@@ -4988,7 +5035,8 @@ async fn collect_operations_universe(
             .collect();
         for entry in &mut entries {
             let work_id = entry
-                .get("beadId")
+                .get("workId")
+                .or_else(|| entry.get("beadId"))
                 .and_then(Value::as_str)
                 .map(str::to_owned);
             if let Some(plan) = work_id.as_deref().and_then(|id| plans_by_id.get(id)) {
@@ -6116,8 +6164,15 @@ pub async fn operations_overview(ctx: &Ctx, req: &OperationRequest) -> Operation
         } else {
             attention_projection
         };
-        Ok(json!({
+        Ok(forged_types::with_work_twins(json!({
             "schema": "forged.operations-overview/1",
+            "subject": {
+                "id": "portfolio",
+                "kind": "portfolio",
+                "title": "Forged operations",
+                "repository": repository,
+                "revision": Value::Null,
+            },
             "scope": {"repository": repository},
             "capturedAt": {
                 "ledger": ledger_captured_at,
@@ -6159,7 +6214,7 @@ pub async fn operations_overview(ctx: &Ctx, req: &OperationRequest) -> Operation
                 "rowsMissingCost": rows_missing_cost,
                 "complete": rows_missing_cost == 0,
             },
-        }))
+        })))
     })
     .await
 }
@@ -6389,8 +6444,15 @@ pub async fn attention_list(ctx: &Ctx, req: &OperationRequest) -> OperationRespo
             }));
         }
 
-        Ok(json!({
+        Ok(forged_types::with_work_twins(json!({
             "schema": "forged.attention-list/1",
+            "subject": {
+                "id": "attention",
+                "kind": "portfolio",
+                "title": "Forged attention",
+                "repository": repo,
+                "revision": Value::Null,
+            },
             "capturedAt": {
                 "ledger": &universe.ledger_captured_at,
                 "beads": &universe.work_captured_at,
@@ -6419,7 +6481,7 @@ pub async fn attention_list(ctx: &Ctx, req: &OperationRequest) -> OperationRespo
                 "nextCursor": Value::Null,
             },
             "groups": groups,
-        }))
+        })))
     })
     .await
 }
@@ -6817,9 +6879,113 @@ fn event_summary(kind: &str, payload: &Value) -> Value {
 
 /// `events` — read-only, paginated; proto rows are validated through the
 /// replay parser on the way out.
+fn events_selector<'a>(
+    params: &'a serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<Option<&'a str>, Failure> {
+    match params.get(key) {
+        None => Ok(None),
+        Some(Value::String(value)) if !value.trim().is_empty() => Ok(Some(value)),
+        Some(_) => Err(Failure::invalid(format!(
+            "events param {key:?} must be a non-empty string"
+        ))),
+    }
+}
+
 pub async fn events_tail(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
     read_only("events_tail", req, || async {
-        let run = param_opt_str(&req.params, "run").map(str::to_owned);
+        let direct_run = events_selector(&req.params, "run")?;
+        let id = events_selector(&req.params, "id")?;
+        let subject_kind = param_opt_str(&req.params, "subjectKind");
+        if direct_run.is_some() && id.is_some() {
+            return Err(Failure::invalid(
+                "events takes param \"run\" or param \"id\", never both",
+            ));
+        }
+        if subject_kind.is_some() && id.is_none() {
+            return Err(Failure::invalid(
+                "events param \"subjectKind\" requires param \"id\"",
+            ));
+        }
+        let target = match (direct_run, id) {
+            (Some(run), None) => {
+                // `--run` predates kinded selectors and names an event-stream
+                // id. Preserve legacy epic streams and typo-as-empty-page
+                // behavior while classifying a known durable identity when
+                // one exists.
+                let run_id = run.to_owned();
+                let identity_id = run_id.clone();
+                let kind = on_ledger(&ctx.ledger, move |ledger| {
+                    if ledger
+                        .get_work_identity(WorkIdentitySubjectKind::Run, &identity_id)?
+                        .is_some()
+                    {
+                        Ok(WorkIdentitySubjectKind::Run)
+                    } else if ledger
+                        .get_work_identity(WorkIdentitySubjectKind::Epic, &identity_id)?
+                        .is_some()
+                    {
+                        Ok(WorkIdentitySubjectKind::Epic)
+                    } else {
+                        Ok(WorkIdentitySubjectKind::Run)
+                    }
+                })
+                .await?;
+                Some((kind, run_id))
+            }
+            (None, Some(id)) => {
+                match super::observe::execution_target(ctx, id, subject_kind).await? {
+                    super::observe::ExecutionTarget::Run(run) => {
+                        Some((WorkIdentitySubjectKind::Run, run))
+                    }
+                    super::observe::ExecutionTarget::Epic(epic) => {
+                        Some((WorkIdentitySubjectKind::Epic, epic))
+                    }
+                    super::observe::ExecutionTarget::Unresolved(resolution) => {
+                        return Ok(json!({
+                            "schema": "forged.events/1",
+                            "resolution": resolution,
+                        }))
+                    }
+                }
+            }
+            (None, None) => None,
+            _ => unreachable!(),
+        };
+        let run = target.as_ref().map(|(_, id)| id.clone());
+        let subject = match target.as_ref() {
+            Some((kind, id)) => {
+                let identity_id = id.clone();
+                let identity_kind = *kind;
+                let identity = on_ledger(&ctx.ledger, move |ledger| {
+                    ledger.get_work_identity(identity_kind, &identity_id)
+                })
+                .await?;
+                let projection_kind = match kind {
+                    WorkIdentitySubjectKind::Run => forged_types::ProjectionSubjectKind::Run,
+                    WorkIdentitySubjectKind::Epic => forged_types::ProjectionSubjectKind::Epic,
+                };
+                identity.map_or_else(
+                    || forged_types::ProjectionSubjectV1 {
+                        id: id.clone(),
+                        kind: projection_kind,
+                        title: None,
+                        repository: None,
+                        revision: None,
+                    },
+                    |identity| {
+                        super::work_identity::projection_subject(&identity, projection_kind, id)
+                    },
+                )
+            }
+            None => forged_types::ProjectionSubjectV1 {
+                id: "portfolio".to_owned(),
+                kind: forged_types::ProjectionSubjectKind::Portfolio,
+                title: Some("Forged event stream".to_owned()),
+                repository: None,
+                revision: None,
+            },
+        };
         let after = req.params.get("after").and_then(Value::as_i64).unwrap_or(0);
         if after < 0 {
             return Err(Failure::invalid("events after must be non-negative"));
@@ -6886,7 +7052,9 @@ pub async fn events_tail(ctx: &Ctx, req: &OperationRequest) -> OperationResponse
             })
             .collect();
         let shown = events.len();
-        Ok(json!({
+        Ok(forged_types::with_work_twins(json!({
+            "schema": "forged.events/1",
+            "subject": subject,
             "events": events,
             "last_event_id": last_event_id,
             "summary": summary,
@@ -6896,7 +7064,7 @@ pub async fn events_tail(ctx: &Ctx, req: &OperationRequest) -> OperationResponse
                 "truncated": truncated,
                 "nextCursor": truncated.then_some(last_event_id),
             },
-        }))
+        })))
     })
     .await
 }

@@ -163,6 +163,12 @@ fn an_unknown_id_answers_with_an_empty_candidate_list() {
                 "query": "nothing-by-that-name",
                 "reason": "unknown",
                 "candidates": [],
+                "remedy": {
+                    "schema": "forged.remedy/1",
+                    "verb": "explain",
+                    "args": {"id": "nothing-by-that-name"},
+                    "reason": "inspect this id with explain --id",
+                },
             },
         })
     );

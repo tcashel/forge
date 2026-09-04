@@ -968,10 +968,10 @@ if (manifest.schema !== 'forged.operation-surface/1' || !Array.isArray(manifest.
   console.error(`${manifestPath}: invalid operation-surface manifest`);
   process.exit(1);
 }
-const cliVerbs = manifest.operations
+const cliVerbs = new Map(manifest.operations
   .filter((row) => row?.cli === true && typeof row.cliVerb === 'string' && row.cliVerb.trim())
-  .map((row) => row.cliVerb)
-  .sort((left, right) => right.length - left.length || left.localeCompare(right));
+  .map((row) => [row.cliVerb, row.name])
+  .sort(([left], [right]) => right.length - left.length || left.localeCompare(right)));
 
 function skillFiles(root) {
   const files = [];
@@ -1009,7 +1009,7 @@ for (const skillPath of skillFiles(skillsRoot)) {
     for (const match of span.body.matchAll(/\bforged[ \t]+([^\n;|]+)/g)) {
       const tail = match[1].trim();
       if (!tail || tail.startsWith('-')) continue;
-      const found = cliVerbs.some((verb) => tail === verb || tail.startsWith(`${verb} `));
+      const found = [...cliVerbs.keys()].some((verb) => tail === verb || tail.startsWith(`${verb} `));
       // An inline family name such as `forged work` is prose, not an
       // invocation. Fenced commands and multi-token inline paths are exact.
       if (!found && !span.fenced && /^[a-z][a-z0-9-]*$/.test(tail)) continue;
