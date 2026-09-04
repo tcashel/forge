@@ -17,11 +17,13 @@ Operator interventions recorded before this provider boundary:
 2. Implement it inside the worktree above. That worktree is disposable and sits
    outside the operator's own checkout; never edit the main checkout, and never
    invoke the `forged` binary — you are the packet, not the orchestrator.
-3. Run the quality gate BEFORE your first commit, so you know what was already
-   broken, and again after your last one:
-{% for c in gate_commands %}     - `{{ c }}`
-{% endfor %}   Fix whatever YOUR change broke. A failure that was already there is a line
-   in your report, not a licence to go fixing unrelated code.
+3. Before each commit run the seat checks, and nothing wider:
+{% if seat_commands %}{% for c in seat_commands %}     - `{{ c }}`
+{% endfor %}{% else %}     - the tests that cover the files you changed
+{% endif %}   Fix whatever YOUR change broke. A failure that was already there is a line
+   in your report, not a licence to go fixing unrelated code. Do NOT run the
+   repository's full gate yourself: forged runs the gate commands after you
+   return, and again after every fix round.
 4. Own your commits: `git add <path>` on files you changed on purpose (never
    `git add -A`), conventional-commit messages, committed as you go. Do NOT
    push, do NOT open a PR, do NOT merge — forged does all three after you
@@ -31,8 +33,9 @@ Operator interventions recorded before this provider boundary:
    and put that number in commitsAhead. If you could not finish, say so with
    implemented=false and the reason in note: a half-built worktree reported as
    done costs the reviewer far more than an honest failure does. gateState is
-   exactly "pass" or "fail" (or null when unknown); put articulate gate detail
-   in summary/note, and put 2-4 sentences on what you changed in summary.
+   the seat-check outcome: exactly "pass" or "fail" (or null when nothing
+   ran); put articulate seat-check detail in summary/note, and put 2-4
+   sentences on what you changed in summary.
    If repository evidence proves the spec contradictory or unsafe, do not
    guess. Return this result instead of an implement outcome:
      {"schema": "{{ result_schema }}", "packetId": "{{ packet_id }}",

@@ -60,27 +60,25 @@ fn set_admission(env: &TestEnv, policy: Value) {
     .expect("write admission config");
 }
 
-fn expire_latest_retry(env: &TestEnv, run: &str) {
-    let connection =
-        rusqlite::Connection::open(env.anvil.join("state.db")).expect("open retry clock");
-    let (event_id, payload): (i64, String) = connection
-        .query_row(
-            "SELECT event_id, payload_json FROM events WHERE run_id = ?1 AND kind = 'proto.retry' ORDER BY event_id DESC LIMIT 1",
-            [run],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .expect("retry event");
-    let mut payload: Value = serde_json::from_str(&payload).expect("retry payload");
-    payload["retryAfter"] = json!("2000-01-01T00:00:00.000000000Z");
-    connection
-        .execute(
-            "UPDATE events SET payload_json = ?1 WHERE event_id = ?2",
-            rusqlite::params![
-                serde_json::to_string(&payload).expect("retry json"),
-                event_id
-            ],
-        )
-        .expect("advance retry clock");
+fn walkdir_prompts(root: &std::path::Path) -> Vec<String> {
+    let mut prompts = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.file_name().is_some_and(|name| name == "prompt.md") {
+                if let Ok(text) = std::fs::read_to_string(&path) {
+                    prompts.push(text);
+                }
+            }
+        }
+    }
+    prompts
 }
 
 #[test]
@@ -2587,7 +2585,7 @@ fn transport_failure_advances_to_the_next_candidate_and_lands_once() {
 }
 
 #[test]
-fn real_provider_timeout_falls_back_to_the_next_candidate() {
+fn real_provider_timeout_relaunches_the_same_candidate_at_once() {
     let env = TestEnv::new("forged-timeout-fallback");
     let config_path = env.anvil.join("config.json");
     let mut config: Value =
@@ -2628,7 +2626,8 @@ fn real_provider_timeout_falls_back_to_the_next_candidate() {
         let (code, advanced) = env.forged(&["run", "advance", "--run", "bead-timeout-fallback"]);
         assert_eq!(code, 0, "timeout advance: {advanced}");
     }
-    expire_latest_retry(&env, "bead-timeout-fallback");
+    // A deadline kill earns no retry grant and no backoff: the next drive
+    // relaunches the same candidate at once, with the relaunch note.
     let (code, driven) = env.forged(&["run", "drive", "--run", "bead-timeout-fallback"]);
     assert_eq!(code, 0, "fallback drive: {driven}");
 
@@ -2644,30 +2643,39 @@ fn real_provider_timeout_falls_back_to_the_next_candidate() {
     assert!(first
         .fail_note
         .as_deref()
-        .is_some_and(|note| note.starts_with("transport: stage deadline exceeded")));
-    assert!(second.claimant.starts_with("codex:"), "{second:?}");
+        .is_some_and(|note| note.starts_with("deadline: stage deadline exceeded")));
+    assert!(
+        second.claimant.starts_with("claude:"),
+        "a deadline kill keeps the candidate; only transport failures rotate: {second:?}"
+    );
     assert_eq!(second.state, forged_ledger::AttemptState::Completed);
-    assert_eq!(
+    assert!(
         ledger
             .list_events(Some("bead-timeout-fallback"), 0, 1_000)
             .expect("events")
             .iter()
-            .filter(|event| event.kind == "proto.retry")
-            .count(),
-        1
+            .all(|event| event.kind != "proto.retry"),
+        "a deadline kill earns no retry grant"
     );
     ledger.close().expect("close ledger");
+    let prompts = walkdir_prompts(&env.anvil.join("runs"));
+    assert!(
+        prompts
+            .iter()
+            .any(|prompt| prompt.contains("already ran here")),
+        "the relaunched attempt reads the relaunch note: {prompts:?}"
+    );
 }
 
 #[test]
-fn real_provider_timeouts_exhaust_the_frozen_retry_budget() {
+fn real_provider_timeouts_exhaust_the_deadline_budget() {
     let env = TestEnv::new("forged-timeout-exhaustion");
     let config_path = env.anvil.join("config.json");
     let mut config: Value =
         serde_json::from_str(&std::fs::read_to_string(&config_path).expect("read timeout config"))
             .expect("timeout config JSON");
     config["stage_budget_s"]["implement"] = json!(1);
-    config["transport_retry_budget"] = json!(1);
+    config["deadline_retry_budget"] = json!(1);
     std::fs::write(
         &config_path,
         serde_json::to_vec_pretty(&config).expect("timeout config JSON"),
@@ -2698,19 +2706,28 @@ fn real_provider_timeouts_exhaust_the_frozen_retry_budget() {
         let (code, advanced) = env.forged(&["run", "advance", "--run", "bead-timeout-exhaustion"]);
         assert_eq!(code, 0, "first timeout advance: {advanced}");
     }
-    expire_latest_retry(&env, "bead-timeout-exhaustion");
-    let (code, second_timeout) =
-        env.forged(&["run", "advance", "--run", "bead-timeout-exhaustion"]);
-    assert_eq!(code, 0, "second timeout: {second_timeout}");
+    // The relaunch is immediate; the second kill is the second charge
+    // against a budget of one, so the drive stops as deadline exhaustion.
     let (code, exhausted) = env.forged(&["run", "drive", "--run", "bead-timeout-exhaustion"]);
     assert_eq!(code, 0, "exhaustion drive: {exhausted}");
     assert_eq!(
-        exhausted["result"]["terminal"]["providerUnavailable"]["stage"],
-        json!("implementation")
+        exhausted["result"]["terminal"]["deadlineExhausted"]["stage"],
+        json!("implementation"),
+        "{exhausted}"
     );
     assert_eq!(
-        exhausted["result"]["terminal"]["providerUnavailable"]["attempts"],
+        exhausted["result"]["terminal"]["deadlineExhausted"]["kills"],
         json!(2)
+    );
+    assert!(exhausted["result"]["terminal"]["providerUnavailable"].is_null());
+    let (code, status) = env.forged(&["run", "status", "--run", "bead-timeout-exhaustion"]);
+    assert_eq!(code, 0, "{status}");
+    assert!(
+        status["result"]["run"]["stopReason"]
+            .as_str()
+            .is_some_and(|reason| reason
+                .starts_with("stage deadline exceeded 2 times in implementation; worktree:")),
+        "{status}"
     );
 
     let ledger = env.ledger();
@@ -2728,8 +2745,8 @@ fn real_provider_timeouts_exhaust_the_frozen_retry_budget() {
             .iter()
             .filter(|event| event.kind == "proto.retry")
             .count(),
-        2,
-        "each timed-out attempt is charged exactly once"
+        0,
+        "deadline kills are counted from the attempt rows, never granted"
     );
     ledger.close().expect("close ledger");
 }
@@ -2743,6 +2760,9 @@ fn policy_revision_between_deadline_retries_stays_projectable_and_stoppable() {
             .expect("retry config JSON");
     config["stage_budget_s"]["implement"] = json!(1);
     config["transport_retry_budget"] = json!(3);
+    // One relaunch per deadline kill: the second kill in a row exhausts the
+    // budget unless a policy revision resets the count in between.
+    config["deadline_retry_budget"] = json!(1);
     std::fs::write(
         &config_path,
         serde_json::to_vec_pretty(&config).expect("retry config JSON"),
@@ -2784,7 +2804,24 @@ fn policy_revision_between_deadline_retries_stays_projectable_and_stoppable() {
             .iter()
             .filter(|event| event.kind == "proto.retry")
             .count(),
-        1
+        0,
+        "a deadline kill earns no transport grant"
+    );
+    let first_kills = env
+        .ledger()
+        .list_attempts_in_state(Some(run), forged_ledger::AttemptState::Failed)
+        .expect("failed attempts")
+        .into_iter()
+        .filter(|attempt| {
+            attempt
+                .fail_note
+                .as_deref()
+                .is_some_and(|note| note.starts_with("deadline: stage deadline exceeded"))
+        })
+        .count();
+    assert_eq!(
+        first_kills, 1,
+        "the first deadline kill is a deadline-class failure"
     );
 
     config["transport_retry_budget"] = json!(4);
@@ -2812,26 +2849,27 @@ fn policy_revision_between_deadline_retries_stays_projectable_and_stoppable() {
 
     let ledger = env.ledger();
     let rows = ledger.list_events(Some(run), 0, 1_000).expect("events");
-    let raw_retries = rows
-        .iter()
-        .filter(|event| event.kind == "proto.retry")
-        .map(|event| serde_json::from_str::<Value>(&event.payload_json).expect("retry payload"))
-        .collect::<Vec<_>>();
-    assert_eq!(raw_retries.len(), 2, "both deadline grants are durable");
-    assert_eq!(raw_retries[0]["transportFailures"], json!(1));
-    assert_eq!(raw_retries[1]["transportFailures"], json!(1));
-    assert_ne!(raw_retries[0]["attemptId"], raw_retries[1]["attemptId"]);
-    assert_ne!(raw_retries[0]["retryAfter"], raw_retries[1]["retryAfter"]);
-    let parsed_retries = forged_proto::parse_proto_events(&rows)
-        .expect("the run remains projectable")
+    assert!(
+        rows.iter().all(|event| event.kind != "proto.retry"),
+        "deadline kills never write retry grants"
+    );
+    let kills = ledger
+        .list_attempts_in_state(Some(run), forged_ledger::AttemptState::Failed)
+        .expect("failed attempts")
         .into_iter()
-        .filter(|event| matches!(event, forged_proto::ProtoEvent::Retry { .. }))
+        .filter(|attempt| {
+            attempt
+                .fail_note
+                .as_deref()
+                .is_some_and(|note| note.starts_with("deadline: stage deadline exceeded"))
+        })
         .count();
-    assert_eq!(parsed_retries, 2, "both grants survive strict replay");
+    assert_eq!(kills, 2, "both kills are durable deadline-class failures");
+    forged_proto::parse_proto_events(&rows).expect("the run remains projectable");
     assert_eq!(
         status["result"]["run"]["nextAction"]["awaitPacket"]["notBefore"],
-        raw_retries[1]["retryAfter"],
-        "transport retry state selects the post-cutoff count/deadline"
+        json!(null),
+        "a deadline relaunch waits for no backoff; the revision reset the kill count"
     );
     ledger.close().expect("close ledger");
 

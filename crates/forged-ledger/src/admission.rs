@@ -91,6 +91,7 @@ fn resource_class(index: usize, raw: &str) -> rusqlite::Result<AdmissionResource
     match raw {
         "read" => Ok(AdmissionResourceClass::Read),
         "repository-write" => Ok(AdmissionResourceClass::RepositoryWrite),
+        "gate" => Ok(AdmissionResourceClass::Gate),
         other => Err(column_decode_error(
             index,
             "admission resource class",
@@ -1021,6 +1022,7 @@ fn insert_batch_tx(
             let class = match decision.resource_class {
                 AdmissionResourceClass::Read => "read",
                 AdmissionResourceClass::RepositoryWrite => "repository-write",
+                AdmissionResourceClass::Gate => "gate",
             };
             let existing_sql = format!(
                 "SELECT {RESERVATION_COLUMNS} FROM admission_reservations \
@@ -1538,6 +1540,7 @@ impl Ledger {
                     match observed.resource_class {
                         AdmissionResourceClass::Read => "read",
                         AdmissionResourceClass::RepositoryWrite => "repository-write",
+                        AdmissionResourceClass::Gate => "gate",
                     },
                     recovery_deadline,
                     now,
@@ -3146,7 +3149,7 @@ mod tests {
                     ledger
                         .revoke_attempt_scoped(
                             attempt.attempt_id,
-                            "transport: stage deadline exceeded: test",
+                            "deadline: stage deadline exceeded: test",
                             RevokeScope::Deadline,
                         )
                         .expect("revoke");

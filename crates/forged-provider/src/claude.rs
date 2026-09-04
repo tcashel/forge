@@ -53,6 +53,7 @@ impl ProviderDriver for ClaudeDriver {
             None,
             Some(&session_id),
             None,
+            &packet.provider_hints.env,
         );
         Ok(Invocation {
             argv,

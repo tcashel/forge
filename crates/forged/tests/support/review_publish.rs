@@ -32,6 +32,7 @@ pub(crate) fn review_packet(run_id: &str, seq: i64) -> WorkPacket {
             gate_commands: Vec::new(),
             deliverable: Deliverable::ReviewBlock,
             budget_s: 60,
+            seat_commands: Vec::new(),
         },
         result_schema: "forged.result/1".to_owned(),
         provider_hints: ProviderHints {
@@ -39,6 +40,7 @@ pub(crate) fn review_packet(run_id: &str, seq: i64) -> WorkPacket {
             model: "fixture".to_owned(),
             effort: None,
             sandbox: Sandbox::ReadOnly,
+            env: Default::default(),
         },
         field_notes: Vec::new(),
     }

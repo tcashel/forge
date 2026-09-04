@@ -17,6 +17,7 @@ fn implement_context() -> Value {
         "base_ref": "main",
         "spec_path": "specs/bead-1.md",
         "gate_commands": ["cargo build --workspace --locked", "cargo test --workspace"],
+        "seat_commands": ["cargo fmt --all -- --check", "cargo clippy --workspace"],
         "field_notes": [],
         "packet_id": PACKET_ID,
         "result_schema": PromptStage::Implement.result_schema(),
@@ -44,6 +45,7 @@ fn fix_context(findings: &[RenderedFinding]) -> Value {
         "round": 1,
         "total_rounds": 2,
         "gate_commands": ["cargo test --workspace"],
+        "seat_commands": ["cargo fmt --all -- --check"],
         "push_url": "https://example.invalid/repo.git",
         "findings": findings,
         "field_notes": [],
@@ -135,8 +137,21 @@ fn render_succeeds_for_all_three_stages() {
         .expect("implement renders");
     assert!(implement.contains("/tmp/worktrees/run-1"), "worktree path");
     assert!(implement.contains("feat/bead-1"), "branch");
-    assert!(implement.contains("cargo build --workspace --locked"));
-    assert!(implement.contains("cargo test --workspace"));
+    // The seat checks render verbatim; the gate commands never do — the
+    // controller owns the gate, and the prompt says so in one sentence.
+    assert!(implement.contains("cargo fmt --all -- --check"));
+    assert!(implement.contains("cargo clippy --workspace"));
+    assert!(!implement.contains("cargo build --workspace --locked"));
+    assert!(!implement.contains("cargo test --workspace"));
+    let flattened = implement.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flattened.contains("forged runs the gate commands after you return"),
+        "names the controller-owned gate: {implement}"
+    );
+    assert!(
+        !flattened.contains("BEFORE your first commit"),
+        "no baseline instruction: {implement}"
+    );
 
     let review = templates
         .render(PromptStage::Review, &review_context())
@@ -250,6 +265,29 @@ fn epic_assurance_fix_carries_exact_sha_and_failed_gate_evidence() {
 }
 
 #[test]
+fn empty_seat_commands_fall_back_to_the_changed_files_sentence() {
+    let templates = PromptTemplates::load().expect("loads");
+    let mut context = implement_context();
+    context["seat_commands"] = json!([]);
+    let implement = templates
+        .render(PromptStage::Implement, &context)
+        .expect("implement renders");
+    let flattened = implement.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(flattened.contains("the tests that cover the files you changed"));
+    assert!(!implement.contains("cargo fmt --all -- --check"));
+    assert!(!implement.contains("cargo test --workspace"));
+    assert!(flattened.contains("forged runs the gate commands after you return"));
+    let mut fix = fix_context(&[]);
+    fix["seat_commands"] = json!([]);
+    let fix = templates
+        .render(PromptStage::Fix, &fix)
+        .expect("fix renders");
+    let flattened = fix.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(flattened.contains("the tests that cover the files you changed"));
+    assert!(!fix.contains("cargo test --workspace"));
+}
+
+#[test]
 fn implement_render_names_the_closed_gate_state_contract() {
     let rendered = PromptTemplates::load()
         .expect("loads")
@@ -259,11 +297,13 @@ fn implement_render_names_the_closed_gate_state_contract() {
     // contract: the assertion pins the words, not the wrap points.
     let flattened = rendered.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(
-        flattened.contains("gateState is exactly \"pass\" or \"fail\" (or null when unknown)"),
+        flattened.contains(
+            "gateState is the seat-check outcome: exactly \"pass\" or \"fail\" (or null when nothing ran)"
+        ),
         "the prompt names the closed machine vocabulary: {rendered}"
     );
     assert!(
-        flattened.contains("put articulate gate detail in summary/note"),
+        flattened.contains("put articulate seat-check detail in summary/note"),
         "the prompt directs prose to free-text fields: {rendered}"
     );
     assert!(
@@ -386,6 +426,7 @@ fn stage_variable_schemas_are_closed_and_exact() {
             "base_ref",
             "spec_path",
             "gate_commands",
+            "seat_commands",
             "field_notes",
             "packet_id",
             "result_schema"
@@ -413,6 +454,7 @@ fn stage_variable_schemas_are_closed_and_exact() {
             "round",
             "total_rounds",
             "gate_commands",
+            "seat_commands",
             "push_url",
             "findings",
             "field_notes",

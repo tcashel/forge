@@ -101,6 +101,9 @@ fn package() -> ExecutionPackageV1 {
             .map(|stage| (stage, 60))
             .collect(),
             transport_retry_budget: 1,
+            seat_commands: Vec::new(),
+            deadline_retry_budget: 1,
+            seat_env: Default::default(),
             termination_grace_s: forged_types::DEFAULT_TERMINATION_GRACE_S,
             host_policy: HostPolicyV1::Off,
             herdr_socket: None,
@@ -141,6 +144,7 @@ fn complete(
             gate_commands: vec!["cargo test --workspace".to_owned()],
             deliverable,
             budget_s: 60,
+            seat_commands: Vec::new(),
         },
         result_schema: "forged.result/1".to_owned(),
         provider_hints: intent.hints.clone(),

@@ -22,6 +22,8 @@ pub enum AdmissionSubjectKind {
 pub enum AdmissionResourceClass {
     Read,
     RepositoryWrite,
+    /// A machine gate stage: one full-suite run on this daemon.
+    Gate,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -40,6 +42,8 @@ pub enum AdmissionReason {
     TotalCapacity,
     ProviderCapacity,
     RepositoryWriteCapacity,
+    /// This daemon's gate slots are all in use.
+    GateCapacity,
     TokenCeiling,
     KnownCostCeiling,
     MissingCost,
@@ -96,6 +100,14 @@ pub struct AdmissionCapacityV1 {
     pub provider_active: std::collections::BTreeMap<String, u32>,
     pub model_active: std::collections::BTreeMap<String, u32>,
     pub repository_write_active: std::collections::BTreeMap<String, u32>,
+    /// Machine gate stages running on this daemon. Omitted at zero so inputs
+    /// persisted before the field existed keep their bytes.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub gate_active: u32,
+}
+
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
 }
 
 /// Provider/model usage represented with integers so the complete input is

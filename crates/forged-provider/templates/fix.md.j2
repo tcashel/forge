@@ -15,9 +15,13 @@ across model families — treat that as the most credible item on the list. A
 location of ? means the reviewer named no file. Findings:
 {% for f in findings %}  - [{{ f.severity }}] {{ f.location }} — {{ f.message }}
 {% endfor %}
-1. Make the fixes in {{ worktree }}, then re-run the quality gate:
-{% for c in gate_commands %}     - `{{ c }}`
-{% endfor %}2. Commit ONLY intentionally-changed files (`git add <path>`, conventional
+1. Make the fixes in {{ worktree }}, then run the seat checks before you
+   commit, and nothing wider:
+{% if seat_commands %}{% for c in seat_commands %}     - `{{ c }}`
+{% endfor %}{% else %}     - the tests that cover the files you changed
+{% endif %}   Do NOT run the repository's full gate yourself: forged runs the gate
+   commands after you return.
+2. Commit ONLY intentionally-changed files (`git add <path>`, conventional
    commit `fix(review): address reviewer feedback (round {{ round }})`) and push
    to {{ push_url }}. If there is nothing to change, report applied=false.
 3. Do NOT mark the PR ready, do NOT merge — forged owns any later round and

@@ -998,7 +998,12 @@ async fn admit_packet_facts_once(
                 sandbox: match packet_facts.resource_class {
                     AdmissionResourceClass::Read => Sandbox::ReadOnly,
                     AdmissionResourceClass::RepositoryWrite => Sandbox::WorkspaceWrite,
+
+                    // A gate reservation never launches a packet; the read-only sandbox
+                    // is the conservative shape for a class that has no seat.
+                    AdmissionResourceClass::Gate => Sandbox::ReadOnly,
                 },
+                env: Default::default(),
             }),
         });
     }
@@ -1098,7 +1103,12 @@ async fn admit_packet_facts_once(
             sandbox: match packet_facts.resource_class {
                 AdmissionResourceClass::Read => Sandbox::ReadOnly,
                 AdmissionResourceClass::RepositoryWrite => Sandbox::WorkspaceWrite,
+
+                // A gate reservation never launches a packet; the read-only sandbox
+                // is the conservative shape for a class that has no seat.
+                AdmissionResourceClass::Gate => Sandbox::ReadOnly,
             },
+            env: Default::default(),
         }),
     })
 }
@@ -1373,6 +1383,9 @@ mod tests {
                 stage_budget_s: BTreeMap::new(),
                 termination_grace_s: DEFAULT_TERMINATION_GRACE_S,
                 transport_retry_budget: 1,
+                seat_commands: Vec::new(),
+                deadline_retry_budget: 1,
+                seat_env: Default::default(),
                 host_policy: HostPolicyV1::Off,
                 herdr_socket: None,
             },
@@ -1539,6 +1552,7 @@ mod tests {
                 provider_active: BTreeMap::from([("codex".to_owned(), 1)]),
                 model_active: BTreeMap::from([("codex/m".to_owned(), 1)]),
                 repository_write_active: BTreeMap::from([(repository, 1)]),
+                gate_active: 0,
             },
             spend: Vec::new(),
             latest_rate_limits: Vec::new(),

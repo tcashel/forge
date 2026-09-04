@@ -53,6 +53,17 @@ itself holds a decision; `reviewed` at the final draft PR; `landed`
 when the human merges it (recorded by `run stop --outcome landed` on
 the epic).
 
+### The seat contract
+
+Inside a stage, the seat owns its edits, its commits, and the seat checks
+named by the packet contract (`seatCommands`); the controller owns the gate
+(`gateCommands`), which it runs after the seat returns and again after each
+fix round, serialized per daemon. An attempt that outlives its stage budget
+is killed as a `deadline:` failure and relaunched at once within
+`deadlineRetryBudget`, with a field note about the work already committed;
+exhaustion is the `deadlineExhausted` terminal, distinct from provider
+unavailability.
+
 ## Decisions
 
 `deciding` is one stage with typed sub-kinds. Each sub-kind is an

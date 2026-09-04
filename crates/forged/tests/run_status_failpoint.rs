@@ -103,7 +103,7 @@ fn deadline_kills_project_from_revoke_scope_while_ordinary_retries_do_not() {
     ledger
         .revoke_attempt_scoped(
             1,
-            "transport: stage deadline exceeded: projection test marker",
+            "deadline: stage deadline exceeded: projection test marker",
             forged_ledger::RevokeScope::Deadline,
         )
         .expect("mark deadline revocation");

@@ -875,6 +875,7 @@ fn open_implement_packet(env: &TestEnv, run: &str, seq: i64) -> (String, String)
             gate_commands: Vec::new(),
             deliverable: forged_types::Deliverable::CommitsInWorktree,
             budget_s: 60,
+            seat_commands: Vec::new(),
         },
         result_schema: "forged.result/1".to_owned(),
         provider_hints: forged_types::ProviderHints {
@@ -882,6 +883,7 @@ fn open_implement_packet(env: &TestEnv, run: &str, seq: i64) -> (String, String)
             model: "fixture".to_owned(),
             effort: None,
             sandbox: forged_types::Sandbox::ReadOnly,
+            env: Default::default(),
         },
         field_notes: Vec::new(),
     };

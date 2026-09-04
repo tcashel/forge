@@ -18,9 +18,9 @@ use forged_ledger::{
     RevokeScope, SpecFence,
 };
 use forged_proto::{
-    advance, parse_proto_events, project_run, reconcile, record, stage_deadline_at,
-    stage_deadline_reached, widen_rfc3339, GatePhase, MachineStage, NextAction, PrSnapshot,
-    ProtoEvent, ReconcileConfig, SessionLiveness,
+    advance, project_run, reconcile, record, stage_deadline_at, stage_deadline_reached,
+    widen_rfc3339, GatePhase, MachineStage, NextAction, PrSnapshot, ProtoEvent, ReconcileConfig,
+    SessionLiveness,
 };
 use forged_types::{OperationRequest, OperationResponse, RunId, Stage};
 use support::*;
@@ -715,29 +715,12 @@ async fn frozen_deadline_ignores_heartbeat_and_grants_one_retry_after_verified_k
     assert!(timed_out
         .fail_note
         .as_deref()
-        .is_some_and(|note| note.starts_with("transport: stage deadline exceeded")));
+        .is_some_and(|note| note.starts_with("deadline: stage deadline exceeded")));
     let rows = ledger.list_events(Some(RUN), 0, 1_000).expect("events");
     assert_eq!(
         rows.iter().filter(|row| row.kind == "proto.retry").count(),
-        1,
-        "one timed-out attempt earns exactly one retry grant"
-    );
-    let retries: Vec<_> = parse_proto_events(&rows)
-        .expect("replay")
-        .into_iter()
-        .filter_map(|event| match event {
-            ProtoEvent::Retry {
-                packet_id,
-                attempt_id,
-                transport_failures,
-                ..
-            } => Some((packet_id, attempt_id, transport_failures)),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(
-        retries,
-        vec![(packet_id.clone(), Some(claim.attempt_id), 1)]
+        0,
+        "a deadline kill earns no retry grant: it is counted from the attempt rows"
     );
     reconcile(
         &ledger,
@@ -755,8 +738,8 @@ async fn frozen_deadline_ignores_heartbeat_and_grants_one_retry_after_verified_k
             .iter()
             .filter(|row| row.kind == "proto.retry")
             .count(),
-        1,
-        "terminal replay cannot grant a second retry"
+        0,
+        "terminal replay grants nothing either"
     );
 
     ledger
@@ -802,7 +785,7 @@ async fn deadline_marker_retains_custody_until_kill_can_be_verified_then_replays
     ledger
         .revoke_attempt_scoped(
             claim.attempt_id,
-            "transport: stage deadline exceeded: crash replay",
+            "deadline: stage deadline exceeded: crash replay",
             RevokeScope::Deadline,
         )
         .expect("marker");

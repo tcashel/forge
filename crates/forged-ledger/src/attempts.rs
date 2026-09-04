@@ -265,6 +265,7 @@ fn validate_packet_admission_tx(
         && match packet_facts.resource_class {
             forged_types::AdmissionResourceClass::Read => "read",
             forged_types::AdmissionResourceClass::RepositoryWrite => "repository-write",
+            forged_types::AdmissionResourceClass::Gate => "gate",
         } == facts.5
         && facts.6 == "reserved"
         && facts.7.is_none()
@@ -296,6 +297,12 @@ fn running_attempt_for(
         return Err(stale_token());
     }
     Ok(attempt)
+}
+
+/// Whether a revoke reason is a stage-deadline note, current or legacy.
+fn is_deadline_note(note: &str) -> bool {
+    note.starts_with("deadline: stage deadline exceeded")
+        || note.starts_with("transport: stage deadline exceeded")
 }
 
 impl Ledger {
@@ -833,16 +840,16 @@ impl Ledger {
     /// Settle a kill-confirmed deadline marker as one retryable transport
     /// failure. The marker's stored reason is the durable timeout evidence;
     /// reservation release and the terminal event commit with the state.
+    ///
+    /// The reason must be a deadline note. Rows revoked before the deadline
+    /// class existed carry the legacy `transport:` prefix and still settle.
     pub fn mark_timed_out(&self, attempt_id: i64) -> Result<(), LedgerError> {
         self.submit(move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let attempt = get_attempt_tx(&tx, attempt_id)?;
             if attempt.state == AttemptState::Failed
                 && attempt.revoke_scope == Some(RevokeScope::Deadline)
-                && attempt
-                    .fail_note
-                    .as_deref()
-                    .is_some_and(|note| note.starts_with("transport: stage deadline exceeded"))
+                && attempt.fail_note.as_deref().is_some_and(is_deadline_note)
             {
                 tx.commit()?;
                 return Ok(());
@@ -861,7 +868,7 @@ impl Ledger {
                     format!("deadline attempt {attempt_id} has no reason"),
                 )
             })?;
-            if !note.starts_with("transport: stage deadline exceeded") {
+            if !is_deadline_note(&note) {
                 return Err(refused(
                     ErrorCode::InvalidRequest,
                     format!("deadline attempt {attempt_id} has an invalid reason"),
@@ -981,6 +988,7 @@ impl Ledger {
                             "repository-write" => {
                                 forged_types::AdmissionResourceClass::RepositoryWrite
                             }
+                            "gate" => forged_types::AdmissionResourceClass::Gate,
                             other => {
                                 return Err(internal(format!(
                                     "unknown admission reservation resource class: {other:?}"
@@ -1017,6 +1025,7 @@ impl Ledger {
             let resource_class = match reservation.4.as_str() {
                 "read" => forged_types::AdmissionResourceClass::Read,
                 "repository-write" => forged_types::AdmissionResourceClass::RepositoryWrite,
+                "gate" => forged_types::AdmissionResourceClass::Gate,
                 other => {
                     return Err(internal(format!(
                         "unknown admission reservation resource class: {other:?}"

@@ -34,6 +34,9 @@ pub enum AttentionCondition {
     RestartBudgetExhausted,
     FailedGate,
     RetryExhausted,
+    /// A stage was deadline-killed past its relaunch budget; the worktree
+    /// may still carry the seat's work.
+    DeadlineExhausted,
     ProviderDegraded,
     AdmissionDeferred,
     AmbiguousEffect,
@@ -95,6 +98,10 @@ pub enum AttentionActionCode {
     ReauthorizeWork,
     RepairGate,
     ReviseRoster,
+    /// Resume a deadline-killed stage from the work its seat left in the
+    /// worktree: retry when the tree is clean, steer the next attempt when
+    /// it is not.
+    ResumeSeat,
     WaitForProvider,
     WaitForCapacity,
     AdjudicateEffect,

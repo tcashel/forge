@@ -54,6 +54,7 @@ fn seed(ledger: &Ledger) -> (String, i64, String) {
             gate_commands: vec![],
             deliverable: Deliverable::CommitsInWorktree,
             budget_s: 60,
+            seat_commands: Vec::new(),
         },
         result_schema: "forged.result/1".into(),
         provider_hints: ProviderHints {
@@ -61,6 +62,7 @@ fn seed(ledger: &Ledger) -> (String, i64, String) {
             model: "sonnet".into(),
             effort: None,
             sandbox: Sandbox::WorkspaceWrite,
+            env: Default::default(),
         },
         field_notes: vec![],
     };

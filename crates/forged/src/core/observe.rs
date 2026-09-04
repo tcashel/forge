@@ -246,6 +246,7 @@ fn summary_run_status(status: &Value) -> Value {
         "outcome": status.get("outcome"),
         "currentStage": status.get("currentStage"),
         "gateState": status.get("gateState"),
+        "seatChecks": status.get("gateState"),
         "claimHealth": status.get("claimHealth"),
         "nextAction": status.get("nextAction"),
     })
@@ -1747,6 +1748,7 @@ fn result_json(result: &PacketResult) -> Value {
             "commitsAhead": commits_ahead,
             "summary": summary,
             "gateState": gate_state,
+            "seatChecks": gate_state,
             "note": note,
         }),
         Outcome::Review {
@@ -2035,15 +2037,16 @@ fn gate_rows(results: &BTreeMap<i64, PacketResult>) -> Vec<Value> {
                     _ => None,
                 };
                 Some(json!({
-                    "attemptId": attempt_id,
-                    "packetId": result.packet_id,
-                    "implemented": implemented,
-                    "commitsAhead": commits_ahead,
-                    "summary": summary,
-                    "gateState": gate_state,
-                    "passed": passed,
-                    "note": note,
-                }))
+                        "attemptId": attempt_id,
+                        "packetId": result.packet_id,
+                        "implemented": implemented,
+                        "commitsAhead": commits_ahead,
+                        "summary": summary,
+                        "gateState": gate_state,
+                "seatChecks": gate_state,
+                        "passed": passed,
+                        "note": note,
+                    }))
             }
             _ => None,
         })

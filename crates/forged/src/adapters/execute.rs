@@ -90,6 +90,9 @@ pub enum PacketOutcome {
     Quarantined,
     /// A transport failure was recorded (free retry within the budget).
     Transport(String),
+    /// The attempt was killed at its stage deadline; relaunched under the
+    /// deadline budget with the worktree intact.
+    Deadline(String),
     /// A claimed attempt was retired before any provider ran, and charged to
     /// the same bounded budget. Distinct from `Transport` because nothing
     /// was transported: no seat spoke, so there is no stage result to read.
@@ -119,7 +122,7 @@ fn deadline_reason(
         return Ok(None);
     }
     Ok(Some(format!(
-        "transport: stage deadline exceeded: attemptId={attempt_id} stage={} startedAt={} budgetS={} deadlineAt={} asOf={as_of}",
+        "deadline: stage deadline exceeded: attemptId={attempt_id} stage={} startedAt={} budgetS={} deadlineAt={} asOf={as_of}",
         stage_str(packet.stage),
         started_at,
         budget_s,
@@ -137,33 +140,18 @@ async fn settle_deadline_retry(
     let current = on_ledger(&ctx.ledger, move |ledger| ledger.get_attempt(attempt_id)).await?;
     if current.state == AttemptState::Failed && current.revoke_scope == Some(RevokeScope::Deadline)
     {
-        return Ok(PacketOutcome::Transport(note));
+        return Ok(PacketOutcome::Deadline(note));
     }
     if current.state != AttemptState::Revoking
         || current.revoke_scope != Some(RevokeScope::Deadline)
     {
         return Ok(PacketOutcome::Revoked);
     }
-    let since = current.updated_at;
-    let started_at = current.started_at;
-    let run_id = run_id.to_owned();
-    let packet_id = packet_id.to_owned();
-    on_ledger(&ctx.ledger, move |ledger| {
-        forged_proto::grant_retry_for_attempt_under_active_policy(
-            ledger,
-            &run_id,
-            &packet_id,
-            attempt_id,
-            &since,
-            &started_at,
-        )
-        .map_err(|error| forged_ledger::LedgerError::Internal {
-            message: error.to_string(),
-        })
-    })
-    .await?;
+    // A deadline kill earns no retry grant: the engine counts it from the
+    // attempt rows under `deadline_retry_budget`, apart from transport.
+    let _ = (run_id, packet_id);
     on_ledger(&ctx.ledger, move |ledger| ledger.mark_timed_out(attempt_id)).await?;
-    Ok(PacketOutcome::Transport(note))
+    Ok(PacketOutcome::Deadline(note))
 }
 
 async fn deadline_marker(ctx: &Ctx, attempt_id: i64, note: &str) -> Result<AttemptRow, Failure> {
@@ -359,6 +347,66 @@ pub(crate) fn packet_keys(packet: &WorkPacket) -> Result<(String, i64), Failure>
     }
 }
 
+/// The line a relaunched attempt reads about the work its packet already
+/// holds: the last settled attempt of the same packet and the commits the
+/// worktree carries ahead of the base ref. `None` for a packet's first
+/// attempt on a clean tree, so the first prompt is byte-identical to today.
+async fn relaunch_note(
+    ctx: &Ctx,
+    run_id: &str,
+    packet: &WorkPacket,
+) -> Result<Option<String>, Failure> {
+    let prior = {
+        let run_id = run_id.to_owned();
+        let packet_id = packet.packet_id.clone();
+        on_ledger(&ctx.ledger, move |ledger| {
+            let mut prior: Vec<i64> = Vec::new();
+            for state in [
+                AttemptState::Completed,
+                AttemptState::Failed,
+                AttemptState::Reclaimed,
+            ] {
+                prior.extend(
+                    ledger
+                        .list_attempts_in_state(Some(&run_id), state)?
+                        .into_iter()
+                        .filter(|attempt| attempt.packet_id == packet_id)
+                        .map(|attempt| attempt.attempt_id),
+                );
+            }
+            Ok(prior.into_iter().max())
+        })
+        .await?
+    };
+    // A worktree that does not exist yet has nothing to report.
+    let (commits_ahead, shas) =
+        super::ports::worktree_commits_ahead(&packet.worktree, &packet.base_ref)
+            .await
+            .unwrap_or_default();
+    match (prior, commits_ahead) {
+        (None, 0) => Ok(None),
+        (prior, commits_ahead) => {
+            let attempt = prior.map_or_else(
+                || "A prior attempt".to_owned(),
+                |id| format!("Attempt {id} of this packet"),
+            );
+            let commits = if commits_ahead == 0 {
+                "no commits".to_owned()
+            } else {
+                format!(
+                    "{commits_ahead} commit(s) ({}) ahead of {}",
+                    shas.join(", "),
+                    packet.base_ref
+                )
+            };
+            Ok(Some(format!(
+                "{attempt} already ran here; the worktree carries {commits}. Continue \
+                 from the committed state: do not redo, re-baseline, or re-verify it."
+            )))
+        }
+    }
+}
+
 /// Fill every `WorkPacket` field the intent does not carry.
 ///
 /// A work-sourced packet reads its spec from the packet directory, where
@@ -372,6 +420,8 @@ pub fn build_packet(
     source: &SpecSource,
     spec: &ResolvedSpec,
     gate_commands: &[String],
+    seat_commands: &[String],
+    seat_env: &std::collections::BTreeMap<String, String>,
     budget_s: u64,
     protocol: Option<&forged_types::ProtocolRef>,
 ) -> Result<WorkPacket, Failure> {
@@ -473,9 +523,18 @@ pub fn build_packet(
             },
             deliverable,
             budget_s: u32::try_from(budget_s).unwrap_or(u32::MAX),
+            seat_commands: if planning {
+                Vec::new()
+            } else {
+                seat_commands.to_vec()
+            },
         },
         result_schema: prompt_stage.result_schema().to_owned(),
-        provider_hints: intent.hints.clone(),
+        provider_hints: {
+            let mut hints = intent.hints.clone();
+            hints.env = seat_env.clone();
+            hints
+        },
         field_notes: spec.work_context.clone(),
     };
     packet.spec.path = match source {
@@ -810,6 +869,7 @@ fn render_context(
             "base_ref": format!("origin/{}", packet.base_ref),
             "spec_path": packet.spec.path,
             "gate_commands": packet.contract.gate_commands,
+            "seat_commands": packet.contract.seat_commands,
             "field_notes": packet.field_notes,
             "packet_id": packet.packet_id,
             "result_schema": packet.result_schema,
@@ -845,6 +905,7 @@ fn render_context(
                 1
             },
             "gate_commands": packet.contract.gate_commands,
+            "seat_commands": packet.contract.seat_commands,
             "push_url": exec.push_url,
             "findings": forged_provider::normalize_findings(&exec.findings),
             "field_notes": packet.field_notes,
@@ -1057,10 +1118,13 @@ pub async fn execute_packet(
             recoverable: true,
         });
     }
-    let admitted_hints = admission
+    let mut admitted_hints = admission
         .packet_provider_hints
         .clone()
         .ok_or_else(|| Failure::internal("packet admission omitted provider launch facts"))?;
+    // Admission decides the launch facts (provider, model, sandbox); the
+    // operator's seat environment is frozen in the packet and rides along.
+    admitted_hints.env = packet.provider_hints.env.clone();
     let reservation_id = admission
         .reservation
         .ok_or_else(|| Failure::internal("admitted packet has no capacity reservation"))?
@@ -1501,6 +1565,9 @@ async fn run_attempt(
                     intervention.id, intervention.requested_by, intervention.message
                 )
             }));
+        if let Some(note) = relaunch_note(ctx, &run_id, &packet).await? {
+            packet.field_notes.push(note);
+        }
         // Renewal targets the lease that is actually held — renewal is
         // owner-only, and a renewal under a second, derived identity would
         // be refused and let the run's own lease lapse under it. Internal
@@ -1701,6 +1768,8 @@ async fn run_attempt(
                         forged_types::AdmissionResourceClass::RepositoryWrite => {
                             "repository-write"
                         }
+
+                        forged_types::AdmissionResourceClass::Gate => "gate",
                     },
                     facts.control_revision
                 ),
@@ -3005,6 +3074,7 @@ mod tests {
                     Deliverable::ReviewBlock
                 },
                 budget_s: 600,
+                seat_commands: Vec::new(),
             },
             result_schema: if purpose == SeatPurpose::Fix {
                 "forged.result.fix/1".to_owned()
@@ -3020,6 +3090,7 @@ mod tests {
                 } else {
                     Sandbox::ReadOnly
                 },
+                env: Default::default(),
             },
             field_notes: Vec::new(),
         }
@@ -3543,6 +3614,9 @@ mod settle_tests {
             gate_commands: Vec::new(),
             stage_budget_s: HashMap::new(),
             transport_retry_budget: 3,
+            seat_commands: Vec::new(),
+            deadline_retry_budget: 1,
+            seat_env: Default::default(),
             transport_patterns: Vec::new(),
             provider_transport_patterns: Default::default(),
             bd_path: root.join("bd"),
@@ -3670,6 +3744,7 @@ mod settle_tests {
                 model: "claude-test".to_owned(),
                 effort: None,
                 sandbox: forged_types::Sandbox::WorkspaceWrite,
+                env: Default::default(),
             },
             execution: None,
             packet_id: None,
@@ -3681,8 +3756,19 @@ mod settle_tests {
             fence: forged_ledger::SpecFence::Sha256(spec_sha.clone()),
             work_context: Vec::new(),
         };
-        let packet = build_packet(&ctx, &run, &intent, &source, &resolved, &[], budget_s, None)
-            .expect("packet");
+        let packet = build_packet(
+            &ctx,
+            &run,
+            &intent,
+            &source,
+            &resolved,
+            &[],
+            &[],
+            &Default::default(),
+            budget_s,
+            None,
+        )
+        .expect("packet");
         std::fs::create_dir_all(&packet.worktree).expect("worktree");
         let packet_id = ledger
             .open_packet(forged_ledger::NewPacket {
@@ -3752,7 +3838,7 @@ mod settle_tests {
         )
         .await
         .expect("overdue adoption settles");
-        assert!(matches!(outcome, PacketOutcome::Transport(_)));
+        assert!(matches!(outcome, PacketOutcome::Deadline(_)));
         assert!(
             fixture
                 .ledger
@@ -3772,7 +3858,7 @@ mod settle_tests {
         assert!(attempt
             .fail_note
             .as_deref()
-            .is_some_and(|note| note.starts_with("transport: stage deadline exceeded")));
+            .is_some_and(|note| note.starts_with("deadline: stage deadline exceeded")));
         let events = fixture
             .ledger
             .list_events(Some(RUN_ID), 0, 1_000)
@@ -3782,8 +3868,8 @@ mod settle_tests {
                 .iter()
                 .filter(|event| event.kind == "proto.retry")
                 .count(),
-            1,
-            "the overdue attempt earns exactly one attempt-addressed successor grant"
+            0,
+            "a deadline kill earns no retry grant; the engine counts it from the attempt rows"
         );
         let attempt_owner = fixture.attempt_id.to_string();
         assert!(fixture
@@ -3830,7 +3916,7 @@ mod settle_tests {
         .await
         .expect("expired preparation settles through the deadline path");
 
-        assert!(matches!(outcome, PacketOutcome::Transport(_)));
+        assert!(matches!(outcome, PacketOutcome::Deadline(_)));
         let methods = seen.lock().expect("method log").clone();
         assert!(
             !methods.iter().any(|method| method == "pane.send_input"),
@@ -3849,7 +3935,7 @@ mod settle_tests {
         assert!(attempt
             .fail_note
             .as_deref()
-            .is_some_and(|note| note.starts_with("transport: stage deadline exceeded")));
+            .is_some_and(|note| note.starts_with("deadline: stage deadline exceeded")));
         let dirs = PacketDirs::new(&fixture.packet_dir, fixture.attempt_id);
         let session: Value = serde_json::from_slice(
             &std::fs::read(dirs.session()).expect("deadline session evidence"),
@@ -3891,10 +3977,10 @@ mod settle_tests {
             started.elapsed() < Duration::from_secs(3),
             "the five-second pid identity window outlived the stage budget"
         );
-        let PacketOutcome::Transport(note) = outcome else {
-            panic!("deadline must settle as transport")
+        let PacketOutcome::Deadline(note) = outcome else {
+            panic!("deadline must settle as a deadline kill")
         };
-        assert!(note.starts_with("transport: stage deadline exceeded"));
+        assert!(note.starts_with("deadline: stage deadline exceeded"));
         assert!(!note.contains("pid file never appeared"));
         let attempt = fixture
             .ledger
@@ -4009,7 +4095,7 @@ mod settle_tests {
         )
         .await
         .expect("late terminal output settles as a timeout");
-        assert!(matches!(outcome, PacketOutcome::Transport(_)));
+        assert!(matches!(outcome, PacketOutcome::Deadline(_)));
 
         let attempt = fixture
             .ledger
@@ -4025,8 +4111,8 @@ mod settle_tests {
                 .iter()
                 .filter(|event| event.kind == "proto.retry")
                 .count(),
-            1,
-            "the late terminal observation earns exactly one retry"
+            0,
+            "a deadline kill earns no retry grant"
         );
         let methods = seen.lock().expect("method log").clone();
         assert_eq!(
@@ -4118,7 +4204,7 @@ mod settle_tests {
             .ledger
             .revoke_attempt_scoped(
                 settle.attempt_id,
-                "transport: stage deadline exceeded: pre-cutoff settle fixture",
+                "deadline: stage deadline exceeded: pre-cutoff settle fixture",
                 RevokeScope::Deadline,
             )
             .expect("deadline marker");
@@ -4128,11 +4214,11 @@ mod settle_tests {
             RUN_ID,
             &settle.packet_id,
             settle.attempt_id,
-            "transport: stage deadline exceeded: pre-cutoff settle fixture".to_owned(),
+            "deadline: stage deadline exceeded: pre-cutoff settle fixture".to_owned(),
         )
         .await
         .expect("settle pre-cutoff deadline");
-        assert!(matches!(outcome, PacketOutcome::Transport(_)));
+        assert!(matches!(outcome, PacketOutcome::Deadline(_)));
         assert_eq!(retry_state(&settle.ledger, &settle.packet_id), before);
         assert_eq!(
             settle
@@ -4176,7 +4262,7 @@ mod settle_tests {
             .ledger
             .revoke_attempt_scoped(
                 reconcile_fixture.attempt_id,
-                "transport: stage deadline exceeded: pre-cutoff reconcile fixture",
+                "deadline: stage deadline exceeded: pre-cutoff reconcile fixture",
                 RevokeScope::Deadline,
             )
             .expect("reconcile deadline marker");
