@@ -85,40 +85,41 @@ pub(crate) async fn stored_attach_hint_for_test(
         .and_then(|record| record.attach_hint)
 }
 
+fn session_record(row: &forged_ledger::EventRow) -> Option<SessionRecord> {
+    if row.kind != SESSION_STARTED {
+        return None;
+    }
+    let payload = event_payload(row)?;
+    Some(SessionRecord {
+        attempt_id: payload.get("attemptId")?.as_i64()?,
+        packet_id: payload.get("packetId")?.as_str()?.to_owned(),
+        host: payload.get("host")?.as_str()?.to_owned(),
+        session_id: payload.get("sessionId")?.as_str()?.to_owned(),
+        socket_path: payload
+            .get("socketPath")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        status_path: payload
+            .get("statusPath")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        controller_generation: payload
+            .get("controllerGeneration")
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok()),
+        layout_id: payload
+            .get("layoutId")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        attach_hint: payload
+            .get("attachHint")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+    })
+}
+
 fn session_records(events: &[forged_ledger::EventRow]) -> Vec<SessionRecord> {
-    events
-        .iter()
-        .filter(|row| row.kind == SESSION_STARTED)
-        .filter_map(|row| {
-            let payload = event_payload(row)?;
-            Some(SessionRecord {
-                attempt_id: payload.get("attemptId")?.as_i64()?,
-                packet_id: payload.get("packetId")?.as_str()?.to_owned(),
-                host: payload.get("host")?.as_str()?.to_owned(),
-                session_id: payload.get("sessionId")?.as_str()?.to_owned(),
-                socket_path: payload
-                    .get("socketPath")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-                status_path: payload
-                    .get("statusPath")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-                controller_generation: payload
-                    .get("controllerGeneration")
-                    .and_then(Value::as_u64)
-                    .and_then(|value| u32::try_from(value).ok()),
-                layout_id: payload
-                    .get("layoutId")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-                attach_hint: payload
-                    .get("attachHint")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-            })
-        })
-        .collect()
+    events.iter().filter_map(session_record).collect()
 }
 
 /// Persist a selected host/session handle after spawn. Pane ids remain useful
@@ -262,6 +263,50 @@ fn parse_session_cursor(value: &str) -> Result<i64, Failure> {
         .ok_or_else(|| Failure::invalid("session list cursor is invalid"))
 }
 
+async fn session_json(
+    ctx: &Ctx,
+    identity: &forged_types::WorkIdentityV1,
+    record: SessionRecord,
+) -> Result<Value, Failure> {
+    let attempt_id = record.attempt_id;
+    let attempt = on_ledger(&ctx.ledger, move |ledger| ledger.get_attempt(attempt_id)).await?;
+    let claim_token = attempt.claim_token.clone();
+    let owned = on_ledger(&ctx.ledger, move |ledger| {
+        ledger.find_owned_herdr_attempt(attempt_id, &claim_token)
+    })
+    .await?;
+    let projection = match owned {
+        Some(owned) => {
+            super::herdr_projection::status_for_ownership(ctx, &owned.ownership_id).await
+        }
+        None => Value::Null,
+    };
+    Ok(json!({
+        "attemptId": attempt.attempt_id,
+        "packetId": record.packet_id,
+        "providerClaimant": attempt.claimant,
+        "state": attempt.state.as_str(),
+        "host": record.host,
+        "sessionId": record.session_id,
+        "socketPath": record.socket_path,
+        "statusPath": record.status_path,
+        "controllerGeneration": record.controller_generation,
+        "layoutId": record.layout_id,
+        "identity": identity,
+        "herdrProjection": projection,
+        // The hint is durable, but terminal pane cleanup is an
+        // independent supervisor effect. `Running` and `Revoking`
+        // are the only states in which attachment remains useful;
+        // every terminal state suppresses the hint even while cleanup
+        // is pending or retrying.
+        "attachHint": match attempt.state {
+            forged_ledger::AttemptState::Running
+            | forged_ledger::AttemptState::Revoking => record.attach_hint,
+            _ => None,
+        },
+    }))
+}
+
 /// `session list` — durable session metadata plus current attempt state.
 pub async fn session_list(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
     read_only("session_list", req, || async {
@@ -321,51 +366,96 @@ pub async fn session_list(ctx: &Ctx, req: &OperationRequest) -> OperationRespons
                     ledger.work_observation_snapshot(WorkIdentitySubjectKind::Epic, &epic_id, 0, 1)
                 })
                 .await?;
+                let child_ids = snapshot
+                    .epic_children
+                    .iter()
+                    .map(|child| child.run_id.clone())
+                    .collect::<Vec<_>>();
+                let page = {
+                    let child_ids = child_ids.clone();
+                    let page_limit = u32::try_from(limit.saturating_add(1)).unwrap_or(501);
+                    on_ledger(&ctx.ledger, move |ledger| {
+                        ledger.list_subjects_events_by_kind_desc_with_counts(
+                            child_ids,
+                            SESSION_STARTED,
+                            before,
+                            page_limit,
+                        )
+                    })
+                    .await?
+                };
+                let mut events = page.rows;
+                let counts = page.counts;
+                let has_more = events.len() > limit as usize;
+                events.truncate(limit as usize);
+                let next_cursor = has_more
+                    .then(|| events.last().map(|row| session_cursor(row.event_id)))
+                    .flatten();
+                let identities = snapshot
+                    .child_identities
+                    .into_iter()
+                    .map(|identity| (identity.subject.id.clone(), identity))
+                    .collect::<BTreeMap<_, _>>();
                 let mut sessions = Vec::new();
-                let mut child_runs = Vec::new();
-                let mut total = 0u64;
-                let mut truncated = false;
-                for child in snapshot.epic_children {
-                    let mut params = serde_json::Map::from_iter([
-                        ("run".to_owned(), json!(child.run_id)),
-                        ("limit".to_owned(), json!(limit)),
-                    ]);
-                    if let Some(cursor) = req.params.get("cursor") {
-                        params.insert("cursor".to_owned(), cursor.clone());
-                    }
-                    let child_req = OperationRequest {
-                        schema_version: req.schema_version,
-                        idempotency_key: String::new(),
-                        run_id: Some(child.run_id.clone()),
-                        params,
+                let mut sessions_by_run = BTreeMap::<String, Vec<Value>>::new();
+                for event in &events {
+                    let Some(record) = session_record(event) else {
+                        continue;
                     };
-                    let response = Box::pin(session_list(ctx, &child_req)).await;
-                    if !response.ok {
-                        let error = response.error.expect("failed response carries error");
-                        return Err(Failure {
-                            code: error.code,
-                            message: error.message,
-                            recoverable: error.recoverable,
-                        });
-                    }
-                    let result = response.result.unwrap_or(Value::Null);
-                    sessions.extend(
-                        result
-                            .get("sessions")
-                            .and_then(Value::as_array)
-                            .into_iter()
-                            .flatten()
-                            .cloned(),
+                    let run_id = event
+                        .run_id
+                        .as_deref()
+                        .ok_or_else(|| Failure::internal("session-started event has no run id"))?;
+                    let identity = identities.get(run_id).ok_or_else(|| {
+                        Failure::internal(format!(
+                            "epic session child {run_id:?} has no durable identity"
+                        ))
+                    })?;
+                    let session = session_json(ctx, identity, record).await?;
+                    sessions.push(session.clone());
+                    sessions_by_run
+                        .entry(run_id.to_owned())
+                        .or_default()
+                        .push(session);
+                }
+                let mut child_runs = Vec::new();
+                for run_id in child_ids {
+                    let identity = identities.get(&run_id).ok_or_else(|| {
+                        Failure::internal(format!(
+                            "epic session child {run_id:?} has no durable identity"
+                        ))
+                    })?;
+                    let child_sessions = sessions_by_run.remove(&run_id).unwrap_or_default();
+                    let shown = child_sessions.len();
+                    let count =
+                        counts
+                            .get(&run_id)
+                            .copied()
+                            .unwrap_or(forged_ledger::SubjectEventCount {
+                                total: 0,
+                                eligible: 0,
+                            });
+                    let truncated = count.eligible > shown as u64;
+                    let pending = pending_interventions(ctx, &run_id).await?;
+                    let subject = super::work_identity::projection_subject(
+                        identity,
+                        forged_types::ProjectionSubjectKind::Run,
+                        &run_id,
                     );
-                    total += result
-                        .pointer("/coverage/total")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0);
-                    truncated |= result
-                        .pointer("/coverage/truncated")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false);
-                    child_runs.push(result);
+                    child_runs.push(forged_types::with_work_twins(json!({
+                        "schema": "forged.session-list/1",
+                        "subject": subject,
+                        "runId": run_id,
+                        "identity": identity,
+                        "sessions": child_sessions,
+                        "pendingInterventions": pending.len(),
+                        "coverage": {
+                            "shown": shown,
+                            "total": count.total,
+                            "truncated": truncated,
+                            "nextCursor": if truncated { next_cursor.clone() } else { None },
+                        },
+                    })));
                 }
                 let identity = snapshot.identity;
                 let subject = super::work_identity::projection_subject(
@@ -374,6 +464,7 @@ pub async fn session_list(ctx: &Ctx, req: &OperationRequest) -> OperationRespons
                     &epic,
                 );
                 let shown = sessions.len();
+                let total = counts.values().map(|count| count.total).sum::<u64>();
                 return Ok(forged_types::with_work_twins(json!({
                     "schema": "forged.session-list/1",
                     "subject": subject,
@@ -384,8 +475,8 @@ pub async fn session_list(ctx: &Ctx, req: &OperationRequest) -> OperationRespons
                     "coverage": {
                         "shown": shown,
                         "total": total,
-                        "truncated": truncated,
-                        "nextCursor": Value::Null,
+                        "truncated": has_more,
+                        "nextCursor": next_cursor,
                     },
                 })));
             }
@@ -413,44 +504,7 @@ pub async fn session_list(ctx: &Ctx, req: &OperationRequest) -> OperationRespons
         let records = session_records(&events);
         let mut sessions = Vec::new();
         for record in records {
-            let attempt_id = record.attempt_id;
-            let attempt =
-                on_ledger(&ctx.ledger, move |ledger| ledger.get_attempt(attempt_id)).await?;
-            let claim_token = attempt.claim_token.clone();
-            let owned = on_ledger(&ctx.ledger, move |ledger| {
-                ledger.find_owned_herdr_attempt(attempt_id, &claim_token)
-            })
-            .await?;
-            let projection = match owned {
-                Some(owned) => {
-                    super::herdr_projection::status_for_ownership(ctx, &owned.ownership_id).await
-                }
-                None => Value::Null,
-            };
-            sessions.push(json!({
-                "attemptId": attempt.attempt_id,
-                "packetId": record.packet_id,
-                "providerClaimant": attempt.claimant,
-                "state": attempt.state.as_str(),
-                "host": record.host,
-                "sessionId": record.session_id,
-                "socketPath": record.socket_path,
-                "statusPath": record.status_path,
-                "controllerGeneration": record.controller_generation,
-                "layoutId": record.layout_id,
-                "identity": identity.clone(),
-                "herdrProjection": projection,
-                // The hint is durable, but terminal pane cleanup is an
-                // independent supervisor effect. `Running` and `Revoking`
-                // are the only states in which attachment remains useful;
-                // every terminal state suppresses the hint even while cleanup
-                // is pending or retrying.
-                "attachHint": match attempt.state {
-                    forged_ledger::AttemptState::Running
-                    | forged_ledger::AttemptState::Revoking => record.attach_hint.clone(),
-                    _ => None,
-                },
-            }));
+            sessions.push(session_json(ctx, &identity, record).await?);
         }
         let pending = pending_interventions(ctx, &run_id).await?;
         let shown = sessions.len();

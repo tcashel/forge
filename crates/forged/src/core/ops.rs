@@ -4366,7 +4366,11 @@ fn operations_subject(entry: &Value) -> Value {
         });
     json!({
         "kind": if entry.get("source").and_then(Value::as_str) == Some("live-plan") {
-            json!("plan")
+            if entry.get("kind").and_then(Value::as_str) == Some("epic") {
+                json!("epic")
+            } else {
+                json!("work")
+            }
         } else {
             identity.pointer("/subject/kind").cloned().unwrap_or_else(|| {
                 if entry.get("kind").and_then(Value::as_str) == Some("epic") {
@@ -6047,10 +6051,23 @@ fn event_summary(kind: &str, payload: &Value) -> Value {
 
 /// `events` — read-only, paginated; proto rows are validated through the
 /// replay parser on the way out.
+fn events_selector<'a>(
+    params: &'a serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<Option<&'a str>, Failure> {
+    match params.get(key) {
+        None => Ok(None),
+        Some(Value::String(value)) if !value.trim().is_empty() => Ok(Some(value)),
+        Some(_) => Err(Failure::invalid(format!(
+            "events param {key:?} must be a non-empty string"
+        ))),
+    }
+}
+
 pub async fn events_tail(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
     read_only("events_tail", req, || async {
-        let direct_run = param_opt_str(&req.params, "run");
-        let id = param_opt_str(&req.params, "id");
+        let direct_run = events_selector(&req.params, "run")?;
+        let id = events_selector(&req.params, "id")?;
         let subject_kind = param_opt_str(&req.params, "subjectKind");
         if direct_run.is_some() && id.is_some() {
             return Err(Failure::invalid(
@@ -6063,7 +6080,31 @@ pub async fn events_tail(ctx: &Ctx, req: &OperationRequest) -> OperationResponse
             ));
         }
         let target = match (direct_run, id) {
-            (Some(run), None) => Some((WorkIdentitySubjectKind::Run, run.to_owned())),
+            (Some(run), None) => {
+                // `--run` predates kinded selectors and names an event-stream
+                // id. Preserve legacy epic streams and typo-as-empty-page
+                // behavior while classifying a known durable identity when
+                // one exists.
+                let run_id = run.to_owned();
+                let identity_id = run_id.clone();
+                let kind = on_ledger(&ctx.ledger, move |ledger| {
+                    if ledger
+                        .get_work_identity(WorkIdentitySubjectKind::Run, &identity_id)?
+                        .is_some()
+                    {
+                        Ok(WorkIdentitySubjectKind::Run)
+                    } else if ledger
+                        .get_work_identity(WorkIdentitySubjectKind::Epic, &identity_id)?
+                        .is_some()
+                    {
+                        Ok(WorkIdentitySubjectKind::Epic)
+                    } else {
+                        Ok(WorkIdentitySubjectKind::Run)
+                    }
+                })
+                .await?;
+                Some((kind, run_id))
+            }
             (None, Some(id)) => {
                 match super::observe::execution_target(ctx, id, subject_kind).await? {
                     super::observe::ExecutionTarget::Run(run) => {
@@ -6086,14 +6127,27 @@ pub async fn events_tail(ctx: &Ctx, req: &OperationRequest) -> OperationResponse
         let run = target.as_ref().map(|(_, id)| id.clone());
         let subject = match target.as_ref() {
             Some((kind, id)) => {
-                let identity = super::work_identity::load(ctx, *kind, id).await?;
-                super::work_identity::projection_subject(
-                    &identity,
-                    match kind {
-                        WorkIdentitySubjectKind::Run => forged_types::ProjectionSubjectKind::Run,
-                        WorkIdentitySubjectKind::Epic => forged_types::ProjectionSubjectKind::Epic,
+                let identity_id = id.clone();
+                let identity_kind = *kind;
+                let identity = on_ledger(&ctx.ledger, move |ledger| {
+                    ledger.get_work_identity(identity_kind, &identity_id)
+                })
+                .await?;
+                let projection_kind = match kind {
+                    WorkIdentitySubjectKind::Run => forged_types::ProjectionSubjectKind::Run,
+                    WorkIdentitySubjectKind::Epic => forged_types::ProjectionSubjectKind::Epic,
+                };
+                identity.map_or_else(
+                    || forged_types::ProjectionSubjectV1 {
+                        id: id.clone(),
+                        kind: projection_kind,
+                        title: None,
+                        repository: None,
+                        revision: None,
                     },
-                    id,
+                    |identity| {
+                        super::work_identity::projection_subject(&identity, projection_kind, id)
+                    },
                 )
             }
             None => forged_types::ProjectionSubjectV1 {

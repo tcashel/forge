@@ -110,6 +110,7 @@ fn work_ready_summarizes_by_default_and_full_round_trips_complete_rows() {
             "repository",
             "revision",
             "status",
+            "subject",
             "title",
         ])
     );
@@ -123,6 +124,13 @@ fn work_ready_summarizes_by_default_and_full_round_trips_complete_rows() {
             "priority": 2,
             "repository": "/tmp/fat-ready-repo",
             "revision": 1,
+            "subject": {
+                "id": "fat-ready",
+                "kind": "work",
+                "title": "Fat ready item",
+                "repository": "/tmp/fat-ready-repo",
+                "revision": "1",
+            },
         })
     );
 
@@ -131,10 +139,9 @@ fn work_ready_summarizes_by_default_and_full_round_trips_complete_rows() {
         full["filters"],
         json!({"detail": "full", "limit": 100, "all": false})
     );
-    assert_eq!(
-        full["ready"][0], created["work"],
-        "--full preserves the complete pre-summary snapshot shape and bytes"
-    );
+    let mut expected_full = created["work"].clone();
+    expected_full["subject"] = row["subject"].clone();
+    assert_eq!(full["ready"][0], expected_full);
 }
 
 #[test]

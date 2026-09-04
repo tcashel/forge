@@ -2213,7 +2213,7 @@ async fn status_json(ctx: &Ctx, view: EpicView) -> Result<Value, Failure> {
     if !view.waves.is_empty() {
         object.insert("waves".to_owned(), Value::Array(view.waves));
     }
-    Ok(forged_types::with_work_twins(status))
+    Ok(status)
 }
 
 /// One preflight verdict row. Failures record rather than short-circuit so
@@ -2571,7 +2571,8 @@ pub async fn epic_preflight(ctx: &Ctx, req: &OperationRequest) -> OperationRespo
 pub async fn epic_status(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
     read_only("epic_status", req, || async {
         let epic = param_str(&req.params, "epic")?;
-        status_json(ctx, project(ctx, epic).await?).await
+        let status = status_json(ctx, project(ctx, epic).await?).await?;
+        Ok(forged_types::with_work_twins(status))
     })
     .await
 }

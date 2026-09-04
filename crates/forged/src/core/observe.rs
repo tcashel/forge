@@ -782,11 +782,11 @@ fn resolution(id: &str, reason: &str, candidates: Vec<Value>, disambiguate: bool
     })
 }
 
-/// Resolve a bare `id` to a kind through ONE inventory scan.
+/// Resolve a bare `id` to a kind through the shared operator index.
 ///
-/// The inventory `work_list` serves is the resolution index — the only place
-/// an epic with no `runs` row is discoverable — so resolution reads it whole
-/// and matches in memory rather than issuing a lookup per candidate.
+/// Exact Work lookup retains the normative precedence. Durable run/epic
+/// identities preserve otherwise-folded namespace collisions, and the
+/// inventory `work_list` serves remains the bounded prefix index.
 ///
 /// An exact id always wins over any prefix interpretation of the same
 /// string, so a shorter id that prefixes a longer one is never shadowed by
@@ -966,10 +966,33 @@ pub(crate) async fn execution_target(
         },
         ResolvedId::WorkItem(work) => {
             let work_id = work.work_id;
+            let work_id_for_runs = work_id.clone();
             let mut runs = on_ledger(&ctx.ledger, move |ledger| ledger.list_runs()).await?;
-            runs.retain(|run| run.work_id == work_id);
+            runs.retain(|run| run.work_id == work_id_for_runs);
             match runs.pop() {
                 Some(run) => ExecutionTarget::Run(run.run_id),
+                None if subject_kind.is_none() => {
+                    // A started epic commonly has the same id as its root
+                    // Work but deliberately has no runs row of its own. Work
+                    // keeps exact resolver precedence; execution reads still
+                    // recover the executable epic projection instead of a
+                    // no-run dead end. Explicit `subjectKind: work` retains
+                    // the per-kind no-run answer.
+                    let epic_id = work_id.clone();
+                    let epic = on_ledger(&ctx.ledger, move |ledger| {
+                        ledger.get_work_identity(
+                            forged_types::WorkIdentitySubjectKind::Epic,
+                            &epic_id,
+                        )
+                    })
+                    .await?;
+                    match epic {
+                        Some(_) => ExecutionTarget::Epic(work_id),
+                        None => {
+                            ExecutionTarget::Unresolved(resolution(id, "no-run", Vec::new(), false))
+                        }
+                    }
+                }
                 None => ExecutionTarget::Unresolved(resolution(id, "no-run", Vec::new(), false)),
             }
         }

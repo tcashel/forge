@@ -206,6 +206,40 @@ fn a_fresh_work_is_never_claimed_while_a_resumable_run_exists() {
 }
 
 #[test]
+fn failed_subject_enrichment_cannot_return_a_successful_claim() {
+    let env = TestEnv::new("forged-claim-next-subject-failure");
+    env.forged(&["init"]);
+    fabricate_resumable(&env, "bead-subject-failure");
+
+    let connection =
+        rusqlite::Connection::open(env.anvil.join("state.db")).expect("open fixture db");
+    connection
+        .execute(
+            "DELETE FROM work_identities WHERE subject_kind = 'run' AND subject_id = ?1",
+            ["bead-subject-failure"],
+        )
+        .expect("remove identity required by the projection");
+    drop(connection);
+
+    let (code, response) = env.forged(&[
+        "claim-next",
+        "--holder",
+        "worker-1",
+        "--idempotency-key",
+        "op:claim_next:subject-failure-1",
+    ]);
+    assert_ne!(code, 0, "missing subject identity must fail: {response}");
+    assert_eq!(response["ok"], json!(false));
+    assert_eq!(response["result"], Value::Null);
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("work identity")),
+        "the failure names the missing projection dependency: {response}"
+    );
+}
+
+#[test]
 fn anothers_live_lease_leaves_the_run_alone() {
     // The refusal shape: the work-lease reclaim reclaims nothing because another
     // worker's lease is live — claim-next leaves the run untouched and

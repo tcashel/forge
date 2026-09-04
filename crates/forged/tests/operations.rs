@@ -1105,7 +1105,7 @@ fn operations_joins_one_bounded_live_plan_without_duplicate_durable_work() {
     ]);
     assert_eq!(code, 0, "summary operations overview: {summary}");
     let rows = entries(&summary);
-    assert_eq!(rows["plan-a"]["subject"]["kind"], json!("plan"));
+    assert_eq!(rows["plan-a"]["subject"]["kind"], json!("work"));
     assert_eq!(rows["plan-a"]["subject"]["id"], json!("plan-a"));
     assert_eq!(
         rows["plan-a"]["subject"]["title"],

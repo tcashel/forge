@@ -145,6 +145,58 @@ async fn find_resumables(ctx: &Ctx) -> Result<Vec<Resumable>, Failure> {
 }
 
 /// The core function behind `claim-next` / the `claim_next` tool.
+async fn claim_subject(
+    ctx: &Ctx,
+    result: &Value,
+) -> Result<forged_types::ProjectionSubjectV1, Failure> {
+    let claimed = result
+        .get("claimed")
+        .ok_or_else(|| Failure::internal("claim-next result has no claimed field"))?;
+    if claimed.is_null() {
+        return Ok(forged_types::ProjectionSubjectV1 {
+            id: "ready".to_owned(),
+            kind: forged_types::ProjectionSubjectKind::Portfolio,
+            title: Some("Ready work".to_owned()),
+            repository: None,
+            revision: None,
+        });
+    }
+    if let Some(run_id) = claimed.get("run_id").and_then(Value::as_str) {
+        let identity =
+            super::work_identity::load(ctx, forged_types::WorkIdentitySubjectKind::Run, run_id)
+                .await?;
+        return Ok(super::work_identity::projection_subject(
+            &identity,
+            forged_types::ProjectionSubjectKind::Run,
+            run_id,
+        ));
+    }
+    if let Some(work_id) = claimed
+        .get("bead_id")
+        .or_else(|| claimed.get("work_id"))
+        .and_then(Value::as_str)
+    {
+        let work_id_owned = work_id.to_owned();
+        let work = on_ledger(&ctx.ledger, move |ledger| ledger.work_item(&work_id_owned))
+            .await?
+            .ok_or_else(|| {
+                Failure::internal(format!(
+                    "claim-next returned work {work_id:?} without a durable work item"
+                ))
+            })?;
+        return Ok(forged_types::ProjectionSubjectV1 {
+            id: work.work_id,
+            kind: forged_types::ProjectionSubjectKind::Work,
+            title: Some(work.spec.title),
+            repository: work.metadata.get("repository").cloned(),
+            revision: Some(work.revision.to_string()),
+        });
+    }
+    Err(Failure::internal(
+        "claim-next claimed value has neither a run nor work id",
+    ))
+}
+
 pub async fn claim_next(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
     let holder = match param_str(&req.params, "holder") {
         Ok(h) => h.to_owned(),
@@ -155,52 +207,23 @@ pub async fn claim_next(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
     })
     .await;
     if let Some(result) = response.result.as_mut() {
-        let claimed = result.get("claimed");
-        let subject = if let Some(run_id) = claimed
-            .and_then(|value| value.get("run_id"))
-            .and_then(Value::as_str)
-        {
-            super::work_identity::load(ctx, forged_types::WorkIdentitySubjectKind::Run, run_id)
-                .await
-                .ok()
-                .map(|identity| {
-                    super::work_identity::projection_subject(
-                        &identity,
-                        forged_types::ProjectionSubjectKind::Run,
-                        run_id,
-                    )
-                })
-        } else if let Some(work_id) = claimed
-            .and_then(|value| value.get("bead_id").or_else(|| value.get("work_id")))
-            .and_then(Value::as_str)
-        {
-            let work_id_owned = work_id.to_owned();
-            on_ledger(&ctx.ledger, move |ledger| ledger.work_item(&work_id_owned))
-                .await
-                .ok()
-                .flatten()
-                .map(|work| forged_types::ProjectionSubjectV1 {
-                    id: work.work_id,
-                    kind: forged_types::ProjectionSubjectKind::Work,
-                    title: Some(work.spec.title),
-                    repository: work.metadata.get("repository").cloned(),
-                    revision: Some(work.revision.to_string()),
-                })
-        } else {
-            Some(forged_types::ProjectionSubjectV1 {
-                id: "ready".to_owned(),
-                kind: forged_types::ProjectionSubjectKind::Portfolio,
-                title: Some("Ready work".to_owned()),
-                repository: None,
-                revision: None,
-            })
+        let subject = match claim_subject(ctx, result).await {
+            Ok(subject) => subject,
+            Err(failure) => return err_response(&response.operation_id, &failure),
         };
-        if let (Some(object), Some(subject)) = (result.as_object_mut(), subject) {
-            object.insert(
-                "subject".to_owned(),
-                serde_json::to_value(subject).expect("projection subject always serializes"),
-            );
-        }
+        let subject = match serde_json::to_value(subject) {
+            Ok(subject) => subject,
+            Err(error) => {
+                return err_response(
+                    &response.operation_id,
+                    &Failure::internal(format!("serializing claim-next subject: {error}")),
+                )
+            }
+        };
+        result
+            .as_object_mut()
+            .expect("claim-next success result is an object")
+            .insert("subject".to_owned(), subject);
         forged_types::add_work_twins(result);
     }
     response
