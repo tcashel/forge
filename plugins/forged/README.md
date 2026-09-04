@@ -13,7 +13,7 @@ target-scoped controls.
 
 ## Lead MCP tools
 
-The default `forged mcp` listing is the manifest's lead audience:
+The Claude plugin registers the server with `--audience all` so the host can offer every App-launching operator read alongside the lead verbs; a bare `forged mcp` (other hosts, machine seats) lists only the manifest's lead audience:
 
 - `attention_acknowledge`
 - `attention_list`
