@@ -738,11 +738,11 @@ fn a_closed_work_converges_for_every_outcome() {
     }
 }
 
-/// An unsupported schemaVersion refuses BEFORE the operation-store probe:
-/// it can neither execute a fresh destructive adjudication nor resume or
-/// replay one through the existing-row path.
+/// A nested legacy envelope refuses before the operation-store probe: the
+/// remedy names the now-flat required field and the malformed call can
+/// neither execute nor replay a destructive adjudication.
 #[test]
-fn an_unsupported_schema_version_never_executes_or_replays_adjudication() {
+fn a_nested_lead_shape_never_executes_or_replays_adjudication() {
     let env = TestEnv::new("forged-adjudicate-schema");
     env.forged(&["init"]);
     let run = "adj-schema";
@@ -758,7 +758,7 @@ fn an_unsupported_schema_version_never_executes_or_replays_adjudication() {
         "rationale": "legacy run",
         "evidenceGap": "controller.started carries no /driver/pid and no lstart",
     });
-    let mut mcp = McpClient::new(&env);
+    let mut mcp = McpClient::new(&env, None);
     let refused = mcp.call_tool(
         "run_adjudicate_settlement",
         json!({"schemaVersion": 99, "runId": run, "params": params}),
@@ -769,13 +769,16 @@ fn an_unsupported_schema_version_never_executes_or_replays_adjudication() {
         json!("INVALID_REQUEST"),
         "{refused}"
     );
-
-    // A durable terminal row exists now; the bad envelope still refuses
-    // instead of replaying the stored destructive response.
-    let accepted = mcp.call_tool(
-        "run_adjudicate_settlement",
-        json!({"schemaVersion": 1, "runId": run, "params": params}),
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("run")),
+        "wrong-shape remedy must name the flat field: {refused}"
     );
+
+    // A durable terminal row exists now; the nested shape still refuses
+    // instead of replaying the stored destructive response.
+    let accepted = mcp.call_tool("run_adjudicate_settlement", params.clone());
     assert_eq!(accepted["ok"], json!(true), "{accepted}");
     let replay_refused = mcp.call_tool(
         "run_adjudicate_settlement",
@@ -788,76 +791,6 @@ fn an_unsupported_schema_version_never_executes_or_replays_adjudication() {
         "{replay_refused}"
     );
     assert_eq!(replay_refused["reused"], json!(false), "{replay_refused}");
-}
-
-/// An envelope runId that disagrees with params.run is refused before
-/// anything durable exists: the effect settles params.run while the
-/// operation row would record the envelope's run, and the two must never
-/// diverge. Only the MCP surface can express the disagreement — the CLI
-/// derives both from `--run`.
-#[test]
-fn a_conflicting_envelope_run_id_is_refused_before_anything_durable() {
-    let env = TestEnv::new("forged-adjudicate-envelope-run");
-    env.forged(&["init"]);
-    let run = "adj-envelope";
-    seed_legacy(&env, run);
-
-    let mut mcp = McpClient::new(&env);
-    let response = mcp.call_tool(
-        "run_adjudicate_settlement",
-        json!({
-            "schemaVersion": 1,
-            "runId": "adj-envelope-other",
-            "params": {
-                "run": run,
-                "outcome": "cancelled",
-                "pr": null,
-                "sha": null,
-                "supersededBy": null,
-                "actor": "operator",
-                "rationale": "legacy run",
-                "evidenceGap": "controller.started carries no /driver/pid and no lstart",
-            },
-        }),
-    );
-    assert_eq!(response["ok"], json!(false), "{response}");
-    assert_eq!(
-        response["error"]["code"],
-        json!("INVALID_REQUEST"),
-        "{response}"
-    );
-    assert!(
-        response["error"]["message"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("params.run"),
-        "the refusal names the disagreement: {response}"
-    );
-
-    let ledger = env.ledger();
-    let row = ledger.get_run(run).expect("run");
-    assert_eq!(
-        row.state,
-        forged_ledger::RunState::Active,
-        "nothing settled"
-    );
-    assert!(
-        ledger
-            .list_events(Some(run), 0, 4096)
-            .expect("events")
-            .iter()
-            .all(|event| event.kind != "forged.settlement-adjudication"),
-        "a refusal records no adjudication"
-    );
-    assert!(
-        ledger
-            .list_inflight_operations(None)
-            .expect("inflight")
-            .iter()
-            .all(|op| op.name != "run_adjudicate_settlement"),
-        "the refusal mints no operation row"
-    );
-    ledger.close().expect("close");
 }
 
 /// A re-assertion under a FRESH key never adopts the standing adjudication:

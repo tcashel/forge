@@ -1,5 +1,6 @@
-//! `forged mcp` — the rmcp stdio server. Each tool takes the same operation
-//! envelope in and returns the same envelope out; every tool
+//! `forged mcp` — the rmcp stdio server. Lead tools take flat arguments while
+//! machine and operator tools retain the operation envelope for one release;
+//! every tool returns the same operation envelope out and
 //! routes through the identical core dispatch the CLI uses, so the two
 //! surfaces are two adapters over one core. The CLI-only set is generated in
 //! the operation-surface manifest rather than repeated here.
@@ -14,10 +15,10 @@ use std::sync::Arc;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CallToolResult, ContentBlock, ErrorData, ExtensionCapabilities, JsonObject,
-    ListResourcesResult, MetaObject, PaginatedRequestParams, ReadResourceRequestParams,
-    ReadResourceResponse, ReadResourceResult, Resource, ResourceContents, ServerCapabilities,
-    ServerInfo,
+    CacheScope, CallToolResult, ContentBlock, ErrorData, ExtensionCapabilities, JsonObject,
+    ListResourcesResult, ListToolsResult, MetaObject, PaginatedRequestParams,
+    ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Resource,
+    ResourceContents, ResultType, ServerCapabilities, ServerInfo,
 };
 use rmcp::schemars::JsonSchema;
 use rmcp::service::{RequestContext, RoleServer};
@@ -27,8 +28,10 @@ use serde_json::Value;
 
 use forged_types::OperationRequest;
 
+use crate::cli::McpAudienceArg;
 use crate::config::ForgedConfig;
 use crate::core::{derive_key, dispatch, err_response, migrate_legacy_state, Ctx, Failure};
+use crate::surface::{mcp_audience, McpAudience};
 
 const OVERVIEW_URI: &str = "ui://forged/overview.html";
 const OPERATIONS_OVERVIEW_URI: &str = "ui://forged/operations-overview.html";
@@ -41,6 +44,17 @@ const OPERATIONS_OVERVIEW_HTML: &str = include_str!("../assets/operations-overvi
 const WORK_DETAIL_HTML: &str = include_str!("../assets/work-detail.html");
 const WORK_MAP_HTML: &str = include_str!("../assets/work-map.html");
 const AGENT_SESSIONS_HTML: &str = include_str!("../assets/agent-sessions.html");
+const SERVER_INSTRUCTIONS: &str = "\
+The work id is the only handle; every id resolves through `explain`.\n\
+Start with `next` for a repository.\n\
+Use `explain --id` for one subject.\n\
+Responses carry `subject`, `health`, and `next`; action classes are should, can, and repair.\n\
+Refusals carry `error.detail.remedy`.\n\
+Reads take flat arguments and their keys derive automatically.\n\
+Writes require `idempotencyKey` only where the manifest says explicit key.\n\
+Lists are bounded with `coverage`; request bodies only when needed.\n\
+Lifecycle stages are drafted, critiqued, adjudicated, ready, dispatched, deciding, reviewed, landed, closed.\n\
+`reused: true` means the response was replayed.";
 
 fn app_tool_meta(uri: &str) -> MetaObject {
     let mut meta = MetaObject::new();
@@ -129,6 +143,133 @@ impl EnvelopeArgs {
             run_id: self.run_id,
             params: self.params,
         }
+    }
+}
+
+/// Flat parameters for a lead read. The arbitrary map preserves the existing
+/// core validation while removing every operation-envelope field from the
+/// public schema.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(rename_all = "camelCase")]
+pub struct LeadReadArgs {
+    #[serde(flatten)]
+    pub params: serde_json::Map<String, Value>,
+}
+
+/// Flat parameters for a lead write. Only writes advertise the optional
+/// caller key; operations that require one explicitly remain outside the lead
+/// audience in this release.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(rename_all = "camelCase")]
+pub struct LeadWriteArgs {
+    /// Optional caller operation identity; otherwise the CLI-equivalent key is derived.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+    #[serde(flatten)]
+    pub params: serde_json::Map<String, Value>,
+}
+
+fn flat_run_id(name: &str, params: &serde_json::Map<String, Value>) -> Option<String> {
+    let key = match name {
+        "run_start" => return None,
+        "run_retry" => "id",
+        "run_status"
+        | "run_stop"
+        | "run_submit"
+        | "run_accept_risk"
+        | "run_adjudicate_settlement"
+        | "run_revise_roster"
+        | "run_revise_policy"
+        | "session_message" => "run",
+        "epic_preflight" | "epic_start" | "epic_submit" | "epic_status" | "epic_pause"
+        | "epic_resume" | "epic_resolve" | "epic_revise_roster" | "epic_revise_policy" => "epic",
+        "session_list" => {
+            return params
+                .get("run")
+                .or_else(|| params.get("id"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        }
+        "usage_report" => "run",
+        "attention_acknowledge" | "attention_resolve" | "attention_reopen" => "subjectId",
+        _ => return None,
+    };
+    params.get(key).and_then(Value::as_str).map(str::to_owned)
+}
+
+fn flat_envelope(
+    name: &str,
+    idempotency_key: Option<String>,
+    params: serde_json::Map<String, Value>,
+) -> Result<EnvelopeArgs, Failure> {
+    if params.contains_key("schemaVersion") || params.contains_key("params") {
+        let flat_fields = params
+            .get("params")
+            .and_then(Value::as_object)
+            .map(|nested| {
+                nested
+                    .keys()
+                    .map(|field| format!("{field:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .filter(|fields| !fields.is_empty())
+            .unwrap_or_else(|| "the tool's argument fields".to_owned());
+        return Err(Failure::invalid(format!(
+            "{name} takes flat arguments; omit legacy envelope fields \"schemaVersion\" and \
+             \"params\", and pass {flat_fields} directly at the top level"
+        )));
+    }
+
+    for key in [
+        "run",
+        "epic",
+        "id",
+        "subjectId",
+        "subjectKind",
+        "bead",
+        "repo",
+    ] {
+        match params.get(key) {
+            None => {}
+            Some(Value::String(value)) if !value.is_empty() => {}
+            Some(_) => {
+                return Err(Failure::invalid(format!(
+                    "{name} flat selector {key:?} must be a non-empty string"
+                )))
+            }
+        }
+    }
+    for key in ["profile", "roster", "runId", "baseRef"] {
+        match params.get(key) {
+            None | Some(Value::Null | Value::String(_)) => {}
+            Some(other) => {
+                return Err(Failure::invalid(format!(
+                    "{name} flat argument {key:?} must be a string when present, got {other}"
+                )))
+            }
+        }
+    }
+
+    Ok(EnvelopeArgs {
+        schema_version: 1,
+        idempotency_key,
+        run_id: flat_run_id(name, &params),
+        params,
+    })
+}
+
+impl LeadReadArgs {
+    fn into_envelope(self, name: &str) -> Result<EnvelopeArgs, Failure> {
+        flat_envelope(name, None, self.params)
+    }
+}
+
+impl LeadWriteArgs {
+    fn into_envelope(self, name: &str) -> Result<EnvelopeArgs, Failure> {
+        flat_envelope(name, self.idempotency_key, self.params)
     }
 }
 
@@ -259,27 +400,12 @@ impl OverviewArgs {
     }
 }
 
-/// Typed MCP envelope for the kind-blind reconnect explanation.
-#[derive(Debug, Deserialize, JsonSchema)]
-#[schemars(crate = "rmcp::schemars")]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ExplainArgs {
-    /// Envelope schema version; always 1.
-    #[serde(default = "default_schema_version")]
-    pub schema_version: u32,
-    /// Optional read-only operation identity.
-    #[serde(default)]
-    pub idempotency_key: Option<String>,
-    /// The one id to explain.
-    pub params: ExplainParams,
-}
-
 /// Exact-only cross-kind selector; run and epic ids also retain unique-prefix
 /// resolution after every exact namespace has missed.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars", inline)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ExplainParams {
+pub struct ExplainArgs {
     #[serde(deserialize_with = "named_string")]
     pub id: String,
     /// Optional namespace disambiguator.
@@ -289,44 +415,25 @@ pub struct ExplainParams {
 
 impl ExplainArgs {
     fn into_envelope(self) -> EnvelopeArgs {
-        let run_id = Some(self.params.id.clone());
-        let params = match serde_json::to_value(&self.params) {
+        let run_id = Some(self.id.clone());
+        let params = match serde_json::to_value(&self) {
             Ok(Value::Object(map)) => map,
             _ => serde_json::Map::new(),
         };
         EnvelopeArgs {
-            schema_version: self.schema_version,
-            idempotency_key: self.idempotency_key,
+            schema_version: 1,
+            idempotency_key: None,
             run_id,
             params,
         }
     }
 }
 
-/// The `work_list` envelope with its typed composable filters.
-#[derive(Debug, Deserialize, JsonSchema)]
-#[schemars(crate = "rmcp::schemars")]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct WorkListArgs {
-    /// Envelope schema version; always 1.
-    #[serde(default = "default_schema_version")]
-    pub schema_version: u32,
-    /// The idempotency key; defaulted to `op:work_list:read` when absent.
-    #[serde(default)]
-    pub idempotency_key: Option<String>,
-    /// Work discovery has no run id; retained for envelope compatibility.
-    #[serde(default)]
-    pub run_id: Option<String>,
-    /// Discovery parameters.
-    #[serde(default)]
-    pub params: WorkListParams,
-}
-
 /// Composable exact scopes for `work_list`.
 #[derive(Debug, Default, Deserialize, Serialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars", inline)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct WorkListParams {
+pub struct WorkListArgs {
     /// Exact repository identity from work `metadata.repository`.
     #[serde(
         default,
@@ -360,14 +467,14 @@ impl WorkListArgs {
     /// Project onto the shared envelope, omitting an absent repository so it
     /// remains byte-compatible with the operator-wide request.
     fn into_envelope(self) -> EnvelopeArgs {
-        let params = match serde_json::to_value(&self.params) {
+        let params = match serde_json::to_value(&self) {
             Ok(Value::Object(map)) => map,
             _ => serde_json::Map::new(),
         };
         EnvelopeArgs {
-            schema_version: self.schema_version,
-            idempotency_key: self.idempotency_key,
-            run_id: self.run_id,
+            schema_version: 1,
+            idempotency_key: None,
+            run_id: None,
             params,
         }
     }
@@ -381,27 +488,11 @@ pub enum WorkReadyDetailParam {
     Full,
 }
 
-/// Typed envelope for the bounded ready frontier.
-#[derive(Debug, Deserialize, JsonSchema)]
-#[schemars(crate = "rmcp::schemars")]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct WorkReadyArgs {
-    /// Envelope schema version; always 1.
-    #[serde(default = "default_schema_version")]
-    pub schema_version: u32,
-    /// The idempotency key; defaulted to `op:work_ready:read` when absent.
-    #[serde(default)]
-    pub idempotency_key: Option<String>,
-    /// Ready-frontier projection parameters.
-    #[serde(default)]
-    pub params: WorkReadyParams,
-}
-
 /// Projection detail and collection bound accepted by `work_ready`.
 #[derive(Debug, Default, Deserialize, Serialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars", inline)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct WorkReadyParams {
+pub struct WorkReadyArgs {
     /// Exact repository identity from work `metadata.repository`.
     #[serde(
         default,
@@ -425,13 +516,13 @@ pub struct WorkReadyParams {
 
 impl WorkReadyArgs {
     fn into_envelope(self) -> EnvelopeArgs {
-        let params = match serde_json::to_value(&self.params) {
+        let params = match serde_json::to_value(&self) {
             Ok(Value::Object(map)) => map,
             _ => serde_json::Map::new(),
         };
         EnvelopeArgs {
-            schema_version: self.schema_version,
-            idempotency_key: self.idempotency_key,
+            schema_version: 1,
+            idempotency_key: None,
             run_id: None,
             params,
         }
@@ -449,27 +540,14 @@ pub enum WorkNoteKindParam {
     Approval,
 }
 
-/// Typed envelope for one append-only work annotation.
-#[derive(Debug, Deserialize, JsonSchema)]
-#[schemars(crate = "rmcp::schemars")]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct WorkNoteAddArgs {
-    /// Envelope schema version; always 1.
-    #[serde(default = "default_schema_version")]
-    pub schema_version: u32,
-    /// Caller operation identity; a canonical payload-derived key is used
-    /// when absent.
-    #[serde(default)]
-    pub idempotency_key: Option<String>,
-    /// Annotation parameters.
-    pub params: WorkNoteAddParams,
-}
-
-/// Parameters for one immutable annotation.
+/// Flat parameters for one immutable annotation.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars", inline)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct WorkNoteAddParams {
+pub struct WorkNoteAddArgs {
+    /// Optional caller operation identity; otherwise a canonical payload-derived key is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
     /// Existing work item id.
     pub id: String,
     /// Closed annotation kind.
@@ -486,39 +564,26 @@ pub struct WorkNoteAddParams {
 
 impl WorkNoteAddArgs {
     fn into_envelope(self) -> EnvelopeArgs {
-        let params = match serde_json::to_value(&self.params) {
+        let idempotency_key = self.idempotency_key.clone();
+        let mut params = match serde_json::to_value(&self) {
             Ok(Value::Object(map)) => map,
             _ => serde_json::Map::new(),
         };
+        params.remove("idempotencyKey");
         EnvelopeArgs {
-            schema_version: self.schema_version,
-            idempotency_key: self.idempotency_key,
+            schema_version: 1,
+            idempotency_key,
             run_id: None,
             params,
         }
     }
 }
 
-/// Typed envelope for one bounded annotation listing.
-#[derive(Debug, Deserialize, JsonSchema)]
-#[schemars(crate = "rmcp::schemars")]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct WorkNoteListArgs {
-    /// Envelope schema version; always 1.
-    #[serde(default = "default_schema_version")]
-    pub schema_version: u32,
-    /// Optional read-only operation identity.
-    #[serde(default)]
-    pub idempotency_key: Option<String>,
-    /// Listing parameters.
-    pub params: WorkNoteListParams,
-}
-
 /// Exact annotation selector and collection bound.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars", inline)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct WorkNoteListParams {
+pub struct WorkNoteListArgs {
     /// Existing work item id.
     pub id: String,
     /// Optional exact annotation kind.
@@ -531,13 +596,13 @@ pub struct WorkNoteListParams {
 
 impl WorkNoteListArgs {
     fn into_envelope(self) -> EnvelopeArgs {
-        let params = match serde_json::to_value(&self.params) {
+        let params = match serde_json::to_value(&self) {
             Ok(Value::Object(map)) => map,
             _ => serde_json::Map::new(),
         };
         EnvelopeArgs {
-            schema_version: self.schema_version,
-            idempotency_key: self.idempotency_key,
+            schema_version: 1,
+            idempotency_key: None,
             run_id: None,
             params,
         }
@@ -767,27 +832,11 @@ impl OperationsOverviewArgs {
     }
 }
 
-/// Typed envelope for the decision-first lead driver surface.
-#[derive(Debug, Deserialize, JsonSchema)]
-#[schemars(crate = "rmcp::schemars")]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct NextArgs {
-    /// Envelope schema version; always 1.
-    #[serde(default = "default_schema_version")]
-    pub schema_version: u32,
-    /// The idempotency key; defaulted to `op:next:read`.
-    #[serde(default)]
-    pub idempotency_key: Option<String>,
-    /// Driver projection parameters.
-    #[serde(default)]
-    pub params: NextParams,
-}
-
 /// Scope and bounded expansion accepted by `next`.
 #[derive(Debug, Default, Deserialize, Serialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars", inline)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct NextParams {
+pub struct NextArgs {
     /// Exact canonical repository root. Mutually exclusive with `id`.
     #[serde(
         default,
@@ -825,13 +874,13 @@ pub enum NextSectionParam {
 
 impl NextArgs {
     fn into_envelope(self) -> EnvelopeArgs {
-        let params = match serde_json::to_value(&self.params) {
+        let params = match serde_json::to_value(&self) {
             Ok(Value::Object(map)) => map,
             _ => serde_json::Map::new(),
         };
         EnvelopeArgs {
-            schema_version: self.schema_version,
-            idempotency_key: self.idempotency_key,
+            schema_version: 1,
+            idempotency_key: None,
             run_id: None,
             params,
         }
@@ -860,27 +909,11 @@ pub enum AttentionListClassParam {
     Symptom,
 }
 
-/// Typed envelope for the authoritative attention listing.
-#[derive(Debug, Deserialize, JsonSchema)]
-#[schemars(crate = "rmcp::schemars")]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct AttentionListArgs {
-    /// Envelope schema version; always 1.
-    #[serde(default = "default_schema_version")]
-    pub schema_version: u32,
-    /// The idempotency key; defaulted to `op:attention_list:read`.
-    #[serde(default)]
-    pub idempotency_key: Option<String>,
-    /// Attention listing parameters.
-    #[serde(default)]
-    pub params: AttentionListParams,
-}
-
 /// Filters accepted by `attention_list`.
 #[derive(Debug, Default, Deserialize, Serialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars", inline)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct AttentionListParams {
+pub struct AttentionListArgs {
     /// Exact durable repository identity.
     #[serde(
         default,
@@ -909,13 +942,13 @@ pub struct AttentionListParams {
 
 impl AttentionListArgs {
     fn into_envelope(self) -> EnvelopeArgs {
-        let params = match serde_json::to_value(&self.params) {
+        let params = match serde_json::to_value(&self) {
             Ok(Value::Object(map)) => map,
             _ => serde_json::Map::new(),
         };
         EnvelopeArgs {
-            schema_version: self.schema_version,
-            idempotency_key: self.idempotency_key,
+            schema_version: 1,
+            idempotency_key: None,
             run_id: None,
             params,
         }
@@ -1302,16 +1335,27 @@ impl McpState {
 #[derive(Clone)]
 pub struct ForgedServer {
     state: Arc<McpState>,
+    audience: McpAudienceArg,
     tool_router: ToolRouter<Self>,
 }
 
 impl ForgedServer {
     /// Build the server over the once-read config; the ledger stays shut
     /// until a tool call needs it.
-    fn new(state: Arc<McpState>) -> Self {
+    fn new(state: Arc<McpState>, audience: McpAudienceArg) -> Self {
         Self {
             state,
+            audience,
             tool_router: Self::tool_router(),
+        }
+    }
+
+    fn lists_tool(&self, name: &str) -> bool {
+        match self.audience {
+            McpAudienceArg::All => true,
+            McpAudienceArg::Lead => mcp_audience(name) == Some(McpAudience::Lead),
+            McpAudienceArg::Machine => mcp_audience(name) == Some(McpAudience::Machine),
+            McpAudienceArg::Operator => mcp_audience(name) == Some(McpAudience::Operator),
         }
     }
 
@@ -1341,6 +1385,29 @@ impl ForgedServer {
     async fn call_structured(&self, name: &str, args: EnvelopeArgs) -> CallToolResult {
         let resp = self.respond(name, args).await;
         Self::tool_result(resp, true)
+    }
+
+    async fn call_lead_read(&self, name: &str, args: LeadReadArgs) -> CallToolResult {
+        match args.into_envelope(name) {
+            Ok(args) => self.call(name, args).await,
+            Err(failure) => {
+                Self::tool_result(err_response(&crate::core::read_key(name), &failure), false)
+            }
+        }
+    }
+
+    async fn call_lead_write(&self, name: &str, args: LeadWriteArgs) -> CallToolResult {
+        let refusal_key = args
+            .idempotency_key
+            .clone()
+            .filter(|key| !key.is_empty())
+            .unwrap_or_else(|| {
+                derive_key(name, flat_run_id(name, &args.params).as_deref(), None, None)
+            });
+        match args.into_envelope(name) {
+            Ok(args) => self.call(name, args).await,
+            Err(failure) => Self::tool_result(err_response(&refusal_key, &failure), false),
+        }
     }
 
     fn tool_result(
@@ -1375,8 +1442,8 @@ pub(crate) fn tool_names() -> BTreeSet<String> {
 impl ForgedServer {
     /// Environment probes: bd, ledger, gh, providers, herdr.
     #[tool(name = "doctor", description = "Run the forged environment probes.")]
-    pub async fn doctor(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
-        self.call("doctor", args.0).await
+    pub async fn doctor(&self, args: Parameters<LeadReadArgs>) -> CallToolResult {
+        self.call_lead_read("doctor", args.0).await
     }
 
     /// Resolve and validate a profile/roster selection.
@@ -1384,14 +1451,14 @@ impl ForgedServer {
         name = "definition_validate",
         description = "Resolve and validate an execution definition."
     )]
-    pub async fn definition_validate(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
-        self.call("definition_validate", args.0).await
+    pub async fn definition_validate(&self, args: Parameters<LeadReadArgs>) -> CallToolResult {
+        self.call_lead_read("definition_validate", args.0).await
     }
 
     /// Start a run for a work item.
     #[tool(name = "run_start", description = "Create a run for a work item.")]
-    pub async fn run_start(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
-        self.call("run_start", args.0).await
+    pub async fn run_start(&self, args: Parameters<LeadWriteArgs>) -> CallToolResult {
+        self.call_lead_write("run_start", args.0).await
     }
 
     /// Re-execute a terminal run on the same Work's current revision.
@@ -1399,8 +1466,8 @@ impl ForgedServer {
         name = "run_retry",
         description = "Mint and submit a fresh successor for a terminal non-landed run. Uses current Work revision and live execution config; the successor receives a fresh restart budget."
     )]
-    pub async fn run_retry(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
-        self.call("run_retry", args.0).await
+    pub async fn run_retry(&self, args: Parameters<LeadWriteArgs>) -> CallToolResult {
+        self.call_lead_write("run_retry", args.0).await
     }
 
     /// One project → advance → honor iteration.
@@ -1414,8 +1481,8 @@ impl ForgedServer {
         name = "run_submit",
         description = "Submit a run for detached driving."
     )]
-    pub async fn run_submit(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
-        self.call("run_submit", args.0).await
+    pub async fn run_submit(&self, args: Parameters<LeadWriteArgs>) -> CallToolResult {
+        self.call_lead_write("run_submit", args.0).await
     }
 
     /// Read-only run projection.
@@ -1423,8 +1490,8 @@ impl ForgedServer {
         name = "run_status",
         description = "Project a run's current state and honesty-tested nextActions."
     )]
-    pub async fn run_status(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
-        self.call("run_status", args.0).await
+    pub async fn run_status(&self, args: Parameters<LeadReadArgs>) -> CallToolResult {
+        self.call_lead_read("run_status", args.0).await
     }
 
     /// Stop and settle a complete run.
@@ -1432,8 +1499,8 @@ impl ForgedServer {
         name = "run_stop",
         description = "Stop every live attempt and settle the run as clean, blocked, input-required, cancelled, superseded, or landed. Landed requires PR and exact SHA evidence."
     )]
-    pub async fn run_stop(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
-        self.call("run_stop", args.0).await
+    pub async fn run_stop(&self, args: Parameters<LeadWriteArgs>) -> CallToolResult {
+        self.call_lead_write("run_stop", args.0).await
     }
 
     /// Explicitly destructive settlement or review-budget lead finish.
@@ -1443,9 +1510,10 @@ impl ForgedServer {
     )]
     pub async fn run_adjudicate_settlement(
         &self,
-        args: Parameters<EnvelopeArgs>,
+        args: Parameters<LeadWriteArgs>,
     ) -> CallToolResult {
-        self.call("run_adjudicate_settlement", args.0).await
+        self.call_lead_write("run_adjudicate_settlement", args.0)
+            .await
     }
 
     /// Append an explicit roster revision.
@@ -1453,16 +1521,16 @@ impl ForgedServer {
         name = "run_revise_roster",
         description = "Append a validated roster revision for a run."
     )]
-    pub async fn run_revise_roster(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
-        self.call("run_revise_roster", args.0).await
+    pub async fn run_revise_roster(&self, args: Parameters<LeadWriteArgs>) -> CallToolResult {
+        self.call_lead_write("run_revise_roster", args.0).await
     }
 
     #[tool(
         name = "run_revise_policy",
         description = "Append a config-sourced operational-policy revision for a run."
     )]
-    pub async fn run_revise_policy(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
-        self.call("run_revise_policy", args.0).await
+    pub async fn run_revise_policy(&self, args: Parameters<LeadWriteArgs>) -> CallToolResult {
+        self.call_lead_write("run_revise_policy", args.0).await
     }
 
     /// Accept the final deduplicated findings after a terminal review failure.
@@ -1470,23 +1538,23 @@ impl ForgedServer {
         name = "run_accept_risk",
         description = "Record an operator's auditable accepted-risk decision after a terminal non-approve review outcome."
     )]
-    pub async fn run_accept_risk(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
-        self.call("run_accept_risk", args.0).await
+    pub async fn run_accept_risk(&self, args: Parameters<LeadWriteArgs>) -> CallToolResult {
+        self.call_lead_write("run_accept_risk", args.0).await
     }
 
     /// Read-only rehearsal of `epic_start`.
     #[tool(
         name = "epic_preflight",
-        description = "Rehearse epic_start read-only: every start check plus the identity tuple it would freeze, with nothing created. Required: params.epic, params.repo; optional params.baseRef, params.profile, params.roster, params.rolling."
+        description = "Rehearse epic_start read-only: every start check plus the identity tuple it would freeze, with nothing created. Required: epic, repo; optional baseRef, profile, roster, rolling."
     )]
-    pub async fn epic_preflight(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
-        self.call("epic_preflight", args.0).await
+    pub async fn epic_preflight(&self, args: Parameters<LeadReadArgs>) -> CallToolResult {
+        self.call_lead_read("epic_preflight", args.0).await
     }
 
     /// Freeze an epic inventory and child execution defaults.
     #[tool(name = "epic_start", description = "Start a durable work epic run.")]
-    pub async fn epic_start(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
-        self.call("epic_start", args.0).await
+    pub async fn epic_start(&self, args: Parameters<LeadWriteArgs>) -> CallToolResult {
+        self.call_lead_write("epic_start", args.0).await
     }
 
     /// Authorize an epic for the supervisor's ore pass.
@@ -1494,48 +1562,48 @@ impl ForgedServer {
         name = "epic_submit",
         description = "Submit an epic for supervisor-owned frontier reconciliation."
     )]
-    pub async fn epic_submit(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
-        self.call("epic_submit", args.0).await
+    pub async fn epic_submit(&self, args: Parameters<LeadWriteArgs>) -> CallToolResult {
+        self.call_lead_write("epic_submit", args.0).await
     }
 
     /// Project an epic frontier, child runs, blockers, and PR state.
     #[tool(name = "epic_status", description = "Project durable epic state.")]
-    pub async fn epic_status(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
-        self.call("epic_status", args.0).await
+    pub async fn epic_status(&self, args: Parameters<LeadReadArgs>) -> CallToolResult {
+        self.call_lead_read("epic_status", args.0).await
     }
 
     /// Pause an epic at its current durable boundary.
     #[tool(name = "epic_pause", description = "Pause epic scheduling.")]
-    pub async fn epic_pause(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
-        self.call("epic_pause", args.0).await
+    pub async fn epic_pause(&self, args: Parameters<LeadWriteArgs>) -> CallToolResult {
+        self.call_lead_write("epic_pause", args.0).await
     }
 
     /// Resume a paused epic.
     #[tool(name = "epic_resume", description = "Resume epic scheduling.")]
-    pub async fn epic_resume(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
-        self.call("epic_resume", args.0).await
+    pub async fn epic_resume(&self, args: Parameters<LeadWriteArgs>) -> CallToolResult {
+        self.call_lead_write("epic_resume", args.0).await
     }
 
     /// Resolve a child-specific input-required stop.
     #[tool(name = "epic_resolve", description = "Resolve held epic child input.")]
-    pub async fn epic_resolve(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
-        self.call("epic_resolve", args.0).await
+    pub async fn epic_resolve(&self, args: Parameters<LeadWriteArgs>) -> CallToolResult {
+        self.call_lead_write("epic_resolve", args.0).await
     }
 
     #[tool(
         name = "epic_revise_roster",
         description = "Append one durable roster revision for current and future epic children."
     )]
-    pub async fn epic_revise_roster(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
-        self.call("epic_revise_roster", args.0).await
+    pub async fn epic_revise_roster(&self, args: Parameters<LeadWriteArgs>) -> CallToolResult {
+        self.call_lead_write("epic_revise_roster", args.0).await
     }
 
     #[tool(
         name = "epic_revise_policy",
         description = "Append config-sourced policy revisions for unmerged epic children."
     )]
-    pub async fn epic_revise_policy(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
-        self.call("epic_revise_policy", args.0).await
+    pub async fn epic_revise_policy(&self, args: Parameters<LeadWriteArgs>) -> CallToolResult {
+        self.call_lead_write("epic_revise_policy", args.0).await
     }
 
     /// Unified reconnect projection, rendered by the optional MCP App.
@@ -1560,7 +1628,7 @@ impl ForgedServer {
     /// Kind-blind reconnect explanation for any durable id.
     #[tool(
         name = "explain",
-        description = "Explain one work item, run, epic, attempt, or attention id without a kind guess, or disambiguate with params.subjectKind: bounded identity and lifecycle position, one centralized health verdict with its observed inputs, and existing honesty-tested nextActions. Exact precedence is work item, run or epic, attempt, then attention; only run and epic ids accept a unique prefix."
+        description = "Explain one work item, run, epic, attempt, or attention id without a kind guess, or disambiguate with subjectKind: bounded identity and lifecycle position, one centralized health verdict with its observed inputs, and existing honesty-tested nextActions. Exact precedence is work item, run or epic, attempt, then attention; only run and epic ids accept a unique prefix."
     )]
     pub async fn explain(&self, args: Parameters<ExplainArgs>) -> CallToolResult {
         self.call_structured("explain", args.0.into_envelope())
@@ -1570,7 +1638,7 @@ impl ForgedServer {
     /// Bounded decision-first lead driver surface.
     #[tool(
         name = "next",
-        description = "Orient the lead with one bounded read-only projection: open decisions first, then currently running work, the ready planning frontier, and work landed in the last 24 hours. Defaults to 30 rows and hides symptoms unless params.symptoms is true. Scope with exact params.repo or epic params.id; params.section plus params.limit widens only that section. Returns forged.next/1 JSON and no App resource.",
+        description = "Orient the lead with one bounded read-only projection: open decisions first, then currently running work, the ready planning frontier, and work landed in the last 24 hours. Defaults to 30 rows and hides symptoms unless symptoms is true. Scope with exact repo or epic id; section plus limit widens only that section. Returns forged.next/1 JSON and no App resource.",
         annotations(read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false),
         meta = lead_tool_meta()
     )]
@@ -1649,10 +1717,10 @@ impl ForgedServer {
     /// Durable provider-session metadata for any resolved id.
     #[tool(
         name = "session_list",
-        description = "List newest provider sessions by params.run or any params.id; an epic id includes every child run. params.subjectKind optionally disambiguates params.id."
+        description = "List newest provider sessions by run or any id; an epic id includes every child run. subjectKind optionally disambiguates id."
     )]
-    pub async fn session_list(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
-        self.call("session_list", args.0).await
+    pub async fn session_list(&self, args: Parameters<LeadReadArgs>) -> CallToolResult {
+        self.call_lead_read("session_list", args.0).await
     }
 
     /// Transaction-consistent provider-session inventory across durable work.
@@ -1671,8 +1739,8 @@ impl ForgedServer {
 
     /// Read recent output from a Herdr-backed session.
     #[tool(name = "session_read", description = "Read a Herdr session pane.")]
-    pub async fn session_read(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
-        self.call("session_read", args.0).await
+    pub async fn session_read(&self, args: Parameters<LeadReadArgs>) -> CallToolResult {
+        self.call_lead_read("session_read", args.0).await
     }
 
     /// Queue or capability-gated live-deliver an intervention.
@@ -1680,8 +1748,8 @@ impl ForgedServer {
         name = "session_message",
         description = "Queue an intervention for a run or live session."
     )]
-    pub async fn session_message(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
-        self.call("session_message", args.0).await
+    pub async fn session_message(&self, args: Parameters<LeadWriteArgs>) -> CallToolResult {
+        self.call_lead_write("session_message", args.0).await
     }
 
     /// Revoke and confirmed-stop one provider attempt.
@@ -1721,8 +1789,8 @@ impl ForgedServer {
 
     /// The read-only usage summary.
     #[tool(name = "usage_report", description = "Summarize recorded usage.")]
-    pub async fn usage_report(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
-        self.call("usage_report", args.0).await
+    pub async fn usage_report(&self, args: Parameters<LeadReadArgs>) -> CallToolResult {
+        self.call_lead_read("usage_report", args.0).await
     }
 
     /// Backfill usage for runs that settled before capture recorded it.
@@ -1747,30 +1815,30 @@ impl ForgedServer {
     #[tool(
         name = "epic_abandon",
         description = "Typed terminal exit for a started epic whose start was structurally \
-                       wrong. params: epic, reason. Refuses until epic_pause has durably \
+                       wrong. Arguments: epic, reason. Refuses until epic_pause has durably \
                        paused the current epoch. A fresh epic_start then opens \
                        a clean epoch; started children settle through their own runs."
     )]
-    pub async fn epic_abandon(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
-        self.call("epic_abandon", args.0).await
+    pub async fn epic_abandon(&self, args: Parameters<LeadWriteArgs>) -> CallToolResult {
+        self.call_lead_write("epic_abandon", args.0).await
     }
 
     /// Typed work authoring: create.
     #[tool(
         name = "work_create",
-        description = "Create a work item with its revision-1 spec. params: id, title \
+        description = "Create a work item with its revision-1 spec. Arguments: id, title \
                        (required); description, acceptanceCriteria, design, notes, kind \
                        (task|epic), status (open|blocked), priority, metadata (string map)."
     )]
-    pub async fn work_create(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
-        self.call("work_create", args.0).await
+    pub async fn work_create(&self, args: Parameters<LeadWriteArgs>) -> CallToolResult {
+        self.call_lead_write("work_create", args.0).await
     }
 
     /// Typed work authoring: guarded spec and/or priority update.
     #[tool(
         name = "work_update",
         description = "CAS-fenced update over priority and/or title/description/\
-                       acceptanceCriteria/design/notes. params: id, expectedRevision (the \
+                       acceptanceCriteria/design/notes. Arguments: id, expectedRevision (the \
                        revision you read), optional priority and actor; omitted spec fields \
                        keep their bytes. Priority is coordination state: a priority-only \
                        write leaves revision unchanged; any supplied spec field mints exactly \
@@ -1779,14 +1847,14 @@ impl ForgedServer {
                        work_promote for blocked/deferred stub promotion, and work_reopen for \
                        closed items."
     )]
-    pub async fn work_update(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
-        self.call("work_update", args.0).await
+    pub async fn work_update(&self, args: Parameters<LeadWriteArgs>) -> CallToolResult {
+        self.call_lead_write("work_update", args.0).await
     }
 
     /// Typed work authoring: atomic stub promotion.
     #[tool(
         name = "work_promote",
-        description = "Atomically promote one blocked or deferred stub. params: id, \
+        description = "Atomically promote one blocked or deferred stub. Arguments: id, \
                        expectedRevision (the revision you read), optional description, \
                        acceptanceCriteria, design, notes, and actor. One fenced operation \
                        mints revision N+1 with cause planning-apply, sets status open, and \
@@ -1794,15 +1862,15 @@ impl ForgedServer {
                        with BEADS_CONTENTION. Open items use work_update; closed items use \
                        work_reopen."
     )]
-    pub async fn work_promote(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
-        self.call("work_promote", args.0).await
+    pub async fn work_promote(&self, args: Parameters<LeadWriteArgs>) -> CallToolResult {
+        self.call_lead_write("work_promote", args.0).await
     }
 
     /// Append one immutable work annotation.
     #[tool(
         name = "work_note_add",
         description = "Append evidence about a work specification without changing its \
-                       revision or coordination state. params: id, kind (comment | critique | \
+                       revision or coordination state. Arguments: id, kind (comment | critique | \
                        recommendation | approval), bodyJson (raw JSON string); recommendation and \
                        approval require their typed v1 payload and schema, while other omitted \
                        schemas default to <kind>/0. actor defaults to operator. Duplicate keys and \
@@ -1816,7 +1884,7 @@ impl ForgedServer {
     #[tool(
         name = "work_note_list",
         description = "List one work item's append-only evidence ordered by writtenAt then \
-                       noteId. params: id; optional kind exact-filter and limit 1..=500 \
+                       noteId. Arguments: id; optional kind exact-filter and limit 1..=500 \
                        (default 100). Returns canonical bodyJson bytes with totals.shown/total."
     )]
     pub async fn work_note_list(&self, args: Parameters<WorkNoteListArgs>) -> CallToolResult {
@@ -1826,77 +1894,77 @@ impl ForgedServer {
     /// Typed work authoring: dependency edge.
     #[tool(
         name = "work_link",
-        description = "Add one dependency edge. params: fromId, toId, kind (blocks | \
+        description = "Add one dependency edge. Arguments: fromId, toId, kind (blocks | \
                        parent-child | related | discovered-from | supersedes; default \
                        blocks). Only blocks edges gate readiness."
     )]
-    pub async fn work_link(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
-        self.call("work_link", args.0).await
+    pub async fn work_link(&self, args: Parameters<LeadWriteArgs>) -> CallToolResult {
+        self.call_lead_write("work_link", args.0).await
     }
 
     /// Typed work verb: close with a recorded reason.
     #[tool(
         name = "work_close",
-        description = "Close a work item. params: id, reason (required), actor. Idempotent \
+        description = "Close a work item. Arguments: id, reason (required), actor. Idempotent \
                        on an already-closed item; work_reopen is the deliberate exit."
     )]
-    pub async fn work_close(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
-        self.call("work_close", args.0).await
+    pub async fn work_close(&self, args: Parameters<LeadWriteArgs>) -> CallToolResult {
+        self.call_lead_write("work_close", args.0).await
     }
 
     /// Typed repair verb: reopen.
     #[tool(
         name = "work_reopen",
         description = "Set a work item's status to open from any state, custody untouched. \
-                       params: id, actor."
+                       Arguments: id, actor."
     )]
-    pub async fn work_reopen(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
-        self.call("work_reopen", args.0).await
+    pub async fn work_reopen(&self, args: Parameters<LeadWriteArgs>) -> CallToolResult {
+        self.call_lead_write("work_reopen", args.0).await
     }
 
     /// Typed repair verb: release custody.
     #[tool(
         name = "work_release",
-        description = "Clear a work item's custody under the actor CAS. params: id, actor \
+        description = "Clear a work item's custody under the actor CAS. Arguments: id, actor \
                        (must equal the current holder; a foreign holder refuses with \
                        BEAD_LEASE_HELD; unheld is an idempotent no-op)."
     )]
-    pub async fn work_release(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
-        self.call("work_release", args.0).await
+    pub async fn work_release(&self, args: Parameters<LeadWriteArgs>) -> CallToolResult {
+        self.call_lead_write("work_release", args.0).await
     }
 
     /// Typed repair verb: supersede (redispatch).
     #[tool(
         name = "work_supersede",
         description = "Atomically link successorId -> id with a supersedes edge and close \
-                       the superseded item. params: id, successorId (create it first with \
+                       the superseded item. Arguments: id, successorId (create it first with \
                        work_create), actor."
     )]
-    pub async fn work_supersede(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
-        self.call("work_supersede", args.0).await
+    pub async fn work_supersede(&self, args: Parameters<LeadWriteArgs>) -> CallToolResult {
+        self.call_lead_write("work_supersede", args.0).await
     }
 
     /// Typed repair verb: revert spec content.
     #[tool(
         name = "work_revert",
         description = "Mint revision N+1 as an exact copy of an earlier revision's spec \
-                       bytes. params: id, expectedRevision (CAS), toRevision, actor. \
+                       bytes. Arguments: id, expectedRevision (CAS), toRevision, actor. \
                        Append-only history means nothing is ever lost."
     )]
-    pub async fn work_revert(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
-        self.call("work_revert", args.0).await
+    pub async fn work_revert(&self, args: Parameters<LeadWriteArgs>) -> CallToolResult {
+        self.call_lead_write("work_revert", args.0).await
     }
 
     /// Read one work item with its dependencies.
     #[tool(
         name = "work_show",
         description = "One work item's current snapshot plus hydrated dependencies — the \
-                       read-only bd show replacement — and honesty-tested nextActions. params: \
+                       read-only bd show replacement — and honesty-tested nextActions. Argument: \
                        id. Returns notesCount but never note bodies; retrieve those with \
                        work_note_list."
     )]
-    pub async fn work_show(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
-        self.call("work_show", args.0).await
+    pub async fn work_show(&self, args: Parameters<LeadReadArgs>) -> CallToolResult {
+        self.call_lead_read("work_show", args.0).await
     }
 
     /// Read the ready frontier.
@@ -1904,11 +1972,11 @@ impl ForgedServer {
         name = "work_ready",
         description = "The bounded ready frontier: open, unassigned, unleased items whose \
                        blocks targets are all closed, priority-ordered. Returns summary rows \
-                       by default. Optional params.repo filters exact work metadata.repository. \
-                       params.detail=\"full\" restores complete snapshots; params.limit is \
+                       by default. Optional repo filters exact work metadata.repository. \
+                       detail=\"full\" restores complete snapshots; limit is \
                        1..=500 and defaults to 100. Pass the returned nextCursor as \
-                       params.cursor to continue the same priority/work-id order, or pass \
-                       params.all to return the whole frontier when it is at most 500 items."
+                       cursor to continue the same priority/work-id order, or pass \
+                       all to return the whole frontier when it is at most 500 items."
     )]
     pub async fn work_ready(&self, args: Parameters<WorkReadyArgs>) -> CallToolResult {
         self.call("work_ready", args.0.into_envelope()).await
@@ -1918,11 +1986,11 @@ impl ForgedServer {
     #[tool(
         name = "work_list",
         description = "List 30 summary rows by default across forged slice runs and started epics. \
-                       coverage states the full matching total; params.detail=\"full\" restores \
+                       coverage states the full matching total; detail=\"full\" restores \
                        diagnostic row fields. Takes no id: this is how a \
                        caller with no prior knowledge discovers the ids the other tools require. \
                        Attention items include mapped nextActions. \
-                       Optional params.repo, params.status, params.assignee, and params.limit are \
+                       Optional repo, status, assignee, and limit are \
                        exact, composable work-store filters."
     )]
     pub async fn work_list(&self, args: Parameters<WorkListArgs>) -> CallToolResult {
@@ -1968,9 +2036,8 @@ impl ForgedServer {
         description = "List attention items grouped by condition, decision groups before symptom \
                        groups, items oldest first, truncation always stated, with nextActions \
                        only for honesty-tested recommendation mappings. Optional exact \
-                       params.repo and params.condition filters, closed params.state \
-                       (active, open, all) and params.classification (decision, symptom), \
-                       and params.limit up to 500."
+                       repo and condition filters, closed state (active, open, all) and \
+                       classification (decision, symptom), and limit up to 500."
     )]
     pub async fn attention_list(&self, args: Parameters<AttentionListArgs>) -> CallToolResult {
         self.call("attention_list", args.0.into_envelope()).await
@@ -1979,28 +2046,28 @@ impl ForgedServer {
     /// Record custody of an exact active attention occurrence.
     #[tool(
         name = "attention_acknowledge",
-        description = "Acknowledge an exact attention occurrence without hiding it or changing domain state. Required: the item's subjectId (as envelope runId or params.subjectId), params.attentionId, params.occurrenceId, params.actor."
+        description = "Acknowledge an exact attention occurrence without hiding it or changing domain state. Required: subjectId, attentionId, occurrenceId, actor."
     )]
-    pub async fn attention_acknowledge(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
-        self.call("attention_acknowledge", args.0).await
+    pub async fn attention_acknowledge(&self, args: Parameters<LeadWriteArgs>) -> CallToolResult {
+        self.call_lead_write("attention_acknowledge", args.0).await
     }
 
     /// Resolve one explicitly adjudicable attention occurrence.
     #[tool(
         name = "attention_resolve",
-        description = "Resolve an exact adjudicable attention occurrence; source-backed domain conditions refuse. Required: the item's subjectId (as envelope runId or params.subjectId), params.attentionId, params.occurrenceId, params.actor, params.disposition."
+        description = "Resolve an exact adjudicable attention occurrence; source-backed domain conditions refuse. Required: subjectId, attentionId, occurrenceId, actor, disposition."
     )]
-    pub async fn attention_resolve(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
-        self.call("attention_resolve", args.0).await
+    pub async fn attention_resolve(&self, args: Parameters<LeadWriteArgs>) -> CallToolResult {
+        self.call_lead_write("attention_resolve", args.0).await
     }
 
     /// Reopen one exact resolved attention occurrence.
     #[tool(
         name = "attention_reopen",
-        description = "Reopen the exact current attention occurrence without changing domain state. Required: the item's subjectId (as envelope runId or params.subjectId), params.attentionId, params.occurrenceId, params.actor."
+        description = "Reopen the exact current attention occurrence without changing domain state. Required: subjectId, attentionId, occurrenceId, actor."
     )]
-    pub async fn attention_reopen(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
-        self.call("attention_reopen", args.0).await
+    pub async fn attention_reopen(&self, args: Parameters<LeadWriteArgs>) -> CallToolResult {
+        self.call_lead_write("attention_reopen", args.0).await
     }
 
     /// Retire a run's worktree through the explicit repair verb.
@@ -2029,13 +2096,31 @@ impl ServerHandler for ForgedServer {
             .build();
         info.server_info.name = "forged".into();
         info.server_info.version = env!("CARGO_PKG_VERSION").into();
-        info.instructions = Some(
-            "forged operation tools: every tool takes one operation envelope \
-             (schemaVersion, idempotencyKey, runId, params) and returns one \
-             operation response envelope as JSON text."
-                .into(),
-        );
+        info.instructions = Some(SERVER_INSTRUCTIONS.into());
         info
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, ErrorData> {
+        let supports_cache_hints = context
+            .protocol_version()
+            .is_some_and(|version| version >= rmcp::model::ProtocolVersion::V_2026_07_28);
+        Ok(ListToolsResult {
+            result_type: Some(ResultType::COMPLETE),
+            tools: self
+                .tool_router
+                .list_all()
+                .into_iter()
+                .filter(|tool| self.lists_tool(tool.name.as_ref()))
+                .collect(),
+            meta: None,
+            next_cursor: None,
+            ttl_ms: supports_cache_hints.then_some(0),
+            cache_scope: supports_cache_hints.then_some(CacheScope::Public),
+        })
     }
 
     async fn list_resources(
@@ -2100,9 +2185,9 @@ impl ServerHandler for ForgedServer {
 /// prints no envelope: it serves the protocol instead. Initialize,
 /// tools/list, and resources never touch the ledger; the two dispatch seams
 /// open it lazily through the gate.
-pub async fn serve(config: ForgedConfig) -> Result<(), String> {
+pub async fn serve(config: ForgedConfig, audience: McpAudienceArg) -> Result<(), String> {
     let state = Arc::new(McpState::new(config));
-    let server = ForgedServer::new(Arc::clone(&state));
+    let server = ForgedServer::new(Arc::clone(&state), audience);
     let result = async {
         let service = server
             .serve(rmcp::transport::stdio())
@@ -2128,6 +2213,31 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use super::*;
+
+    #[test]
+    fn server_orientation_is_the_ten_pinned_lines() {
+        let lines = SERVER_INSTRUCTIONS.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 10, "server orientation must stay ten lines");
+        for (line, anchor) in [
+            (0, "only handle"),
+            (1, "Start with `next`"),
+            (2, "`explain --id`"),
+            (3, "should, can, and repair"),
+            (4, "error.detail.remedy"),
+            (5, "flat arguments"),
+            (6, "explicit key"),
+            (7, "bounded with `coverage`"),
+            (8, "drafted, critiqued, adjudicated, ready, dispatched, deciding, reviewed, landed, closed"),
+            (9, "`reused: true`"),
+        ] {
+            assert!(
+                lines[line].contains(anchor),
+                "orientation line {} must contain {anchor:?}: {}",
+                line + 1,
+                lines[line]
+            );
+        }
+    }
 
     fn scratch_state(root: &std::path::Path) -> McpState {
         // Each caller supplies its tempdir as ANVIL_HOME. scratch_config also

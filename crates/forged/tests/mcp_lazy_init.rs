@@ -101,17 +101,17 @@ fn uninitialized_tool_calls_refuse_with_setup_guidance_and_create_nothing() {
         "uninitialized refusals must create nothing"
     );
 
-    // operationId is a pinned wire-shape contract: an explicitly supplied
-    // idempotency key is echoed even on the gate's refusal, and only a
-    // keyless request answers the derived form.
+    // operationId is a pinned wire-shape contract: a lead write may supply an
+    // explicit idempotency key, which is echoed even on the gate's refusal.
+    // Lead reads intentionally do not expose that field.
     let keyed = mcp.call_tool(
-        "work_list",
-        json!({"idempotencyKey": "op:work_list:gate-echo"}),
+        "run_start",
+        json!({"idempotencyKey": "op:run_start:gate-echo"}),
     );
     assert_eq!(keyed["ok"], json!(false), "{keyed}");
     assert_eq!(
         keyed["operationId"],
-        json!("op:work_list:gate-echo"),
+        json!("op:run_start:gate-echo"),
         "{keyed}"
     );
 }
@@ -172,7 +172,7 @@ fn an_initialized_scope_first_call_matches_the_eager_open_response() {
         assert_eq!(markers(&conn), 0);
     }
 
-    let mut mcp = McpClient::new(&env);
+    let mut mcp = McpClient::new(&env, None);
     let lazy = mcp.call_tool("work_list", json!({}));
     assert_eq!(
         normalized(lazy),

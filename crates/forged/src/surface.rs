@@ -31,6 +31,136 @@ impl OperationClass {
     }
 }
 
+/// The human or automation role an MCP operation is intended for. This is a
+/// discovery concern only: every registered tool remains callable regardless
+/// of the audience selected for `tools/list`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum McpAudience {
+    Lead,
+    Machine,
+    Operator,
+}
+
+impl McpAudience {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Lead => "lead",
+            Self::Machine => "machine",
+            Self::Operator => "operator",
+        }
+    }
+}
+
+/// The audience census is deliberately explicit. New MCP verbs must join one
+/// and only one set before the generated manifest can pass its drift gate.
+const LEAD_MCP_OPERATIONS: &[&str] = &[
+    "doctor",
+    "definition_validate",
+    "explain",
+    "next",
+    "run_retry",
+    "run_status",
+    "run_stop",
+    "run_accept_risk",
+    "run_adjudicate_settlement",
+    "run_revise_roster",
+    "run_revise_policy",
+    "run_start",
+    "run_submit",
+    "epic_preflight",
+    "epic_start",
+    "epic_submit",
+    "epic_status",
+    "epic_pause",
+    "epic_resume",
+    "epic_resolve",
+    "epic_abandon",
+    "epic_revise_roster",
+    "epic_revise_policy",
+    "session_list",
+    "session_read",
+    "session_message",
+    "usage_report",
+    "work_create",
+    "work_update",
+    "work_promote",
+    "work_link",
+    "work_close",
+    "work_reopen",
+    "work_release",
+    "work_supersede",
+    "work_revert",
+    "work_show",
+    "work_ready",
+    "work_list",
+    "work_note_add",
+    "work_note_list",
+    "attention_list",
+    "attention_acknowledge",
+    "attention_resolve",
+    "attention_reopen",
+];
+
+const OPERATOR_MCP_OPERATIONS: &[&str] = &[
+    "operations_overview",
+    "overview",
+    "work_detail",
+    "work_map",
+    "work_history",
+    "session_inventory",
+    "events_tail",
+    "usage_ingest",
+    "review_publish",
+    "worktree_retire",
+];
+
+const MACHINE_MCP_OPERATIONS: &[&str] = &[
+    "run_advance",
+    "packet_show",
+    "packet_claim",
+    "packet_complete",
+    "packet_fail",
+    "claim_next",
+    "gate_run",
+    "reconcile",
+    "artifact_verify",
+    "artifact_compact",
+    "session_stop",
+];
+
+pub(crate) fn mcp_audience(name: &str) -> Option<McpAudience> {
+    if LEAD_MCP_OPERATIONS.contains(&name) {
+        Some(McpAudience::Lead)
+    } else if OPERATOR_MCP_OPERATIONS.contains(&name) {
+        Some(McpAudience::Operator)
+    } else if MACHINE_MCP_OPERATIONS.contains(&name) {
+        Some(McpAudience::Machine)
+    } else {
+        None
+    }
+}
+
+fn validate_mcp_audiences(mcp: &BTreeSet<String>) -> Result<(), String> {
+    for name in mcp {
+        if mcp_audience(name).is_none() {
+            return Err(format!("MCP operation {name} has no audience assignment"));
+        }
+    }
+    for name in LEAD_MCP_OPERATIONS
+        .iter()
+        .chain(OPERATOR_MCP_OPERATIONS)
+        .chain(MACHINE_MCP_OPERATIONS)
+    {
+        if !mcp.contains(*name) {
+            return Err(format!(
+                "non-MCP operation {name} has an audience assignment"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// The classification decision is intentionally explicit. Source scans prove
 /// literal call sites agree, while shared variable-name helpers remain decided
 /// here because their call sites cannot identify the operation mechanically.
@@ -111,6 +241,8 @@ const OPERATION_CLASSES: &[(&str, OperationClass)] = &[
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SurfaceRow {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    audience: Option<McpAudience>,
     class: Option<OperationClass>,
     cli: bool,
     cli_verb: String,
@@ -547,6 +679,7 @@ fn manifest_rows() -> Result<Vec<SurfaceRow>, String> {
             "MCP router names non-dispatch operations: {extra:?}"
         ));
     }
+    validate_mcp_audiences(&mcp)?;
 
     let hidden = "generate_surface_manifest";
     let public_commands = command_names
@@ -567,7 +700,10 @@ fn manifest_rows() -> Result<Vec<SurfaceRow>, String> {
     let mut rows = Vec::new();
     for name in public_commands {
         let is_dispatch = dispatch.contains(&name);
+        let is_mcp = mcp.contains(&name);
+        let audience = mcp_audience(&name);
         rows.push(SurfaceRow {
+            audience,
             class: is_dispatch.then(|| classes[&name]),
             cli: true,
             cli_verb: cli_verbs
@@ -576,7 +712,7 @@ fn manifest_rows() -> Result<Vec<SurfaceRow>, String> {
                 .clone(),
             dispatch: is_dispatch,
             explicit_key: explicit_keys.contains(&name),
-            mcp: mcp.contains(&name),
+            mcp: is_mcp,
             name,
         });
     }
@@ -608,18 +744,20 @@ fn render_markdown(rows: &[SurfaceRow]) -> String {
         "# Operation surface\n\n\
          Generated from the dispatch table, clap tree, MCP router, and fenced-call audit. \
          Regenerate with `{REGENERATE_COMMAND}`; do not edit this table directly.\n\n\
-         `class` applies only to dispatch operations. `explicit key` means dispatch refuses a \
+         `class` applies only to dispatch operations. `audience` filters MCP discovery only. \
+         `explicit key` means dispatch refuses a \
          keyless request before any defaulting.\n\n\
-         | Operation | CLI verb | CLI | MCP | Class | Explicit key | Dispatch |\n\
-         | --- | --- | --- | --- | --- | --- | --- |\n",
+         | Operation | CLI verb | CLI | MCP | Audience | Class | Explicit key | Dispatch |\n\
+         | --- | --- | --- | --- | --- | --- | --- | --- |\n",
     );
     for row in rows {
         output.push_str(&format!(
-            "| `{}` | `forged {}` | {} | {} | {} | {} | {} |\n",
+            "| `{}` | `forged {}` | {} | {} | {} | {} | {} | {} |\n",
             row.name,
             row.cli_verb,
             yes_no(row.cli),
             yes_no(row.mcp),
+            row.audience.map_or("—", McpAudience::as_str),
             row.class.map_or("—", OperationClass::as_str),
             yes_no(row.explicit_key),
             yes_no(row.dispatch),
@@ -695,6 +833,7 @@ mod tests {
     fn added_tool_requires_regeneration_without_writing() {
         let mut rows = manifest_rows().expect("generate operation surface rows in memory");
         rows.push(SurfaceRow {
+            audience: Some(McpAudience::Lead),
             class: Some(OperationClass::ReadOnly),
             cli: true,
             cli_verb: "simulated new-tool".to_owned(),
@@ -712,6 +851,40 @@ mod tests {
         )
         .expect_err("an added tool must fail the drift comparison");
         assert!(error.contains(REGENERATE_COMMAND), "{error}");
+    }
+
+    #[test]
+    fn every_mcp_tool_has_exactly_one_audience() {
+        let rows = manifest_rows().expect("generate operation surface rows in memory");
+        for row in rows {
+            assert_eq!(
+                row.mcp,
+                row.audience.is_some(),
+                "{} audience assignment must match MCP registration",
+                row.name
+            );
+        }
+
+        let mut assigned = LEAD_MCP_OPERATIONS
+            .iter()
+            .chain(OPERATOR_MCP_OPERATIONS)
+            .chain(MACHINE_MCP_OPERATIONS)
+            .copied()
+            .collect::<Vec<_>>();
+        let assigned_len = assigned.len();
+        assigned.sort_unstable();
+        assigned.dedup();
+        assert_eq!(
+            assigned.len(),
+            assigned_len,
+            "an MCP operation must not appear in multiple audience lists"
+        );
+
+        let mut registered = crate::mcp::tool_names();
+        registered.insert("simulated_unassigned_tool".to_owned());
+        let error = validate_mcp_audiences(&registered)
+            .expect_err("an unassigned MCP tool must fail audience validation");
+        assert!(error.contains("simulated_unassigned_tool"), "{error}");
     }
 
     #[test]

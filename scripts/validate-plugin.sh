@@ -494,7 +494,7 @@ function loadHost(host) {
     exactKeys(manifest.mcpServers.forged, ['args', 'command'], 'Claude manifest forged MCP server');
     invariant(manifest.mcpServers.forged.command === 'forged', 'Claude manifest forged MCP server command moved');
     invariant(
-      stableJson(manifest.mcpServers.forged.args) === stableJson(['mcp']),
+      stableJson(manifest.mcpServers.forged.args) === stableJson(['mcp', '--audience', 'all']),
       'Claude manifest forged MCP server args moved',
     );
   }
@@ -730,12 +730,12 @@ try {
     'operation-surface manifest contract moved',
   );
   expectedTools = operationSurface.operations
-    .filter((row) => row?.mcp === true)
+    .filter((row) => row?.mcp === true && row?.audience === 'lead')
     .map((row) => row?.name);
   invariant(
     expectedTools.every((name) => typeof name === 'string') &&
       new Set(expectedTools).size === expectedTools.length,
-    'operation-surface MCP names must be unique strings',
+    'operation-surface lead MCP names must be unique strings',
   );
 
   const claude = loadHost('claude');
@@ -1009,12 +1009,17 @@ for (const skillPath of skillFiles(skillsRoot)) {
     for (const match of span.body.matchAll(/\bforged[ \t]+([^\n;|]+)/g)) {
       const tail = match[1].trim();
       if (!tail || tail.startsWith('-')) continue;
-      const found = [...cliVerbs.keys()].some((verb) => tail === verb || tail.startsWith(`${verb} `));
+      const matched = [...cliVerbs.entries()].find(([verb]) => tail === verb || tail.startsWith(`${verb} `));
       // An inline family name such as `forged work` is prose, not an
       // invocation. Fenced commands and multi-token inline paths are exact.
-      if (!found && !span.fenced && /^[a-z][a-z0-9-]*$/.test(tail)) continue;
-      if (!found) {
+      if (!matched && !span.fenced && /^[a-z][a-z0-9-]*$/.test(tail)) continue;
+      if (!matched) {
         console.error(`${skillPath}: forged verb is absent from the operation surface: ${displayedVerb(tail)}`);
+        process.exit(1);
+      }
+      const [_verb, operationName] = matched;
+      if (typeof operationName !== 'string' || operationName.length === 0) {
+        console.error(`${skillPath}: forged verb has no manifest operation name`);
         process.exit(1);
       }
     }
