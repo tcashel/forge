@@ -61,6 +61,9 @@ fn normalized(mut envelope: Value) -> Value {
     if envelope["result"]["capturedAt"]["beads"].is_string() {
         envelope["result"]["capturedAt"]["beads"] = json!("<sampled>");
     }
+    if envelope["result"]["capturedAt"]["work"].is_string() {
+        envelope["result"]["capturedAt"]["work"] = json!("<sampled>");
+    }
     if envelope["result"]["capturedAt"]["history"].is_string() {
         envelope["result"]["capturedAt"]["history"] = json!("<sampled>");
     }
@@ -88,6 +91,25 @@ fn normalized(mut envelope: Value) -> Value {
         }
     }
     envelope
+}
+
+fn assert_subject_parity(cli: &Value, tool: &Value, context: &str) {
+    for (surface, envelope) in [("CLI", cli), ("MCP", tool)] {
+        let subject = envelope
+            .pointer("/result/subject")
+            .and_then(Value::as_object)
+            .unwrap_or_else(|| panic!("{context} {surface} projection has a subject: {envelope}"));
+        for key in ["id", "kind", "title", "repository", "revision"] {
+            assert!(
+                subject.contains_key(key),
+                "{context} {surface} subject carries {key}: {envelope}"
+            );
+        }
+    }
+    assert_eq!(
+        cli["result"]["subject"], tool["result"]["subject"],
+        "{context}"
+    );
 }
 
 /// Strip volatile probe details from a doctor envelope, keeping names and
@@ -728,6 +750,7 @@ fn all_manifest_tools_match_their_cli_counterparts() {
             "params": {"run": "par-repository"},
         }),
     );
+    assert_subject_parity(&cli, &tool, "run_status subject parity");
     assert_eq!(
         normalized(cli),
         normalized(tool.clone()),
@@ -743,6 +766,7 @@ fn all_manifest_tools_match_their_cli_counterparts() {
         .forged(&["work", "show", "--id", "bead-par-repository"])
         .1;
     let tool = mcp.call_tool("work_show", envelope(json!({"id": "bead-par-repository"})));
+    assert_subject_parity(&cli, &tool, "work_show subject parity");
     assert_eq!(
         normalized(cli),
         normalized(tool.clone()),
@@ -756,6 +780,7 @@ fn all_manifest_tools_match_their_cli_counterparts() {
 
     let cli = env.forged(&["explain", "--id", "bead-par-repository"]).1;
     let tool = mcp.call_tool("explain", envelope(json!({"id": "bead-par-repository"})));
+    assert_subject_parity(&cli, &tool, "explain subject parity");
     assert_eq!(normalized(cli), normalized(tool.clone()), "explain parity");
     assert_eq!(tool["result"]["kind"], json!("work-item"));
     assert!(tool["result"]["next"].is_array(), "{tool}");
@@ -898,6 +923,19 @@ fn all_manifest_tools_match_their_cli_counterparts() {
         json!({"schemaVersion": 1, "runId": "absent", "params": {"run": "absent", "detail": "summary", "symptoms": true}}),
     );
     assert_eq!(normalized(cli), normalized(tool), "overview parity");
+    let cli = env
+        .forged(&["overview", "--run", "par-repository", "--detail", "summary"])
+        .1;
+    let tool = mcp.call_tool(
+        "overview",
+        json!({
+            "schemaVersion": 1,
+            "runId": "par-repository",
+            "params": {"run": "par-repository", "detail": "summary"}
+        }),
+    );
+    assert_subject_parity(&cli, &tool, "overview subject parity");
+    assert_eq!(normalized(cli), normalized(tool), "overview subject parity");
     let structured = mcp.call_tool_result(
         "overview",
         json!({"schemaVersion": 1, "runId": "absent", "params": {"run": "absent"}}),
@@ -934,6 +972,7 @@ fn all_manifest_tools_match_their_cli_counterparts() {
             "maxNodes": 25
         })),
     );
+    assert_subject_parity(&cli, &tool, "work_map subject parity");
     assert_eq!(normalized(cli), normalized(tool), "work_map parity");
     let structured = mcp.call_tool_result(
         "work_map",
@@ -989,6 +1028,7 @@ fn all_manifest_tools_match_their_cli_counterparts() {
         "attention_list",
         envelope(json!({"state": "all", "limit": 25})),
     );
+    assert_subject_parity(&cli, &tool, "attention_list subject parity");
     assert_eq!(tool["operationId"], json!("op:attention_list:read"));
     assert_eq!(
         tool["result"]["schema"],
@@ -1028,6 +1068,7 @@ fn all_manifest_tools_match_their_cli_counterparts() {
     // identically on both surfaces.
     let cli = env.forged(&["work", "detail", "--id", "par-repository"]).1;
     let tool = mcp.call_tool("work_detail", envelope(json!({"id": "par-repository"})));
+    assert_subject_parity(&cli, &tool, "work_detail subject parity");
     assert_eq!(
         tool["result"]["schema"],
         json!("forged.work-detail/1"),
@@ -1377,6 +1418,10 @@ fn all_manifest_tools_match_their_cli_counterparts() {
         json!({"schemaVersion": 1, "runId": "absent", "params": {"run": "absent"}}),
     );
     assert_eq!(normalized(cli), normalized(tool), "session_list parity");
+    let cli = env.forged(&["session", "list", "--id", "par-repository"]).1;
+    let tool = mcp.call_tool("session_list", envelope(json!({"id": "par-repository"})));
+    assert_subject_parity(&cli, &tool, "session_list subject parity");
+    assert_eq!(normalized(cli), normalized(tool), "session_list id parity");
 
     let cli = env
         .forged(&[
@@ -1506,6 +1551,7 @@ fn all_manifest_tools_match_their_cli_counterparts() {
             "params": {"holder": "w"},
         }),
     );
+    assert_subject_parity(&cli, &tool, "claim_next subject parity");
     assert_eq!(normalized(cli), normalized(tool), "claim_next parity");
 
     // gate_run: a nonexistent run refuses before the operation fence on both
@@ -1534,14 +1580,16 @@ fn all_manifest_tools_match_their_cli_counterparts() {
     let tool = mcp.call_tool("usage_report", envelope(json!({})));
     assert_eq!(normalized(cli), normalized(tool), "usage_report parity");
 
-    let cli = env.forged(&["events"]).1;
-    let tool = mcp.call_tool("events_tail", envelope(json!({})));
+    let cli = env.forged(&["events", "--id", "par-repository"]).1;
+    let tool = mcp.call_tool("events_tail", envelope(json!({"id": "par-repository"})));
+    assert_subject_parity(&cli, &tool, "events_tail subject parity");
     assert_eq!(normalized(cli), normalized(tool), "events_tail parity");
 
     // work_list: no selector and the exact repository selector are the same
     // shared operation on both surfaces.
     let cli = env.forged(&["work", "list"]).1;
     let tool = mcp.call_tool("work_list", envelope(json!({})));
+    assert_subject_parity(&cli, &tool, "work_list subject parity");
     assert_eq!(tool["operationId"], json!("op:work_list:read"));
     assert_eq!(normalized(cli), normalized(tool), "work_list parity");
     let cli = env
@@ -1675,6 +1723,7 @@ fn all_manifest_tools_match_their_cli_counterparts() {
         "work_ready",
         envelope(json!({"repo": repository, "detail": "full", "limit": 25})),
     );
+    assert_subject_parity(&cli, &tool, "work_ready subject parity");
     assert_eq!(tool["operationId"], json!("op:work_ready:read"));
     assert_eq!(normalized(cli), normalized(tool), "work_ready parity");
 

@@ -265,7 +265,28 @@ fn parse_session_cursor(value: &str) -> Result<i64, Failure> {
 /// `session list` — durable session metadata plus current attempt state.
 pub async fn session_list(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
     read_only("session_list", req, || async {
-        let run_id = param_str(&req.params, "run")?;
+        let direct_run = param_opt_str(&req.params, "run");
+        let id = param_opt_str(&req.params, "id");
+        let subject_kind = param_opt_str(&req.params, "subjectKind");
+        if direct_run.is_some() && id.is_some() {
+            return Err(Failure::invalid(
+                "session list takes param \"run\" or param \"id\", never both",
+            ));
+        }
+        if subject_kind.is_some() && id.is_none() {
+            return Err(Failure::invalid(
+                "session list param \"subjectKind\" requires param \"id\"",
+            ));
+        }
+        let target = match (direct_run, id) {
+            (Some(run), None) => super::observe::ExecutionTarget::Run(run.to_owned()),
+            (None, Some(id)) => super::observe::execution_target(ctx, id, subject_kind).await?,
+            _ => {
+                return Err(Failure::invalid(
+                    "session list requires param \"run\" or param \"id\"",
+                ))
+            }
+        };
         let limit = req
             .params
             .get("limit")
@@ -286,8 +307,91 @@ pub async fn session_list(ctx: &Ctx, req: &OperationRequest) -> OperationRespons
             Some(Value::String(value)) => Some(parse_session_cursor(value)?),
             Some(_) => return Err(Failure::invalid("session list cursor is invalid")),
         };
+        let run_id = match target {
+            super::observe::ExecutionTarget::Run(run) => run,
+            super::observe::ExecutionTarget::Unresolved(resolution) => {
+                return Ok(json!({
+                    "schema": "forged.session-list/1",
+                    "resolution": resolution,
+                }))
+            }
+            super::observe::ExecutionTarget::Epic(epic) => {
+                let epic_id = epic.clone();
+                let snapshot = on_ledger(&ctx.ledger, move |ledger| {
+                    ledger.work_observation_snapshot(WorkIdentitySubjectKind::Epic, &epic_id, 0, 1)
+                })
+                .await?;
+                let mut sessions = Vec::new();
+                let mut child_runs = Vec::new();
+                let mut total = 0u64;
+                let mut truncated = false;
+                for child in snapshot.epic_children {
+                    let mut params = serde_json::Map::from_iter([
+                        ("run".to_owned(), json!(child.run_id)),
+                        ("limit".to_owned(), json!(limit)),
+                    ]);
+                    if let Some(cursor) = req.params.get("cursor") {
+                        params.insert("cursor".to_owned(), cursor.clone());
+                    }
+                    let child_req = OperationRequest {
+                        schema_version: req.schema_version,
+                        idempotency_key: String::new(),
+                        run_id: Some(child.run_id.clone()),
+                        params,
+                    };
+                    let response = Box::pin(session_list(ctx, &child_req)).await;
+                    if !response.ok {
+                        let error = response.error.expect("failed response carries error");
+                        return Err(Failure {
+                            code: error.code,
+                            message: error.message,
+                            recoverable: error.recoverable,
+                        });
+                    }
+                    let result = response.result.unwrap_or(Value::Null);
+                    sessions.extend(
+                        result
+                            .get("sessions")
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .cloned(),
+                    );
+                    total += result
+                        .pointer("/coverage/total")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                    truncated |= result
+                        .pointer("/coverage/truncated")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    child_runs.push(result);
+                }
+                let identity = snapshot.identity;
+                let subject = super::work_identity::projection_subject(
+                    &identity,
+                    forged_types::ProjectionSubjectKind::Epic,
+                    &epic,
+                );
+                let shown = sessions.len();
+                return Ok(forged_types::with_work_twins(json!({
+                    "schema": "forged.session-list/1",
+                    "subject": subject,
+                    "epicId": epic,
+                    "identity": identity,
+                    "runs": child_runs,
+                    "sessions": sessions,
+                    "coverage": {
+                        "shown": shown,
+                        "total": total,
+                        "truncated": truncated,
+                        "nextCursor": Value::Null,
+                    },
+                })));
+            }
+        };
         let identity =
-            super::work_identity::load(ctx, WorkIdentitySubjectKind::Run, run_id).await?;
+            super::work_identity::load(ctx, WorkIdentitySubjectKind::Run, &run_id).await?;
         let (mut events, total) = {
             let run_id = run_id.to_owned();
             let page_limit = u32::try_from(limit.saturating_add(1)).unwrap_or(501);
@@ -348,9 +452,16 @@ pub async fn session_list(ctx: &Ctx, req: &OperationRequest) -> OperationRespons
                 },
             }));
         }
-        let pending = pending_interventions(ctx, run_id).await?;
+        let pending = pending_interventions(ctx, &run_id).await?;
         let shown = sessions.len();
-        Ok(json!({
+        let subject = super::work_identity::projection_subject(
+            &identity,
+            forged_types::ProjectionSubjectKind::Run,
+            &run_id,
+        );
+        Ok(forged_types::with_work_twins(json!({
+            "schema": "forged.session-list/1",
+            "subject": subject,
             "runId": run_id,
             "identity": identity,
             "sessions": sessions,
@@ -361,7 +472,7 @@ pub async fn session_list(ctx: &Ctx, req: &OperationRequest) -> OperationRespons
                 "truncated": has_more,
                 "nextCursor": next_cursor,
             },
-        }))
+        })))
     })
     .await
 }

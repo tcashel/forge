@@ -45,6 +45,7 @@ fn result(response: OperationResponse) -> Result<Value, Failure> {
 async fn events(
     ctx: &Ctx,
     run_id: &str,
+    kind: forged_types::WorkIdentitySubjectKind,
     after: i64,
     limit: u64,
     detail: super::ops::ProjectionDetail,
@@ -53,16 +54,20 @@ async fn events(
         super::ops::ProjectionDetail::Summary => "summary",
         super::ops::ProjectionDetail::Full => "full",
     };
-    result(
-        super::ops::events_tail(
-            ctx,
-            &request(
-                run_id,
-                json!({"run": run_id, "after": after, "limit": limit, "detail": detail}),
-            ),
-        )
-        .await,
-    )
+    let scope = match kind {
+        forged_types::WorkIdentitySubjectKind::Run => json!({"run": run_id}),
+        forged_types::WorkIdentitySubjectKind::Epic => {
+            json!({"id": run_id, "subjectKind": "epic"})
+        }
+    };
+    let mut params = scope.as_object().cloned().unwrap_or_default();
+    params.extend(
+        json!({"after": after, "limit": limit, "detail": detail})
+            .as_object()
+            .cloned()
+            .unwrap_or_default(),
+    );
+    result(super::ops::events_tail(ctx, &request(run_id, Value::Object(params))).await)
 }
 
 const FULL_EVENT_HISTORY_LIMIT: u32 = 4_096;
@@ -270,11 +275,26 @@ async fn run_overview(
     limit: u64,
     detail: super::ops::ProjectionDetail,
 ) -> Result<Value, Failure> {
+    let identity =
+        super::work_identity::load(ctx, forged_types::WorkIdentitySubjectKind::Run, run_id).await?;
+    let subject = super::work_identity::projection_subject(
+        &identity,
+        forged_types::ProjectionSubjectKind::Run,
+        run_id,
+    );
     let status =
         result(super::ops::run_status(ctx, &request(run_id, json!({"run": run_id}))).await)?;
     let usage =
         result(super::ops::usage_report(ctx, &request(run_id, json!({"run": run_id}))).await)?;
-    let event_page = events(ctx, run_id, after, limit, detail).await?;
+    let event_page = events(
+        ctx,
+        run_id,
+        forged_types::WorkIdentitySubjectKind::Run,
+        after,
+        limit,
+        detail,
+    )
+    .await?;
     let view = super::drive::project(ctx, run_id).await?;
     let workers = if detail == super::ops::ProjectionDetail::Full {
         Some(result(
@@ -308,6 +328,7 @@ async fn run_overview(
         let worker_total = view.live_attempts.len();
         return Ok(json!({
             "schema": "forged.overview/1",
+            "subject": subject,
             "kind": "slice",
             "id": run_id,
             "identity": status.pointer("/run/identity"),
@@ -336,6 +357,7 @@ async fn run_overview(
     let policy_revisions = policy_revisions(ctx, run_id).await?;
     Ok(json!({
         "schema": "forged.overview/1",
+        "subject": subject,
         "kind": "slice",
         "id": run_id,
         "identity": status.pointer("/run/identity"),
@@ -423,9 +445,25 @@ async fn epic_overview(
     limit: u64,
     detail: super::ops::ProjectionDetail,
 ) -> Result<Value, Failure> {
+    let identity =
+        super::work_identity::load(ctx, forged_types::WorkIdentitySubjectKind::Epic, epic_id)
+            .await?;
+    let subject = super::work_identity::projection_subject(
+        &identity,
+        forged_types::ProjectionSubjectKind::Epic,
+        epic_id,
+    );
     let status =
         result(super::epic::epic_status(ctx, &request(epic_id, json!({"epic": epic_id}))).await)?;
-    let event_page = events(ctx, epic_id, after, limit, detail).await?;
+    let event_page = events(
+        ctx,
+        epic_id,
+        forged_types::WorkIdentitySubjectKind::Epic,
+        after,
+        limit,
+        detail,
+    )
+    .await?;
     let epic_admission = {
         let epic_id = epic_id.to_owned();
         on_ledger(&ctx.ledger, move |ledger| {
@@ -537,6 +575,7 @@ async fn epic_overview(
     if detail == super::ops::ProjectionDetail::Summary {
         return Ok(json!({
             "schema": "forged.overview/1",
+            "subject": subject,
             "kind": "epic",
             "id": epic_id,
             "identity": status.get("identity"),
@@ -569,6 +608,7 @@ async fn epic_overview(
     let scheduler_events = subject_events_by_kind_prefix(ctx, epic_id, "forged.epic.").await?;
     Ok(json!({
         "schema": "forged.overview/1",
+        "subject": subject,
         "kind": "epic",
         "id": epic_id,
         "identity": status.get("identity"),
@@ -686,6 +726,13 @@ async fn portfolio_overview(ctx: &Ctx, req: &OperationRequest) -> Result<Value, 
     });
     Ok(json!({
         "schema": "forged.overview/1",
+        "subject": {
+            "id": "portfolio",
+            "kind": "portfolio",
+            "title": "Forged portfolio",
+            "repository": Value::Null,
+            "revision": Value::Null,
+        },
         "kind": "portfolio",
         "entries": entries,
         "total": total,
@@ -706,18 +753,33 @@ async fn portfolio_overview(ctx: &Ctx, req: &OperationRequest) -> Result<Value, 
     }))
 }
 
-/// What a bare `id` resolved to.
-enum Resolved {
-    /// The id names one slice run.
-    Slice(String),
-    /// The id names one epic.
+/// One result from the shared operator-id resolver. Every read surface uses
+/// this contract so precedence and namespace disambiguation cannot drift.
+pub(crate) enum ResolvedId {
+    WorkItem(Box<WorkItemSnapshot>),
+    Run(String),
     Epic(String),
-    /// The id named no single subject; the raw
-    /// `{query, reason, candidates}` resolution object, which each caller
-    /// wraps under its OWN schema key — a chooser that invented another
-    /// tool's schema would be a payload the caller's consumer refuses to
-    /// draw.
+    Attempt(Box<forged_ledger::AttemptRow>),
+    Attention(Box<AttentionItemV1>),
     Unresolved(Value),
+}
+
+fn resolution(id: &str, reason: &str, candidates: Vec<Value>, disambiguate: bool) -> Value {
+    json!({
+        "query": id,
+        "reason": reason,
+        "candidates": candidates,
+        "remedy": {
+            "schema": "forged.remedy/1",
+            "verb": "explain",
+            "args": {"id": id},
+            "reason": if disambiguate {
+                "rerun this read with --subject-kind to select one namespace"
+            } else {
+                "inspect this id with explain --id"
+            },
+        },
+    })
 }
 
 /// Resolve a bare `id` to a kind through ONE inventory scan.
@@ -732,84 +794,186 @@ enum Resolved {
 /// `unknown` with an empty candidate list and two or more is `ambiguous`
 /// with those entries. Neither is an error: a wrong guess degrades into a
 /// menu, and "nothing could have been meant" is a successful answer.
-async fn resolve(ctx: &Ctx, id: &str) -> Result<Resolved, Failure> {
+pub(crate) async fn resolve_id(
+    ctx: &Ctx,
+    id: &str,
+    subject_kind: Option<&str>,
+) -> Result<ResolvedId, Failure> {
+    let subject_kind = subject_kind
+        .map(|kind| match kind {
+            "work" | "work-item" => Ok("work"),
+            "run" | "slice" => Ok("run"),
+            "epic" => Ok("epic"),
+            "attempt" => Ok("attempt"),
+            "attention" => Ok("attention"),
+            other => Err(Failure::invalid(format!(
+                "subjectKind must be work, run, epic, attempt, or attention, got {other:?}"
+            ))),
+        })
+        .transpose()?;
+
+    if subject_kind.is_none() || subject_kind == Some("work") {
+        let work_id = id.to_owned();
+        if let Some(work) = on_ledger(&ctx.ledger, move |ledger| ledger.work_item(&work_id)).await?
+        {
+            return Ok(ResolvedId::WorkItem(Box::new(work)));
+        }
+        if subject_kind.is_some() {
+            return Ok(ResolvedId::Unresolved(resolution(
+                id,
+                "unknown",
+                Vec::new(),
+                false,
+            )));
+        }
+    }
+
     let entries = super::ops::inventory(ctx, super::ops::Spend::Omit).await?;
     let resolved = |entry: &Value| {
         let entry_id = entry["id"].as_str().unwrap_or_default().to_owned();
         match entry["kind"].as_str() {
-            Some("epic") => Resolved::Epic(entry_id),
-            _ => Resolved::Slice(entry_id),
+            Some("epic") => ResolvedId::Epic(entry_id),
+            _ => ResolvedId::Run(entry_id),
         }
     };
-    if let Some(entry) = entries.iter().find(|entry| entry["id"] == json!(id)) {
-        return Ok(resolved(entry));
+    if subject_kind.is_none() || matches!(subject_kind, Some("run" | "epic")) {
+        // Inventory intentionally folds a legacy run row and an epic start
+        // with the same id into one epic entry. Identity rows preserve both
+        // namespaces, so consult them for exact resolution and expose the
+        // collision instead of silently picking the folded entry.
+        let identities = on_ledger(&ctx.ledger, |ledger| ledger.list_work_identities()).await?;
+        let exact_run =
+            identities.get(&(forged_types::WorkIdentitySubjectKind::Run, id.to_owned()));
+        let exact_epic =
+            identities.get(&(forged_types::WorkIdentitySubjectKind::Epic, id.to_owned()));
+        match subject_kind {
+            Some("run") if exact_run.is_some() => return Ok(ResolvedId::Run(id.to_owned())),
+            Some("epic") if exact_epic.is_some() => return Ok(ResolvedId::Epic(id.to_owned())),
+            None if exact_run.is_some() && exact_epic.is_none() => {
+                return Ok(ResolvedId::Run(id.to_owned()))
+            }
+            None if exact_epic.is_some() && exact_run.is_none() => {
+                return Ok(ResolvedId::Epic(id.to_owned()))
+            }
+            _ => {}
+        }
+        if let (None, Some(exact_run), Some(exact_epic)) = (subject_kind, exact_run, exact_epic) {
+            let candidate = |kind: &str, identity: &forged_types::WorkIdentityV1| {
+                let mut candidate = entries
+                    .iter()
+                    .find(|entry| entry["id"] == json!(id))
+                    .cloned()
+                    .unwrap_or_else(|| json!({"id": id}));
+                candidate["kind"] = json!(kind);
+                candidate["identity"] = json!(identity);
+                candidate["beadId"] = json!(identity.work.id);
+                candidate
+            };
+            return Ok(ResolvedId::Unresolved(resolution(
+                id,
+                "ambiguous",
+                vec![candidate("slice", exact_run), candidate("epic", exact_epic)],
+                true,
+            )));
+        }
+        if subject_kind.is_some() {
+            return Ok(ResolvedId::Unresolved(resolution(
+                id,
+                "unknown",
+                Vec::new(),
+                false,
+            )));
+        }
     }
-    let candidates: Vec<Value> = entries
+
+    if subject_kind.is_none() || subject_kind == Some("attempt") {
+        if let Ok(attempt_id) = id.parse::<i64>() {
+            if let Some(attempt) =
+                on_ledger(&ctx.ledger, move |ledger| ledger.find_attempt(attempt_id)).await?
+            {
+                return Ok(ResolvedId::Attempt(Box::new(attempt)));
+            }
+        }
+        if subject_kind.is_some() {
+            return Ok(ResolvedId::Unresolved(resolution(
+                id,
+                "unknown",
+                Vec::new(),
+                false,
+            )));
+        }
+    }
+
+    if subject_kind.is_none() || subject_kind == Some("attention") {
+        if let Some(item) = super::ops::all_attention(ctx)
+            .await?
+            .into_iter()
+            .find(|item| item.attention_id == id)
+        {
+            return Ok(ResolvedId::Attention(Box::new(item)));
+        }
+        if subject_kind.is_some() {
+            return Ok(ResolvedId::Unresolved(resolution(
+                id,
+                "unknown",
+                Vec::new(),
+                false,
+            )));
+        }
+    }
+
+    let candidates = entries
         .into_iter()
         .filter(|entry| {
             entry["id"]
                 .as_str()
                 .is_some_and(|entry_id| entry_id.starts_with(id))
         })
-        .collect();
+        .collect::<Vec<_>>();
     if candidates.len() == 1 {
         return Ok(resolved(&candidates[0]));
     }
-    Ok(Resolved::Unresolved(json!({
-        "query": id,
-        "reason": if candidates.is_empty() { "unknown" } else { "ambiguous" },
-        "candidates": candidates,
-    })))
+    let ambiguous = !candidates.is_empty();
+    Ok(ResolvedId::Unresolved(resolution(
+        id,
+        if !ambiguous { "unknown" } else { "ambiguous" },
+        candidates,
+        ambiguous,
+    )))
 }
 
-/// What the explain-only resolver selected. Overview's two-kind [`Resolved`]
-/// contract remains untouched; this layer adds exact-only namespaces around
-/// it and defers its prefix result until every exact namespace was checked.
-enum ExplainResolved {
-    WorkItem(Box<WorkItemSnapshot>),
+pub(crate) enum ExecutionTarget {
     Run(String),
     Epic(String),
-    Attempt(Box<forged_ledger::AttemptRow>),
-    Attention(Box<AttentionItemV1>),
     Unresolved(Value),
 }
 
-async fn resolve_explain(ctx: &Ctx, id: &str) -> Result<ExplainResolved, Failure> {
-    let work_id = id.to_owned();
-    if let Some(work) = on_ledger(&ctx.ledger, move |ledger| ledger.work_item(&work_id)).await? {
-        return Ok(ExplainResolved::WorkItem(Box::new(work)));
-    }
-
-    // `resolve` owns the established run/epic exact and prefix semantics.
-    // Hold a unique prefix aside: exact attempt and attention ids outrank it,
-    // while exact run/epic ids return immediately at their normative rank.
-    let durable = resolve(ctx, id).await?;
-    match &durable {
-        Resolved::Slice(run) if run == id => return Ok(ExplainResolved::Run(run.clone())),
-        Resolved::Epic(epic) if epic == id => return Ok(ExplainResolved::Epic(epic.clone())),
-        _ => {}
-    }
-
-    if let Ok(attempt_id) = id.parse::<i64>() {
-        if let Some(attempt) =
-            on_ledger(&ctx.ledger, move |ledger| ledger.find_attempt(attempt_id)).await?
-        {
-            return Ok(ExplainResolved::Attempt(Box::new(attempt)));
+pub(crate) async fn execution_target(
+    ctx: &Ctx,
+    id: &str,
+    subject_kind: Option<&str>,
+) -> Result<ExecutionTarget, Failure> {
+    Ok(match resolve_id(ctx, id, subject_kind).await? {
+        ResolvedId::Run(run) => ExecutionTarget::Run(run),
+        ResolvedId::Epic(epic) => ExecutionTarget::Epic(epic),
+        ResolvedId::Attempt(attempt) => {
+            let (run, _, _) = super::split_packet_key(&attempt.packet_id)?;
+            ExecutionTarget::Run(run)
         }
-    }
-
-    if let Some(item) = super::ops::all_attention(ctx)
-        .await?
-        .into_iter()
-        .find(|item| item.attention_id == id)
-    {
-        return Ok(ExplainResolved::Attention(Box::new(item)));
-    }
-
-    Ok(match durable {
-        Resolved::Slice(run) => ExplainResolved::Run(run),
-        Resolved::Epic(epic) => ExplainResolved::Epic(epic),
-        Resolved::Unresolved(resolution) => ExplainResolved::Unresolved(resolution),
+        ResolvedId::Attention(item) => match item.subject_kind {
+            AttentionSubjectKind::Run => ExecutionTarget::Run(item.subject_id),
+            AttentionSubjectKind::Epic => ExecutionTarget::Epic(item.subject_id),
+        },
+        ResolvedId::WorkItem(work) => {
+            let work_id = work.work_id;
+            let mut runs = on_ledger(&ctx.ledger, move |ledger| ledger.list_runs()).await?;
+            runs.retain(|run| run.work_id == work_id);
+            match runs.pop() {
+                Some(run) => ExecutionTarget::Run(run.run_id),
+                None => ExecutionTarget::Unresolved(resolution(id, "no-run", Vec::new(), false)),
+            }
+        }
+        ResolvedId::Unresolved(value) => ExecutionTarget::Unresolved(value),
     })
 }
 
@@ -986,6 +1150,13 @@ async fn explain_work_item(ctx: &Ctx, work: WorkItemSnapshot) -> Result<Value, F
     let next = super::work_ops::projection_actions(&work);
     Ok(json!({
         "schema": "forged.explain/1",
+        "subject": {
+            "id": work.work_id,
+            "kind": "work",
+            "title": work.spec.title,
+            "repository": work.metadata.get("repository"),
+            "revision": work.revision,
+        },
         "kind": "work-item",
         "id": work.work_id,
         "what": {
@@ -1128,6 +1299,11 @@ async fn explain_run(ctx: &Ctx, id: String) -> Result<Value, Failure> {
     let next_coverage = next_coverage(next.len(), next_total);
     Ok(json!({
         "schema": "forged.explain/1",
+        "subject": super::work_identity::projection_subject(
+            &observation.identity,
+            forged_types::ProjectionSubjectKind::Run,
+            &run.run_id,
+        ),
         "kind": "run",
         "id": run.run_id,
         "what": {
@@ -1179,6 +1355,11 @@ async fn explain_epic(ctx: &Ctx, id: String) -> Result<Value, Failure> {
     let next_coverage = next_coverage(next.len(), next_total);
     Ok(json!({
         "schema": "forged.explain/1",
+        "subject": super::work_identity::projection_subject(
+            &observation.identity,
+            forged_types::ProjectionSubjectKind::Epic,
+            &id,
+        ),
         "kind": "epic",
         "id": id,
         "what": {
@@ -1225,6 +1406,11 @@ async fn explain_attempt(ctx: &Ctx, resolved: forged_ledger::AttemptRow) -> Resu
     let next = super::ops::run_projection_actions(run);
     Ok(json!({
         "schema": "forged.explain/1",
+        "subject": super::work_identity::projection_subject(
+            &observation.identity,
+            forged_types::ProjectionSubjectKind::Attempt,
+            attempt.attempt_id.to_string(),
+        ),
         "kind": "attempt",
         "id": attempt.attempt_id,
         "what": {
@@ -1256,6 +1442,11 @@ async fn explain_attention(ctx: &Ctx, item: AttentionItemV1) -> Result<Value, Fa
     });
     Ok(json!({
         "schema": "forged.explain/1",
+        "subject": super::work_identity::projection_subject(
+            &observation.identity,
+            forged_types::ProjectionSubjectKind::Attention,
+            &item.attention_id,
+        ),
         "kind": "attention",
         "id": item.attention_id,
         "what": {
@@ -1284,17 +1475,19 @@ pub async fn explain(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
         let id = param_named_str(&req.params, "id")
             .ok_or_else(|| Failure::invalid("explain param \"id\" must name a subject"))?
             .to_owned();
-        match resolve_explain(ctx, &id).await? {
-            ExplainResolved::WorkItem(work) => explain_work_item(ctx, *work).await,
-            ExplainResolved::Run(run) => explain_run(ctx, run).await,
-            ExplainResolved::Epic(epic) => explain_epic(ctx, epic).await,
-            ExplainResolved::Attempt(attempt) => explain_attempt(ctx, *attempt).await,
-            ExplainResolved::Attention(item) => explain_attention(ctx, *item).await,
-            ExplainResolved::Unresolved(resolution) => Ok(json!({
+        let subject_kind = param_opt_str(&req.params, "subjectKind");
+        let projected = match resolve_id(ctx, &id, subject_kind).await? {
+            ResolvedId::WorkItem(work) => explain_work_item(ctx, *work).await,
+            ResolvedId::Run(run) => explain_run(ctx, run).await,
+            ResolvedId::Epic(epic) => explain_epic(ctx, epic).await,
+            ResolvedId::Attempt(attempt) => explain_attempt(ctx, *attempt).await,
+            ResolvedId::Attention(item) => explain_attention(ctx, *item).await,
+            ResolvedId::Unresolved(resolution) => Ok(json!({
                 "schema": "forged.explain/1",
                 "resolution": resolution,
             })),
-        }
+        }?;
+        Ok(forged_types::with_work_twins(projected))
     })
     .await
 }
@@ -1319,9 +1512,10 @@ pub async fn overview(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
         let run = param_opt_str(&req.params, "run");
         let epic = param_opt_str(&req.params, "epic");
         let id = param_opt_str(&req.params, "id");
+        let subject_kind = param_opt_str(&req.params, "subjectKind");
         let detail = super::ops::projection_detail(req, "overview")?;
         super::ops::projection_symptoms(req, "overview")?;
-        for key in ["run", "epic", "id"] {
+        for key in ["run", "epic", "id", "subjectKind"] {
             if req.params.contains_key(key) && param_opt_str(&req.params, key).is_none() {
                 return Err(Failure::invalid(format!(
                     "overview param {key:?} must name a subject; omit it entirely \
@@ -1332,6 +1526,11 @@ pub async fn overview(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
         if id.is_some() && (run.is_some() || epic.is_some()) {
             return Err(Failure::invalid(
                 "overview takes param \"id\" or an explicit \"run\"/\"epic\", never both",
+            ));
+        }
+        if subject_kind.is_some() && id.is_none() {
+            return Err(Failure::invalid(
+                "overview param \"subjectKind\" requires param \"id\"",
             ));
         }
         if run.is_some() && epic.is_some() {
@@ -1372,22 +1571,25 @@ pub async fn overview(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
                 }
             }
         }
-        match (run, epic, id) {
+        let projected = match (run, epic, id) {
             (None, None, None) => portfolio_overview(ctx, req).await,
             (Some(run), None, None) => run_overview(ctx, run, after, limit, detail).await,
             (None, Some(epic), None) => epic_overview(ctx, epic, after, limit, detail).await,
             // A resolved id projects through the SAME call the explicit
             // param makes, so the two answers cannot drift.
-            (None, None, Some(id)) => match resolve(ctx, id).await? {
-                Resolved::Slice(run) => run_overview(ctx, &run, after, limit, detail).await,
-                Resolved::Epic(epic) => epic_overview(ctx, &epic, after, limit, detail).await,
-                Resolved::Unresolved(resolution) => Ok(json!({
+            (None, None, Some(id)) => match execution_target(ctx, id, subject_kind).await? {
+                ExecutionTarget::Run(run) => run_overview(ctx, &run, after, limit, detail).await,
+                ExecutionTarget::Epic(epic) => {
+                    epic_overview(ctx, &epic, after, limit, detail).await
+                }
+                ExecutionTarget::Unresolved(resolution) => Ok(json!({
                     "schema": "forged.overview/1",
                     "resolution": resolution,
                 })),
             },
             _ => unreachable!(),
-        }
+        }?;
+        Ok(forged_types::with_work_twins(projected))
     })
     .await
 }
@@ -2294,8 +2496,19 @@ async fn project_work_detail(
         })
         .count();
 
+    let subject = super::work_identity::projection_subject(
+        &snapshot.identity,
+        match snapshot.subject.kind {
+            forged_types::WorkIdentitySubjectKind::Run => forged_types::ProjectionSubjectKind::Run,
+            forged_types::WorkIdentitySubjectKind::Epic => {
+                forged_types::ProjectionSubjectKind::Epic
+            }
+        },
+        &snapshot.subject.id,
+    );
     Ok(json!({
         "schema": "forged.work-detail/1",
+        "subject": subject,
         // Compatibility aliases retained for the current App shell.
         "kind": if snapshot.subject.kind == forged_types::WorkIdentitySubjectKind::Epic {
             "epic"
@@ -2454,6 +2667,7 @@ fn summarize_work_detail(full: &Value) -> Value {
     }
     json!({
         "schema": "forged.work-detail/1",
+        "subject": full.get("subject"),
         "kind": full.get("kind"),
         "id": full.get("id"),
         "workRef": full.get("workRef"),
@@ -2526,19 +2740,18 @@ pub async fn work_detail(ctx: &Ctx, req: &OperationRequest) -> OperationResponse
         let bare = param_named_str(&req.params, "id").map(str::to_owned);
         let subject_kind = param_named_str(&req.params, "subjectKind");
         let subject_id = param_named_str(&req.params, "subjectId").map(str::to_owned);
-        if bare.is_some() && (subject_kind.is_some() || subject_id.is_some()) {
+        if bare.is_some() && subject_id.is_some() {
             return Err(Failure::invalid(
-                "work detail takes param \"id\" or the exact \"subjectKind\"/\"subjectId\" \
-                 pair, never both",
+                "work detail takes param \"id\" or the exact \"subjectKind\"/\"subjectId\" pair, never both",
             ));
         }
-        if subject_kind.is_some() != subject_id.is_some() {
+        if bare.is_none() && subject_kind.is_some() != subject_id.is_some() {
             return Err(Failure::invalid(
                 "work detail params \"subjectKind\" and \"subjectId\" travel as a pair; \
-                 send both or address by bare \"id\"",
+                 send both or address by \"id\" with optional \"subjectKind\"",
             ));
         }
-        let exact = match (subject_kind, subject_id) {
+        let exact = match (subject_kind, subject_id.as_ref()) {
             (Some(kind), Some(id)) => {
                 let kind = match kind {
                     "run" => forged_types::WorkIdentitySubjectKind::Run,
@@ -2549,7 +2762,7 @@ pub async fn work_detail(ctx: &Ctx, req: &OperationRequest) -> OperationResponse
                         )))
                     }
                 };
-                Some((kind, id))
+                Some((kind, id.clone()))
             }
             (None, None) if bare.is_none() => {
                 return Err(Failure::invalid(
@@ -2557,7 +2770,7 @@ pub async fn work_detail(ctx: &Ctx, req: &OperationRequest) -> OperationResponse
                      \"subjectKind\"/\"subjectId\" pair",
                 ))
             }
-            (None, None) => None,
+            (_, None) if bare.is_some() => None,
             _ => unreachable!("a half pair is refused above"),
         };
         let after = req.params.get("after").and_then(Value::as_i64).unwrap_or(0);
@@ -2583,10 +2796,10 @@ pub async fn work_detail(ctx: &Ctx, req: &OperationRequest) -> OperationResponse
             // resolved by the first cannot vanish from the second, so the
             // two answers agree — the resolved kind is the inventory's,
             // never a guess.
-            (None, Some(bare)) => match resolve(ctx, &bare).await? {
-                Resolved::Slice(run) => (forged_types::WorkIdentitySubjectKind::Run, run),
-                Resolved::Epic(epic) => (forged_types::WorkIdentitySubjectKind::Epic, epic),
-                Resolved::Unresolved(resolution) => {
+            (None, Some(bare)) => match execution_target(ctx, &bare, subject_kind).await? {
+                ExecutionTarget::Run(run) => (forged_types::WorkIdentitySubjectKind::Run, run),
+                ExecutionTarget::Epic(epic) => (forged_types::WorkIdentitySubjectKind::Epic, epic),
+                ExecutionTarget::Unresolved(resolution) => {
                     return Ok(json!({
                         "schema": "forged.work-detail/1",
                         "resolution": resolution,
@@ -2600,11 +2813,12 @@ pub async fn work_detail(ctx: &Ctx, req: &OperationRequest) -> OperationResponse
         })
         .await?;
         let full = project_work_detail(ctx, snapshot).await?;
-        Ok(if detail == super::ops::ProjectionDetail::Full {
+        let projected = if detail == super::ops::ProjectionDetail::Full {
             full
         } else {
             summarize_work_detail(&full)
-        })
+        };
+        Ok(forged_types::with_work_twins(projected))
     })
     .await
 }

@@ -150,10 +150,60 @@ pub async fn claim_next(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
         Ok(h) => h.to_owned(),
         Err(f) => return err_response(&req.idempotency_key, &f),
     };
-    fenced(ctx, "claim_next", EffectClass::SafeRetry, req, None, {
+    let mut response = fenced(ctx, "claim_next", EffectClass::SafeRetry, req, None, {
         move |_op_id| async move { claim_next_effect(ctx, &holder).await }
     })
-    .await
+    .await;
+    if let Some(result) = response.result.as_mut() {
+        let claimed = result.get("claimed");
+        let subject = if let Some(run_id) = claimed
+            .and_then(|value| value.get("run_id"))
+            .and_then(Value::as_str)
+        {
+            super::work_identity::load(ctx, forged_types::WorkIdentitySubjectKind::Run, run_id)
+                .await
+                .ok()
+                .map(|identity| {
+                    super::work_identity::projection_subject(
+                        &identity,
+                        forged_types::ProjectionSubjectKind::Run,
+                        run_id,
+                    )
+                })
+        } else if let Some(work_id) = claimed
+            .and_then(|value| value.get("bead_id").or_else(|| value.get("work_id")))
+            .and_then(Value::as_str)
+        {
+            let work_id_owned = work_id.to_owned();
+            on_ledger(&ctx.ledger, move |ledger| ledger.work_item(&work_id_owned))
+                .await
+                .ok()
+                .flatten()
+                .map(|work| forged_types::ProjectionSubjectV1 {
+                    id: work.work_id,
+                    kind: forged_types::ProjectionSubjectKind::Work,
+                    title: Some(work.spec.title),
+                    repository: work.metadata.get("repository").cloned(),
+                    revision: Some(work.revision.to_string()),
+                })
+        } else {
+            Some(forged_types::ProjectionSubjectV1 {
+                id: "ready".to_owned(),
+                kind: forged_types::ProjectionSubjectKind::Portfolio,
+                title: Some("Ready work".to_owned()),
+                repository: None,
+                revision: None,
+            })
+        };
+        if let (Some(object), Some(subject)) = (result.as_object_mut(), subject) {
+            object.insert(
+                "subject".to_owned(),
+                serde_json::to_value(subject).expect("projection subject always serializes"),
+            );
+        }
+        forged_types::add_work_twins(result);
+    }
+    response
 }
 
 async fn claim_next_effect(ctx: &Ctx, holder: &str) -> Result<Value, Failure> {

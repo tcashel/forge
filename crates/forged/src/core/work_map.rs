@@ -408,7 +408,8 @@ fn route_attention(entries: &mut [Value], attention: &[Value]) -> Result<(), Fai
             .and_then(Value::as_str)
             .ok_or_else(|| Failure::internal("operator entry has no id"))?;
         let work_id = entry
-            .get("beadId")
+            .get("workId")
+            .or_else(|| entry.get("beadId"))
             .and_then(Value::as_str)
             .unwrap_or_default();
         let is_plan = entry.get("source").and_then(Value::as_str) == Some("live-plan");
@@ -912,7 +913,8 @@ async fn project(ctx: &Ctx, request: MapRequest) -> Result<Value, Failure> {
         focus: request.focus,
         captured_at: WorkMapCapturedAtV1 {
             ledger: ledger_captured_at,
-            work: plan_inventory.as_ref().map(|_| work_captured_at),
+            work: plan_inventory.as_ref().map(|_| work_captured_at.clone()),
+            work_twin: plan_inventory.as_ref().map(|_| work_captured_at),
             history: history_captured_at,
         },
         source_health,
@@ -939,7 +941,22 @@ async fn project(ctx: &Ctx, request: MapRequest) -> Result<Value, Failure> {
 pub async fn work_map(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
     read_only("work_map", req, || async {
         let request = normalize_request(req)?;
-        project(ctx, request).await
+        let repository = request.scope.repository.clone();
+        let mut projected = project(ctx, request).await?;
+        projected
+            .as_object_mut()
+            .ok_or_else(|| Failure::internal("Work Map projection is not an object"))?
+            .insert(
+                "subject".to_owned(),
+                json!({
+                    "id": "work-map",
+                    "kind": "portfolio",
+                    "title": "Forged work map",
+                    "repository": repository,
+                    "revision": Value::Null,
+                }),
+            );
+        Ok(forged_types::with_work_twins(projected))
     })
     .await
 }

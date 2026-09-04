@@ -119,8 +119,106 @@ struct SurfaceRow {
     name: String,
 }
 
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeprecatedKey {
+    schema: &'static str,
+    key: &'static str,
+    twin: &'static str,
+    remove_at: &'static str,
+}
+
+const DEPRECATED_KEYS: &[DeprecatedKey] = &[
+    DeprecatedKey {
+        schema: "forged.work-identity/1",
+        key: "bead",
+        twin: "work",
+        remove_at: "1.0",
+    },
+    DeprecatedKey {
+        schema: "forged.packet/1",
+        key: "beadId",
+        twin: "workId",
+        remove_at: "1.0",
+    },
+    DeprecatedKey {
+        schema: "forged.admission-inputs/1",
+        key: "beadId",
+        twin: "workId",
+        remove_at: "1.0",
+    },
+    DeprecatedKey {
+        schema: "forged.admission-inputs/1",
+        key: "beadRevision",
+        twin: "workRevision",
+        remove_at: "1.0",
+    },
+    DeprecatedKey {
+        schema: "forged.admission-inputs/1",
+        key: "beadStatus",
+        twin: "workStatus",
+        remove_at: "1.0",
+    },
+    DeprecatedKey {
+        schema: "forged.admission-inputs/1",
+        key: "beadRepository",
+        twin: "workRepository",
+        remove_at: "1.0",
+    },
+    DeprecatedKey {
+        schema: "forged.projection/*",
+        key: "bead",
+        twin: "work",
+        remove_at: "1.0",
+    },
+    DeprecatedKey {
+        schema: "forged.projection/*",
+        key: "bead_id",
+        twin: "work_id",
+        remove_at: "1.0",
+    },
+    DeprecatedKey {
+        schema: "forged.projection/*",
+        key: "beadId",
+        twin: "workId",
+        remove_at: "1.0",
+    },
+    DeprecatedKey {
+        schema: "forged.projection/*",
+        key: "beadTitle",
+        twin: "workTitle",
+        remove_at: "1.0",
+    },
+    DeprecatedKey {
+        schema: "forged.projection/*",
+        key: "beadRevision",
+        twin: "workRevision",
+        remove_at: "1.0",
+    },
+    DeprecatedKey {
+        schema: "forged.projection/*",
+        key: "beads",
+        twin: "work",
+        remove_at: "1.0",
+    },
+    DeprecatedKey {
+        schema: "forged.projection/*",
+        key: "beadsStatus",
+        twin: "workStatus",
+        remove_at: "1.0",
+    },
+    DeprecatedKey {
+        schema: "forged.projection/*",
+        key: "beadsInventory",
+        twin: "workInventory",
+        remove_at: "1.0",
+    },
+];
+
 #[derive(Debug, Serialize)]
 struct SurfaceManifest {
+    #[serde(rename = "deprecatedKeys")]
+    deprecated_keys: Vec<DeprecatedKey>,
     operations: Vec<SurfaceRow>,
     schema: &'static str,
 }
@@ -481,6 +579,7 @@ fn manifest_rows() -> Result<Vec<SurfaceRow>, String> {
 
 fn render_json(rows: &[SurfaceRow]) -> Result<String, String> {
     let manifest = SurfaceManifest {
+        deprecated_keys: DEPRECATED_KEYS.to_vec(),
         operations: rows.to_vec(),
         schema: "forged.operation-surface/1",
     };
@@ -517,6 +616,18 @@ fn render_markdown(rows: &[SurfaceRow]) -> String {
             row.class.map_or("—", OperationClass::as_str),
             yes_no(row.explicit_key),
             yes_no(row.dispatch),
+        ));
+    }
+    output.push_str("\n## Deprecated projection keys\n\n");
+    output.push_str(
+        "Legacy keys remain present with same-value provider-neutral twins until 1.0.\n\n",
+    );
+    output.push_str("| Schema | Legacy key | Twin | Remove at |\n");
+    output.push_str("| --- | --- | --- | --- |\n");
+    for key in DEPRECATED_KEYS {
+        output.push_str(&format!(
+            "| `{}` | `{}` | `{}` | `{}` |\n",
+            key.schema, key.key, key.twin, key.remove_at,
         ));
     }
     output

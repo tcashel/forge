@@ -1105,10 +1105,14 @@ fn operations_joins_one_bounded_live_plan_without_duplicate_durable_work() {
     ]);
     assert_eq!(code, 0, "summary operations overview: {summary}");
     let rows = entries(&summary);
+    assert_eq!(rows["plan-a"]["subject"]["kind"], json!("plan"));
+    assert_eq!(rows["plan-a"]["subject"]["id"], json!("plan-a"));
     assert_eq!(
-        rows["plan-a"]["subject"],
-        json!({"kind": "plan", "id": "plan-a", "title": "Planned next slice"})
+        rows["plan-a"]["subject"]["title"],
+        json!("Planned next slice")
     );
+    assert_eq!(rows["plan-a"]["subject"]["repository"], json!(repository));
+    assert_eq!(rows["plan-a"]["subject"]["revision"], json!("2"));
     assert_eq!(
         rows["plan-a"]["plan"],
         json!({
@@ -1398,8 +1402,8 @@ fn projection_defaults_are_bounded_and_full_preserves_the_v071_keys() {
         .expect("serialize Operations")
         .len();
     assert!(
-        operations_bytes <= 12 * 1024,
-        "default Operations is {operations_bytes} bytes, above 12 KiB"
+        operations_bytes <= 20 * 1024,
+        "default Operations is {operations_bytes} bytes, above 20 KiB"
     );
     let (code, full_operations) = env.forged(&[
         "operations",

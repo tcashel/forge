@@ -2159,8 +2159,14 @@ async fn status_json(ctx: &Ctx, view: EpicView) -> Result<Value, Failure> {
         epic_desired,
         Some(pass_or_children_live),
     ));
+    let subject = super::work_identity::projection_subject(
+        &identity,
+        forged_types::ProjectionSubjectKind::Epic,
+        &view.config.epic_id,
+    );
     let mut status = json!({
         "schema": "forged.epic.status/1",
+        "subject": subject,
         "epicId": view.config.epic_id,
         "executionHealth": epic_health,
         "desired": desired_json(epic_desired),
@@ -2207,7 +2213,7 @@ async fn status_json(ctx: &Ctx, view: EpicView) -> Result<Value, Failure> {
     if !view.waves.is_empty() {
         object.insert("waves".to_owned(), Value::Array(view.waves));
     }
-    Ok(status)
+    Ok(forged_types::with_work_twins(status))
 }
 
 /// One preflight verdict row. Failures record rather than short-circuit so

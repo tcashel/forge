@@ -308,6 +308,20 @@ fn a_live_attempt_carries_own_state_stage_and_owning_run_actions() {
         json!({"state": "running", "stage": "implement"})
     );
     assert_next(&response, "run stop");
+
+    let attempt_id = attempt_id.to_string();
+    for command in [
+        vec!["work", "detail", "--id", &attempt_id],
+        vec!["events", "--id", &attempt_id],
+        vec!["session", "list", "--id", &attempt_id],
+    ] {
+        let (code, routed) = env.forged(&command);
+        assert_eq!(code, 0, "attempt-routed {}: {routed}", command.join(" "));
+        assert_eq!(
+            routed["result"]["subject"]["id"],
+            json!("explain-attempt-run")
+        );
+    }
 }
 
 #[test]
@@ -348,6 +362,20 @@ fn an_attention_id_carries_subject_health_and_its_mapped_action() {
         json!("blocked")
     );
     assert_next(&response, "work reopen");
+
+    for command in [
+        vec!["overview", "--id", attention_id],
+        vec!["work", "detail", "--id", attention_id],
+        vec!["events", "--id", attention_id],
+        vec!["session", "list", "--id", attention_id],
+    ] {
+        let (code, routed) = env.forged(&command);
+        assert_eq!(code, 0, "attention-routed {}: {routed}", command.join(" "));
+        assert_eq!(
+            routed["result"]["subject"]["id"],
+            json!("explain-attention-run")
+        );
+    }
 }
 
 #[test]
@@ -366,6 +394,12 @@ fn an_unknown_id_is_the_existing_successful_unresolved_shape() {
                 "query": "unknown-id",
                 "reason": "unknown",
                 "candidates": [],
+                "remedy": {
+                    "schema": "forged.remedy/1",
+                    "verb": "explain",
+                    "args": {"id": "unknown-id"},
+                    "reason": "inspect this id with explain --id",
+                },
             },
         })
     );

@@ -1027,12 +1027,19 @@ pub async fn work_show(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
             let id = id.clone();
             on_ledger(&ctx.ledger, move |l| l.work_note_count(&id)).await?
         };
-        Ok(json!({
+        Ok(forged_types::with_work_twins(json!({
+            "subject": {
+                "id": snapshot.work_id,
+                "kind": "work",
+                "title": snapshot.spec.title,
+                "repository": snapshot.metadata.get("repository"),
+                "revision": snapshot.revision.to_string(),
+            },
             "work": snapshot,
             "dependencies": deps,
             "notesCount": notes_count,
             "nextActions": projection_actions(&snapshot),
-        }))
+        })))
     })
     .await
 }
@@ -1172,6 +1179,13 @@ pub async fn work_ready(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
                 .into_iter()
                 .map(|item| {
                     json!({
+                        "subject": {
+                            "id": item.work_id,
+                            "kind": "work",
+                            "title": item.spec.title,
+                            "repository": item.metadata.get("repository"),
+                            "revision": item.revision.to_string(),
+                        },
                         "id": item.work_id,
                         "title": item.spec.title,
                         "kind": item.kind,
@@ -1185,7 +1199,18 @@ pub async fn work_ready(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
             WorkReadyDetail::Full => page
                 .items
                 .into_iter()
-                .map(|item| json!(item))
+                .map(|item| {
+                    let subject = json!({
+                        "id": item.work_id,
+                        "kind": "work",
+                        "title": item.spec.title,
+                        "repository": item.metadata.get("repository"),
+                        "revision": item.revision.to_string(),
+                    });
+                    let mut value = json!(item);
+                    value["subject"] = subject;
+                    value
+                })
                 .collect::<Vec<_>>(),
         };
         let mut applied_filters = json!({
@@ -1193,10 +1218,17 @@ pub async fn work_ready(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
             "limit": page_limit,
             "all": all,
         });
-        if let Some(repository) = repository {
+        if let Some(ref repository) = repository {
             applied_filters["repo"] = json!(repository);
         }
-        Ok(json!({
+        Ok(forged_types::with_work_twins(json!({
+            "subject": {
+                "id": "ready",
+                "kind": "portfolio",
+                "title": "Ready work",
+                "repository": repository,
+                "revision": Value::Null,
+            },
             "filters": applied_filters,
             "totals": {
                 "shown": ready.len(),
@@ -1210,7 +1242,7 @@ pub async fn work_ready(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
             },
             "ready": ready,
             "nextCursor": next_cursor,
-        }))
+        })))
     })
     .await;
     if response

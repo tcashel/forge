@@ -163,11 +163,53 @@ pub struct AdmissionDecisionV1 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn decision_vocabulary_is_closed() {
         assert!(serde_json::from_str::<AdmissionOutcome>("\"maybe\"").is_err());
         assert!(serde_json::from_str::<AdmissionReason>("\"capacity-ish\"").is_err());
         assert!(serde_json::from_str::<AdmissionResourceClass>("\"shell\"").is_err());
+    }
+
+    #[test]
+    fn projection_twins_do_not_change_admission_input_storage_bytes() {
+        let candidate = AdmissionCandidateV1 {
+            subject_kind: AdmissionSubjectKind::Run,
+            subject_id: "run-1".to_owned(),
+            control_revision: 7,
+            work_id: "ore-1".to_owned(),
+            work_revision: Some("3".to_owned()),
+            work_status: Some("open".to_owned()),
+            priority: Some(1),
+            repository: "/repo".to_owned(),
+            work_repository: Some("/repo".to_owned()),
+            input_error: None,
+            desired_wake_at: None,
+            provider: Some("codex".to_owned()),
+            model: Some("model".to_owned()),
+            resource_class: AdmissionResourceClass::RepositoryWrite,
+            authorized_at: "2026-01-01T00:00:00Z".to_owned(),
+        };
+        let before = serde_json::to_string(&candidate).expect("candidate bytes");
+        assert!(before.contains("\"beadId\":\"ore-1\""));
+        assert!(!before.contains("\"workId\""));
+
+        let projected = crate::with_work_twins(
+            serde_json::from_str(&before).expect("stored candidate is JSON"),
+        );
+        for (legacy, twin) in [
+            ("beadId", "workId"),
+            ("beadRevision", "workRevision"),
+            ("beadStatus", "workStatus"),
+            ("beadRepository", "workRepository"),
+        ] {
+            assert_eq!(projected[legacy], projected[twin], "{legacy} twin");
+        }
+        assert_eq!(
+            serde_json::to_string(&candidate).expect("candidate bytes again"),
+            before
+        );
+        assert_eq!(projected["workId"], json!("ore-1"));
     }
 }

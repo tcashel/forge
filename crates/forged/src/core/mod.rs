@@ -1474,7 +1474,7 @@ pub async fn dispatch(ctx: &Ctx, name: &str, mut req: OperationRequest) -> Opera
         }
         _ => {}
     }
-    match name {
+    let mut response = match name {
         "doctor" => ops::doctor(ctx, &req).await,
         "init" => ops::init(ctx, &mut req).await,
         "definition_validate" => ops::definition_validate(ctx, &req).await,
@@ -1549,7 +1549,15 @@ pub async fn dispatch(ctx: &Ctx, name: &str, mut req: OperationRequest) -> Opera
             &read_key(other),
             &Failure::invalid(format!("unknown command {other:?}")),
         ),
+    };
+    // Compatibility aliases belong to the projection boundary, never to
+    // durable operation results or event payloads. Replayed pre-twin and
+    // newly stored responses therefore project identically without changing
+    // a byte in the ledger.
+    if let Some(result) = response.result.as_mut() {
+        forged_types::add_work_twins(result);
     }
+    response
 }
 
 /// A reconcile pass's own idempotency key: the run's derived key plus a

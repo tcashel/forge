@@ -131,7 +131,11 @@ pub async fn spec_source_of(ctx: &Ctx, run_id: &str) -> Result<SpecSource, Failu
                 if let Some(path) = payload.get("specPath").and_then(Value::as_str) {
                     return Ok(SpecSource::File(path.to_owned()));
                 }
-                if let Some(work) = payload.get("beadId").and_then(Value::as_str) {
+                if let Some(work) = payload
+                    .get("workId")
+                    .or_else(|| payload.get("beadId"))
+                    .and_then(Value::as_str)
+                {
                     return Ok(SpecSource::Work(work.to_owned()));
                 }
             }
