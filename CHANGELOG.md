@@ -4,6 +4,87 @@ This file records user-visible changes to Forge.
 
 ## [Unreleased]
 
+## [0.7.2] - 2026-09-04
+
+Wave 1 of the agent driver surface (epic ore-080, ADR-0036, PRs #254
+through #263, landed on `main` as #264): the operator of record is a
+fresh-context agent, so every verb now answers with one id, one lifecycle
+position, and one `next`. The wave also carries the seat contract, taken
+straight from the dogfood of running that epic through forged itself.
+
+### Added
+
+- `next`, the one driver verb (ore-080.1, PR #260). Bare `forged` runs it
+  for the current repository in text form; `--json`, `--text`, and
+  `--follow` select the shape. Every projection carries `subject`,
+  `lifecycle`, `health`, and `next`, the whole answer fits in 4 KiB, and
+  the `workId` twins and the envelope are charged against that budget
+  (PR #261), so the reader never pages.
+- Action classes on every advertised verb (ore-080.2, PR #255): `class` is
+  `should`, `can`, or `repair`; a subject carries at most one `should`;
+  `explain` puts it at `next[0]`. Terminal runs advertise honestly:
+  Cancelled offers no `should`, Landed and Superseded point at evidence,
+  Clean and AcceptedRisk say "land it". When a run outcome and an open
+  decision both name a `should`, the outcome wins and the decision's verb
+  is listed as `can`.
+- One id on every read (ore-080.4, PR #259): each read resolves an ore id
+  or a legacy bead key, and every response that names a bead key carries
+  its `workId` twin, so an agent never translates between stores.
+- MCP audiences (ore-080.5, PR #262): `forged mcp --audience lead |
+  operator | machine | all` filters `tools/list` by intended reader
+  (default `lead`); lead reads return envelope-free bodies; the server
+  orients a fresh session with its own instructions. The Claude plugin
+  launches with `--audience all` so the App's operator reads still resolve.
+- The seat contract (ore-080.15, PR #263). Config `seat_commands` names the
+  checks a seat runs before each commit, and the implement and fix prompts
+  say that forged runs the gate commands after the seat returns and after
+  every fix round; with the list empty the seat runs the tests that cover
+  the files it changed. Config `seat_env` reaches every provider process
+  (the operator's value wins). Both, with `deadline_retry_budget`
+  (default 1), are revisable policy re-resolved by `run revise-policy` and
+  `epic revise-policy`. A relaunched attempt gets one field note naming
+  the prior attempt and the commits its worktree already carries. Machine
+  Gate and ReGate take one ledger-backed slot per daemon
+  (`admission.gateActive`, default 1); a full house parks the run with a
+  `gate-capacity:` deferral, and operator `gate run` never waits. The
+  seat's result field projects as `seatChecks` beside the legacy
+  `gateState`.
+
+### Changed
+
+- Bounded projections by construction (ore-080.3, PR #254): every list
+  verb returns summary rows under the ADR-0036 budgets with `coverage`
+  (`shown`, `total`, `truncated`, `nextCursor`); spec bodies, event tails,
+  attempt history, and artifacts are opt-in through `--detail full`;
+  `work ready --all` returns the frontier whole or refuses
+  `FRONTIER_TOO_LARGE` with a remedy; `operations overview` is thirty
+  summary entries with attention as counts plus decisions, and the App
+  reads the same shape. `events --summary` is honoured again and conflicts
+  with `--detail`.
+- Restart accounting no longer charges the first launch (ore-080.6, PR
+  #258): restart-budget exhaustion means the configured number of
+  recoveries failed.
+
+### Fixed
+
+- A deadline kill was recorded as a transport failure, so a seat that ran
+  the full gate inside its budget spent the transport retry budget and the
+  run stopped Blocked with "provider unavailable" while the seat's work
+  sat uncommitted in the worktree. Both producers now write a `deadline:`
+  note with its own class and budget; past the budget the run stops
+  Blocked as `deadlineExhausted` with condition `deadline-exhausted`,
+  whose `next` offers `should run retry` only when the tree was read and
+  is clean and `can session message` otherwise. Legacy
+  `transport: stage deadline exceeded` rows keep their class and still
+  settle (PR #263).
+- An admission reservation orphaned by a controller death held a
+  repository-write slot until the operator adjudicated it by hand;
+  reconciliation now releases it once the next generation is reserved and
+  the evidence says no effect is live (PR #258).
+- Stored packets, execution packages, admission inputs, and identities
+  keep their bytes and digests: every field added in this release is
+  omitted when empty or at its default.
+
 ## [0.7.1] - 2026-09-02
 
 Two dead states closed and a leaner CI gate: a roster revision can no
@@ -361,7 +442,8 @@ historical TypeScript `v0.4.0` product has been replaced and is unsupported.
 - Refuses non-normalized or root-equivalent install prefixes before touching a
   live path.
 
-[Unreleased]: https://github.com/tcashel/forge/compare/v0.7.1...HEAD
+[Unreleased]: https://github.com/tcashel/forge/compare/v0.7.2...HEAD
+[0.7.2]: https://github.com/tcashel/forge/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/tcashel/forge/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/tcashel/forge/compare/v0.6.3...v0.7.0
 [0.6.3]: https://github.com/tcashel/forge/compare/v0.6.2...v0.6.3
