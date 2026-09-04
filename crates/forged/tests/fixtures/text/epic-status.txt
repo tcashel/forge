@@ -1,4 +1,21 @@
-EPIC  2026-09-03T12:00:00Z
-capturedAt: 2026-09-03T12:00:00Z
-id: ore-1
-state: running
+EPIC
+id: ore-epic
+title: Bounded epic
+health: running
+desired: running
+draft PR: 260
+final PR: —
+counts: active 1  landed 2
+INPUT REQUIRED: {"code":"operator-choice","detail":"choose a child"}
+children: 12
+  child-00  implementation  running
+  child-01  implementation  running
+  child-02  implementation  running
+  child-03  implementation  running
+  child-04  implementation  running
+  child-05  implementation  running
+  child-06  implementation  running
+  child-07  implementation  running
+  child-08  implementation  running
+  child-09  implementation  running
+  … 2 more child(ren) not shown

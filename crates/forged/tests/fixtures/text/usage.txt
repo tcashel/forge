@@ -1,4 +1,21 @@
-USAGE  2026-09-03T12:00:00Z
-capturedAt: 2026-09-03T12:00:00Z
-id: ore-1
-state: running
+USAGE
+input tokens: 1200
+output tokens: 300
+cache read tokens: 100
+cache write tokens: 20
+known spend USD: 3.0
+rows missing cost: 1
+pricing source: operator
+rates as of: 2026-09-01
+rows: 12
+  run-00  codex/gpt-5  $0.25
+  run-01  codex/gpt-5  $0.25
+  run-02  codex/gpt-5  $0.25
+  run-03  codex/gpt-5  $0.25
+  run-04  codex/gpt-5  $0.25
+  run-05  codex/gpt-5  $0.25
+  run-06  codex/gpt-5  $0.25
+  run-07  codex/gpt-5  $0.25
+  run-08  codex/gpt-5  $0.25
+  run-09  codex/gpt-5  $0.25
+  … 2 more usage row(s) not shown

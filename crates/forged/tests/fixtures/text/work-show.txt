@@ -1,4 +1,14 @@
-WORK  2026-09-03T12:00:00Z
-capturedAt: 2026-09-03T12:00:00Z
+WORK
 id: ore-1
-state: running
+kind: task
+status: open
+title: Driver surface
+priority: 1
+assignee: —
+revision: 3
+repository: /repo
+notes count: 2
+dependencies: 1
+  blocks ore-0  closed
+next actions: 1
+  should run start --work ore-1

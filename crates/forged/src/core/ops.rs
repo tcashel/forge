@@ -5041,6 +5041,7 @@ async fn collect_operations_universe(
 
 const NEXT_DEFAULT_LIMIT: usize = 30;
 const NEXT_MAX_LIMIT: u64 = 500;
+const NEXT_DEFAULT_BYTE_LIMIT: usize = 4096;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum NextSection {
@@ -5216,6 +5217,86 @@ fn next_is_epic_member(entry: &Value, epic_id: &str) -> bool {
         || entry.pointer("/plan/parent").and_then(Value::as_str) == Some(epic_id)
 }
 
+fn attach_plan_to_entry(entry: &mut Value, plan: &crate::core::work_types::PlanIssue) {
+    let Some(object) = entry.as_object_mut() else {
+        return;
+    };
+    object.insert("priority".to_owned(), json!(plan.issue.priority));
+    object.insert(
+        "plan".to_owned(),
+        json!({
+            "source": "beads",
+            "status": plan.issue.status,
+            "readiness": plan.readiness(),
+            "priority": plan.issue.priority,
+            "assignee": plan.issue.assignee,
+            "issueType": plan.issue.issue_type,
+            "revision": plan.issue.revision,
+            "parent": plan.parent,
+            "dependencies": plan.dependencies,
+        }),
+    );
+}
+
+/// Hydrate an exact epic scope before any portfolio presentation bound is
+/// applied. The root and both native and legacy children come from exact
+/// ledger identities, so an epic ordered after the 500-row live-plan window
+/// remains addressable and its ready children remain selectable.
+async fn hydrate_next_epic_scope(
+    ctx: &Ctx,
+    epic_id: &str,
+    captured_at: &str,
+    entries: &mut Vec<Value>,
+    work_summaries: &mut Vec<crate::core::work_types::IssueSummary>,
+) -> Result<BTreeSet<String>, Failure> {
+    let root = super::workstore::show_issue(&ctx.ledger, epic_id).await?;
+    if root.issue_type != "epic" {
+        return Err(Failure::invalid(format!(
+            "next id {epic_id:?} does not name an epic"
+        )));
+    }
+    let (children, _) = super::workstore::epic_children_with_legacy(&ctx.ledger, epic_id).await?;
+    let mut ids = Vec::with_capacity(children.len().saturating_add(1));
+    ids.push(root.id.clone());
+    ids.extend(children.iter().map(|child| child.id.clone()));
+    let plans = super::workstore::plan_issues(&ctx.ledger, &ids).await?;
+    let scope_ids = ids.into_iter().collect::<BTreeSet<_>>();
+
+    let plans_by_id = plans
+        .iter()
+        .map(|plan| (plan.issue.id.as_str(), plan))
+        .collect::<BTreeMap<_, _>>();
+    for entry in entries.iter_mut() {
+        let work_id = entry
+            .get("beadId")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        if let Some(plan) = work_id.as_deref().and_then(|id| plans_by_id.get(id)) {
+            attach_plan_to_entry(entry, plan);
+        }
+    }
+    let represented = entry_work_ids(entries).into_iter().collect::<BTreeSet<_>>();
+    for plan in plans
+        .iter()
+        .filter(|plan| plan.issue.status != "closed")
+        .filter(|plan| !represented.contains(&plan.issue.id))
+    {
+        entries.push(live_plan_entry(plan, captured_at)?);
+    }
+
+    let mut known = work_summaries
+        .iter()
+        .map(|issue| issue.id.clone())
+        .collect::<BTreeSet<_>>();
+    for plan in plans {
+        if known.insert(plan.issue.id.clone()) {
+            work_summaries.push(plan.issue);
+        }
+    }
+    decorate_titles(entries, work_summaries)?;
+    Ok(scope_ids)
+}
+
 fn next_spend(entries: &[Value], subject_id: &str, kind: &str) -> Value {
     let mut known = 0.0;
     let mut missing = 0u64;
@@ -5380,6 +5461,7 @@ fn next_landed_row(entry: &Value, entries: &[Value], captured_at: &str) -> Resul
     });
     row["pr"] = entry
         .pointer("/delivery/pr")
+        .filter(|value| !value.is_null())
         .or_else(|| entry.pointer("/pr/number"))
         .cloned()
         .unwrap_or(Value::Null);
@@ -5407,6 +5489,53 @@ fn next_coverage(shown: usize, total: usize) -> Value {
         "total": total,
         "truncated": shown < total,
     })
+}
+
+/// Keep the default driver read inside its byte contract without lying about
+/// coverage. Decision rows have highest priority, followed by running, ready,
+/// and landed; optional symptoms are discarded first. Explicit section reads
+/// are the widening escape hatch and do not use this byte cap.
+fn bound_next_default_result(result: &mut Value) {
+    while serde_json::to_vec(result).is_ok_and(|bytes| bytes.len() > NEXT_DEFAULT_BYTE_LIMIT) {
+        let mut removed = None;
+        for section in ["symptoms", "landed", "ready", "running", "decisions"] {
+            let Some(rows) = result
+                .pointer_mut(&format!("/sections/{section}"))
+                .and_then(Value::as_array_mut)
+            else {
+                continue;
+            };
+            if rows.pop().is_some() {
+                removed = Some((section, rows.len()));
+                break;
+            }
+        }
+        let Some((section, shown)) = removed else {
+            break;
+        };
+        if let Some(coverage) = result
+            .pointer_mut(&format!("/coverage/sections/{section}"))
+            .and_then(Value::as_object_mut)
+        {
+            let total = coverage
+                .get("total")
+                .and_then(Value::as_u64)
+                .unwrap_or(shown as u64);
+            coverage.insert("shown".to_owned(), json!(shown));
+            coverage.insert("truncated".to_owned(), json!((shown as u64) < total));
+        }
+        if let Some(shown_total) = result.pointer("/coverage/shown").and_then(Value::as_u64) {
+            result["coverage"]["shown"] = json!(shown_total.saturating_sub(1));
+        }
+        result["coverage"]["truncated"] = json!(true);
+        if section == "symptoms" {
+            let hidden = result
+                .pointer("/hidden/symptoms")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            result["hidden"]["symptoms"] = json!(hidden.saturating_add(1));
+        }
+    }
 }
 
 /// `next` — the bounded decision-first lead surface.
@@ -5462,7 +5591,7 @@ pub async fn next(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
             },
         )
         .await?;
-        let source_health = universe.source_health();
+        let mut source_health = universe.source_health();
         if repository.is_some()
             && source_health
                 .pointer("/beads/state")
@@ -5478,12 +5607,33 @@ pub async fn next(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
             snapshot,
             work_captured_at,
             mut entries,
-            work_summaries,
+            mut work_summaries,
             claim_error,
             plan_truncated,
             ..
         } = universe;
         let captured_at = work_captured_at;
+        let epic_scope_work_ids = match epic_id.as_deref() {
+            Some(epic_id) => {
+                let ids = hydrate_next_epic_scope(
+                    ctx,
+                    epic_id,
+                    &captured_at,
+                    &mut entries,
+                    &mut work_summaries,
+                )
+                .await?;
+                source_health["plan"] = json!({
+                    "state": "available",
+                    "error": Value::Null,
+                    "discovered": ids.len(),
+                    "limit": ids.len(),
+                    "truncated": false,
+                });
+                Some(ids)
+            }
+            None => None,
+        };
         let attention_items =
             super::attention::project_active(&snapshot, &entries, &work_summaries)?;
         let attention_json = attention_items
@@ -5501,17 +5651,15 @@ pub async fn next(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
         };
         let _queue = operator_queue(&snapshot, &mut entries, &attention_json, work_read);
 
-        if let Some(epic_id) = epic_id.as_deref() {
-            let epic_exists = entries.iter().any(|entry| {
-                entry.get("id").and_then(Value::as_str) == Some(epic_id)
-                    && entry.get("kind").and_then(Value::as_str) == Some("epic")
+        if let (Some(epic_id), Some(scope_ids)) = (epic_id.as_deref(), epic_scope_work_ids.as_ref())
+        {
+            entries.retain(|entry| {
+                next_is_epic_member(entry, epic_id)
+                    || entry
+                        .get("beadId")
+                        .and_then(Value::as_str)
+                        .is_some_and(|id| scope_ids.contains(id))
             });
-            if !epic_exists {
-                return Err(Failure::invalid(format!(
-                    "next id {epic_id:?} does not name an epic"
-                )));
-            }
-            entries.retain(|entry| next_is_epic_member(entry, epic_id));
         }
         let scoped_ids = entries
             .iter()
@@ -5559,42 +5707,37 @@ pub async fn next(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
             .collect::<Result<Vec<_>, _>>()?;
         running.sort_by(|left, right| left["id"].as_str().cmp(&right["id"].as_str()));
 
-        let ready_page = on_ledger(&ctx.ledger, {
-            let repository = repository.clone();
-            move |ledger| {
-                ledger.ready_work_items_page_filtered(
-                    WorkItemFilters {
-                        repository,
-                        ..WorkItemFilters::default()
-                    },
-                    None,
-                    NEXT_MAX_LIMIT as usize,
-                )
-            }
-        })
-        .await?;
-        let scoped_work_ids = entries
-            .iter()
-            .flat_map(|entry| {
-                [
-                    entry.get("beadId").and_then(Value::as_str),
-                    entry.get("id").and_then(Value::as_str),
-                ]
-                .into_iter()
-                .flatten()
-                .map(str::to_owned)
-            })
-            .collect::<BTreeSet<_>>();
-        let ready_total = usize::try_from(ready_page.total).unwrap_or(usize::MAX);
-        let ready_items = ready_page
-            .items
-            .into_iter()
-            .filter(|item| epic_id.is_none() || scoped_work_ids.contains(&item.work_id))
-            .collect::<Vec<_>>();
-        let ready_total = if epic_id.is_some() {
-            ready_items.len()
+        let (ready_items, ready_total, ready_has_more) =
+            if let Some(scope_ids) = epic_scope_work_ids.as_ref() {
+                let items = on_ledger(&ctx.ledger, |ledger| ledger.ready_work_items()).await?;
+                let items = items
+                    .into_iter()
+                    .filter(|item| scope_ids.contains(&item.work_id))
+                    .collect::<Vec<_>>();
+                let total = items.len();
+                (items, total, false)
+            } else {
+                let page = on_ledger(&ctx.ledger, {
+                    let repository = repository.clone();
+                    move |ledger| {
+                        ledger.ready_work_items_page_filtered(
+                            WorkItemFilters {
+                                repository,
+                                ..WorkItemFilters::default()
+                            },
+                            None,
+                            NEXT_MAX_LIMIT as usize,
+                        )
+                    }
+                })
+                .await?;
+                let total = usize::try_from(page.total).unwrap_or(usize::MAX);
+                (page.items, total, page.has_more)
+            };
+        let scope_plan_truncated = if epic_id.is_some() {
+            false
         } else {
-            ready_total
+            plan_truncated
         };
         let ready_ids = ready_items
             .iter()
@@ -5688,6 +5831,8 @@ pub async fn next(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
         if include_symptoms {
             coverage_sections["symptoms"] = next_coverage(symptom_rows.len(), symptoms.len());
         }
+        let bound_default_portfolio =
+            section.is_none() && repository.is_none() && epic_id.is_none();
         let scope = if let Some(repository) = repository {
             json!({"repository": repository})
         } else if let Some(epic_id) = epic_id {
@@ -5695,7 +5840,7 @@ pub async fn next(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
         } else {
             json!({"portfolio": true})
         };
-        Ok(json!({
+        let mut result = json!({
             "schema": "forged.next/1",
             "capturedAt": captured_at,
             "scope": scope,
@@ -5708,11 +5853,15 @@ pub async fn next(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
                 "limit": NEXT_DEFAULT_LIMIT,
                 "shown": shown,
                 "total": total,
-                "truncated": shown < total || ready_page.has_more || plan_truncated,
+                "truncated": shown < total || ready_has_more || scope_plan_truncated,
                 "sourceHealth": source_health,
                 "sections": coverage_sections,
             },
-        }))
+        });
+        if bound_default_portfolio {
+            bound_next_default_result(&mut result);
+        }
+        Ok(result)
     })
     .await
 }
@@ -6807,7 +6956,10 @@ mod tests {
     use forged_types::{ExecutionPolicyV1, HostPolicyV1, Stage};
     use serde_json::{json, Value};
 
-    use super::{next_default_limits, next_spend, next_title, next_within_last_day, splice_policy};
+    use super::{
+        next_default_limits, next_landed_row, next_spend, next_title, next_within_last_day,
+        splice_policy,
+    };
 
     #[test]
     fn next_spend_is_known_only_when_every_matching_usage_row_is_costed() {
@@ -6851,6 +7003,22 @@ mod tests {
             Some("2026-09-02T11:59:59Z")
         ));
         assert!(!next_within_last_day("2026-09-03T12:00:00Z", None));
+
+        let legacy = json!({
+            "id": "legacy-landed",
+            "delivery": {"pr": Value::Null},
+            "pr": {"number": 260},
+            "updatedAt": "2026-09-03T11:00:00Z",
+            "costUsdKnown": 0.0,
+            "rowsMissingCost": 0,
+        });
+        let row = next_landed_row(
+            &legacy,
+            std::slice::from_ref(&legacy),
+            "2026-09-03T12:00:00Z",
+        )
+        .expect("legacy landed row");
+        assert_eq!(row["pr"], json!(260));
     }
 
     #[test]

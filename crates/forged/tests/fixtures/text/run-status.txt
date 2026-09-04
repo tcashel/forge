@@ -1,4 +1,12 @@
-RUN  2026-09-03T12:00:00Z
-capturedAt: 2026-09-03T12:00:00Z
-id: ore-1
-state: running
+RUN
+id: run-1
+state: active
+outcome: —
+stage: implementation
+health: in_progress
+controller: running
+pr: —
+packets: 1  live attempts: 1
+driver next: {"awaitPacket":{"packetId":"run-1/implementation/0"}}
+next actions: 1
+  can run status --run run-1

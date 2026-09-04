@@ -1,4 +1,14 @@
 HISTORY  2026-09-03T12:00:00Z
-capturedAt: 2026-09-03T12:00:00Z
-id: ore-1
-state: running
+from: 2026-09-01T00:00:00Z
+to: 2026-09-03T00:00:00Z
+bucket: day
+group by: repository
+runs started: 3
+runs settled: 2
+attempts started: 4
+known spend USD: 1.5
+rows missing cost: 1
+subjects: 1 of 3 shown (truncated; next cursor available)
+degraded: 1 usage row retains unknown cost
+series: 1
+  repository:/repo  /repo
