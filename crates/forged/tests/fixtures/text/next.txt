@@ -1,0 +1,17 @@
+NEXT  portfolio  2026-09-03T12:00:00Z
+
+DECISIONS  1/1
+  ore-080  awaiting_operator  Choose the release
+    age 12m  lifecycle reviewed  spend $1.25
+    should: forged epic resolve --id ore-080  (+1 can)
+
+RUNNING  0/0
+  —
+
+READY  0/0
+  —
+
+LANDED  0/0
+  —
+
+HIDDEN  symptoms 47  parked 2

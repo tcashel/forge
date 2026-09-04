@@ -21,6 +21,7 @@ fn help_lists_every_command_and_subcommand_flags() {
     let env = TestEnv::new("forged-help");
     let top = help_text(&env, &["--help"]);
     for command in [
+        "next",
         "doctor",
         "init",
         "definition",
@@ -39,6 +40,17 @@ fn help_lists_every_command_and_subcommand_flags() {
         "mcp",
     ] {
         assert!(top.contains(command), "--help must list {command}: {top}");
+    }
+    let next = help_text(&env, &["next", "--help"]);
+    for flag in [
+        "--repo",
+        "--id",
+        "--symptoms",
+        "--section",
+        "--limit",
+        "--follow",
+    ] {
+        assert!(next.contains(flag), "next --help must document {flag}");
     }
     let run = help_text(&env, &["run", "--help"]);
     for sub in ["start", "advance", "drive", "status"] {

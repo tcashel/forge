@@ -219,6 +219,15 @@
     {
       "class": "read_only",
       "cli": true,
+      "cliVerb": "next",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": true,
+      "name": "next"
+    },
+    {
+      "class": "read_only",
+      "cli": true,
       "cliVerb": "operations overview",
       "dispatch": true,
       "explicitKey": false,

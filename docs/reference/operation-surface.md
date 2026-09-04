@@ -30,6 +30,7 @@ Generated from the dispatch table, clap tree, MCP router, and fenced-call audit.
 | `gate_run` | `forged gate run` | yes | yes | fenced | no | yes |
 | `init` | `forged init` | yes | no | fenced | no | yes |
 | `mcp` | `forged mcp` | yes | no | — | no | no |
+| `next` | `forged next` | yes | yes | read_only | no | yes |
 | `operations_overview` | `forged operations overview` | yes | yes | read_only | no | yes |
 | `overview` | `forged overview` | yes | yes | read_only | no | yes |
 | `packet_claim` | `forged packet claim` | yes | yes | fenced | no | yes |

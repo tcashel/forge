@@ -13,7 +13,7 @@
 //! and the planning apply is guarded by empty custody + blocked status + the
 //! revision CAS.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use forged_types::{
     canonical_json_bytes, parse_canonical, request_sha256, ErrorCode, OperationRequest,
@@ -1102,6 +1102,33 @@ impl Ledger {
             )?;
             u64::try_from(count)
                 .map_err(|_| internal(format!("negative work note count for {work_id:?}")))
+        })
+    }
+
+    /// Return the exact requested work ids carrying at least one note of
+    /// `kind`, in one read transaction and without loading note bodies.
+    pub fn work_items_with_note_kind(
+        &self,
+        work_ids: &[String],
+        kind: WorkNoteKind,
+    ) -> Result<BTreeSet<String>, LedgerError> {
+        let work_ids = work_ids.to_vec();
+        self.submit(move |conn| {
+            if work_ids.is_empty() {
+                return Ok(BTreeSet::new());
+            }
+            let ids_json = serde_json::to_string(&work_ids)?;
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT work_id FROM work_notes \
+                 WHERE kind = ?1 AND work_id IN (SELECT value FROM json_each(?2)) \
+                 ORDER BY work_id",
+            )?;
+            let rows = stmt.query_map([kind.as_str(), ids_json.as_str()], |row| row.get(0))?;
+            let mut found = BTreeSet::new();
+            for row in rows {
+                found.insert(row?);
+            }
+            Ok(found)
         })
     }
 
