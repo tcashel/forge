@@ -344,7 +344,9 @@ fn once_adopts_live_work_and_concurrent_ticks_restart_once() {
             DesiredSubjectKind::Run,
             "run-supervised",
             DesiredState::Running,
-            DesiredReconcileOutcome::Authorized,
+            // A recovery, not a fresh authorization: the free first launch
+            // already happened, so this restart charges the budget.
+            DesiredReconcileOutcome::Restarted,
             Some("2000-01-01T00:00:00.000000000Z".to_owned()),
             None,
         )
@@ -944,11 +946,8 @@ fn nonrecoverable_terminal_halts_without_charging_the_budget() {
             "reason": "omit the idempotency key so forged can mint the next controller generation",
         })
     );
-    let mut mcp = McpClient::new(&env);
-    let resubmitted = mcp.call_tool(
-        "run_submit",
-        json!({"schemaVersion": 1, "params": remedy["args"]}),
-    );
+    let mut mcp = McpClient::new(&env, None);
+    let resubmitted = mcp.call_tool("run_submit", remedy["args"].clone());
     assert_eq!(
         resubmitted["ok"],
         json!(true),
@@ -1040,7 +1039,7 @@ fn mutable_host_invalid_request_restarts_with_evidence_and_backoff() {
         .get_desired_work(DesiredSubjectKind::Run, "run-backoff")
         .expect("desired query")
         .expect("desired row");
-    assert_eq!(desired.restart_used, 1);
+    assert_eq!(desired.restart_used, 0);
     assert_eq!(desired.controller_generation, 2);
     assert_eq!(
         desired.last_error.as_deref(),
@@ -1081,7 +1080,7 @@ fn mutable_host_invalid_request_restarts_with_evidence_and_backoff() {
             DesiredSubjectKind::Run,
             "run-backoff",
             DesiredState::Running,
-            DesiredReconcileOutcome::Authorized,
+            DesiredReconcileOutcome::Restarted,
             Some("2000-01-01T00:00:00.000000000Z".to_owned()),
             None,
         )
@@ -1096,12 +1095,12 @@ fn mutable_host_invalid_request_restarts_with_evidence_and_backoff() {
         .get_desired_work(DesiredSubjectKind::Run, "run-backoff")
         .expect("desired query")
         .expect("desired row");
-    assert_eq!(desired.restart_used, 2);
+    assert_eq!(desired.restart_used, 1);
     assert_eq!(desired.controller_generation, 3);
     let wake = desired.next_wake_at.as_deref().expect("backoff wake");
     assert!(
-        seconds_between(&desired.updated_at, wake) >= 9.0,
-        "the second restart doubles the observation backoff: {} -> {wake}",
+        seconds_between(&desired.updated_at, wake) >= 4.0,
+        "the first charged recovery keeps the flat observation backoff: {} -> {wake}",
         desired.updated_at
     );
     ledger.close().expect("close");
@@ -1165,7 +1164,7 @@ fn a_terminal_drive_error_records_durable_evidence() {
 }
 
 fn controller_dead_attention(env: &TestEnv, run: &str) -> Option<Value> {
-    let (code, overview) = env.forged(&["overview"]);
+    let (code, overview) = env.forged(&["overview", "--detail", "full"]);
     assert_eq!(code, 0, "{overview}");
     overview["result"]["attention"]
         .as_array()

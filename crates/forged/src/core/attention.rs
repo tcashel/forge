@@ -186,6 +186,12 @@ pub(crate) fn policy(
             Action::ReviseRoster,
             "Revise provider policy or explicitly adjudicate exhaustion",
         ),
+        Condition::DeadlineExhausted => (
+            Severity::High,
+            Owner::LeadAgent,
+            Action::ResumeSeat,
+            "Resume the deadline-killed stage from the worktree the seat left",
+        ),
         Condition::ProviderDegraded => (
             Severity::Medium,
             Owner::LeadAgent,
@@ -244,32 +250,37 @@ pub(crate) fn recommendation_actions(
     work_id: Option<&str>,
     occurrence_resolution_allowed: bool,
     risk_acceptance_allowed: bool,
+    evidence: Option<&Value>,
 ) -> Vec<OperationActionV1> {
     use AttentionActionCode as Action;
-    let action = |verb: &str, args: Value, reason: &str| {
-        let Value::Object(args) = args else {
-            unreachable!("attention action args are objects")
+    let classified_action =
+        |verb: &str, args: Value, reason: &str, class: forged_types::ActionClass| {
+            let Value::Object(args) = args else {
+                unreachable!("attention action args are objects")
+            };
+            OperationActionV1 {
+                verb: verb.to_owned(),
+                args,
+                reason: reason.to_owned(),
+                class,
+            }
         };
-        OperationActionV1 {
-            verb: verb.to_owned(),
-            args,
-            reason: reason.to_owned(),
-        }
-    };
-    let attention_resolution = |disposition: Value, reason: &str| {
-        action(
-            "attention resolve",
-            json!({
-                "subject": subject_id,
-                "attentionId": attention_id,
-                "occurrenceId": occurrence_id,
-                "actor": Value::Null,
-                "disposition": disposition,
-                "note": Value::Null,
-            }),
-            reason,
-        )
-    };
+    let attention_resolution =
+        |disposition: Value, reason: &str, class: forged_types::ActionClass| {
+            classified_action(
+                "attention resolve",
+                json!({
+                    "subject": subject_id,
+                    "attentionId": attention_id,
+                    "occurrenceId": occurrence_id,
+                    "actor": Value::Null,
+                    "disposition": disposition,
+                    "note": Value::Null,
+                }),
+                reason,
+                class,
+            )
+        };
     let retryable = run.filter(|run| {
         run.state == RunState::Stopped
             && !matches!(
@@ -283,71 +294,167 @@ pub(crate) fn recommendation_actions(
             let Some(work_id) = work_id else {
                 return Vec::new();
             };
-            vec![action(
+            vec![classified_action(
                 "work reopen",
                 json!({"id": work_id}),
                 &recommendation.text,
+                forged_types::ActionClass::Repair,
             )]
         }
         Action::ProvideInput => match subject_kind {
-            AttentionSubjectKind::Epic => vec![action(
+            AttentionSubjectKind::Epic => vec![classified_action(
                 "epic resolve",
                 json!({"epic": subject_id, "child": Value::Null, "note": Value::Null}),
                 "bind the held child when the input requirement names one and record the resolution note",
+                forged_types::ActionClass::Should,
             )],
             AttentionSubjectKind::Run => retryable.map_or_else(Vec::new, |run| {
-                vec![super::ops::retry_action(
-                    subject_id,
-                    super::ops::retry_reason(run),
-                )]
+                let work_id = work_id.unwrap_or(&run.work_id);
+                vec![
+                    classified_action(
+                        "work update",
+                        json!({
+                            "id": work_id,
+                            "expectedRevision": Value::Null,
+                            "description": Value::Null,
+                        }),
+                        super::ops::retry_reason(run),
+                        forged_types::ActionClass::Should,
+                    ),
+                    super::ops::retry_action(subject_id, super::ops::retry_reason(run)),
+                ]
             }),
         },
         Action::AdjudicateQuarantine => vec![attention_resolution(
             Value::Null,
             "bind the adjudicated disposition and note for this exact quarantined occurrence",
+            forged_types::ActionClass::Should,
         )],
         Action::RepairPricing => vec![attention_resolution(
             json!("accepted-unknown"),
             "edit the config file to repair pricing, or bind a note accepting this unknown spend",
+            forged_types::ActionClass::Should,
         )],
         Action::ReviseRoster => match subject_kind {
-            AttentionSubjectKind::Run => vec![action(
-                "run revise-roster",
-                json!({"run": subject_id, "roster": Value::Null, "reason": Value::Null}),
-                "bind a configured roster name and the reason for revising provider policy",
-            )],
-            AttentionSubjectKind::Epic => vec![action(
+            AttentionSubjectKind::Run => {
+                // A revision binds at the run's next durable boundary; a
+                // stopped run has none, so there the revision is optional
+                // context and the lifecycle `run retry` carries the `should`.
+                let class = if run.is_some_and(|run| run.state == RunState::Active) {
+                    forged_types::ActionClass::Should
+                } else {
+                    forged_types::ActionClass::Can
+                };
+                vec![classified_action(
+                    "run revise-roster",
+                    json!({"run": subject_id, "roster": Value::Null, "reason": Value::Null}),
+                    "bind a configured roster name and the reason for revising provider policy",
+                    class,
+                )]
+            }
+            AttentionSubjectKind::Epic => vec![classified_action(
                 "epic revise-roster",
                 json!({"epic": subject_id, "roster": Value::Null, "reason": Value::Null}),
                 "bind a configured roster name and the reason for revising provider policy",
+                forged_types::ActionClass::Should,
             )],
         },
+        Action::ResumeSeat => match subject_kind {
+            AttentionSubjectKind::Run => {
+                let facts = evidence.and_then(|value| value.pointer("/terminal/deadlineExhausted"));
+                let facts_known = facts
+                    .and_then(|value| value.get("factsKnown"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let uncommitted = facts
+                    .and_then(|value| value.get("uncommitted"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                if !facts_known {
+                    // Unknown facts never license a retry that could discard
+                    // work: steer or inspect instead.
+                    vec![classified_action(
+                        "session message",
+                        json!({"run": subject_id, "attempt": Value::Null, "message": Value::Null}),
+                        "the worktree state could not be read at settlement; inspect it before any retry, since run retry would discard uncommitted work",
+                        forged_types::ActionClass::Can,
+                    )]
+                } else if uncommitted > 0 {
+                    // The seat's work is still in the worktree and a retry
+                    // would discard it: steer the next attempt instead and
+                    // leave the landing to the lead until retry keeps the
+                    // branch (ore-080.9). No `should` is honest here.
+                    vec![classified_action(
+                        "session message",
+                        json!({"run": subject_id, "attempt": Value::Null, "message": Value::Null}),
+                        &format!(
+                            "{uncommitted} uncommitted file(s) remain in the worktree; queue guidance for the next attempt or land the worktree by hand, since run retry would discard the work"
+                        ),
+                        forged_types::ActionClass::Can,
+                    )]
+                } else {
+                    retryable.map_or_else(Vec::new, |run| {
+                        vec![super::ops::retry_action_with_class(
+                            subject_id,
+                            super::ops::retry_reason(run),
+                            forged_types::ActionClass::Should,
+                        )]
+                    })
+                }
+            }
+            AttentionSubjectKind::Epic => Vec::new(),
+        },
         Action::AdjudicateReview => {
-            let mut actions = vec![attention_resolution(
-                Value::Null,
-                "bind the adjudicated disposition and note for this exact review disagreement",
-            )];
             if subject_kind == AttentionSubjectKind::Run && risk_acceptance_allowed {
-                actions.push(action(
+                let mut actions = vec![classified_action(
                     "run accept-risk",
                     json!({"run": subject_id, "acceptedBy": Value::Null, "rationale": Value::Null}),
                     "bind the accepting operator and rationale after the persisted terminal non-approve review outcome",
+                    forged_types::ActionClass::Should,
+                )];
+                if let Some(run) = retryable {
+                    actions.push(super::ops::retry_action(
+                        subject_id,
+                        super::ops::retry_reason(run),
+                    ));
+                }
+                actions.push(classified_action(
+                    "run adjudicate-settlement",
+                    json!({
+                        "run": subject_id,
+                        "outcome": "landed",
+                        "pr": Value::Null,
+                        "sha": Value::Null,
+                        "actor": Value::Null,
+                        "rationale": Value::Null,
+                        "evidenceGap": Value::Null,
+                    }),
+                    "repair the review-budget settlement with explicit delivery evidence",
+                    forged_types::ActionClass::Repair,
                 ));
+                actions
+            } else {
+                vec![attention_resolution(
+                    Value::Null,
+                    "bind the adjudicated disposition and note for this exact review disagreement",
+                    forged_types::ActionClass::Should,
+                )]
             }
-            actions
         }
         Action::ReauthorizeWork => match subject_kind {
             AttentionSubjectKind::Run => {
                 if let Some(run) = retryable {
-                    vec![super::ops::retry_action(
+                    vec![super::ops::retry_action_with_class(
                         subject_id,
                         super::ops::retry_reason(run),
+                        forged_types::ActionClass::Should,
                     )]
                 } else if run.is_some_and(|run| run.state == RunState::Active) {
-                    vec![action(
+                    vec![classified_action(
                         "run stop",
                         json!({"run": subject_id, "outcome": Value::Null, "reason": Value::Null}),
                         "stop with an outcome and reason, then retry the terminal run",
+                        forged_types::ActionClass::Should,
                     )]
                 } else {
                     Vec::new()
@@ -355,16 +462,18 @@ pub(crate) fn recommendation_actions(
             }
             AttentionSubjectKind::Epic => {
                 if desired_state == Some(DesiredState::Paused) {
-                    vec![action(
+                    vec![classified_action(
                         "epic resume",
                         json!({"epic": subject_id, "reason": Value::Null}),
                         "bind the reason for resuming the paused epic",
+                        forged_types::ActionClass::Should,
                     )]
                 } else {
-                    vec![action(
+                    vec![classified_action(
                         "epic submit",
                         json!({"epic": subject_id}),
                         "resubmit the epic to authorize a fresh controller revision",
+                        forged_types::ActionClass::Should,
                     )]
                 }
             }
@@ -372,6 +481,7 @@ pub(crate) fn recommendation_actions(
         Action::RepairEvidence if occurrence_resolution_allowed => vec![attention_resolution(
             json!("evidence-absent"),
             "bind a nonblank note explaining why this attempt-only evidence was never captured",
+            forged_types::ActionClass::Repair,
         )],
         // These decision codes have no honesty-tested in-surface domain verb.
         // RepairEvidence is likewise empty for the repairable, non-attempt
@@ -412,6 +522,7 @@ struct SubjectMetadata {
     kind: AttentionSubjectKind,
     title: Option<WorkTitleV1>,
     repository: Option<String>,
+    revision: Option<String>,
 }
 
 fn subject_metadata(input: &ProjectionInput<'_>, id: &str) -> Option<SubjectMetadata> {
@@ -429,6 +540,11 @@ fn subject_metadata(input: &ProjectionInput<'_>, id: &str) -> Option<SubjectMeta
             kind: subject_kind(entry),
             title: subject_title(entry),
             repository: repository(entry),
+            revision: entry
+                .pointer("/identity/bead/revision")
+                .or_else(|| entry.pointer("/identity/work/revision"))
+                .and_then(Value::as_str)
+                .map(str::to_owned),
         });
     };
     if let Some(run) = snapshot.runs.iter().find(|run| run.run_id == id) {
@@ -446,6 +562,12 @@ fn subject_metadata(input: &ProjectionInput<'_>, id: &str) -> Option<SubjectMeta
             kind: AttentionSubjectKind::Run,
             title,
             repository: Some(run.repo.clone()),
+            revision: snapshot
+                .child_identities
+                .iter()
+                .find(|identity| identity.subject.id == id)
+                .or_else(|| (snapshot.identity.subject.id == id).then_some(&snapshot.identity))
+                .and_then(|identity| identity.work.revision.clone()),
         });
     }
     (snapshot.subject.id == id).then(|| SubjectMetadata {
@@ -459,6 +581,7 @@ fn subject_metadata(input: &ProjectionInput<'_>, id: &str) -> Option<SubjectMeta
             .repository
             .as_ref()
             .map(|repository| repository.path.clone()),
+        revision: snapshot.identity.work.revision.clone(),
     })
 }
 
@@ -661,7 +784,8 @@ fn collect_domain_sources(input: &ProjectionInput<'_>) -> Result<Vec<RawAttentio
         match outcome {
             Some("blocked") => {
                 let live_status = entry
-                    .get("beadId")
+                    .get("workId")
+                    .or_else(|| entry.get("beadId"))
                     .and_then(Value::as_str)
                     .and_then(|work_id| work_by_id.get(work_id))
                     .map(|issue| issue.status.as_str());
@@ -799,7 +923,15 @@ fn collect_domain_sources(input: &ProjectionInput<'_>) -> Result<Vec<RawAttentio
         // it as a guard rather than minting a second causal source.
         let by_work: BTreeMap<&str, &str> = entries_slice
             .iter()
-            .filter_map(|entry| Some((entry.get("beadId")?.as_str()?, entry.get("id")?.as_str()?)))
+            .filter_map(|entry| {
+                Some((
+                    entry
+                        .get("workId")
+                        .or_else(|| entry.get("beadId"))?
+                        .as_str()?,
+                    entry.get("id")?.as_str()?,
+                ))
+            })
             .collect();
         for issue in work.iter().filter(|issue| issue.status == "blocked") {
             let Some(id) = by_work.get(issue.id.as_str()) else {
@@ -1329,18 +1461,28 @@ fn collect_domain_sources(input: &ProjectionInput<'_>) -> Result<Vec<RawAttentio
         } else {
             event_value(&event.payload_json)
         };
-        if payload.pointer("/terminal/providerUnavailable").is_none() {
+        let (condition, detail) = if payload.pointer("/terminal/providerUnavailable").is_some() {
+            (
+                AttentionCondition::RetryExhausted,
+                "provider retry budget is exhausted",
+            )
+        } else if payload.pointer("/terminal/deadlineExhausted").is_some() {
+            (
+                AttentionCondition::DeadlineExhausted,
+                "stage deadline relaunch budget is exhausted",
+            )
+        } else {
             continue;
-        }
+        };
         add_raw(
             &mut raw,
             &id,
-            AttentionCondition::RetryExhausted,
+            condition,
             &event.ts,
             &event.ts,
             event.event_id,
             format!("event:{}", event.event_id),
-            "provider retry budget is exhausted",
+            detail,
             payload,
             AttentionEvidenceKind::Event,
             event.event_id.to_string(),
@@ -1915,6 +2057,7 @@ pub(crate) fn classification(condition: AttentionCondition) -> AttentionClass {
         | Condition::Quarantined
         | Condition::MissingCost
         | Condition::RetryExhausted
+        | Condition::DeadlineExhausted
         | Condition::ReviewerDisagreement
         | Condition::AmbiguousEffect
         | Condition::RestartBudgetExhausted
@@ -1945,7 +2088,10 @@ fn project(input: ProjectionInput<'_>) -> Result<Vec<AttentionItemV1>, Failure> 
         .iter()
         .filter_map(|entry| {
             let subject = entry.get("id")?.as_str()?;
-            let work_id = entry.get("beadId")?.as_str()?;
+            let work_id = entry
+                .get("workId")
+                .or_else(|| entry.get("beadId"))?
+                .as_str()?;
             blocked_work.contains(work_id).then_some((subject, work_id))
         })
         .collect();
@@ -2052,6 +2198,7 @@ fn project(input: ProjectionInput<'_>) -> Result<Vec<AttentionItemV1>, Failure> 
             work_by_subject.get(subject_id.as_str()).copied(),
             occurrence_resolution_allowed,
             persisted_risk_acceptance_allowed(&input, &subject_id),
+            Some(&latest.evidence),
         );
         projected.push(Projected {
             source_cursor: latest.source_cursor,
@@ -2066,7 +2213,17 @@ fn project(input: ProjectionInput<'_>) -> Result<Vec<AttentionItemV1>, Failure> 
                 attention_id: stable_id,
                 occurrence_id,
                 subject_kind,
-                subject_id,
+                subject_id: subject_id.clone(),
+                subject: Some(forged_types::ProjectionSubjectV1 {
+                    id: subject_id,
+                    kind: match subject_kind {
+                        AttentionSubjectKind::Run => forged_types::ProjectionSubjectKind::Run,
+                        AttentionSubjectKind::Epic => forged_types::ProjectionSubjectKind::Epic,
+                    },
+                    title: subject.title.as_ref().map(|title| title.value.clone()),
+                    repository: subject.repository.clone(),
+                    revision: subject.revision,
+                }),
                 subject_title: subject.title,
                 repository: subject.repository,
                 condition,
@@ -2317,10 +2474,42 @@ mod tests {
             None,
             resolution_allowed,
             risk_allowed,
+            None,
         )
         .into_iter()
         .map(|action| action.verb)
         .collect()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn assert_one_should(
+        condition: AttentionCondition,
+        subject_kind: AttentionSubjectKind,
+        run: Option<&RunRow>,
+        desired_state: Option<DesiredState>,
+        resolution_allowed: bool,
+        risk_allowed: bool,
+        expected_verb: &str,
+    ) {
+        let actions = recommendation_actions(
+            &policy(condition).2,
+            "subject-1",
+            "attention-1",
+            "occurrence-1",
+            subject_kind,
+            run,
+            desired_state,
+            Some("bead-subject-1"),
+            resolution_allowed,
+            risk_allowed,
+            None,
+        );
+        let should = actions
+            .iter()
+            .filter(|action| action.class == forged_types::ActionClass::Should)
+            .collect::<Vec<_>>();
+        assert_eq!(should.len(), 1, "{condition:?}: {actions:?}");
+        assert_eq!(should[0].verb, expected_verb, "{condition:?}: {actions:?}");
     }
 
     #[test]
@@ -2336,6 +2525,7 @@ mod tests {
             None,
             true,
             false,
+            None,
         );
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].verb, "attention resolve");
@@ -2394,7 +2584,7 @@ mod tests {
                 false,
                 false,
             ),
-            ["run retry"]
+            ["work update", "run retry"]
         );
         assert_eq!(
             action_verbs(
@@ -2449,7 +2639,7 @@ mod tests {
                 true,
                 true,
             ),
-            ["attention resolve", "run accept-risk"]
+            ["run accept-risk", "run retry", "run adjudicate-settlement"]
         );
         assert_eq!(
             action_verbs(
@@ -2553,6 +2743,128 @@ mod tests {
             false,
         )
         .is_empty());
+    }
+
+    #[test]
+    fn coverage_and_exempt_decisions_pin_should_cardinality() {
+        let active = run_row("subject-1", RunState::Active, None);
+        let retryable = run_row(
+            "subject-1",
+            RunState::Stopped,
+            Some(RunOutcome::InputRequired),
+        );
+        let review_budget = run_row("subject-1", RunState::Stopped, Some(RunOutcome::Blocked));
+
+        assert_one_should(
+            AttentionCondition::InputRequired,
+            AttentionSubjectKind::Run,
+            Some(&retryable),
+            None,
+            false,
+            false,
+            "work update",
+        );
+        assert_one_should(
+            AttentionCondition::RestartBudgetExhausted,
+            AttentionSubjectKind::Run,
+            Some(&retryable),
+            None,
+            false,
+            false,
+            "run retry",
+        );
+        assert_one_should(
+            AttentionCondition::ReviewerDisagreement,
+            AttentionSubjectKind::Run,
+            Some(&review_budget),
+            None,
+            true,
+            true,
+            "run accept-risk",
+        );
+        assert_one_should(
+            AttentionCondition::ReviewerDisagreement,
+            AttentionSubjectKind::Run,
+            Some(&active),
+            None,
+            true,
+            false,
+            "attention resolve",
+        );
+        assert_one_should(
+            AttentionCondition::Quarantined,
+            AttentionSubjectKind::Run,
+            Some(&active),
+            None,
+            true,
+            false,
+            "attention resolve",
+        );
+        assert_one_should(
+            AttentionCondition::MissingCost,
+            AttentionSubjectKind::Run,
+            Some(&active),
+            None,
+            true,
+            false,
+            "attention resolve",
+        );
+        assert_one_should(
+            AttentionCondition::RetryExhausted,
+            AttentionSubjectKind::Run,
+            Some(&active),
+            None,
+            true,
+            false,
+            "run revise-roster",
+        );
+
+        let review_actions = recommendation_actions(
+            &policy(AttentionCondition::ReviewerDisagreement).2,
+            "subject-1",
+            "attention-1",
+            "occurrence-1",
+            AttentionSubjectKind::Run,
+            Some(&review_budget),
+            None,
+            Some("bead-subject-1"),
+            true,
+            true,
+            None,
+        );
+        assert!(review_actions.iter().any(|action| {
+            action.verb == "run retry" && action.class == forged_types::ActionClass::Can
+        }));
+        assert!(review_actions.iter().any(|action| {
+            action.verb == "run adjudicate-settlement"
+                && action.class == forged_types::ActionClass::Repair
+        }));
+
+        for (condition, resolution_allowed) in [
+            (AttentionCondition::AmbiguousEffect, false),
+            (AttentionCondition::MergeApproval, false),
+            (AttentionCondition::MissingEvidence, false),
+        ] {
+            let actions = recommendation_actions(
+                &policy(condition).2,
+                "subject-1",
+                "attention-1",
+                "occurrence-1",
+                AttentionSubjectKind::Run,
+                Some(&active),
+                None,
+                Some("bead-subject-1"),
+                resolution_allowed,
+                false,
+                None,
+            );
+            assert!(
+                actions
+                    .iter()
+                    .all(|action| action.class != forged_types::ActionClass::Should),
+                "{condition:?}: {actions:?}"
+            );
+        }
     }
 
     fn desired(id: &str) -> DesiredWorkRow {
@@ -3017,5 +3329,77 @@ mod tests {
             Ok(_) => panic!("invalid stored transition was accepted"),
         };
         assert!(error.message.contains("transition event 9"), "{error:?}");
+    }
+
+    #[test]
+    fn deadline_exhaustion_offers_retry_only_when_the_worktree_is_clean() {
+        let stopped = run_row("subject-1", RunState::Stopped, Some(RunOutcome::Blocked));
+        let dirty = json!({"terminal": {"deadlineExhausted": {
+            "stage": "remediation", "kills": 2, "commitsAhead": 1, "uncommitted": 9,
+            "factsKnown": true
+        }}});
+        let actions = recommendation_actions(
+            &policy(AttentionCondition::DeadlineExhausted).2,
+            "subject-1",
+            "attention-1",
+            "occurrence-1",
+            AttentionSubjectKind::Run,
+            Some(&stopped),
+            None,
+            Some("bead-subject-1"),
+            false,
+            false,
+            Some(&dirty),
+        );
+        assert_eq!(actions.len(), 1, "{actions:?}");
+        assert_eq!(actions[0].verb, "session message");
+        assert_eq!(actions[0].class, forged_types::ActionClass::Can);
+        assert!(actions[0].reason.contains("9 uncommitted file(s)"));
+
+        let clean = json!({"terminal": {"deadlineExhausted": {
+            "stage": "remediation", "kills": 2, "commitsAhead": 2, "uncommitted": 0,
+            "factsKnown": true
+        }}});
+        let actions = recommendation_actions(
+            &policy(AttentionCondition::DeadlineExhausted).2,
+            "subject-1",
+            "attention-1",
+            "occurrence-1",
+            AttentionSubjectKind::Run,
+            Some(&stopped),
+            None,
+            Some("bead-subject-1"),
+            false,
+            false,
+            Some(&clean),
+        );
+        assert_eq!(actions.len(), 1, "{actions:?}");
+        assert_eq!(actions[0].verb, "run retry");
+        assert_eq!(actions[0].class, forged_types::ActionClass::Should);
+        assert_eq!(
+            classification(AttentionCondition::DeadlineExhausted),
+            AttentionClass::Decision
+        );
+
+        let unknown = json!({"terminal": {"deadlineExhausted": {
+            "stage": "remediation", "kills": 2, "commitsAhead": 0, "uncommitted": 0,
+            "factsKnown": false
+        }}});
+        let actions = recommendation_actions(
+            &policy(AttentionCondition::DeadlineExhausted).2,
+            "subject-1",
+            "attention-1",
+            "occurrence-1",
+            AttentionSubjectKind::Run,
+            Some(&stopped),
+            None,
+            Some("bead-subject-1"),
+            false,
+            false,
+            Some(&unknown),
+        );
+        assert_eq!(actions.len(), 1, "{actions:?}");
+        assert_eq!(actions[0].verb, "session message");
+        assert_eq!(actions[0].class, forged_types::ActionClass::Can);
     }
 }

@@ -5,14 +5,32 @@
 //! them after the fact.
 
 use forged_types::{
-    normalize_repository_path, repository_label, work_display_title, WorkIdentityContextV1,
-    WorkIdentityRepositoryV1, WorkIdentitySource, WorkIdentitySubjectKind, WorkIdentitySubjectV1,
-    WorkIdentityV1, WorkIdentityWorkV1, WORK_IDENTITY_SCHEMA_V1,
+    normalize_repository_path, repository_label, work_display_title, ProjectionSubjectKind,
+    ProjectionSubjectV1, WorkIdentityContextV1, WorkIdentityRepositoryV1, WorkIdentitySource,
+    WorkIdentitySubjectKind, WorkIdentitySubjectV1, WorkIdentityV1, WorkIdentityWorkV1,
+    WORK_IDENTITY_SCHEMA_V1,
 };
 use serde_json::{Map, Value};
 
 use crate::config::now_iso;
 use crate::core::{on_ledger, Ctx, Failure};
+
+pub(crate) fn projection_subject(
+    identity: &WorkIdentityV1,
+    kind: ProjectionSubjectKind,
+    id: impl Into<String>,
+) -> ProjectionSubjectV1 {
+    ProjectionSubjectV1 {
+        id: id.into(),
+        kind,
+        title: Some(identity.display_title.clone()),
+        repository: identity
+            .repository
+            .as_ref()
+            .map(|repository| repository.path.clone()),
+        revision: identity.work.revision.clone(),
+    }
+}
 
 /// Normalize one launch-time repository path without consulting the live
 /// filesystem. Renaming or replacing a checkout later cannot rewrite the

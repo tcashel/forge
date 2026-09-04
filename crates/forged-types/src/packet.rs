@@ -1,6 +1,7 @@
 //! Work packets and packet results — the `forged.packet/1` wire contract
 //! between the orchestrator and provider-run stages.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -51,6 +52,12 @@ pub struct StageContract {
     pub gate_commands: Vec<String>,
     pub deliverable: Deliverable,
     pub budget_s: u32,
+    /// Checks the seat runs before each commit. Distinct from
+    /// `gate_commands`, which the controller runs after the seat returns.
+    /// Omitted when empty so packet bodies stored before the field existed
+    /// keep their bytes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub seat_commands: Vec<String>,
 }
 
 /// Filesystem access granted to the provider process.
@@ -69,6 +76,11 @@ pub struct ProviderHints {
     pub model: String,
     pub effort: Option<String>,
     pub sandbox: Sandbox,
+    /// Operator environment applied to the provider process; an entry here
+    /// overrides the provider's own. Omitted when empty so stored packet
+    /// bodies keep their bytes.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
 }
 
 /// One unit of dispatched work, schema `forged.packet/1`.
@@ -344,6 +356,7 @@ mod tests {
                 gate_commands: vec!["cargo test --workspace".to_owned()],
                 deliverable: Deliverable::CommitsInWorktree,
                 budget_s: 3600,
+                seat_commands: Vec::new(),
             },
             result_schema: "forged.result/1".to_owned(),
             provider_hints: ProviderHints {
@@ -351,6 +364,7 @@ mod tests {
                 model: "opus".to_owned(),
                 effort: Some("high".to_owned()),
                 sandbox: Sandbox::WorkspaceWrite,
+                env: BTreeMap::new(),
             },
             field_notes: vec!["watch the seam".to_owned()],
         }
@@ -429,11 +443,16 @@ mod tests {
             gate_commands: vec!["cargo build".to_owned()],
             deliverable: Deliverable::ReviewBlock,
             budget_s: 900,
+            seat_commands: vec!["cargo fmt --all -- --check".to_owned()],
         };
         round_trip(&contract);
         let value = serde_json::to_value(&contract).expect("serializes");
         assert_eq!(value["gateCommands"][0], json!("cargo build"));
         assert_eq!(value["budgetS"], json!(900));
+        assert_eq!(
+            value["seatCommands"][0],
+            json!("cargo fmt --all -- --check")
+        );
     }
 
     #[test]
@@ -443,6 +462,7 @@ mod tests {
             model: "gpt".to_owned(),
             effort: None,
             sandbox: Sandbox::ReadOnly,
+            env: BTreeMap::new(),
         });
     }
 
@@ -494,7 +514,21 @@ mod tests {
     }
 
     #[test]
-    fn a_body_written_before_the_projection_still_rehydrates_from_its_columns() {
+    fn projection_twins_do_not_change_packet_storage_bytes() {
+        let packet = sample_packet();
+        let before = packet.stored_body().expect("stored body");
+        assert!(before.contains("\"beadId\":\"bead-1\""));
+        assert!(!before.contains("\"workId\""));
+
+        let projected = crate::with_work_twins(
+            serde_json::from_str(&before).expect("stored packet body is JSON"),
+        );
+        assert_eq!(projected["beadId"], projected["workId"]);
+        assert_eq!(packet.stored_body().expect("stored body again"), before);
+    }
+
+    #[test]
+    fn a_previous_binary_body_still_reopens_from_its_columns() {
         // Legacy rows carry the whole packet, every projected-out key
         // included. The columns are what the claim fence and the projection
         // read, so they win and no row is migrated.

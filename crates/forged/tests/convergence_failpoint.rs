@@ -171,7 +171,7 @@ fn capacity_deferral_parks_the_controller_instead_of_recycling() {
         json!("repository-write-capacity"),
         "{status}"
     );
-    let (code, listed) = env.forged(&["overview"]);
+    let (code, listed) = env.forged(&["overview", "--detail", "full"]);
     assert_eq!(code, 0, "overview: {listed}");
     let parked_items = listed["result"]["attention"]
         .as_array()
@@ -206,7 +206,7 @@ fn capacity_deferral_parks_the_controller_instead_of_recycling() {
                 .iter()
                 .any(|attempt| attempt.packet_id == packet)
     });
-    let (code, cleared) = env.forged(&["overview"]);
+    let (code, cleared) = env.forged(&["overview", "--detail", "full"]);
     assert_eq!(code, 0, "post-admit overview: {cleared}");
     assert!(
         cleared["result"]["attention"]
@@ -784,7 +784,7 @@ fn convergence_crash_matrix_is_effect_exact() {
         .expect("desired query")
         .expect("desired row");
     assert_eq!(desired.controller_generation, 2);
-    assert_eq!(desired.restart_used, 1);
+    assert_eq!(desired.restart_used, 0);
     assert_eq!(
         ledger
             .list_events(Some("conv-controller-death"), 0, 65_536)

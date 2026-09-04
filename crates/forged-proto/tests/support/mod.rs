@@ -70,6 +70,7 @@ pub fn full_roster() -> HashMap<Stage, ProviderHints> {
         model: model.to_owned(),
         effort: None,
         sandbox: Sandbox::WorkspaceWrite,
+        env: Default::default(),
     };
     HashMap::from([
         (Stage::Implement, hint("claude", "fable")),
@@ -442,6 +443,9 @@ impl ViewBuilder {
                 .collect(),
                 termination_grace_s: forged_types::DEFAULT_TERMINATION_GRACE_S,
                 transport_retry_budget: self.budget,
+                seat_commands: Vec::new(),
+                deadline_retry_budget: 1,
+                seat_env: Default::default(),
                 host_policy: forged_types::HostPolicyV1::Off,
                 herdr_socket: None,
             },

@@ -27,6 +27,304 @@ fn candidates(envelope: &Value) -> Vec<Value> {
         .unwrap_or_else(|| panic!("a resolution carries a candidate array: {envelope}"))
 }
 
+fn append_session(env: &TestEnv, run_id: &str, seq: i64) {
+    use sha2::Digest as _;
+
+    let spec_bytes = std::fs::read(&env.spec).expect("spec bytes");
+    let sha = sha2::Sha256::digest(spec_bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let ledger = env.ledger();
+    let packet_id = ledger
+        .open_packet(forged_ledger::NewPacket {
+            run_id: run_id.to_owned(),
+            stage: forged_types::Stage::Implement,
+            seq,
+            spec_path: env.spec.to_string_lossy().into_owned(),
+            spec_sha256: sha.clone(),
+            spec_revision: None,
+            policy_revision: None,
+            body_json: json!({"fabricated": true}).to_string(),
+        })
+        .expect("session packet");
+    let attempt = ledger
+        .claim_packet(
+            &packet_id,
+            &format!("fixture:{packet_id}"),
+            &forged_ledger::SpecFence::Sha256(sha),
+        )
+        .expect("session attempt");
+    ledger
+        .append_event(
+            Some(run_id),
+            "forged.session.started",
+            json!({
+                "schemaVersion": 2,
+                "attemptId": attempt.attempt_id,
+                "packetId": packet_id,
+                "host": "process",
+                "sessionId": format!("session-{run_id}-{seq}"),
+            }),
+        )
+        .expect("session event");
+    ledger.close().expect("close ledger");
+}
+
+#[test]
+fn a_work_id_routes_read_verbs_to_its_latest_run() {
+    let env = TestEnv::new("forged-resolve-work-id");
+    assert_eq!(env.forged(&["init"]).0, 0);
+    env.ensure_work_item("bead-work-target");
+    fabricate_run(&env, "work-target");
+
+    let (code, by_work) = env.forged(&["overview", "--id", "bead-work-target"]);
+    assert_eq!(code, 0, "overview by work id: {by_work}");
+    let (code, by_run) = env.forged(&["overview", "--run", "work-target"]);
+    assert_eq!(code, 0, "overview by run: {by_run}");
+    assert_eq!(result(&by_work), result(&by_run));
+    assert_eq!(by_work["result"]["subject"]["id"], json!("work-target"));
+
+    for command in [
+        vec!["work", "detail", "--id", "bead-work-target"],
+        vec!["events", "--id", "bead-work-target"],
+        vec!["session", "list", "--id", "bead-work-target"],
+    ] {
+        let (code, routed) = env.forged(&command);
+        assert_eq!(code, 0, "{} by work id: {routed}", command.join(" "));
+        assert_eq!(routed["result"]["subject"]["id"], json!("work-target"));
+    }
+}
+
+#[test]
+fn an_unstarted_work_id_returns_the_shared_no_run_resolution() {
+    let env = TestEnv::new("forged-resolve-work-no-run");
+    assert_eq!(env.forged(&["init"]).0, 0);
+    env.seed_work_spec("unstarted-work", "Not started", "No run exists.");
+
+    for command in [
+        vec!["overview", "--id", "unstarted-work"],
+        vec!["work", "detail", "--id", "unstarted-work"],
+        vec!["events", "--id", "unstarted-work"],
+        vec!["session", "list", "--id", "unstarted-work"],
+    ] {
+        let (code, response) = env.forged(&command);
+        assert_eq!(code, 0, "{}: {response}", command.join(" "));
+        assert_eq!(resolution(&response)["reason"], json!("no-run"));
+        assert_eq!(candidates(&response), Vec::<Value>::new());
+        assert_eq!(
+            resolution(&response)["remedy"]["args"],
+            json!({"id": "unstarted-work"})
+        );
+    }
+}
+
+#[test]
+fn an_exact_run_and_epic_collision_returns_candidates_and_can_be_disambiguated() {
+    let env = TestEnv::new("forged-resolve-kind-collision");
+    assert_eq!(env.forged(&["init"]).0, 0);
+    fabricate_run(&env, "same-id");
+    fabricate_epic(&env, "same-id");
+
+    for command in [
+        vec!["overview", "--id", "same-id"],
+        vec!["work", "detail", "--id", "same-id"],
+        vec!["events", "--id", "same-id"],
+        vec!["session", "list", "--id", "same-id"],
+    ] {
+        let (code, bare) = env.forged(&command);
+        assert_eq!(code, 0, "bare collision for {}: {bare}", command.join(" "));
+        assert_eq!(resolution(&bare)["reason"], json!("ambiguous"));
+        assert_eq!(candidates(&bare).len(), 2);
+        assert!(resolution(&bare)["remedy"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("--subject-kind")));
+    }
+
+    let (code, run) = env.forged(&["overview", "--id", "same-id", "--subject-kind", "run"]);
+    assert_eq!(code, 0, "run-disambiguated collision: {run}");
+    assert_eq!(run["result"]["subject"]["kind"], json!("run"));
+    assert_eq!(run["result"]["subject"]["id"], json!("same-id"));
+}
+
+#[test]
+fn an_epic_session_id_lists_every_child_run() {
+    let env = TestEnv::new("forged-resolve-epic-sessions");
+    assert_eq!(env.forged(&["init"]).0, 0);
+    fabricate_epic(&env, "session-epic");
+    fabricate_run(&env, "session-child-a");
+    fabricate_run(&env, "session-child-b");
+    let repository = forged_types::normalize_repository_path(&env.repos.repo.to_string_lossy())
+        .expect("canonical repository");
+    let label = forged_types::repository_label(&repository).expect("repository label");
+    let epic = forged_types::WorkIdentityContextV1 {
+        id: "session-epic".to_owned(),
+        title: Some("Epic session-epic".to_owned()),
+    };
+    let connection =
+        rusqlite::Connection::open(env.anvil.join("state.db")).expect("open fixture db");
+    for child in ["session-child-a", "session-child-b"] {
+        let display_title =
+            forged_types::work_display_title(child, None, Some(&label), None, Some(&epic));
+        connection
+            .execute(
+                "DELETE FROM work_identities WHERE subject_kind = 'run' AND subject_id = ?1",
+                rusqlite::params![child],
+            )
+            .expect("remove identity without epic context");
+        connection
+            .execute(
+                "INSERT INTO work_identities (
+                   schema, subject_kind, subject_id, bead_id, bead_title, bead_revision,
+                   repository_path, repository_label, project_id, project_title,
+                   epic_id, epic_title, display_title, captured_at, source
+                 ) VALUES ('forged.work-identity/1', 'run', ?1, ?2, NULL, NULL,
+                   ?3, ?4, NULL, NULL, 'session-epic', 'Epic session-epic', ?5,
+                   '2026-09-03T12:00:00Z', 'durable')",
+                rusqlite::params![
+                    child,
+                    format!("bead-{child}"),
+                    repository,
+                    label,
+                    display_title
+                ],
+            )
+            .expect("insert child identity with epic context");
+    }
+    drop(connection);
+    let ledger = env.ledger();
+    for child in ["session-child-a", "session-child-b"] {
+        ledger
+            .append_event(
+                Some("session-epic"),
+                "forged.epic.child.started",
+                json!({"childId": format!("bead-{child}"), "runId": child}),
+            )
+            .expect("link epic child");
+    }
+    ledger.close().expect("close ledger");
+    append_session(&env, "session-child-a", 1);
+    append_session(&env, "session-child-b", 1);
+    append_session(&env, "session-child-a", 2);
+    append_session(&env, "session-child-b", 2);
+
+    let (code, response) = env.forged(&[
+        "session",
+        "list",
+        "--id",
+        "session-epic",
+        "--subject-kind",
+        "epic",
+    ]);
+    assert_eq!(code, 0, "epic sessions: {response}");
+    assert_eq!(response["result"]["subject"]["kind"], json!("epic"));
+    let mut run_ids = response["result"]["runs"]
+        .as_array()
+        .expect("child run session projections")
+        .iter()
+        .map(|run| run["runId"].as_str().unwrap_or_default())
+        .collect::<Vec<_>>();
+    run_ids.sort_unstable();
+    assert_eq!(run_ids, ["session-child-a", "session-child-b"]);
+    assert_eq!(response["result"]["sessions"].as_array().unwrap().len(), 4);
+
+    let (code, newest) = env.forged(&[
+        "session",
+        "list",
+        "--id",
+        "session-epic",
+        "--subject-kind",
+        "epic",
+        "--limit",
+        "2",
+    ]);
+    assert_eq!(code, 0, "bounded epic sessions: {newest}");
+    assert_eq!(newest["result"]["coverage"]["shown"], json!(2));
+    assert_eq!(newest["result"]["coverage"]["truncated"], json!(true));
+    let cursor = newest["result"]["coverage"]["nextCursor"]
+        .as_str()
+        .expect("epic session continuation");
+    let (code, older) = env.forged(&[
+        "session",
+        "list",
+        "--id",
+        "session-epic",
+        "--subject-kind",
+        "epic",
+        "--limit",
+        "2",
+        "--cursor",
+        cursor,
+    ]);
+    assert_eq!(code, 0, "continued epic sessions: {older}");
+    assert_eq!(older["result"]["coverage"]["shown"], json!(2));
+    assert_eq!(older["result"]["coverage"]["truncated"], json!(false));
+    assert_eq!(older["result"]["coverage"]["nextCursor"], Value::Null);
+    let mut attempts = newest["result"]["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .chain(older["result"]["sessions"].as_array().unwrap())
+        .map(|session| session["attemptId"].as_i64().unwrap())
+        .collect::<Vec<_>>();
+    attempts.sort_unstable();
+    attempts.dedup();
+    assert_eq!(
+        attempts.len(),
+        4,
+        "global cursor must not skip a child: {older}"
+    );
+
+    let (code, events) = env.forged(&["events", "--id", "session-epic", "--subject-kind", "epic"]);
+    assert_eq!(code, 0, "epic events: {events}");
+    assert_eq!(events["result"]["subject"]["kind"], json!("epic"));
+}
+
+#[test]
+fn legacy_event_stream_selectors_stay_narrow_and_tolerate_missing_identity() {
+    let env = TestEnv::new("forged-events-legacy-selector");
+    assert_eq!(env.forged(&["init"]).0, 0);
+    fabricate_epic(&env, "events-epic");
+    let ledger = env.ledger();
+    ledger
+        .append_event(
+            Some("events-epic"),
+            "events.epic.fixture",
+            json!({"ordinal": 1}),
+        )
+        .expect("epic event");
+    ledger.close().expect("close ledger");
+
+    let (code, epic) = env.forged(&["events", "--run", "events-epic"]);
+    assert_eq!(code, 0, "legacy epic event stream: {epic}");
+    assert_eq!(epic["result"]["subject"]["kind"], json!("epic"));
+    assert!(epic["result"]["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|event| event["kind"] == json!("events.epic.fixture")));
+
+    let (code, unknown) = env.forged(&["events", "--run", "unknown-stream"]);
+    assert_eq!(code, 0, "unknown legacy stream is an empty page: {unknown}");
+    assert_eq!(unknown["result"]["subject"]["id"], json!("unknown-stream"));
+    assert_eq!(unknown["result"]["events"], json!([]));
+    assert_eq!(unknown["result"]["coverage"]["total"], json!(0));
+
+    let (code, empty) = env.forged(&["events", "--id", ""]);
+    assert_ne!(
+        code, 0,
+        "an empty id must not widen to the portfolio: {empty}"
+    );
+    assert_eq!(empty["error"]["code"], json!("INVALID_REQUEST"));
+
+    let mut mcp = McpClient::new(&env, None);
+    for params in [json!({"id": 7}), json!({"run": ""})] {
+        let malformed = mcp.call_tool("events_tail", json!({"schemaVersion": 1, "params": params}));
+        assert_eq!(malformed["ok"], json!(false), "{malformed}");
+        assert_eq!(malformed["error"]["code"], json!("INVALID_REQUEST"));
+    }
+}
+
 /// The whole point: an agent that guessed the kind wrong, and one that never
 /// guessed at all, read the same projection.
 #[test]
@@ -62,11 +360,28 @@ fn an_exact_id_answers_identically_to_the_explicit_param() {
     assert_eq!(by_id["result"]["kind"], json!("slice"));
 
     let (code, by_id) = env.forged(&["overview", "--id", "rs-epic"]);
-    assert_eq!(code, 0, "overview --id: {by_id}");
+    assert_eq!(code, 0, "bare started epic id: {by_id}");
     let (code, by_epic) = env.forged(&["overview", "--epic", "rs-epic"]);
     assert_eq!(code, 0, "overview --epic: {by_epic}");
     assert_eq!(result(&by_id), result(&by_epic), "epic projections differ");
     assert_eq!(by_id["result"]["kind"], json!("epic"));
+
+    for command in [
+        vec!["work", "detail", "--id", "rs-epic"],
+        vec!["events", "--id", "rs-epic"],
+        vec!["session", "list", "--id", "rs-epic"],
+    ] {
+        let (code, routed) = env.forged(&command);
+        assert_eq!(
+            code,
+            0,
+            "bare started epic id for {}: {routed}",
+            command.join(" ")
+        );
+        assert_eq!(routed["result"]["subject"]["kind"], json!("epic"));
+        assert_eq!(routed["result"]["subject"]["id"], json!("rs-epic"));
+        assert_eq!(routed["result"].get("resolution"), None);
+    }
 }
 
 /// An id naming nothing is a successful "nothing", not an error: the answer
@@ -100,6 +415,12 @@ fn an_unknown_id_answers_with_an_empty_candidate_list() {
                 "query": "nothing-by-that-name",
                 "reason": "unknown",
                 "candidates": [],
+                "remedy": {
+                    "schema": "forged.remedy/1",
+                    "verb": "explain",
+                    "args": {"id": "nothing-by-that-name"},
+                    "reason": "inspect this id with explain --id",
+                },
             },
         })
     );
@@ -191,7 +512,7 @@ fn an_exact_id_outranks_every_prefix_reading_of_it() {
 fn an_id_alongside_an_explicit_kind_is_refused() {
     let env = TestEnv::new("forged-resolve-conflict");
     env.forged(&["init"]);
-    let mut mcp = McpClient::new(&env);
+    let mut mcp = McpClient::new(&env, None);
 
     for explicit in ["run", "epic"] {
         let response = mcp.call_tool(

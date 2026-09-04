@@ -296,18 +296,111 @@ fn a_resolution_leaves_refresh_able_to_re_ask_the_same_question() {
 
 // ------------------------------------------------------------- portfolio
 
-/// One portfolio payload, in the shape `portfolio_overview` emits.
+fn is_decision(condition: Option<&str>) -> bool {
+    matches!(
+        condition,
+        Some(
+            "input-required"
+                | "merge-approval"
+                | "quarantined"
+                | "missing-cost"
+                | "retry-exhausted"
+                | "reviewer-disagreement"
+                | "ambiguous-effect"
+                | "restart-budget-exhausted"
+                | "missing-evidence"
+        )
+    )
+}
+
+/// Convert the old diagnostic entry shorthand used by the tests into the
+/// summary row `operations_entry` now supplies to the default portfolio.
+fn portfolio_entry(entry: &Value, attention: &[Value]) -> Value {
+    let id = entry.get("id").cloned().unwrap_or(Value::Null);
+    let id_text = id.as_str();
+    let kind = if entry.get("source") == Some(&json!("live-plan")) {
+        "plan"
+    } else if entry.get("kind") == Some(&json!("epic")) {
+        "epic"
+    } else {
+        "run"
+    };
+    let title = entry
+        .pointer("/titleSource/value")
+        .or_else(|| entry.pointer("/identity/displayTitle"))
+        .or_else(|| entry.get("title"))
+        .or_else(|| entry.get("beadId"))
+        .or_else(|| entry.get("id"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let own = attention
+        .iter()
+        .filter(|item| {
+            item.get("subjectId")
+                .or_else(|| item.get("id"))
+                .and_then(Value::as_str)
+                == id_text
+        })
+        .collect::<Vec<_>>();
+    let decisions = own
+        .iter()
+        .filter(|item| is_decision(item.get("condition").and_then(Value::as_str)))
+        .count();
+    let symptoms = own.len().saturating_sub(decisions);
+    json!({
+        "subject": {"kind": kind, "id": id, "title": title},
+        "state": entry.get("state").cloned().unwrap_or(Value::Null),
+        "executionHealth": entry.get("executionHealth").cloned().unwrap_or(Value::Null),
+        "claimHealth": entry.get("claimHealth").cloned().unwrap_or(json!("unknown")),
+        "currentStage": entry.get("currentStage").cloned().unwrap_or(Value::Null),
+        "liveSeats": entry.get("liveSeats").cloned().unwrap_or(json!(0)),
+        "spend": entry.get("spend").cloned().unwrap_or_else(|| json!({
+            "costUsdKnown": entry.get("costUsdKnown").cloned().unwrap_or(json!(0.0)),
+            "rowsMissingCost": entry.get("rowsMissingCost").cloned().unwrap_or(json!(0)),
+        })),
+        "nextAction": entry.get("nextAction").cloned().unwrap_or(Value::Null),
+        "pr": entry.get("pr").cloned().unwrap_or(Value::Null),
+        "delivery": entry.get("delivery").cloned().unwrap_or(Value::Null),
+        "attention": {"decisions": decisions, "symptoms": symptoms},
+    })
+}
+
+/// One portfolio payload in the new producer-shaped default: subject-owned
+/// identity rows and object-valued bounded attention.
 fn portfolio(entries: Vec<Value>, attention: Vec<Value>) -> Value {
     let (total, held) = (entries.len(), attention.len());
+    let entries = entries
+        .iter()
+        .map(|entry| portfolio_entry(entry, &attention))
+        .collect::<Vec<_>>();
+    let decisions = attention
+        .iter()
+        .filter(|item| is_decision(item.get("condition").and_then(Value::as_str)))
+        .cloned()
+        .collect::<Vec<_>>();
+    let symptoms = held.saturating_sub(decisions.len());
     json!({
         "schema": "forged.overview/1",
         "kind": "portfolio",
-        "entries": entries,
+        "entries": entries.clone(),
         "total": total,
-        "cap": 200,
+        "cap": 30,
         "liveSeats": 2,
-        "attention": attention,
+        "attention": {
+            "counts": {"decisions": decisions.len(), "symptoms": symptoms, "acknowledged": 0},
+            "decisions": decisions,
+        },
         "attentionTotal": held,
+        "queue": {"groups": [{
+            "name": "Running", "count": entries.len(), "entries": entries,
+            "code": "running", "shown": total, "total": total,
+            "excluded": {"livePlan": 0},
+        }], "total": total, "cap": 30, "asOf": Value::Null},
+        "coverage": {"total": total, "available": total, "matching": total,
+                     "shown": total, "limit": 30, "filteredOut": 0,
+                     "truncated": false, "nextCursor": Value::Null},
+        "counts": {"durable": total, "live": 0, "admitted": 0, "queued": 0,
+                   "reviewReady": 0, "recent": 0, "attention": held, "planOnly": 0},
         "spend": {"costUsdKnown": 1.25, "rowsMissingCost": 3},
     })
 }
@@ -872,9 +965,9 @@ fn portfolio_headline_is_full_capped_degradation_first_and_model_identical() {
         "1 decision, oldest",
         "1 running",
         "1 ready to merge",
-        "symptoms: blocked 1",
+        "1 symptoms",
         "$1.25 known spend + 3 unpriced",
-        "2 of 5 attention conditions classified (capped)",
+        "1 of 5 attention conditions classified (capped)",
     ] {
         assert!(
             dispatched.headline.contains(expected),
@@ -1344,6 +1437,11 @@ fn split_apps_are_dependency_free_safe_and_javascript_valid() {
             "{} never renders tool data as HTML",
             path.display()
         );
+        assert!(
+            html.contains("detail:\"full\"") || html.contains("detail: \"full\""),
+            "{} requests full Work Detail for its evidence drawer",
+            path.display()
+        );
 
         let output = Command::new(&node)
             .args([
@@ -1362,7 +1460,7 @@ fn split_apps_are_dependency_free_safe_and_javascript_valid() {
     }
 
     let html = std::fs::read_to_string(operations).expect("read Operations App");
-    assert!(html.contains("entry.detailTarget"));
+    assert!(html.contains("detailTarget(entry)"));
     assert!(html.contains("host.capabilities.serverTools"));
     assert!(html.contains("name: \"operations_overview\""));
     assert!(html.contains("name: \"work_detail\""));
@@ -1793,7 +1891,7 @@ fn agent_sessions_controls_are_bounded_exact_and_read_only() {
             },
             {
                 "name": "work_detail",
-                "arguments": {"schemaVersion": 1, "params": {"subjectKind": "run", "subjectId": "run-next"}}
+                "arguments": {"schemaVersion": 1, "params": {"subjectKind": "run", "subjectId": "run-next", "detail": "full"}}
             }
         ]),
         "refresh is single-flight, history drops a prior cursor, next uses the exact request-bound cursor, and detail uses only the canonical run: {report}"
@@ -2056,6 +2154,59 @@ fn work_detail_states_a_finding_bound_rather_than_slicing_silently() {
     );
 }
 
+#[test]
+fn work_detail_renders_summary_totals_without_claiming_omitted_evidence_is_empty() {
+    let Some(node) = require_node() else { return };
+    let asset = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("assets")
+        .join("work-detail.html");
+    let report = run_split_app_host_scenario(
+        &node,
+        &asset,
+        &json!({
+            "hostCapabilities": {"updateModelContext": true},
+            "allowedTools": [],
+            "toolResult": {"structuredContent": {"ok": true, "result": {
+                "schema": "forged.work-detail/1",
+                "id": "summary-run",
+                "kind": "run",
+                "workRef": {"kind": "run", "id": "summary-run"},
+                "identity": {"displayTitle": "Summary-shaped work"},
+                "status": {"state": "active"},
+                "workers": {"total": 3},
+                "reviews": {"findingCounts": {"total": 7, "bySeverity": {"high": 7}}},
+                "gates": {"total": 3, "latest": {
+                    "packetId": "summary-run/review/0", "gateState": "pass",
+                    "passed": true, "summary": "Latest gate passed"
+                }},
+                "attention": {"counts": {"decisions": 2, "symptoms": 2, "acknowledged": 0}, "total": 4},
+                "usage": {"totals": {"costUsdKnown": 2.5, "rowsMissingCost": 0}}
+            }}},
+        }),
+    );
+    let text = report["text"].to_string();
+    let labels = report["text"].as_array().expect("rendered summary text");
+    for value in ["3", "7", "4", "workers", "findings", "attention"] {
+        assert!(
+            labels.contains(&json!(value)),
+            "summary carries {value}: {report}"
+        );
+    }
+    for expected in [
+        "3 provider sessions counted; refresh for full detail.",
+        "7 findings counted; none carried in this page.",
+        "4 conditions counted; none carried in this page.",
+        "Latest gate passed",
+        "Artifact rows are not included in the summary; refresh for full detail.",
+        "Event rows are not included in the summary; refresh for full detail.",
+    ] {
+        assert!(
+            text.contains(expected),
+            "summary Work Detail retains {expected}: {report}"
+        );
+    }
+}
+
 fn triage_item(
     id: &str,
     work: &str,
@@ -2282,8 +2433,8 @@ fn operations_triage_consumes_server_classes_order_actions_and_acknowledgements(
     assert_eq!(
         report["serverToolCalls"],
         json!([
-            {"name": "attention_list", "arguments": {"schemaVersion": 1, "params": {"repo": "/repo", "state": "active", "limit": 100}}},
-            {"name": "attention_list", "arguments": {"schemaVersion": 1, "params": {"repo": "/repo", "state": "all", "limit": 500}}},
+            {"name": "attention_list", "arguments": {"repo": "/repo", "state": "active", "limit": 100}},
+            {"name": "attention_list", "arguments": {"repo": "/repo", "state": "all", "limit": 500}},
             {"name": "work_map", "arguments": {"schemaVersion": 1, "params": {"scope": "repository", "repository": "/repo"}}}
         ]),
         "load separates active attention from bounded settlements and reads the scoped map: {report}"
@@ -2421,16 +2572,26 @@ fn operations_durable_row_fetches_exact_work_detail_with_projected_fallback_rese
     );
     let mut scenario = triage_scenario(listed, empty_work_map(vec![], vec![]), json!("absent"));
     let entry = json!({
-        "id": "display-alias",
+        "subject": {
+            "id": "run-1",
+            "kind": "run",
+            "title": "Durable work",
+            "source": "durable",
+            "repository": "/repo"
+        },
         "state": "active",
-        "source": "durable",
-        "identity": {"displayTitle": "Durable work", "repository": {"path": "/repo", "label": "repo"}},
-        "titleSource": {"known": true, "value": "Durable work", "source": "identity.displayTitle"},
-        "lastProgressAt": "2026-08-22T11:00:00.000Z",
-        "detailTarget": {"subjectKind": "run", "subjectId": "run-1"},
+        "executionHealth": "running",
+        "claimHealth": {"known": true, "staleInProgress": false},
+        "currentStage": "implement",
+        "liveSeats": 1,
+        "spend": {"costUsdKnown": 1.25, "rowsMissingCost": 0},
+        "nextAction": "Wait for the active implementation seat",
+        "pr": null,
+        "delivery": null,
+        "attention": {"decisions": 0, "symptoms": 0}
     });
     scenario["toolResult"]["structuredContent"]["result"]["coverage"] =
-        json!({"total": 1, "shown": 1, "matching": 1, "truncated": false});
+        json!({"total": 1, "shown": 1, "matching": 1, "truncated": false, "nextCursor": null});
     scenario["toolResult"]["structuredContent"]["result"]["queue"] = json!({
         "groups": [{"code": "running", "label": "Running", "total": 1, "shown": 1, "entries": [entry]}]
     });
@@ -2442,8 +2603,8 @@ fn operations_durable_row_fetches_exact_work_detail_with_projected_fallback_rese
         "identity": {"displayTitle": "Exact durable detail", "repository": {"path": "/repo", "label": "repo"}},
         "titleSource": {"known": true, "value": "Exact durable detail", "source": "identity.displayTitle"},
         "status": {"state": "active"},
-        "workers": {"sessions": [{"attemptId": 7}]},
-        "reviews": {"latestFindingTotal": 2},
+        "workers": {"total": 1},
+        "reviews": {"findingCounts": {"total": 2, "bySeverity": {"high": 2}}},
         "usage": {"totals": {"costUsdKnown": 1.25, "rowsMissingCost": 0}}
     }}});
     scenario["actions"] = json!([{"type": "click", "class": "row", "index": 0}]);
@@ -2455,7 +2616,7 @@ fn operations_durable_row_fetches_exact_work_detail_with_projected_fallback_rese
             .and_then(|calls| calls.last()),
         Some(&json!({
             "name": "work_detail",
-            "arguments": {"schemaVersion": 1, "params": {"subjectKind": "run", "subjectId": "run-1"}}
+            "arguments": {"schemaVersion": 1, "params": {"id": "run-1", "detail": "full"}}
         })),
         "durable drill-down uses the exact projection target: {report}"
     );

@@ -79,7 +79,7 @@ const host = {
 };
 const source = [
   "el", "arr", "num", "int", "DECISION_CONDITIONS", "SYMPTOM_CONDITIONS", "stamp", "ms", "ago",
-  "ageTone", "ageNode", "conditionRows", "semanticState", "semanticLabel", "spendText", "chip", "panel",
+  "ageTone", "ageNode", "attentionRows", "subjectOf", "conditionRows", "semanticState", "semanticLabel", "spendText", "chip", "panel",
   "pickGrid", "choose", "viewResolution",
 ]
   .map(lift)

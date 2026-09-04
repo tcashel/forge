@@ -14,7 +14,7 @@ fn append(env: &TestEnv, run: &str, kind: &str, payload: Value) {
 }
 
 fn overview(env: &TestEnv) -> Value {
-    let (code, envelope) = env.forged(&["overview"]);
+    let (code, envelope) = env.forged(&["overview", "--detail", "full"]);
     assert_eq!(code, 0, "{envelope}");
     envelope["result"].clone()
 }
@@ -60,9 +60,13 @@ fn start_run(env: &TestEnv, run: &str) {
     assert_eq!(code, 0, "start {run}: {started}");
 }
 
+/// Drive the finite recovery budget to durable exhaustion. The first
+/// reservation is the free initial launch — only a reservation that follows a
+/// non-authorized outcome charges — so exactly `restart_budget + 2` passes
+/// separate a fresh authorization from the exhaustion attention.
 fn exhaust_restart_budget(env: &TestEnv, run: &str) {
     use forged_ledger::{
-        DesiredReconcileOutcome, DesiredReconcileUpdate, DesiredRestartReservation, DesiredState,
+        DesiredReconcileOutcome, DesiredReconcileUpdate, DesiredRestartReservation,
         DesiredSubjectKind,
     };
 
@@ -72,17 +76,7 @@ fn exhaust_restart_budget(env: &TestEnv, run: &str) {
         .expect("desired query")
         .expect("desired row")
         .restart_budget;
-    for index in 0..=restart_budget {
-        ledger
-            .record_desired_outcome(
-                DesiredSubjectKind::Run,
-                run,
-                DesiredState::Running,
-                DesiredReconcileOutcome::Authorized,
-                Some("2000-01-01T00:00:00.000000000Z".to_owned()),
-                None,
-            )
-            .expect("make desired row due");
+    for index in 0..=restart_budget.saturating_add(1) {
         let token = format!("attention-restart-{index}");
         let claimed = ledger
             .claim_desired_work(
@@ -104,7 +98,10 @@ fn exhaust_restart_budget(env: &TestEnv, run: &str) {
             .expect("reserve restart")
         {
             DesiredRestartReservation::Reserved(reserved) => {
-                assert!(index < restart_budget);
+                assert!(
+                    index <= restart_budget,
+                    "the initial launch plus the finite recovery budget may reserve"
+                );
                 ledger
                     .finish_desired_reconciliation(
                         DesiredSubjectKind::Run,
@@ -124,7 +121,12 @@ fn exhaust_restart_budget(env: &TestEnv, run: &str) {
                     .expect("finish desired reconciliation");
             }
             DesiredRestartReservation::Exhausted(exhausted) => {
-                assert_eq!(index, restart_budget);
+                assert_eq!(
+                    index,
+                    restart_budget.saturating_add(1),
+                    "exhaust after exactly the configured recovery count"
+                );
+                assert_eq!(exhausted.restart_used, exhausted.restart_budget);
                 assert!(exhausted.exhausted_at.is_some());
             }
         }
@@ -167,13 +169,14 @@ fn attention_is_identical_across_surfaces_and_controls_are_occurrence_fenced() {
                 "note": null,
             },
             "reason": "bind the adjudicated disposition and note for this exact quarantined occurrence",
+            "class": "should",
         }]),
         "ore-070.5 deliberately moves the quarantined action pin"
     );
     let attention_id = item["attentionId"].as_str().expect("attention id");
     let occurrence_id = item["occurrenceId"].as_str().expect("occurrence id");
 
-    let (code, listed) = env.forged(&["work", "list"]);
+    let (code, listed) = env.forged(&["work", "list", "--detail", "full"]);
     assert_eq!(code, 0, "{listed}");
     assert_eq!(listed["result"]["attention"], initial["attention"]);
     assert_eq!(listed["result"]["attentionTotal"], json!(1));
@@ -198,21 +201,18 @@ fn attention_is_identical_across_surfaces_and_controls_are_occurrence_fenced() {
     assert_eq!(replayed["reused"], json!(true));
     assert_eq!(quarantine(&overview(&env))["state"], json!("acknowledged"));
 
-    let mut mcp = McpClient::new(&env);
+    let mut mcp = McpClient::new(&env, None);
     let resolved = mcp.call_tool(
         "attention_resolve",
         json!({
-            "schemaVersion": 1,
-            "runId": "attention-run",
-            "params": {
-                "attentionId": attention_id,
-                "occurrenceId": occurrence_id,
-                "actor": "operator",
-                "disposition": item["nextActions"][0]["args"]["disposition"]
-                    .as_str()
-                    .unwrap_or("accepted-risk"),
-                "note": "reviewed exact quarantined evidence",
-            },
+            "subjectId": "attention-run",
+            "attentionId": attention_id,
+            "occurrenceId": occurrence_id,
+            "actor": "operator",
+            "disposition": item["nextActions"][0]["args"]["disposition"]
+                .as_str()
+                .unwrap_or("accepted-risk"),
+            "note": "reviewed exact quarantined evidence",
         }),
     );
     assert_eq!(resolved["ok"], json!(true), "{resolved}");
@@ -286,6 +286,7 @@ fn source_backed_attention_cannot_substitute_for_domain_resolution() {
             "verb": "work reopen",
             "args": {"id": "bead-attention-blocked"},
             "reason": blocked["recommendedAction"]["text"],
+            "class": "repair",
         }]),
         "the closed recommendation mapping publishes one domain verb"
     );
@@ -331,7 +332,12 @@ fn restart_exhaustion_advertises_stop_then_retry_and_clears_durably() {
     let env = TestEnv::new("forged-attention-restart-actions");
     env.forged(&["init"]);
     let run = "attention-restart";
-    start_run(&env, run);
+    env.seed_work_spec(
+        "bead-attention-restart",
+        "Exercise the advertised attention recovery verb.",
+        "- the advertised verb executes",
+    );
+    fabricate_run(&env, run);
     env.authorize_run(run);
     exhaust_restart_budget(&env, run);
 
@@ -343,6 +349,7 @@ fn restart_exhaustion_advertises_stop_then_retry_and_clears_durably() {
             "verb": "run stop",
             "args": {"run": run, "outcome": null, "reason": null},
             "reason": "stop with an outcome and reason, then retry the terminal run",
+            "class": "should",
         }]),
         "an active run must never advertise run retry"
     );
@@ -363,6 +370,7 @@ fn restart_exhaustion_advertises_stop_then_retry_and_clears_durably() {
         .expect("terminal exhausted run attention");
     let retry = &terminal["nextActions"][0];
     assert_eq!(retry["verb"], json!("run retry"));
+    assert_eq!(retry["class"], json!("should"));
     assert_eq!(
         retry["args"],
         json!({"id": run, "runId": null}),
@@ -371,6 +379,17 @@ fn restart_exhaustion_advertises_stop_then_retry_and_clears_durably() {
     assert!(retry["reason"]
         .as_str()
         .is_some_and(|reason| reason.contains("current spec")));
+
+    let (code, explained) = env.forged(&["explain", "--id", run]);
+    assert_eq!(code, 0, "explain exhausted run: {explained}");
+    let explain_should = explained["result"]["next"]
+        .as_array()
+        .expect("explain next actions")
+        .iter()
+        .filter(|action| action["class"] == json!("should"))
+        .collect::<Vec<_>>();
+    assert_eq!(explain_should.len(), 1, "{explained}");
+    assert_eq!(explain_should[0]["verb"], json!("run retry"));
 
     env.set_work_field(
         run,
@@ -389,7 +408,7 @@ fn restart_exhaustion_advertises_stop_then_retry_and_clears_durably() {
         attention(&overview(&env), run, "restart-budget-exhausted").is_none(),
         "a terminal exhausted source with a live same-work successor clears"
     );
-    let (code, detail) = env.forged(&["work", "detail", "--id", run]);
+    let (code, detail) = env.forged(&["work", "detail", "--id", run, "--detail", "full"]);
     assert_eq!(code, 0, "original run Work Detail: {detail}");
     assert!(
         attention(&detail["result"], run, "restart-budget-exhausted").is_none(),
@@ -413,7 +432,7 @@ fn restart_exhaustion_advertises_stop_then_retry_and_clears_durably() {
         attention(&overview(&env), run, "restart-budget-exhausted").is_none(),
         "clearance survives the successor's own settlement"
     );
-    let (code, detail) = env.forged(&["work", "detail", "--id", run]);
+    let (code, detail) = env.forged(&["work", "detail", "--id", run, "--detail", "full"]);
     assert_eq!(code, 0, "post-settlement Work Detail: {detail}");
     assert!(
         attention(&detail["result"], run, "restart-budget-exhausted").is_none(),
@@ -457,6 +476,7 @@ fn epic_input_attention_advertises_and_executes_epic_resolve() {
             "verb": "epic resolve",
             "args": {"epic": epic, "child": null, "note": null},
             "reason": "bind the held child when the input requirement names one and record the resolution note",
+            "class": "should",
         }])
     );
     let action = &item["nextActions"][0];
@@ -500,6 +520,7 @@ fn provider_exhaustion_advertises_and_executes_run_roster_revision() {
             "verb": "run revise-roster",
             "args": {"run": run, "roster": null, "reason": null},
             "reason": "bind a configured roster name and the reason for revising provider policy",
+            "class": "should",
         }])
     );
     let action = &item["nextActions"][0];
@@ -580,6 +601,7 @@ fn review_disagreement_advertises_accept_risk_only_after_a_persisted_terminal_re
                 "note": null,
             },
             "reason": "bind the adjudicated disposition and note for this exact review disagreement",
+            "class": "should",
         }]),
         "accept-risk must be absent while terminal review evidence is not in the required stopped-blocked state"
     );
@@ -599,16 +621,22 @@ fn review_disagreement_advertises_accept_risk_only_after_a_persisted_terminal_re
 
     let gated_item =
         attention(&overview(&env), gated, "reviewer-disagreement").expect("gated disagreement");
-    assert_eq!(
-        gated_item["nextActions"][0]["verb"],
-        json!("attention resolve")
-    );
-    let accept = &gated_item["nextActions"][1];
+    let accept = &gated_item["nextActions"][0];
     assert_eq!(accept["verb"], json!("run accept-risk"));
+    assert_eq!(accept["class"], json!("should"));
     assert_eq!(
         accept["args"],
         json!({"run": gated, "acceptedBy": null, "rationale": null})
     );
+    assert!(gated_item["nextActions"].as_array().is_some_and(|actions| {
+        actions
+            .iter()
+            .any(|action| action["verb"] == json!("run retry") && action["class"] == json!("can"))
+            && actions.iter().any(|action| {
+                action["verb"] == json!("run adjudicate-settlement")
+                    && action["class"] == json!("repair")
+            })
+    }));
     let (code, accepted) = env.forged(&[
         "run",
         "accept-risk",
@@ -636,6 +664,7 @@ fn review_disagreement_advertises_accept_risk_only_after_a_persisted_terminal_re
         "accepted-risk state must not keep advertising a non-replayable generic acceptance"
     );
     assert_eq!(after["nextActions"][0]["verb"], json!("attention resolve"));
+    assert_eq!(after["nextActions"][0]["class"], json!("should"));
 }
 
 #[test]
@@ -846,6 +875,7 @@ fn open_implement_packet(env: &TestEnv, run: &str, seq: i64) -> (String, String)
             gate_commands: Vec::new(),
             deliverable: forged_types::Deliverable::CommitsInWorktree,
             budget_s: 60,
+            seat_commands: Vec::new(),
         },
         result_schema: "forged.result/1".to_owned(),
         provider_hints: forged_types::ProviderHints {
@@ -853,6 +883,7 @@ fn open_implement_packet(env: &TestEnv, run: &str, seq: i64) -> (String, String)
             model: "fixture".to_owned(),
             effort: None,
             sandbox: forged_types::Sandbox::ReadOnly,
+            env: Default::default(),
         },
         field_notes: Vec::new(),
     };
@@ -922,6 +953,7 @@ fn missing_evidence_is_adjudicated_per_occurrence_with_its_full_attempt_scope() 
                 "note": null,
             },
             "reason": "bind a nonblank note explaining why this attempt-only evidence was never captured",
+            "class": "repair",
         }])
     );
     let evidence_action = item["nextActions"][0].clone();
@@ -943,7 +975,14 @@ fn missing_evidence_is_adjudicated_per_occurrence_with_its_full_attempt_scope() 
 
     // Surface parity while open: work_detail names the same occurrence, so
     // the address it serves can pass resolve validation.
-    let (code, detail) = env.forged(&["work", "detail", "--id", "attention-evidence"]);
+    let (code, detail) = env.forged(&[
+        "work",
+        "detail",
+        "--id",
+        "attention-evidence",
+        "--detail",
+        "full",
+    ]);
     assert_eq!(code, 0, "{detail}");
     let observed = attention(&detail["result"], "attention-evidence", "missing-evidence")
         .expect("work_detail missing-evidence");
@@ -1055,7 +1094,14 @@ fn missing_evidence_is_adjudicated_per_occurrence_with_its_full_attempt_scope() 
             .all(|group| group["condition"] != json!("missing-evidence")),
         "{listed}"
     );
-    let (code, detail) = env.forged(&["work", "detail", "--id", "attention-evidence"]);
+    let (code, detail) = env.forged(&[
+        "work",
+        "detail",
+        "--id",
+        "attention-evidence",
+        "--detail",
+        "full",
+    ]);
     assert_eq!(code, 0, "{detail}");
     assert!(
         attention(&detail["result"], "attention-evidence", "missing-evidence").is_none(),
@@ -1223,7 +1269,14 @@ fn merged_delivery_evidence_defers_adjudication_until_the_pr_is_repaired() {
     // cursor), so while the delivery gap is live its attempt-only
     // occurrence id differs from the rail's merged id and a resolve
     // against it fails closed as stale. The rail is the resolve surface.
-    let (code, detail) = env.forged(&["work", "detail", "--id", "attention-merged"]);
+    let (code, detail) = env.forged(&[
+        "work",
+        "detail",
+        "--id",
+        "attention-merged",
+        "--detail",
+        "full",
+    ]);
     assert_eq!(code, 0, "{detail}");
     let derived = attention(&detail["result"], "attention-merged", "missing-evidence")
         .expect("work_detail missing-evidence");
@@ -1290,7 +1343,14 @@ fn merged_delivery_evidence_defers_adjudication_until_the_pr_is_repaired() {
     );
     // With the settlement source gone the anti-joins agree again, so the
     // occurrence id work_detail prints is the one the rail validates.
-    let (code, detail) = env.forged(&["work", "detail", "--id", "attention-merged"]);
+    let (code, detail) = env.forged(&[
+        "work",
+        "detail",
+        "--id",
+        "attention-merged",
+        "--detail",
+        "full",
+    ]);
     assert_eq!(code, 0, "{detail}");
     let repaired_view = attention(&detail["result"], "attention-merged", "missing-evidence")
         .expect("work_detail attempt-scoped missing-evidence");
@@ -1371,7 +1431,14 @@ fn interrupted_attempts_never_owe_a_manifest_on_any_surface() {
         attention(&overview(&env), "attention-interrupted", "missing-evidence").is_none(),
         "an interrupted attempt never owed a manifest"
     );
-    let (code, detail) = env.forged(&["work", "detail", "--id", "attention-interrupted"]);
+    let (code, detail) = env.forged(&[
+        "work",
+        "detail",
+        "--id",
+        "attention-interrupted",
+        "--detail",
+        "full",
+    ]);
     assert_eq!(code, 0, "{detail}");
     assert!(
         attention(
@@ -1536,7 +1603,7 @@ fn attention_list_groups_decisions_first_and_serves_complete_rail_items() {
 
     // Items are the complete unmodified forged.attention-item/1 objects the
     // embedded operations_overview rail serves.
-    let (code, ops) = env.forged(&["operations", "overview"]);
+    let (code, ops) = env.forged(&["operations", "overview", "--detail", "full"]);
     assert_eq!(code, 0, "{ops}");
     for (run, condition) in [
         ("att-a", "quarantined"),
@@ -1568,7 +1635,7 @@ fn attention_list_serves_the_plan_only_blocked_work_exactly_as_the_rail() {
     env.set_work_field("plan-blk", "title", "Blocked plan-only bead");
     env.set_work_repository("plan-blk", &repository);
 
-    let (code, ops) = env.forged(&["operations", "overview"]);
+    let (code, ops) = env.forged(&["operations", "overview", "--detail", "full"]);
     assert_eq!(code, 0, "{ops}");
     let rail = attention(&ops["result"], "plan-blk", "blocked")
         .unwrap_or_else(|| panic!("plan-only blocked bead is on the rail: {ops}"));
@@ -1792,9 +1859,8 @@ fn attention_list_repo_scope_matches_the_durable_item_repository() {
     assert_eq!(foreign["groups"], json!([]), "{foreign}");
 }
 
-/// The subject id travels as the envelope `runId` (the CLI's `--subject`),
-/// and `params.subjectId` — the name `attention_list` hands back — is an
-/// accepted alias. Absence names both forms; disagreement refuses.
+/// The subject id travels as the top-level `subjectId` field that
+/// `attention_list` hands back. Absence names that field.
 #[test]
 fn attention_controls_accept_the_subject_id_alias() {
     let env = TestEnv::new("forged-attention-subject-alias");
@@ -1813,7 +1879,7 @@ fn attention_controls_accept_the_subject_id_alias() {
     let item = quarantine(&overview(&env));
     let attention_id = item["attentionId"].as_str().expect("attention id");
     let occurrence_id = item["occurrenceId"].as_str().expect("occurrence id");
-    let mut mcp = McpClient::new(&env);
+    let mut mcp = McpClient::new(&env, None);
 
     let base = json!({
         "attentionId": attention_id,
@@ -1821,47 +1887,22 @@ fn attention_controls_accept_the_subject_id_alias() {
         "actor": "operator",
     });
 
-    let refused = mcp.call_tool(
-        "attention_acknowledge",
-        json!({"schemaVersion": 1, "params": base}),
-    );
+    let refused = mcp.call_tool("attention_acknowledge", base.clone());
     assert_eq!(refused["ok"], json!(false), "{refused}");
     let message = refused["error"]["message"].as_str().expect("message");
-    assert!(message.contains("params.subjectId"), "{message}");
-    assert!(message.contains("runId"), "{message}");
-
-    let mut conflicted = base.clone();
-    conflicted["subjectId"] = json!("attention-run");
-    let conflicted = mcp.call_tool(
-        "attention_acknowledge",
-        json!({"schemaVersion": 1, "runId": "another-run", "params": conflicted}),
-    );
-    assert_eq!(conflicted["ok"], json!(false), "{conflicted}");
-    assert!(
-        conflicted["error"]["message"]
-            .as_str()
-            .expect("message")
-            .contains("conflicts"),
-        "{conflicted}"
-    );
+    assert!(message.contains("subjectId"), "{message}");
 
     let mut aliased = base.clone();
     aliased["subjectId"] = json!("attention-run");
-    let acknowledged = mcp.call_tool(
-        "attention_acknowledge",
-        json!({"schemaVersion": 1, "params": aliased}),
-    );
+    let acknowledged = mcp.call_tool("attention_acknowledge", aliased);
     assert_eq!(acknowledged["ok"], json!(true), "{acknowledged}");
     assert_eq!(acknowledged["reused"], json!(false), "{acknowledged}");
     assert_eq!(quarantine(&overview(&env))["state"], json!("acknowledged"));
 
-    // The two documented request forms share one idempotency identity: a
-    // retry that switches from the alias form to the envelope form replays
-    // the stored response instead of conflicting.
-    let replayed = mcp.call_tool(
-        "attention_acknowledge",
-        json!({"schemaVersion": 1, "runId": "attention-run", "params": base}),
-    );
+    // The same flat request derives the same idempotency identity.
+    let mut replay = base;
+    replay["subjectId"] = json!("attention-run");
+    let replayed = mcp.call_tool("attention_acknowledge", replay);
     assert_eq!(replayed["ok"], json!(true), "{replayed}");
     assert_eq!(replayed["reused"], json!(true), "{replayed}");
 }

@@ -136,7 +136,7 @@ const source = [
   .map(lift)
   .join("\n");
 const semanticSource = [
-  "DECISION_CONDITIONS", "SYMPTOM_CONDITIONS", "conditionRows", "semanticState", "semanticLabel",
+  "DECISION_CONDITIONS", "SYMPTOM_CONDITIONS", "attentionRows", "subjectOf", "conditionRows", "semanticState", "semanticLabel",
   "degradedSources", "queueCount", "spendText", "fullHeadline", "pushPortfolioModelContext",
 ]
   .map(lift)

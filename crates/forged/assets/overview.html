@@ -489,13 +489,15 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
 
   function ageTone(ts) { const elapsed=Date.now()-stamp(ts); return !Number.isFinite(elapsed)||elapsed<3600000?"quiet":elapsed<86400000?"amber":"loud"; }
   function ageNode(ts) { return el("span",`age age--${ageTone(ts)}`,ago(ts)||String(ts||"—")); }
-  function conditionRows(value, all=[]) { const own=arr(value?.attention?.items??value?.attentionItems?.items??value?.attention);if(own.length)return own;const id=value?.subjectId||value?.id||value?.runId||value?.workRef?.id;return id?arr(all).filter(item=>(item?.subjectId||item?.id)===id):[]; }
-  function semanticState(value, group, conditions=conditionRows(value)) { const queue=String(group||value?.queueGroup||value?.queue?.group||"").toLowerCase().replace(/\s+/g,"-");const outcome=value?.outcome||value?.terminalOutcome||value?.execution?.outcome||value?.status?.outcome||value?.status?.terminalOutcome;const attempt=value?.attempt?.activity||value?.attempt?.state||value?.runState;const merged=[value?.merged,value?.execution?.merged,value?.status?.merged].some(item=>item===true||(item&&typeof item==="object"));const names=conditions.map(item=>typeof item==="string"?item:item?.condition).filter(Boolean);if(["needs-me","ready-to-merge"].includes(queue)||["clean","accepted-risk","input-required"].includes(outcome)||names.some(name=>DECISION_CONDITIONS.includes(name)))return "attend";if(queue==="running"||["running","active"].includes(attempt)||names.includes("revoking"))return "running";if(outcome==="landed"||merged)return "landed";if(["cancelled","superseded"].includes(outcome))return "dormant";if(queue==="stalled-or-recoverable"||outcome==="blocked"||names.some(name=>name!=="revoking"&&SYMPTOM_CONDITIONS.includes(name)))return "stalled";if(queue==="planned"||value?.source==="live-plan"||value?.workRef?.kind==="plan")return "dormant";return "dormant"; }
+  function attentionRows(value) { return Array.isArray(value) ? value : [...arr(value?.decisions),...arr(value?.symptoms)]; }
+  function subjectOf(value) { return value?.subject || {}; }
+  function conditionRows(value, all=[]) { const own=arr(value?.attention?.items??value?.attentionItems?.items??value?.attention);if(own.length)return own;const id=value?.subjectId||value?.id||value?.runId||value?.workRef?.id||subjectOf(value).id;return id?attentionRows(all).filter(item=>(item?.subjectId||item?.id)===id):[]; }
+  function semanticState(value, group, conditions=conditionRows(value)) { const queue=String(group||value?.queueGroup||value?.queue?.group||"").toLowerCase().replace(/\s+/g,"-");const outcome=value?.outcome||value?.terminalOutcome||value?.execution?.outcome||value?.status?.outcome||value?.status?.terminalOutcome;const attempt=value?.attempt?.activity||value?.attempt?.state||value?.runState;const merged=[value?.merged,value?.execution?.merged,value?.status?.merged].some(item=>item===true||(item&&typeof item==="object"));const names=conditions.map(item=>typeof item==="string"?item:item?.condition).filter(Boolean);if(["needs-me","ready-to-merge"].includes(queue)||["clean","accepted-risk","input-required"].includes(outcome)||names.some(name=>DECISION_CONDITIONS.includes(name)))return "attend";if(queue==="running"||["running","active"].includes(attempt)||names.includes("revoking"))return "running";if(outcome==="landed"||merged)return "landed";if(["cancelled","superseded"].includes(outcome))return "dormant";if(queue==="stalled-or-recoverable"||outcome==="blocked"||names.some(name=>name!=="revoking"&&SYMPTOM_CONDITIONS.includes(name)))return "stalled";if(queue==="planned"||value?.source==="live-plan"||subjectOf(value).kind==="plan"||value?.workRef?.kind==="plan")return "dormant";return "dormant"; }
   function semanticLabel(value, conditions, semantic=semanticState(value,null,conditions)) { return semantic==="running"&&conditions.some(item=>(typeof item==="string"?item:item?.condition)==="revoking")?"recovering":semantic; }
   function degradedSources(data) { const degraded=[];for(const name of ["ledger","beads","plan"]){const source=data?.sourceHealth?.[name];if(!source)continue;const state=source.state||"unknown";if(state!=="available")degraded.push(`${name==="beads"?"work":name} ${state}`);}return degraded; }
   function queueCount(data, code, label) { const group=arr(data?.queue?.groups).find(row=>row?.code===code||row?.label===label||row?.name===label);return group?num(group.total??group.count):null; }
   function spendText(spend) { if(!spend||(!Object.hasOwn(spend,"costUsdKnown")&&!Object.hasOwn(spend,"rowsMissingCost")))return null;const known=num(spend.costUsdKnown),missing=num(spend.rowsMissingCost);if(missing>0&&known===0)return "?";return `$${known.toFixed(2)}${missing>0?` + ${int(missing)} unpriced`:""}`; }
-  function fullHeadline(data) { const hasAttention=Array.isArray(data?.attention),items=arr(data?.attention),total=typeof data?.attentionTotal==="number"?data.attentionTotal:typeof data?.counts?.attention==="number"?data.counts.attention:items.length;const decisions=items.filter(item=>DECISION_CONDITIONS.includes(item?.condition));const symptoms=new Map();for(const item of items)if(SYMPTOM_CONDITIONS.includes(item?.condition))symptoms.set(item.condition,(symptoms.get(item.condition)||0)+1);const oldest=decisions.map(item=>item?.openedAt).filter(Boolean).sort()[0];const parts=[];const degraded=degradedSources(data);if(degraded.length)parts.push(`Degraded sources: ${degraded.join(", ")}`);if(hasAttention)parts.push(`${int(decisions.length)} decision${decisions.length===1?"":"s"}${oldest?`, oldest ${ago(oldest)}`:""}`);const running=queueCount(data,"running","Running");if(running!=null)parts.push(`${int(running)} running`);const ready=queueCount(data,"ready-to-merge","Ready to merge");if(ready!=null)parts.push(`${int(ready)} ready to merge`);const grouped=[...symptoms].sort(([a],[b])=>a.localeCompare(b)).map(([name,count])=>`${name.replace(/-/g," ")} ${int(count)}`).join(", ");if(hasAttention)parts.push(grouped?`symptoms: ${grouped}`:"0 symptoms");if(data?.spend){const known=num(data.spend.costUsdKnown),missing=num(data.spend.rowsMissingCost);parts.push(missing>0&&known===0?`? known spend (${int(missing)} unpriced)`:`$${known.toFixed(2)} known spend${missing?` + ${int(missing)} unpriced`:""}`);}if(hasAttention&&total>items.length)parts.push(`${int(items.length)} of ${int(total)} attention conditions classified (capped)`);return `${parts.join("; ")}.`; }
+  function fullHeadline(data) { const hasAttention=!!data?.attention,items=attentionRows(data?.attention),total=typeof data?.attentionTotal==="number"?data.attentionTotal:typeof data?.counts?.attention==="number"?data.counts.attention:items.length;const decisions=items.filter(item=>DECISION_CONDITIONS.includes(item?.condition));const decisionCount=num(data?.attention?.counts?.decisions??decisions.length);const symptomCount=num(data?.attention?.counts?.symptoms??items.filter(item=>SYMPTOM_CONDITIONS.includes(item?.condition)).length);const symptoms=new Map();for(const item of items)if(SYMPTOM_CONDITIONS.includes(item?.condition))symptoms.set(item.condition,(symptoms.get(item.condition)||0)+1);const oldest=decisions.map(item=>item?.openedAt).filter(Boolean).sort()[0];const parts=[];const degraded=degradedSources(data);if(degraded.length)parts.push(`Degraded sources: ${degraded.join(", ")}`);if(hasAttention)parts.push(`${int(decisionCount)} decision${decisionCount===1?"":"s"}${oldest?`, oldest ${ago(oldest)}`:""}`);const running=queueCount(data,"running","Running");if(running!=null)parts.push(`${int(running)} running`);const ready=queueCount(data,"ready-to-merge","Ready to merge");if(ready!=null)parts.push(`${int(ready)} ready to merge`);const grouped=[...symptoms].sort(([a],[b])=>a.localeCompare(b)).map(([name,count])=>`${name.replace(/-/g," ")} ${int(count)}`).join(", ");if(hasAttention)parts.push(grouped?`symptoms: ${grouped}`:`${int(symptomCount)} symptoms`);if(data?.spend){const known=num(data.spend.costUsdKnown),missing=num(data.spend.rowsMissingCost);parts.push(missing>0&&known===0?`? known spend (${int(missing)} unpriced)`:`$${known.toFixed(2)} known spend${missing?` + ${int(missing)} unpriced`:""}`);}if(hasAttention&&total>items.length)parts.push(`${int(items.length)} of ${int(total)} attention conditions classified (capped)`);return `${parts.join("; ")}.`; }
 
   const VERDICT = {
     approve: { label: "approve", tone: "pass" },
@@ -1740,6 +1742,7 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
     const canPick = !!host.capabilities.serverTools;
     const grid = el("div", "work-grid");
     for (const entry of entries) {
+      const subject = subjectOf(entry);
       const conditions = conditionRows(entry, attentionItems);
       const semantic = semanticState(entry, groupName, conditions);
       const card = el("button", `${canPick ? "work-card work-card--pick" : "work-card"} semantic--${semantic}`);
@@ -1748,10 +1751,10 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
       // The display title leads the card. The canonical id keeps its place
       // beside the kind, because it is what addresses the next call — but a
       // queue of ids names nothing, and the title is what names the work.
-      const displayTitle = (entry.titleSource && entry.titleSource.value) || (entry.identity && entry.identity.displayTitle) || entry.title || entry.beadId || entry.id || "";
+      const displayTitle = subject.title || (entry.titleSource && entry.titleSource.value) || (entry.identity && entry.identity.displayTitle) || entry.title || entry.beadId || subject.id || entry.id || "";
       card.append(el("div", "work-card__title", displayTitle));
       const top = el("div", "work-card__top");
-      top.append(chip(entry.id, "id"));
+      top.append(chip(subject.id || entry.id, "id"));
       top.append(el("span", `semantic-chip semantic-chip--${semantic}`, semanticLabel(entry, conditions, semantic)));
       card.append(top);
       // The title states its authority: an id form reads as an id, and a
@@ -1771,7 +1774,7 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
       if (recoveryReason) foot.append(el("span", "", recoveryReason));
       const progress = ago(entry.lastProgressAt || entry.updatedAt);
       if (progress) foot.append(ageNode(entry.lastProgressAt || entry.updatedAt));
-      if (entry.kind) foot.append(el("span", "", entry.kind));
+      if (subject.kind || entry.kind) foot.append(el("span", "", subject.kind || entry.kind));
       if (num(entry.liveSeats)) foot.append(el("span", "", `${int(entry.liveSeats)} live`));
       // Key PRESENCE, not truthiness: a measured $0.00 is a fact, and
       // hiding it exactly like an absent key would tell the operator the
@@ -1867,11 +1870,14 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
     // `pickGrid` already declines to bind the click; this is the second
     // door, for every other caller.
     if (!host.capabilities.serverTools) return;
+    const subject = subjectOf(entry);
+    const kind = subject.kind || entry.kind;
+    const id = subject.id || entry.id;
     state.args = {
       schemaVersion: 1,
-      params: entry.kind === "portfolio"
+      params: kind === "portfolio"
         ? {}
-        : entry.kind === "epic" ? { epic: entry.id } : { run: entry.id },
+        : kind === "epic" ? { epic: id } : { run: id },
     };
     refresh();
   }
@@ -1931,7 +1937,7 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
    */
   function portfolioRail(data) {
     const tone = { critical: "block", high: "block", medium: "warn", low: "info" };
-    return arr(data.attention).map((item) => ({
+    return attentionRows(data.attention).map((item) => ({
       tone: tone[item.severity] || "warn",
       label: String(item.condition || "attention").replace(/-/g, " "),
       detail: `${item.subjectId || item.id} · ${item.detail || ""}`,

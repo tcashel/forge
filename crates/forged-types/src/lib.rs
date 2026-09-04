@@ -14,6 +14,7 @@ pub mod herdr_ownership;
 pub mod herdr_projection;
 pub mod ids;
 pub mod packet;
+pub mod projection;
 pub mod provider_session_inventory;
 pub mod review_publication;
 pub mod work_history;
@@ -41,13 +42,14 @@ pub use contract::{
     ExecutionPolicyV1, HostPolicyV1, PolicyRevisionV1, ProfileDefinitionV1, ProfileRef,
     ProtocolRef, ProviderCandidateV1, ResolvedRosterV1, RoleId, RosterDefinitionV1, RosterRef,
     RosterRevisionV1, SeatDefinitionV1, SeatExecutionV1, SeatId, SeatPurpose,
-    DEFAULT_TERMINATION_GRACE_S, EXECUTION_PACKAGE_SCHEMA_V1, MAX_STAGE_BUDGET_S,
-    MAX_TERMINATION_GRACE_S, MODEL_VALUE_CHARSET_ERROR, PROFILE_SCHEMA_V1,
+    DEFAULT_DEADLINE_RETRY_BUDGET, DEFAULT_TERMINATION_GRACE_S, EXECUTION_PACKAGE_SCHEMA_V1,
+    MAX_STAGE_BUDGET_S, MAX_TERMINATION_GRACE_S, MODEL_VALUE_CHARSET_ERROR, PROFILE_SCHEMA_V1,
     RESOLVED_ROSTER_SCHEMA_V1, ROSTER_SCHEMA_V1,
 };
 pub use controller_env::{CONTROLLER_ENV, OPERATOR_STATE_ENV};
 pub use envelope::{
-    OpError, OperationActionV1, OperationRequest, OperationResponse, RemedyV1, REMEDY_SCHEMA_V1,
+    ActionClass, OpError, OperationActionV1, OperationRequest, OperationResponse, RemedyV1,
+    REMEDY_SCHEMA_V1,
 };
 pub use error::ErrorCode;
 pub use herdr_layout::{
@@ -70,6 +72,7 @@ pub use packet::{
     PacketResult, PlanTraceabilityV1, ProviderHints, Sandbox, Severity, SpecAmendment, SpecRef,
     Stage, StageContract, Verdict, WorkPacket,
 };
+pub use projection::{add_work_twins, with_work_twins, ProjectionSubjectKind, ProjectionSubjectV1};
 pub use provider_session_inventory::{
     ProviderSessionActivity, ProviderSessionAttemptV1, ProviderSessionDesiredWorkV1,
     ProviderSessionDiagnosticAction, ProviderSessionEvidenceV1, ProviderSessionHostMode,

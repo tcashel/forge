@@ -394,6 +394,7 @@ fn settlement_refreshes_siblings_after_whole_run_deadline_reconciliation() {
                 gate_commands: Vec::new(),
                 deliverable: forged_types::Deliverable::CommitsInWorktree,
                 budget_s: 1_800,
+                seat_commands: Vec::new(),
             },
             result_schema: "forged.result/1".to_owned(),
             provider_hints: forged_types::ProviderHints {
@@ -401,6 +402,7 @@ fn settlement_refreshes_siblings_after_whole_run_deadline_reconciliation() {
                 model: "fixture".to_owned(),
                 effort: None,
                 sandbox: forged_types::Sandbox::ReadOnly,
+                env: Default::default(),
             },
             field_notes: Vec::new(),
         };
@@ -441,7 +443,7 @@ fn settlement_refreshes_siblings_after_whole_run_deadline_reconciliation() {
     ledger
         .revoke_attempt_scoped(
             attempts[0],
-            "transport: stage deadline exceeded: seeded marker",
+            "deadline: stage deadline exceeded: seeded marker",
             forged_ledger::RevokeScope::Deadline,
         )
         .expect("seed first deadline marker");

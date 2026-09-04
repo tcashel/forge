@@ -56,6 +56,13 @@ pub struct ForgedConfig {
     pub gate_commands: Vec<String>,
     pub stage_budget_s: HashMap<Stage, u64>,
     pub transport_retry_budget: u32,
+    /// Checks a seat runs before each commit; the gate stays the controller's.
+    pub seat_commands: Vec<String>,
+    /// Relaunches allowed after stage-deadline kills, counted apart from
+    /// transport failures.
+    pub deadline_retry_budget: u32,
+    /// Environment applied to every provider process the controller spawns.
+    pub seat_env: BTreeMap<String, String>,
     /// Operator-defined, case-insensitive transport substrings extending the
     /// built-in classifier. An over-broad match can consume no more than the
     /// existing transport retry budget frozen into the execution package.
@@ -80,6 +87,10 @@ pub struct AdmissionPolicy {
     pub total_active: u32,
     pub provider_active: u32,
     pub repository_write_active: u32,
+    /// Machine gate stages this daemon runs at once. Live config: read at
+    /// every gate admission, never frozen into an execution package.
+    #[serde(default = "default_gate_active")]
+    pub gate_active: u32,
     /// Maximum number of non-terminal child runs one epic may hold.
     ///
     /// This is independently bounded from the global admission policy: the
@@ -108,6 +119,7 @@ impl Default for AdmissionPolicy {
             total_active: 8,
             provider_active: 4,
             repository_write_active: 1,
+            gate_active: default_gate_active(),
             epic_fanout: default_epic_fanout(),
             defer_seconds: 60,
             provider_overrides: BTreeMap::new(),
@@ -125,6 +137,7 @@ impl AdmissionPolicy {
         if self.total_active == 0
             || self.provider_active == 0
             || self.repository_write_active == 0
+            || self.gate_active == 0
             || self.epic_fanout == 0
             || self.defer_seconds == 0
             || self.provider_overrides.values().any(|limit| *limit == 0)
@@ -179,6 +192,12 @@ struct ConfigFile {
     stage_budget_s: Option<HashMap<Stage, u64>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     transport_retry_budget: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    seat_commands: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    deadline_retry_budget: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    seat_env: Option<BTreeMap<String, String>>,
     #[serde(
         rename = "transportPatterns",
         default,
@@ -214,6 +233,7 @@ fn hints(provider: &str, model: &str, effort: Option<&str>, sandbox: Sandbox) ->
         model: model.to_owned(),
         effort: effort.map(str::to_owned),
         sandbox,
+        env: BTreeMap::new(),
     }
 }
 
@@ -362,6 +382,10 @@ fn default_rosters() -> BTreeMap<String, RosterDefinitionV1> {
     BTreeMap::from([("default".to_owned(), roster)])
 }
 
+fn default_gate_active() -> u32 {
+    1
+}
+
 fn default_gate_commands() -> Vec<String> {
     vec![
         "cargo build --workspace --locked".to_owned(),
@@ -471,6 +495,9 @@ impl ForgedConfig {
                 .collect(),
             termination_grace_s: forged_types::DEFAULT_TERMINATION_GRACE_S,
             transport_retry_budget: self.transport_retry_budget,
+            seat_commands: self.seat_commands.clone(),
+            deadline_retry_budget: self.deadline_retry_budget,
+            seat_env: self.seat_env.clone(),
             host_policy: self.host_policy,
             herdr_socket: self.herdr_sock.clone(),
         };
@@ -575,6 +602,11 @@ impl ForgedConfig {
             transport_retry_budget: file
                 .transport_retry_budget
                 .unwrap_or(DEFAULT_TRANSPORT_RETRY_BUDGET),
+            seat_commands: file.seat_commands.unwrap_or_default(),
+            deadline_retry_budget: file
+                .deadline_retry_budget
+                .unwrap_or(forged_types::DEFAULT_DEADLINE_RETRY_BUDGET),
+            seat_env: file.seat_env.unwrap_or_default(),
             transport_patterns,
             provider_transport_patterns,
             bd_path,
@@ -883,6 +915,9 @@ impl ForgedConfig {
             gate_commands: Some(default_gate_commands()),
             stage_budget_s: Some(default_stage_budget_s()),
             transport_retry_budget: Some(DEFAULT_TRANSPORT_RETRY_BUDGET),
+            seat_commands: Some(self.seat_commands.clone()),
+            deadline_retry_budget: Some(self.deadline_retry_budget),
+            seat_env: (!self.seat_env.is_empty()).then(|| self.seat_env.clone()),
             transport_patterns: Some(self.transport_patterns.clone()),
             providers: (!self.provider_transport_patterns.is_empty()).then(|| {
                 self.provider_transport_patterns
@@ -1302,6 +1337,7 @@ fn compatibility_projection(
                 model: value.model.clone(),
                 effort: value.effort.clone(),
                 sandbox: value.sandbox,
+                env: Default::default(),
             })
             .ok_or_else(|| DefinitionError {
                 path: format!("$.roster.roles.{}", seat.role.as_str()),
@@ -1402,6 +1438,9 @@ pub(crate) fn scratch_config(anvil_home: &std::path::Path) -> ForgedConfig {
         gate_commands: default_gate_commands(),
         stage_budget_s: default_stage_budget_s(),
         transport_retry_budget: DEFAULT_TRANSPORT_RETRY_BUDGET,
+        seat_commands: Vec::new(),
+        deadline_retry_budget: 1,
+        seat_env: Default::default(),
         transport_patterns: Vec::new(),
         provider_transport_patterns: BTreeMap::new(),
         bd_path: PathBuf::from("bd"),
@@ -1435,6 +1474,9 @@ mod tests {
             gate_commands: default_gate_commands(),
             stage_budget_s: default_stage_budget_s(),
             transport_retry_budget: DEFAULT_TRANSPORT_RETRY_BUDGET,
+            seat_commands: Vec::new(),
+            deadline_retry_budget: 1,
+            seat_env: Default::default(),
             transport_patterns: Vec::new(),
             provider_transport_patterns: BTreeMap::new(),
             bd_path: PathBuf::from("/tmp/configured/bd"),
@@ -2509,5 +2551,66 @@ mod tests {
         std::fs::write(&path, "default_profile: [broken").expect("break config");
         let error = snapshot.refreshed().expect_err("malformed gate");
         assert!(error.contains("does not parse"), "{error}");
+    }
+
+    #[test]
+    fn seat_contract_knobs_parse_and_reach_the_execution_policy() {
+        let file: ConfigFile = serde_yaml::from_str(
+            "seat_commands:\n  - cargo fmt --all -- --check\n  - cargo clippy --workspace\ndeadline_retry_budget: 2\nseat_env:\n  RUSTC_WRAPPER: \"\"\nadmission:\n  totalActive: 8\n  providerActive: 4\n  repositoryWriteActive: 1\n  gateActive: 2\n  deferSeconds: 60\n",
+        )
+        .expect("seat knobs parse");
+        assert_eq!(
+            file.seat_commands.as_deref(),
+            Some(
+                &[
+                    "cargo fmt --all -- --check".to_owned(),
+                    "cargo clippy --workspace".to_owned()
+                ][..]
+            )
+        );
+        assert_eq!(file.deadline_retry_budget, Some(2));
+        assert_eq!(
+            file.seat_env
+                .as_ref()
+                .and_then(|env| env.get("RUSTC_WRAPPER"))
+                .map(String::as_str),
+            Some("")
+        );
+        assert_eq!(
+            file.admission.as_ref().map(|policy| policy.gate_active),
+            Some(2)
+        );
+
+        let mut cfg = config();
+        cfg.seat_commands = file.seat_commands.clone().unwrap_or_default();
+        cfg.deadline_retry_budget = file.deadline_retry_budget.unwrap_or(1);
+        cfg.seat_env = file.seat_env.clone().unwrap_or_default();
+        let policy = cfg.execution_policy().expect("policy compiles");
+        assert_eq!(policy.seat_commands, cfg.seat_commands);
+        assert_eq!(policy.deadline_retry_budget, 2);
+        assert_eq!(
+            policy.seat_env.get("RUSTC_WRAPPER").map(String::as_str),
+            Some("")
+        );
+
+        // Absent knobs keep their defaults, and a stored policy without the
+        // fields still deserializes.
+        let bare: ConfigFile = serde_yaml::from_str("gate_commands: []\n").expect("bare");
+        assert!(bare.seat_commands.is_none() && bare.deadline_retry_budget.is_none());
+        let legacy: forged_types::ExecutionPolicyV1 = serde_json::from_value(serde_json::json!({
+            "gateCommands": [],
+            "stageBudgetS": {"implement": 60, "reviewclaude": 60, "reviewcodex": 60, "fix": 60},
+            "transportRetryBudget": 3,
+            "hostPolicy": "off",
+            "herdrSocket": null
+        }))
+        .expect("legacy policy reads");
+        assert!(legacy.seat_commands.is_empty());
+        assert_eq!(
+            legacy.deadline_retry_budget,
+            forged_types::DEFAULT_DEADLINE_RETRY_BUDGET
+        );
+        assert!(legacy.seat_env.is_empty());
+        assert_eq!(AdmissionPolicy::default().gate_active, 1);
     }
 }

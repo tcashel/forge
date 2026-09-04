@@ -47,6 +47,7 @@ fn packet_body(run_id: &str, packet_id: &str, provider: &str) -> String {
             gate_commands: Vec::new(),
             deliverable: Deliverable::CommitsInWorktree,
             budget_s: 60,
+            seat_commands: Vec::new(),
         },
         result_schema: "forged.result/1".to_owned(),
         provider_hints: ProviderHints {
@@ -54,6 +55,7 @@ fn packet_body(run_id: &str, packet_id: &str, provider: &str) -> String {
             model: "model".to_owned(),
             effort: None,
             sandbox: Sandbox::WorkspaceWrite,
+            env: Default::default(),
         },
         field_notes: Vec::new(),
     }

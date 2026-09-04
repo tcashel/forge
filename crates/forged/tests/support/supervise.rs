@@ -281,6 +281,11 @@ pub(crate) fn kill_controller_and_make_due(
     killpg(Pid::from_raw(pid), Signal::SIGKILL).expect("kill controller group");
     wait_until("controller group death", || !process_group_alive(pid));
     let ledger = env.ledger();
+    let outcome = ledger
+        .get_desired_work(DesiredSubjectKind::Run, run)
+        .expect("desired query")
+        .and_then(|row| row.last_outcome)
+        .unwrap_or(DesiredReconcileOutcome::Authorized);
     ledger
         .append_event(
             Some(run),
@@ -293,7 +298,7 @@ pub(crate) fn kill_controller_and_make_due(
             DesiredSubjectKind::Run,
             run,
             DesiredState::Running,
-            DesiredReconcileOutcome::Authorized,
+            outcome,
             Some("2000-01-01T00:00:00.000000000Z".to_owned()),
             None,
         )

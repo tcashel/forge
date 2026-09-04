@@ -332,7 +332,7 @@ async fn reconcile_inner(
                     (
                         true,
                         format!(
-                            "transport: stage deadline exceeded: attemptId={} startedAt={} budgetS={} asOf={now}",
+                            "deadline: stage deadline exceeded: attemptId={} startedAt={} budgetS={} asOf={now}",
                             attempt.attempt_id, attempt.started_at, budget
                         ),
                         RevokeScope::Deadline,
@@ -489,7 +489,7 @@ async fn get_attempt(ledger: &Ledger, attempt_id: i64) -> Result<AttemptRow, Pro
 async fn deadline_order(
     ledger: &Ledger,
     ports: &dyn ReconcilePorts,
-    run: &RunRow,
+    _run: &RunRow,
     attempt: &AttemptRow,
     report: &mut ReconcileReport,
     termination_grace_s: u64,
@@ -512,21 +512,8 @@ async fn deadline_order(
         }
         return Ok(());
     }
-    let packet_id = current.packet_id.clone();
-    let since = current.updated_at.clone();
-    let started_at = current.started_at;
-    let run_id = run.run_id.clone();
-    on_ledger(ledger, move |l| {
-        crate::grant_retry_for_attempt_under_active_policy(
-            l,
-            &run_id,
-            &packet_id,
-            attempt_id,
-            &since,
-            &started_at,
-        )
-    })
-    .await?;
+    // A deadline kill earns no retry grant: it is counted from the attempt
+    // rows by `deadline_failures` and never touches the transport budget.
     on_ledger(ledger, move |l| {
         l.mark_timed_out(attempt_id).map_err(ProtoError::Ledger)
     })

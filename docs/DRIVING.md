@@ -25,6 +25,8 @@ id from a response you just read.
 forged            # bare: next for the current repository, text form
 forged next --repo "$(git rev-parse --show-toplevel)"
 forged next --json | jq …
+forged next --text                       # deterministic text, even when piped
+forged next --follow                     # terminal only; refreshes every 5s
 ```
 
 Every lead-audience read renders a fixed text form when stdout is a
@@ -38,18 +40,23 @@ Sections, in fixed order, capped to one tool result:
 
 1. **decisions** — what is waiting on you or the human, each with its
    `should` verb and pre-bound args, spend so far, and the estimated
-   cost of each option;
+   spend so far;
 2. **running** — id, stage, seat, minutes in stage, total age, spend;
 3. **ready** — the frontier with each item's lifecycle stage
-   (`drafted`, `critiqued`, `adjudicated`), so you know which need a
-   skill before dispatch;
+   (`drafted`, `critiqued`, `held`), with the stored evidence for that
+   classification and adjudication reported as unknown until ore-080.8;
 4. **landed** — recent deliveries with PR numbers;
 5. **hidden** — counts of symptoms and parked items not shown.
 
-**Today:** `forged operations overview --group needs-me --limit 20`,
-`forged attention list --classification decision --limit 20`, and
-`forged work ready --repo <root>`; expect the overview to be large and
-the rail to carry `blocked` symptoms you should ignore.
+Use `--symptoms` only when diagnosing hidden operational trouble. Use
+`--section <name> --limit <n>` to widen exactly one section; widening
+`decisions` also includes its full `next` alternatives. The ordinary read
+keeps only `should` plus `canCount` and remains capped at 30 rows.
+
+The same terminal rule applies to `explain`, `run status`, `epic status`,
+`usage`, `work history`, and `work show`. `work show` omits specification
+bodies in text unless `--full` is explicit. Service and MCP responses remain
+JSON-only.
 
 ## Decide
 
@@ -60,15 +67,19 @@ forged explain --id <id>
 `explain` resolves any id (work item, run, attempt, attention) and
 answers what it is, its lifecycle stage, one health verdict with its
 inputs, and `next`. Read `next[0]` when its class is `should`. If there
-is no `should`, the subject is terminal or idle: do nothing to it.
+is no `should`, nothing is required of you: the subject is terminal or
+idle. `can` actions are optional; `repair` actions fix a state the
+ledger cannot leave on its own. When a run's own outcome and an open
+decision both name a `should`, the outcome wins and the decision's
+action is listed as `can`.
 
 Make routine engineering judgments yourself. Ask the operator only when
 a decision changes product scope, external authority, or accepts risk
 — and ask with the exact tuple the decision needs (id, revision, the
 options, the consequence, the cost).
 
-**Today:** `explain` reports execution health only; a closed epic reads
-`not-started` and a landed item still advertises `work reopen`. Treat
+**Today:** `explain` reads `landed`, `closed`, and `parked` from the
+ledger, and a closed item lists `work reopen` only as `repair`. Treat
 `status: closed` and `outcome: landed` as terminal regardless of
 `next`.
 
@@ -119,6 +130,22 @@ Refusals carry `error.detail.remedy`. Run the remedy, not a guess.
 | `ADJUDICATION_REQUIRED` | no durable driver identity to fence | `run adjudicate-settlement` after confirming the evidence gap |
 | `SPEC_DRIFT` | the packet's pinned body no longer matches | re-read `work show`; the next packet re-pins |
 | `INVALID_REQUEST` with field names | admission preflight refused | fix the named fields (priority, repository) and dispatch again |
+
+### Seats, gates, and deadlines
+
+A seat runs the repository's **seat checks** (`seat_commands` in the operator
+config) before each commit and never the full gate: the controller runs the
+gate commands after every seat returns and again after each fix round, one
+machine gate at a time per daemon (`admission.gate_active`). A relaunched
+attempt reads one field note naming the prior attempt and the commits its
+worktree already carries, so it continues instead of re-verifying. A stage
+deadline kill is its own failure class (`deadline:` note, counted against
+`deadline_retry_budget`, never transport). Past that budget the run stops
+with `deadlineExhausted` naming the stage, the kill count, and the
+worktree's commits ahead and uncommitted paths; `next` offers `run retry`
+on a clean tree and `session message` while the seat's work is still
+uncommitted. The seat's `gateState` result field is the seat-check outcome
+and projects as `seatChecks`; the gate verdict lives in the gate stage.
 
 ## Wait
 

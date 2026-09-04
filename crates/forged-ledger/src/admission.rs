@@ -91,6 +91,7 @@ fn resource_class(index: usize, raw: &str) -> rusqlite::Result<AdmissionResource
     match raw {
         "read" => Ok(AdmissionResourceClass::Read),
         "repository-write" => Ok(AdmissionResourceClass::RepositoryWrite),
+        "gate" => Ok(AdmissionResourceClass::Gate),
         other => Err(column_decode_error(
             index,
             "admission resource class",
@@ -1021,6 +1022,7 @@ fn insert_batch_tx(
             let class = match decision.resource_class {
                 AdmissionResourceClass::Read => "read",
                 AdmissionResourceClass::RepositoryWrite => "repository-write",
+                AdmissionResourceClass::Gate => "gate",
             };
             let existing_sql = format!(
                 "SELECT {RESERVATION_COLUMNS} FROM admission_reservations \
@@ -1326,6 +1328,230 @@ impl Ledger {
         })
     }
 
+    /// Replace one evidence-proven orphaned run-controller reservation after
+    /// the desired-work generation has advanced. Releasing the old custody,
+    /// recording why it is safe, and installing ownerless capacity for the
+    /// successor are one transaction, so recovery never creates a capacity
+    /// gap and never reactivates the orphaned row.
+    pub fn supersede_orphaned_admission_reservation(
+        &self,
+        observed: &AdmissionReservationRow,
+        successor: &AdmissionDecisionV1,
+        generation: u32,
+        recovery_deadline: &str,
+    ) -> Result<AdmissionReservationRow, LedgerError> {
+        if observed.subject_kind != AdmissionSubjectKind::Run
+            || observed.state != AdmissionReservationState::Orphaned
+            || observed.owner_kind.as_deref() != Some("controller")
+        {
+            return Err(refused(
+                ErrorCode::InvalidRequest,
+                "only an orphaned run-controller reservation can be superseded",
+            ));
+        }
+        if successor.schema != ADMISSION_DECISION_SCHEMA_V1
+            || successor.outcome != AdmissionOutcome::Admitted
+            || successor.subject_kind != observed.subject_kind
+            || successor.subject_id != observed.subject_id
+            || successor.control_revision != observed.control_revision
+            || successor.repository != observed.repository
+            || successor.provider.as_deref() != Some(observed.provider.as_str())
+            || successor.model.as_deref() != Some(observed.model.as_str())
+            || successor.resource_class != observed.resource_class
+        {
+            return Err(refused(
+                ErrorCode::InvalidRequest,
+                "successor admission decision does not match orphaned reservation facts",
+            ));
+        }
+        let owner = observed.owner_id.as_deref().ok_or_else(|| {
+            refused(
+                ErrorCode::InvalidRequest,
+                "orphaned controller reservation has no owner identity",
+            )
+        })?;
+        let (owner_prefix, owner_generation) = owner.rsplit_once(':').ok_or_else(|| {
+            refused(
+                ErrorCode::InvalidRequest,
+                "orphaned controller reservation has malformed owner identity",
+            )
+        })?;
+        let owner_generation = owner_generation.parse::<u32>().map_err(|_| {
+            refused(
+                ErrorCode::InvalidRequest,
+                "orphaned controller reservation has malformed owner generation",
+            )
+        })?;
+        let expected_prefix = format!("run:{}", observed.subject_id);
+        if owner_prefix != expected_prefix || generation <= owner_generation {
+            return Err(refused(
+                ErrorCode::InvalidRequest,
+                "successor generation does not supersede the orphaned controller owner",
+            ));
+        }
+        if recovery_deadline.is_empty() {
+            return Err(refused(
+                ErrorCode::InvalidRequest,
+                "successor reservation recovery deadline must not be empty",
+            ));
+        }
+
+        let observed = observed.clone();
+        let successor = successor.clone();
+        let recovery_deadline = recovery_deadline.to_owned();
+        self.submit(move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let successor_decision_id = format!(
+                "admission:{}:run:{}",
+                successor.batch_id, successor.subject_id
+            );
+            let persisted_successor = tx
+                .query_row(
+                    "SELECT decision_json FROM admission_decisions WHERE decision_id = ?1",
+                    [&successor_decision_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+                .ok_or_else(|| {
+                    refused(
+                        ErrorCode::OperationInProgress,
+                        "successor admission decision is not durable",
+                    )
+                })?;
+            if decode_admission_decision(&persisted_successor)? != successor {
+                return Err(refused(
+                    ErrorCode::IdempotencyConflict,
+                    "successor admission decision differs from the durable record",
+                ));
+            }
+            let replacement_id =
+                format!("reservation:{successor_decision_id}:orphan-relaunch:{generation}");
+            let sql = format!(
+                "SELECT {RESERVATION_COLUMNS} FROM admission_reservations WHERE reservation_id = ?1"
+            );
+            let current = tx
+                .query_row(&sql, [&observed.reservation_id], reservation_row)
+                .optional()?
+                .ok_or_else(|| {
+                    refused(
+                        ErrorCode::OperationInProgress,
+                        "orphaned admission reservation custody changed",
+                    )
+                })?;
+
+            if current.state == AdmissionReservationState::Released {
+                let replacement = tx
+                    .query_row(&sql, [&replacement_id], reservation_row)
+                    .optional()?
+                    .ok_or_else(|| {
+                        refused(
+                            ErrorCode::OperationInProgress,
+                            "orphaned admission reservation was released by another transition",
+                        )
+                    })?;
+                tx.commit()?;
+                return Ok(replacement);
+            }
+            if current.state != observed.state
+                || current.owner_kind != observed.owner_kind
+                || current.owner_id != observed.owner_id
+            {
+                return Err(refused(
+                    ErrorCode::OperationInProgress,
+                    "orphaned admission reservation custody changed",
+                ));
+            }
+
+            let uncontained = crate::operations::uncontained_machine_operations_tx(
+                &tx,
+                &observed.subject_id,
+                None,
+            )?;
+            if !uncontained.is_empty() {
+                return Err(refused(
+                    ErrorCode::OperationInProgress,
+                    "orphaned admission reservation still has an uncontained machine operation",
+                ));
+            }
+            let live_attempts =
+                crate::attempts::list_live_attempts_tx(&tx, Some(&observed.subject_id))?;
+            if !live_attempts.is_empty() {
+                return Err(refused(
+                    ErrorCode::OperationInProgress,
+                    "orphaned admission reservation still has a live attempt",
+                ));
+            }
+
+            let now = now_iso();
+            let affected = tx.execute(
+                "UPDATE admission_reservations SET state = 'released', \
+                 last_error = 'orphan-superseded-by-generation', updated_at = ?1, released_at = ?1 \
+                 WHERE reservation_id = ?2 AND state = 'orphaned' \
+                   AND owner_kind = ?3 AND owner_id = ?4",
+                rusqlite::params![
+                    now,
+                    observed.reservation_id,
+                    observed.owner_kind,
+                    observed.owner_id,
+                ],
+            )?;
+            if affected != 1 {
+                return Err(refused(
+                    ErrorCode::OperationInProgress,
+                    "orphaned admission reservation custody changed",
+                ));
+            }
+            crate::events::append_event_tx(
+                &tx,
+                Some(&observed.subject_id),
+                "forged.admission.reservation.released",
+                &json!({
+                    "reservationId": observed.reservation_id,
+                    "subject": {
+                        "kind": observed.subject_kind,
+                        "id": observed.subject_id,
+                    },
+                    "generation": generation,
+                    "reason": "orphan-superseded-by-generation",
+                    "evidence": {
+                        "uncontainedOperations": 0,
+                        "liveAttempts": 0,
+                        "identity": "absent",
+                    },
+                }),
+            )?;
+            tx.execute(
+                "INSERT INTO admission_reservations (reservation_id, decision_id, work_key, \
+                 subject_kind, subject_id, control_revision, repository, provider, model, \
+                 resource_class, state, recovery_deadline, created_at, updated_at) \
+                 VALUES (?1, ?2, ?3, 'run', ?4, ?5, ?6, ?7, ?8, ?9, 'reserved', ?10, ?11, ?11)",
+                rusqlite::params![
+                    replacement_id,
+                    successor_decision_id,
+                    observed.work_key,
+                    observed.subject_id,
+                    i64::try_from(observed.control_revision).map_err(|_| refused(
+                        ErrorCode::InvalidRequest,
+                        "control revision exceeds i64",
+                    ))?,
+                    observed.repository,
+                    observed.provider,
+                    observed.model,
+                    match observed.resource_class {
+                        AdmissionResourceClass::Read => "read",
+                        AdmissionResourceClass::RepositoryWrite => "repository-write",
+                        AdmissionResourceClass::Gate => "gate",
+                    },
+                    recovery_deadline,
+                    now,
+                ],
+            )?;
+            let replacement = tx.query_row(&sql, [&replacement_id], reservation_row)?;
+            tx.commit()?;
+            Ok(replacement)
+        })
+    }
+
     /// Mark overdue unknown-effect reservations for bounded recovery. They
     /// remain capacity-bearing and therefore cannot silently oversubscribe.
     pub fn mark_expired_admission_orphaned(
@@ -1435,11 +1661,11 @@ impl Ledger {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{NewPacket, NewRun, RevokeScope, SpecFence};
+    use crate::types::{EffectClass, NewPacket, NewRun, RevokeScope, SpecFence};
     use crate::{NewWorkItem, WorkKind, WorkRevisionCause, WorkSpecFields, WorkStatus};
     use forged_types::{
-        AdmissionCandidateV1, AdmissionInputsV1, AdmissionReason, Outcome, PacketResult, RunId,
-        Stage, ADMISSION_DECISION_SCHEMA_V1, ADMISSION_INPUTS_SCHEMA_V1,
+        AdmissionCandidateV1, AdmissionInputsV1, AdmissionReason, OperationRequest, Outcome,
+        PacketResult, RunId, Stage, ADMISSION_DECISION_SCHEMA_V1, ADMISSION_INPUTS_SCHEMA_V1,
     };
 
     fn seed_packet(ledger: &Ledger, suffix: &str) -> (String, String) {
@@ -1860,12 +2086,148 @@ mod tests {
         let snapshot = ledger.admission_snapshot(None).expect("orphan snapshot");
         assert_eq!(snapshot.capacity.total_active, 1);
         assert_eq!(snapshot.reservations, vec![orphaned.clone()]);
-        let released = ledger
-            .release_admission_reservation(&orphaned, Some("orphan reconciled"))
-            .expect("release exact orphan custody");
-        assert_eq!(released.state, AdmissionReservationState::Released);
-        assert_eq!(released.owner_kind, orphaned.owner_kind);
-        assert_eq!(released.owner_id, orphaned.owner_id);
+        let successor_write = write_for(
+            &ledger,
+            snapshot,
+            AdmissionSubjectKind::Run,
+            &run_id,
+            orphaned.control_revision,
+            "batch-custody-aba-successor",
+            AdmissionOutcome::Admitted,
+            AdmissionReason::CapacityAvailable,
+            "2030-01-01T00:01:00.000000000Z",
+        );
+        let successor = successor_write.decisions[0].clone();
+        ledger
+            .commit_admission_batch(successor_write)
+            .expect("persist successor admission decision");
+        let replacement = ledger
+            .supersede_orphaned_admission_reservation(
+                &orphaned,
+                &successor,
+                2,
+                "2030-01-01T00:01:00.000000000Z",
+            )
+            .expect("supersede exact orphan custody");
+        assert_ne!(replacement.reservation_id, orphaned.reservation_id);
+        assert_eq!(replacement.state, AdmissionReservationState::Reserved);
+        assert!(replacement.owner_kind.is_none());
+        assert!(replacement.owner_id.is_none());
+        assert_eq!(
+            ledger
+                .admission_snapshot(None)
+                .expect("successor capacity snapshot")
+                .reservations,
+            vec![replacement.clone()],
+            "capacity transfers to a new row instead of reactivating the orphan"
+        );
+        let release: Value = ledger
+            .latest_event_of_kind(&run_id, "forged.admission.reservation.released")
+            .expect("release event query")
+            .and_then(|event| serde_json::from_str(&event.payload_json).ok())
+            .expect("release event");
+        assert_eq!(release["reservationId"], json!(orphaned.reservation_id));
+        assert_eq!(release["subject"], json!({"kind": "run", "id": run_id}));
+        assert_eq!(release["generation"], json!(2));
+        assert_eq!(release["reason"], json!("orphan-superseded-by-generation"));
+        assert_eq!(
+            release["evidence"],
+            json!({
+                "uncontainedOperations": 0,
+                "liveAttempts": 0,
+                "identity": "absent",
+            })
+        );
+        let error = ledger
+            .activate_admission_reservation(&orphaned.reservation_id, "controller", &owner_id)
+            .expect_err("the late old generation stays fenced");
+        assert_eq!(error.code(), ErrorCode::OperationInProgress);
+        ledger
+            .activate_admission_reservation(
+                &replacement.reservation_id,
+                "controller",
+                &format!("run:{run_id}:2"),
+            )
+            .expect("activate successor custody");
+    }
+
+    #[test]
+    fn orphaned_custody_with_uncontained_machine_effect_cannot_be_superseded() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ledger = Ledger::open(&dir.path().join("state.db")).expect("ledger");
+        let (run_id, _) = seed_packet(&ledger, "custody-unsafe-effect");
+        let reservation = reserve(
+            &ledger,
+            AdmissionSubjectKind::Run,
+            &run_id,
+            "batch-custody-unsafe-effect",
+            "2000-01-01T00:00:00.000000000Z",
+        );
+        ledger
+            .activate_admission_reservation(
+                &reservation.reservation_id,
+                "controller",
+                &format!("run:{run_id}:1"),
+            )
+            .expect("activate");
+        let orphaned = ledger
+            .mark_expired_admission_orphaned("2030-01-01T00:00:00.000000000Z")
+            .expect("orphan expired custody")
+            .into_iter()
+            .next()
+            .expect("orphan row");
+        ledger
+            .begin_operation(
+                "gate",
+                &OperationRequest {
+                    schema_version: 1,
+                    idempotency_key: "unsafe-gate-effect".to_owned(),
+                    run_id: Some(run_id.clone()),
+                    params: serde_json::Map::new(),
+                },
+                EffectClass::SafeRetry,
+                None,
+            )
+            .expect("seed in-progress machine operation");
+        let successor_write = write_for(
+            &ledger,
+            ledger.admission_snapshot(None).expect("successor snapshot"),
+            AdmissionSubjectKind::Run,
+            &run_id,
+            orphaned.control_revision,
+            "batch-custody-unsafe-effect-successor",
+            AdmissionOutcome::Admitted,
+            AdmissionReason::CapacityAvailable,
+            "2030-01-01T00:01:00.000000000Z",
+        );
+        let successor = successor_write.decisions[0].clone();
+        ledger
+            .commit_admission_batch(successor_write)
+            .expect("persist successor admission decision");
+
+        let error = ledger
+            .supersede_orphaned_admission_reservation(
+                &orphaned,
+                &successor,
+                2,
+                "2030-01-01T00:01:00.000000000Z",
+            )
+            .expect_err("uncontained machine effect must retain orphan custody");
+        assert_eq!(error.code(), ErrorCode::OperationInProgress);
+        assert_eq!(
+            ledger
+                .admission_snapshot(None)
+                .expect("retained orphan snapshot")
+                .reservations,
+            vec![orphaned]
+        );
+        assert!(
+            ledger
+                .latest_event_of_kind(&run_id, "forged.admission.reservation.released")
+                .expect("release event query")
+                .is_none(),
+            "unsafe residue cannot emit release evidence"
+        );
     }
 
     #[test]
@@ -2787,7 +3149,7 @@ mod tests {
                     ledger
                         .revoke_attempt_scoped(
                             attempt.attempt_id,
-                            "transport: stage deadline exceeded: test",
+                            "deadline: stage deadline exceeded: test",
                             RevokeScope::Deadline,
                         )
                         .expect("revoke");

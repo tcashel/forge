@@ -42,27 +42,64 @@ fn result(response: OperationResponse) -> Result<Value, Failure> {
     })
 }
 
-async fn events(ctx: &Ctx, run_id: &str, after: i64, limit: Option<u64>) -> Result<Value, Failure> {
-    result(
-        super::ops::events_tail(
-            ctx,
-            &request(
-                run_id,
-                json!({"run": run_id, "after": after, "limit": limit}),
-            ),
-        )
-        .await,
-    )
+async fn events(
+    ctx: &Ctx,
+    run_id: &str,
+    kind: forged_types::WorkIdentitySubjectKind,
+    after: i64,
+    limit: u64,
+    detail: super::ops::ProjectionDetail,
+) -> Result<Value, Failure> {
+    let detail = match detail {
+        super::ops::ProjectionDetail::Summary => "summary",
+        super::ops::ProjectionDetail::Full => "full",
+    };
+    let scope = match kind {
+        forged_types::WorkIdentitySubjectKind::Run => json!({"run": run_id}),
+        forged_types::WorkIdentitySubjectKind::Epic => {
+            json!({"id": run_id, "subjectKind": "epic"})
+        }
+    };
+    let mut params = scope.as_object().cloned().unwrap_or_default();
+    params.extend(
+        json!({"after": after, "limit": limit, "detail": detail})
+            .as_object()
+            .cloned()
+            .unwrap_or_default(),
+    );
+    result(super::ops::events_tail(ctx, &request(run_id, Value::Object(params))).await)
 }
 
-fn event_payloads(all: &Value, kind: impl Fn(&str) -> bool) -> Vec<Value> {
-    all.get("events")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter(|event| event.get("kind").and_then(Value::as_str).is_some_and(&kind))
-        .cloned()
-        .collect()
+const FULL_EVENT_HISTORY_LIMIT: u32 = 4_096;
+const SUMMARY_EVENT_PAGE_LIMIT: u64 = 30;
+const FULL_EVENT_PAGE_LIMIT: u64 = 100;
+
+async fn subject_events_by_kind(
+    ctx: &Ctx,
+    run_id: &str,
+    kind: &str,
+) -> Result<Vec<Value>, Failure> {
+    let run_id = run_id.to_owned();
+    let kind = kind.to_owned();
+    let rows = on_ledger(&ctx.ledger, move |ledger| {
+        ledger.list_subject_events_by_kind(&run_id, &kind, FULL_EVENT_HISTORY_LIMIT)
+    })
+    .await?;
+    rows.iter().map(event_json).collect()
+}
+
+async fn subject_events_by_kind_prefix(
+    ctx: &Ctx,
+    run_id: &str,
+    prefix: &str,
+) -> Result<Vec<Value>, Failure> {
+    let run_id = run_id.to_owned();
+    let prefix = prefix.to_owned();
+    let rows = on_ledger(&ctx.ledger, move |ledger| {
+        ledger.list_subject_events_by_kind_prefix(&run_id, &prefix, FULL_EVENT_HISTORY_LIMIT)
+    })
+    .await?;
+    rows.iter().map(event_json).collect()
 }
 
 async fn packet_artifacts(ctx: &Ctx, view: &forged_proto::RunView) -> Result<Vec<Value>, Failure> {
@@ -201,16 +238,72 @@ async fn policy_revisions(ctx: &Ctx, run_id: &str) -> Result<Vec<Value>, Failure
         .collect()
 }
 
-async fn run_overview(ctx: &Ctx, run_id: &str, after: i64, limit: u64) -> Result<Value, Failure> {
+fn summary_run_status(status: &Value) -> Value {
+    json!({
+        "runId": status.get("runId"),
+        "state": status.get("state"),
+        "stopReason": status.get("stopReason"),
+        "outcome": status.get("outcome"),
+        "currentStage": status.get("currentStage"),
+        "gateState": status.get("gateState"),
+        "seatChecks": status.get("gateState"),
+        "claimHealth": status.get("claimHealth"),
+        "nextAction": status.get("nextAction"),
+    })
+}
+
+fn finding_counts(findings: &[Finding]) -> Value {
+    let mut counts = BTreeMap::<String, usize>::new();
+    for finding in findings {
+        let severity = serde_json::to_value(finding)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("severity")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| "unknown".to_owned());
+        *counts.entry(severity).or_default() += 1;
+    }
+    json!({"total": findings.len(), "bySeverity": counts})
+}
+
+async fn run_overview(
+    ctx: &Ctx,
+    run_id: &str,
+    after: i64,
+    limit: u64,
+    detail: super::ops::ProjectionDetail,
+) -> Result<Value, Failure> {
+    let identity =
+        super::work_identity::load(ctx, forged_types::WorkIdentitySubjectKind::Run, run_id).await?;
+    let subject = super::work_identity::projection_subject(
+        &identity,
+        forged_types::ProjectionSubjectKind::Run,
+        run_id,
+    );
     let status =
         result(super::ops::run_status(ctx, &request(run_id, json!({"run": run_id}))).await)?;
-    let workers =
-        result(super::sessions::session_list(ctx, &request(run_id, json!({"run": run_id}))).await)?;
     let usage =
         result(super::ops::usage_report(ctx, &request(run_id, json!({"run": run_id}))).await)?;
-    let all_events = events(ctx, run_id, 0, None).await?;
-    let event_page = events(ctx, run_id, after, Some(limit)).await?;
+    let event_page = events(
+        ctx,
+        run_id,
+        forged_types::WorkIdentitySubjectKind::Run,
+        after,
+        limit,
+        detail,
+    )
+    .await?;
     let view = super::drive::project(ctx, run_id).await?;
+    let workers = if detail == super::ops::ProjectionDetail::Full {
+        Some(result(
+            super::sessions::session_list(ctx, &request(run_id, json!({"run": run_id}))).await,
+        )?)
+    } else {
+        None
+    };
     let packet_ids = view
         .packets
         .iter()
@@ -232,24 +325,54 @@ async fn run_overview(ctx: &Ctx, run_id: &str, after: i64, limit: u64) -> Result
             .collect::<Vec<_>>()
     };
     let findings = super::drive::latest_review_findings(&view);
+    if detail == super::ops::ProjectionDetail::Summary {
+        let worker_total = view.live_attempts.len();
+        return Ok(json!({
+            "schema": "forged.overview/1",
+            "subject": subject,
+            "kind": "slice",
+            "id": run_id,
+            "identity": status.pointer("/run/identity"),
+            "events": event_page.get("events"),
+            "cursor": event_page.get("last_event_id"),
+            "coverage": event_page.get("coverage"),
+            "status": summary_run_status(status.get("run").unwrap_or(&Value::Null)),
+            "workers": {"total": worker_total},
+            "gates": {
+                "latestState": status.pointer("/run/gateState"),
+            },
+            "reviews": {
+                "findingCounts": finding_counts(&findings),
+            },
+            "admission": {"total": run_admission.len()},
+            "usage": {
+                "totals": usage.pointer("/usage/totals").cloned().unwrap_or(Value::Null),
+            },
+        }));
+    }
+    let workers = workers.expect("full detail reads session metadata");
+    let gates = subject_events_by_kind(ctx, run_id, "proto.gate").await?;
+    let review_events = subject_events_by_kind(ctx, run_id, "proto.review").await?;
+    let interventions = subject_events_by_kind_prefix(ctx, run_id, "forged.intervention.").await?;
     let roster_revisions = roster_revisions(ctx, run_id).await?;
     let policy_revisions = policy_revisions(ctx, run_id).await?;
     Ok(json!({
         "schema": "forged.overview/1",
+        "subject": subject,
         "kind": "slice",
         "id": run_id,
         "identity": status.pointer("/run/identity"),
         "cursor": event_page.get("last_event_id"),
         "status": status.get("run"),
         "workers": workers,
-        "gates": event_payloads(&all_events, |kind| kind == "proto.gate"),
+        "gates": gates,
         "reviews": {
-            "events": event_payloads(&all_events, |kind| kind == "proto.review"),
+            "events": review_events,
             "latestFindings": findings,
         },
         "packetHistory": packet_history(&view),
         "artifacts": packet_artifacts(ctx, &view).await?,
-        "interventions": event_payloads(&all_events, |kind| kind.starts_with("forged.intervention.")),
+        "interventions": interventions,
         "rosterRevisions": roster_revisions,
         "policyRevisions": policy_revisions,
         "admission": run_admission,
@@ -316,11 +439,32 @@ fn absorb_usage(
     }
 }
 
-async fn epic_overview(ctx: &Ctx, epic_id: &str, after: i64, limit: u64) -> Result<Value, Failure> {
+async fn epic_overview(
+    ctx: &Ctx,
+    epic_id: &str,
+    after: i64,
+    limit: u64,
+    detail: super::ops::ProjectionDetail,
+) -> Result<Value, Failure> {
+    let identity =
+        super::work_identity::load(ctx, forged_types::WorkIdentitySubjectKind::Epic, epic_id)
+            .await?;
+    let subject = super::work_identity::projection_subject(
+        &identity,
+        forged_types::ProjectionSubjectKind::Epic,
+        epic_id,
+    );
     let status =
         result(super::epic::epic_status(ctx, &request(epic_id, json!({"epic": epic_id}))).await)?;
-    let all_events = events(ctx, epic_id, 0, None).await?;
-    let event_page = events(ctx, epic_id, after, Some(limit)).await?;
+    let event_page = events(
+        ctx,
+        epic_id,
+        forged_types::WorkIdentitySubjectKind::Epic,
+        after,
+        limit,
+        detail,
+    )
+    .await?;
     let epic_admission = {
         let epic_id = epic_id.to_owned();
         on_ledger(&ctx.ledger, move |ledger| {
@@ -333,8 +477,13 @@ async fn epic_overview(ctx: &Ctx, epic_id: &str, after: i64, limit: u64) -> Resu
     };
     let mut child_runs = Vec::new();
     let mut workers = Vec::new();
+    let mut worker_total = 0u64;
     let mut gates = Vec::new();
+    let mut passed_gates = 0u64;
+    let mut failed_gates = 0u64;
+    let mut unknown_gates = 0u64;
     let mut reviews = Vec::new();
+    let mut review_total = 0u64;
     let mut artifacts = Vec::new();
     let mut interventions = Vec::new();
     let mut usage = BTreeMap::<&'static str, f64>::new();
@@ -349,48 +498,67 @@ async fn epic_overview(ctx: &Ctx, epic_id: &str, after: i64, limit: u64) -> Resu
         let Some(run_id) = child.get("runId").and_then(Value::as_str) else {
             continue;
         };
-        match run_overview(ctx, run_id, 0, limit.min(25)).await {
+        match run_overview(ctx, run_id, 0, limit.min(25), detail).await {
             Ok(mut overview) => {
-                workers.extend(
-                    overview
-                        .pointer("/workers/sessions")
-                        .and_then(Value::as_array)
-                        .into_iter()
-                        .flatten()
-                        .cloned(),
-                );
-                gates.extend(
-                    overview
-                        .get("gates")
-                        .and_then(Value::as_array)
-                        .into_iter()
-                        .flatten()
-                        .cloned(),
-                );
-                reviews.extend(
-                    overview
-                        .pointer("/reviews/latestFindings")
-                        .and_then(Value::as_array)
-                        .into_iter()
-                        .flatten()
-                        .cloned(),
-                );
-                artifacts.extend(
-                    overview
-                        .get("artifacts")
-                        .and_then(Value::as_array)
-                        .into_iter()
-                        .flatten()
-                        .cloned(),
-                );
-                interventions.extend(
-                    overview
-                        .get("interventions")
-                        .and_then(Value::as_array)
-                        .into_iter()
-                        .flatten()
-                        .cloned(),
-                );
+                if detail == super::ops::ProjectionDetail::Full {
+                    workers.extend(
+                        overview
+                            .pointer("/workers/sessions")
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .cloned(),
+                    );
+                    gates.extend(
+                        overview
+                            .get("gates")
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .cloned(),
+                    );
+                    reviews.extend(
+                        overview
+                            .pointer("/reviews/latestFindings")
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .cloned(),
+                    );
+                    artifacts.extend(
+                        overview
+                            .get("artifacts")
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .cloned(),
+                    );
+                    interventions.extend(
+                        overview
+                            .get("interventions")
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .cloned(),
+                    );
+                } else {
+                    worker_total += overview
+                        .pointer("/workers/total")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                    match overview
+                        .pointer("/gates/latestState")
+                        .and_then(Value::as_str)
+                    {
+                        Some("passed") => passed_gates += 1,
+                        Some("failed") => failed_gates += 1,
+                        _ => unknown_gates += 1,
+                    }
+                    review_total += overview
+                        .pointer("/reviews/findingCounts/total")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                }
                 for (key, value) in totals(&overview) {
                     *usage.entry(key).or_default() += value;
                 }
@@ -405,8 +573,43 @@ async fn epic_overview(ctx: &Ctx, epic_id: &str, after: i64, limit: u64) -> Resu
             })),
         }
     }
+    if detail == super::ops::ProjectionDetail::Summary {
+        return Ok(json!({
+            "schema": "forged.overview/1",
+            "subject": subject,
+            "kind": "epic",
+            "id": epic_id,
+            "identity": status.get("identity"),
+            "events": event_page.get("events"),
+            "cursor": event_page.get("last_event_id"),
+            "coverage": event_page.get("coverage"),
+            "status": {
+                "state": status.get("state"),
+                "executionHealth": status.get("executionHealth"),
+                "desiredState": status.get("desiredState"),
+                "nextAction": status.get("nextAction"),
+            },
+            "children": {
+                "total": child_runs.len(),
+                "items": child_runs,
+            },
+            "workers": {"total": worker_total},
+            "gates": {
+                "passed": passed_gates,
+                "failed": failed_gates,
+                "unknown": unknown_gates,
+            },
+            "reviews": {"findingCounts": {"total": review_total}},
+            "admission": {"total": epic_admission.len()},
+            "usage": {"totals": usage},
+            "inputRequired": status.get("inputRequired"),
+            "paused": status.get("paused"),
+        }));
+    }
+    let scheduler_events = subject_events_by_kind_prefix(ctx, epic_id, "forged.epic.").await?;
     Ok(json!({
         "schema": "forged.overview/1",
+        "subject": subject,
         "kind": "epic",
         "id": epic_id,
         "identity": status.get("identity"),
@@ -419,7 +622,7 @@ async fn epic_overview(ctx: &Ctx, epic_id: &str, after: i64, limit: u64) -> Resu
         "artifacts": artifacts,
         "interventions": interventions,
         "admission": epic_admission,
-        "schedulerEvents": event_payloads(&all_events, |kind| kind.starts_with("forged.epic.")),
+        "schedulerEvents": scheduler_events,
         "usage": {
             "rows": usage_rows,
             "totals": usage,
@@ -433,23 +636,20 @@ async fn epic_overview(ctx: &Ctx, epic_id: &str, after: i64, limit: u64) -> Resu
     }))
 }
 
-/// The newest entries a portfolio carries.
+/// The maximum diagnostic entries a full portfolio carries. Summary mode
+/// inherits Operations' 30-row default.
 ///
 /// The inventory grows for the life of the operator's ledger and is never
 /// pruned, so an uncapped portfolio eventually becomes a payload no host
-/// will carry. Two hundred: an entry is a dozen scalar keys — ~300 bytes —
-/// so a full page is under 100 KB, well below the epic projection this same
-/// tool already returns, which embeds a whole child overview per child. It
-/// is also more concurrent work than an operator runs, so truncation is the
-/// exception `total` exists to announce; `work_list` serves the inventory
-/// whole for a caller that wants the tail.
+/// will carry. Full retains the v0.7.1 cap so its body remains a compatible
+/// superset.
 const PORTFOLIO_CAP: usize = 200;
 
 /// The portfolio: every unit of work and what needs a human, for a caller
 /// that cannot name a subject yet.
 ///
-/// Newest first, capped at [`PORTFOLIO_CAP`] with the totals stated, so a
-/// consumer distinguishes a complete answer from a truncated one. `spend`
+/// Newest first, 30 summary entries by default and up to
+/// [`PORTFOLIO_CAP`] in full detail, with totals stated. `spend`
 /// and `attentionTotal` cover the WHOLE inventory, never the capped page:
 /// a figure that quietly described only what fit would be read as complete.
 /// `attention` is present and empty when nothing needs a human — an omitted
@@ -458,7 +658,17 @@ const PORTFOLIO_CAP: usize = 200;
 /// Carries no event page: `after`/`limit` address one subject's stream, and
 /// the portfolio is the level above any subject.
 async fn portfolio_overview(ctx: &Ctx, req: &OperationRequest) -> Result<Value, Failure> {
-    let operations = super::ops::operations_projection(ctx, req).await?;
+    let detail = super::ops::projection_detail(req, "overview")?;
+    let mut operations_req = req.clone();
+    if detail == super::ops::ProjectionDetail::Full {
+        operations_req
+            .params
+            .insert("limit".to_owned(), json!(PORTFOLIO_CAP));
+        operations_req
+            .params
+            .insert("symptoms".to_owned(), json!(true));
+    }
+    let operations = super::ops::operations_projection(ctx, &operations_req).await?;
     let queue_groups = super::ops::durable_compatibility_groups(&operations);
     let entries = queue_groups
         .iter()
@@ -470,17 +680,22 @@ async fn portfolio_overview(ctx: &Ctx, req: &OperationRequest) -> Result<Value, 
         .and_then(Value::as_u64)
         .unwrap_or(entries.len() as u64);
     let attention_total = operations
-        .get("attention")
-        .and_then(Value::as_array)
-        .map_or(0, Vec::len);
-    let attention = operations
-        .get("attention")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .take(PORTFOLIO_CAP)
-        .cloned()
-        .collect::<Vec<_>>();
+        .pointer("/counts/attention")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let attention = if detail == super::ops::ProjectionDetail::Full {
+        operations
+            .get("attention")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .take(PORTFOLIO_CAP)
+            .cloned()
+            .collect::<Vec<_>>()
+            .into()
+    } else {
+        operations.get("attention").cloned().unwrap_or(Value::Null)
+    };
     let admission = entries
         .iter()
         .flat_map(|entry| {
@@ -496,25 +711,39 @@ async fn portfolio_overview(ctx: &Ctx, req: &OperationRequest) -> Result<Value, 
         .iter()
         .filter_map(|entry| entry.get("liveSeats").and_then(Value::as_u64))
         .sum::<u64>();
+    let cap = if detail == super::ops::ProjectionDetail::Full {
+        json!(PORTFOLIO_CAP)
+    } else {
+        operations
+            .pointer("/coverage/limit")
+            .cloned()
+            .unwrap_or(json!(30))
+    };
     let queue = json!({
         "groups": queue_groups,
         "total": total,
-        "cap": PORTFOLIO_CAP,
+        "cap": cap,
         "asOf": operations.pointer("/capturedAt/ledger").cloned().unwrap_or(Value::Null),
     });
     Ok(json!({
         "schema": "forged.overview/1",
+        "subject": {
+            "id": "portfolio",
+            "kind": "portfolio",
+            "title": "Forged portfolio",
+            "repository": Value::Null,
+            "revision": Value::Null,
+        },
         "kind": "portfolio",
         "entries": entries,
         "total": total,
-        "cap": PORTFOLIO_CAP,
+        "cap": cap,
         "liveSeats": live_seats,
         "attention": attention,
         "attentionTotal": attention_total,
         "queue": queue,
-        // Verbatim Operations counts. `coverage` is deliberately NOT passed
-        // through: this payload already carries `cap`, and two
-        // differently-defined caps in one envelope is a trap.
+        "coverage": operations.get("coverage").cloned().unwrap_or(Value::Null),
+        // Verbatim Operations counts.
         "counts": operations.get("counts").cloned().unwrap_or(Value::Null),
         "admission": admission,
         "spend": {
@@ -525,66 +754,9 @@ async fn portfolio_overview(ctx: &Ctx, req: &OperationRequest) -> Result<Value, 
     }))
 }
 
-/// What a bare `id` resolved to.
-enum Resolved {
-    /// The id names one slice run.
-    Slice(String),
-    /// The id names one epic.
-    Epic(String),
-    /// The id named no single subject; the raw
-    /// `{query, reason, candidates}` resolution object, which each caller
-    /// wraps under its OWN schema key — a chooser that invented another
-    /// tool's schema would be a payload the caller's consumer refuses to
-    /// draw.
-    Unresolved(Value),
-}
-
-/// Resolve a bare `id` to a kind through ONE inventory scan.
-///
-/// The inventory `work_list` serves is the resolution index — the only place
-/// an epic with no `runs` row is discoverable — so resolution reads it whole
-/// and matches in memory rather than issuing a lookup per candidate.
-///
-/// An exact id always wins over any prefix interpretation of the same
-/// string, so a shorter id that prefixes a longer one is never shadowed by
-/// it. A prefix resolves only when exactly one entry matches; zero is
-/// `unknown` with an empty candidate list and two or more is `ambiguous`
-/// with those entries. Neither is an error: a wrong guess degrades into a
-/// menu, and "nothing could have been meant" is a successful answer.
-async fn resolve(ctx: &Ctx, id: &str) -> Result<Resolved, Failure> {
-    let entries = super::ops::inventory(ctx, super::ops::Spend::Omit).await?;
-    let resolved = |entry: &Value| {
-        let entry_id = entry["id"].as_str().unwrap_or_default().to_owned();
-        match entry["kind"].as_str() {
-            Some("epic") => Resolved::Epic(entry_id),
-            _ => Resolved::Slice(entry_id),
-        }
-    };
-    if let Some(entry) = entries.iter().find(|entry| entry["id"] == json!(id)) {
-        return Ok(resolved(entry));
-    }
-    let candidates: Vec<Value> = entries
-        .into_iter()
-        .filter(|entry| {
-            entry["id"]
-                .as_str()
-                .is_some_and(|entry_id| entry_id.starts_with(id))
-        })
-        .collect();
-    if candidates.len() == 1 {
-        return Ok(resolved(&candidates[0]));
-    }
-    Ok(Resolved::Unresolved(json!({
-        "query": id,
-        "reason": if candidates.is_empty() { "unknown" } else { "ambiguous" },
-        "candidates": candidates,
-    })))
-}
-
-/// What the explain-only resolver selected. Overview's two-kind [`Resolved`]
-/// contract remains untouched; this layer adds exact-only namespaces around
-/// it and defers its prefix result until every exact namespace was checked.
-enum ExplainResolved {
+/// One result from the shared operator-id resolver. Every read surface uses
+/// this contract so precedence and namespace disambiguation cannot drift.
+pub(crate) enum ResolvedId {
     WorkItem(Box<WorkItemSnapshot>),
     Run(String),
     Epic(String),
@@ -593,42 +765,239 @@ enum ExplainResolved {
     Unresolved(Value),
 }
 
-async fn resolve_explain(ctx: &Ctx, id: &str) -> Result<ExplainResolved, Failure> {
-    let work_id = id.to_owned();
-    if let Some(work) = on_ledger(&ctx.ledger, move |ledger| ledger.work_item(&work_id)).await? {
-        return Ok(ExplainResolved::WorkItem(Box::new(work)));
-    }
+fn resolution(id: &str, reason: &str, candidates: Vec<Value>, disambiguate: bool) -> Value {
+    json!({
+        "query": id,
+        "reason": reason,
+        "candidates": candidates,
+        "remedy": {
+            "schema": "forged.remedy/1",
+            "verb": "explain",
+            "args": {"id": id},
+            "reason": if disambiguate {
+                "rerun this read with --subject-kind to select one namespace"
+            } else {
+                "inspect this id with explain --id"
+            },
+        },
+    })
+}
 
-    // `resolve` owns the established run/epic exact and prefix semantics.
-    // Hold a unique prefix aside: exact attempt and attention ids outrank it,
-    // while exact run/epic ids return immediately at their normative rank.
-    let durable = resolve(ctx, id).await?;
-    match &durable {
-        Resolved::Slice(run) if run == id => return Ok(ExplainResolved::Run(run.clone())),
-        Resolved::Epic(epic) if epic == id => return Ok(ExplainResolved::Epic(epic.clone())),
-        _ => {}
-    }
+/// Resolve a bare `id` to a kind through the shared operator index.
+///
+/// Exact Work lookup retains the normative precedence. Durable run/epic
+/// identities preserve otherwise-folded namespace collisions, and the
+/// inventory `work_list` serves remains the bounded prefix index.
+///
+/// An exact id always wins over any prefix interpretation of the same
+/// string, so a shorter id that prefixes a longer one is never shadowed by
+/// it. A prefix resolves only when exactly one entry matches; zero is
+/// `unknown` with an empty candidate list and two or more is `ambiguous`
+/// with those entries. Neither is an error: a wrong guess degrades into a
+/// menu, and "nothing could have been meant" is a successful answer.
+pub(crate) async fn resolve_id(
+    ctx: &Ctx,
+    id: &str,
+    subject_kind: Option<&str>,
+) -> Result<ResolvedId, Failure> {
+    let subject_kind = subject_kind
+        .map(|kind| match kind {
+            "work" | "work-item" => Ok("work"),
+            "run" | "slice" => Ok("run"),
+            "epic" => Ok("epic"),
+            "attempt" => Ok("attempt"),
+            "attention" => Ok("attention"),
+            other => Err(Failure::invalid(format!(
+                "subjectKind must be work, run, epic, attempt, or attention, got {other:?}"
+            ))),
+        })
+        .transpose()?;
 
-    if let Ok(attempt_id) = id.parse::<i64>() {
-        if let Some(attempt) =
-            on_ledger(&ctx.ledger, move |ledger| ledger.find_attempt(attempt_id)).await?
+    if subject_kind.is_none() || subject_kind == Some("work") {
+        let work_id = id.to_owned();
+        if let Some(work) = on_ledger(&ctx.ledger, move |ledger| ledger.work_item(&work_id)).await?
         {
-            return Ok(ExplainResolved::Attempt(Box::new(attempt)));
+            return Ok(ResolvedId::WorkItem(Box::new(work)));
+        }
+        if subject_kind.is_some() {
+            return Ok(ResolvedId::Unresolved(resolution(
+                id,
+                "unknown",
+                Vec::new(),
+                false,
+            )));
         }
     }
 
-    if let Some(item) = super::ops::all_attention(ctx)
-        .await?
-        .into_iter()
-        .find(|item| item.attention_id == id)
-    {
-        return Ok(ExplainResolved::Attention(Box::new(item)));
+    let entries = super::ops::inventory(ctx, super::ops::Spend::Omit).await?;
+    let resolved = |entry: &Value| {
+        let entry_id = entry["id"].as_str().unwrap_or_default().to_owned();
+        match entry["kind"].as_str() {
+            Some("epic") => ResolvedId::Epic(entry_id),
+            _ => ResolvedId::Run(entry_id),
+        }
+    };
+    if subject_kind.is_none() || matches!(subject_kind, Some("run" | "epic")) {
+        // Inventory intentionally folds a legacy run row and an epic start
+        // with the same id into one epic entry. Identity rows preserve both
+        // namespaces, so consult them for exact resolution and expose the
+        // collision instead of silently picking the folded entry.
+        let identities = on_ledger(&ctx.ledger, |ledger| ledger.list_work_identities()).await?;
+        let exact_run =
+            identities.get(&(forged_types::WorkIdentitySubjectKind::Run, id.to_owned()));
+        let exact_epic =
+            identities.get(&(forged_types::WorkIdentitySubjectKind::Epic, id.to_owned()));
+        match subject_kind {
+            Some("run") if exact_run.is_some() => return Ok(ResolvedId::Run(id.to_owned())),
+            Some("epic") if exact_epic.is_some() => return Ok(ResolvedId::Epic(id.to_owned())),
+            None if exact_run.is_some() && exact_epic.is_none() => {
+                return Ok(ResolvedId::Run(id.to_owned()))
+            }
+            None if exact_epic.is_some() && exact_run.is_none() => {
+                return Ok(ResolvedId::Epic(id.to_owned()))
+            }
+            _ => {}
+        }
+        if let (None, Some(exact_run), Some(exact_epic)) = (subject_kind, exact_run, exact_epic) {
+            let candidate = |kind: &str, identity: &forged_types::WorkIdentityV1| {
+                let mut candidate = entries
+                    .iter()
+                    .find(|entry| entry["id"] == json!(id))
+                    .cloned()
+                    .unwrap_or_else(|| json!({"id": id}));
+                candidate["kind"] = json!(kind);
+                candidate["identity"] = json!(identity);
+                candidate["beadId"] = json!(identity.work.id);
+                candidate
+            };
+            return Ok(ResolvedId::Unresolved(resolution(
+                id,
+                "ambiguous",
+                vec![candidate("slice", exact_run), candidate("epic", exact_epic)],
+                true,
+            )));
+        }
+        if subject_kind.is_some() {
+            return Ok(ResolvedId::Unresolved(resolution(
+                id,
+                "unknown",
+                Vec::new(),
+                false,
+            )));
+        }
     }
 
-    Ok(match durable {
-        Resolved::Slice(run) => ExplainResolved::Run(run),
-        Resolved::Epic(epic) => ExplainResolved::Epic(epic),
-        Resolved::Unresolved(resolution) => ExplainResolved::Unresolved(resolution),
+    if subject_kind.is_none() || subject_kind == Some("attempt") {
+        if let Ok(attempt_id) = id.parse::<i64>() {
+            if let Some(attempt) =
+                on_ledger(&ctx.ledger, move |ledger| ledger.find_attempt(attempt_id)).await?
+            {
+                return Ok(ResolvedId::Attempt(Box::new(attempt)));
+            }
+        }
+        if subject_kind.is_some() {
+            return Ok(ResolvedId::Unresolved(resolution(
+                id,
+                "unknown",
+                Vec::new(),
+                false,
+            )));
+        }
+    }
+
+    if subject_kind.is_none() || subject_kind == Some("attention") {
+        if let Some(item) = super::ops::all_attention(ctx)
+            .await?
+            .into_iter()
+            .find(|item| item.attention_id == id)
+        {
+            return Ok(ResolvedId::Attention(Box::new(item)));
+        }
+        if subject_kind.is_some() {
+            return Ok(ResolvedId::Unresolved(resolution(
+                id,
+                "unknown",
+                Vec::new(),
+                false,
+            )));
+        }
+    }
+
+    let candidates = entries
+        .into_iter()
+        .filter(|entry| {
+            entry["id"]
+                .as_str()
+                .is_some_and(|entry_id| entry_id.starts_with(id))
+        })
+        .collect::<Vec<_>>();
+    if candidates.len() == 1 {
+        return Ok(resolved(&candidates[0]));
+    }
+    let ambiguous = !candidates.is_empty();
+    Ok(ResolvedId::Unresolved(resolution(
+        id,
+        if !ambiguous { "unknown" } else { "ambiguous" },
+        candidates,
+        ambiguous,
+    )))
+}
+
+pub(crate) enum ExecutionTarget {
+    Run(String),
+    Epic(String),
+    Unresolved(Value),
+}
+
+pub(crate) async fn execution_target(
+    ctx: &Ctx,
+    id: &str,
+    subject_kind: Option<&str>,
+) -> Result<ExecutionTarget, Failure> {
+    Ok(match resolve_id(ctx, id, subject_kind).await? {
+        ResolvedId::Run(run) => ExecutionTarget::Run(run),
+        ResolvedId::Epic(epic) => ExecutionTarget::Epic(epic),
+        ResolvedId::Attempt(attempt) => {
+            let (run, _, _) = super::split_packet_key(&attempt.packet_id)?;
+            ExecutionTarget::Run(run)
+        }
+        ResolvedId::Attention(item) => match item.subject_kind {
+            AttentionSubjectKind::Run => ExecutionTarget::Run(item.subject_id),
+            AttentionSubjectKind::Epic => ExecutionTarget::Epic(item.subject_id),
+        },
+        ResolvedId::WorkItem(work) => {
+            let work_id = work.work_id;
+            let work_id_for_runs = work_id.clone();
+            let mut runs = on_ledger(&ctx.ledger, move |ledger| ledger.list_runs()).await?;
+            runs.retain(|run| run.work_id == work_id_for_runs);
+            match runs.pop() {
+                Some(run) => ExecutionTarget::Run(run.run_id),
+                None if subject_kind.is_none() => {
+                    // A started epic commonly has the same id as its root
+                    // Work but deliberately has no runs row of its own. Work
+                    // keeps exact resolver precedence; execution reads still
+                    // recover the executable epic projection instead of a
+                    // no-run dead end. Explicit `subjectKind: work` retains
+                    // the per-kind no-run answer.
+                    let epic_id = work_id.clone();
+                    let epic = on_ledger(&ctx.ledger, move |ledger| {
+                        ledger.get_work_identity(
+                            forged_types::WorkIdentitySubjectKind::Epic,
+                            &epic_id,
+                        )
+                    })
+                    .await?;
+                    match epic {
+                        Some(_) => ExecutionTarget::Epic(work_id),
+                        None => {
+                            ExecutionTarget::Unresolved(resolution(id, "no-run", Vec::new(), false))
+                        }
+                    }
+                }
+                None => ExecutionTarget::Unresolved(resolution(id, "no-run", Vec::new(), false)),
+            }
+        }
+        ResolvedId::Unresolved(value) => ExecutionTarget::Unresolved(value),
     })
 }
 
@@ -761,15 +1130,31 @@ async fn explain_work_item(ctx: &Ctx, work: WorkItemSnapshot) -> Result<Value, F
     let mut runs = on_ledger(&ctx.ledger, move |ledger| ledger.list_runs()).await?;
     runs.retain(|run| run.work_id == work_id);
     let latest = runs.last().cloned();
+    let work_verdict = match work.status {
+        forged_ledger::WorkStatus::Closed => Some("closed"),
+        forged_ledger::WorkStatus::Deferred => Some("parked"),
+        _ => None,
+    };
     let how = if let Some(run) = latest.as_ref() {
         let observation =
             explain_observation(ctx, forged_types::WorkIdentitySubjectKind::Run, &run.run_id)
                 .await?;
-        explain_how(observation_inputs(&observation)?)
+        let inputs = observation_inputs(&observation)?;
+        let verdict = if run.terminal_outcome == Some(RunOutcome::Landed)
+            || (run.delivery_pr.is_some() && run.delivery_sha.is_some())
+        {
+            "landed"
+        } else if run.state == forged_ledger::RunState::Active {
+            "running"
+        } else {
+            work_verdict.unwrap_or_else(|| super::health::execution_health(inputs))
+        };
+        explain_how_with_verdict(inputs, verdict)
     } else {
-        explain_how(super::health::HealthInputs::observation(
-            false, false, false, false, false, None, None,
-        ))
+        let inputs =
+            super::health::HealthInputs::observation(false, false, false, false, false, None, None);
+        let verdict = work_verdict.unwrap_or_else(|| super::health::execution_health(inputs));
+        explain_how_with_verdict(inputs, verdict)
     };
     let total = runs.len();
     let run_items = runs
@@ -789,6 +1174,13 @@ async fn explain_work_item(ctx: &Ctx, work: WorkItemSnapshot) -> Result<Value, F
     let next = super::work_ops::projection_actions(&work);
     Ok(json!({
         "schema": "forged.explain/1",
+        "subject": {
+            "id": work.work_id,
+            "kind": "work",
+            "title": work.spec.title,
+            "repository": work.metadata.get("repository"),
+            "revision": work.revision,
+        },
         "kind": "work-item",
         "id": work.work_id,
         "what": {
@@ -832,15 +1224,65 @@ async fn subject_attention_actions(
         })
     {
         for action in item.next_actions {
-            if actions.len() == EXPLAIN_COLLECTION_CAP {
-                return Ok(actions);
-            }
             if !actions.contains(&action) {
                 actions.push(action);
             }
         }
     }
     Ok(actions)
+}
+
+/// Rank one subject's advertised actions into its `next`. Duplicates (same
+/// verb and args) merge into the earliest occurrence and keep the strongest
+/// class, so a lifecycle `can` and a decision `should` for one verb collapse
+/// into one `should`. Then exactly one `should` survives — the first in
+/// emitter order, which callers arrange lifecycle-first so a run's own
+/// outcome outranks an open decision — and it moves to `next[0]`; every
+/// later `should` demotes to `can`. Returns the list capped at
+/// `EXPLAIN_COLLECTION_CAP` with the pre-cap total so the caller states
+/// coverage.
+fn rank_subject_actions(
+    actions: Vec<forged_types::OperationActionV1>,
+) -> (Vec<forged_types::OperationActionV1>, usize) {
+    let mut merged: Vec<forged_types::OperationActionV1> = Vec::with_capacity(actions.len());
+    for action in actions {
+        if let Some(seen) = merged
+            .iter_mut()
+            .find(|seen| seen.verb == action.verb && seen.args == action.args)
+        {
+            if action.class == forged_types::ActionClass::Should {
+                seen.class = forged_types::ActionClass::Should;
+            }
+            continue;
+        }
+        merged.push(action);
+    }
+    let total = merged.len();
+    let mut first_should = None;
+    for (index, action) in merged.iter_mut().enumerate() {
+        if action.class != forged_types::ActionClass::Should {
+            continue;
+        }
+        if first_should.is_none() {
+            first_should = Some(index);
+        } else {
+            action.class = forged_types::ActionClass::Can;
+        }
+    }
+    if let Some(index) = first_should {
+        merged[..=index].rotate_right(1);
+    }
+    merged.truncate(EXPLAIN_COLLECTION_CAP);
+    (merged, total)
+}
+
+fn next_coverage(shown: usize, total: usize) -> Value {
+    json!({
+        "shown": shown,
+        "total": total,
+        "limit": EXPLAIN_COLLECTION_CAP,
+        "truncated": total > shown,
+    })
 }
 
 async fn explain_run(ctx: &Ctx, id: String) -> Result<Value, Failure> {
@@ -873,9 +1315,19 @@ async fn explain_run(ctx: &Ctx, id: String) -> Result<Value, Failure> {
         .await?
         .map(|revision| revision.revision)
     };
-    let next = super::ops::run_projection_actions(run);
+    // Lifecycle first: the run's own outcome names the one `should`; open
+    // decisions on the same subject merge into it or demote to `can`.
+    let mut next = super::ops::run_projection_actions(run);
+    next.extend(subject_attention_actions(ctx, AttentionSubjectKind::Run, &id).await?);
+    let (next, next_total) = rank_subject_actions(next);
+    let next_coverage = next_coverage(next.len(), next_total);
     Ok(json!({
         "schema": "forged.explain/1",
+        "subject": super::work_identity::projection_subject(
+            &observation.identity,
+            forged_types::ProjectionSubjectKind::Run,
+            &run.run_id,
+        ),
         "kind": "run",
         "id": run.run_id,
         "what": {
@@ -896,6 +1348,7 @@ async fn explain_run(ctx: &Ctx, id: String) -> Result<Value, Failure> {
         },
         "how": explain_how(inputs),
         "next": next,
+        "nextCoverage": next_coverage,
     }))
 }
 
@@ -920,9 +1373,17 @@ async fn explain_epic(ctx: &Ctx, id: String) -> Result<Value, Failure> {
             })
         })
         .collect::<Vec<_>>();
-    let next = subject_attention_actions(ctx, AttentionSubjectKind::Epic, &id).await?;
+    let (next, next_total) = rank_subject_actions(
+        subject_attention_actions(ctx, AttentionSubjectKind::Epic, &id).await?,
+    );
+    let next_coverage = next_coverage(next.len(), next_total);
     Ok(json!({
         "schema": "forged.explain/1",
+        "subject": super::work_identity::projection_subject(
+            &observation.identity,
+            forged_types::ProjectionSubjectKind::Epic,
+            &id,
+        ),
         "kind": "epic",
         "id": id,
         "what": {
@@ -939,6 +1400,7 @@ async fn explain_epic(ctx: &Ctx, id: String) -> Result<Value, Failure> {
         },
         "how": explain_how_with_verdict(inputs, verdict),
         "next": next,
+        "nextCoverage": next_coverage,
     }))
 }
 
@@ -968,6 +1430,11 @@ async fn explain_attempt(ctx: &Ctx, resolved: forged_ledger::AttemptRow) -> Resu
     let next = super::ops::run_projection_actions(run);
     Ok(json!({
         "schema": "forged.explain/1",
+        "subject": super::work_identity::projection_subject(
+            &observation.identity,
+            forged_types::ProjectionSubjectKind::Attempt,
+            attempt.attempt_id.to_string(),
+        ),
         "kind": "attempt",
         "id": attempt.attempt_id,
         "what": {
@@ -999,6 +1466,11 @@ async fn explain_attention(ctx: &Ctx, item: AttentionItemV1) -> Result<Value, Fa
     });
     Ok(json!({
         "schema": "forged.explain/1",
+        "subject": super::work_identity::projection_subject(
+            &observation.identity,
+            forged_types::ProjectionSubjectKind::Attention,
+            &item.attention_id,
+        ),
         "kind": "attention",
         "id": item.attention_id,
         "what": {
@@ -1027,17 +1499,19 @@ pub async fn explain(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
         let id = param_named_str(&req.params, "id")
             .ok_or_else(|| Failure::invalid("explain param \"id\" must name a subject"))?
             .to_owned();
-        match resolve_explain(ctx, &id).await? {
-            ExplainResolved::WorkItem(work) => explain_work_item(ctx, *work).await,
-            ExplainResolved::Run(run) => explain_run(ctx, run).await,
-            ExplainResolved::Epic(epic) => explain_epic(ctx, epic).await,
-            ExplainResolved::Attempt(attempt) => explain_attempt(ctx, *attempt).await,
-            ExplainResolved::Attention(item) => explain_attention(ctx, *item).await,
-            ExplainResolved::Unresolved(resolution) => Ok(json!({
+        let subject_kind = param_opt_str(&req.params, "subjectKind");
+        let projected = match resolve_id(ctx, &id, subject_kind).await? {
+            ResolvedId::WorkItem(work) => explain_work_item(ctx, *work).await,
+            ResolvedId::Run(run) => explain_run(ctx, run).await,
+            ResolvedId::Epic(epic) => explain_epic(ctx, epic).await,
+            ResolvedId::Attempt(attempt) => explain_attempt(ctx, *attempt).await,
+            ResolvedId::Attention(item) => explain_attention(ctx, *item).await,
+            ResolvedId::Unresolved(resolution) => Ok(json!({
                 "schema": "forged.explain/1",
                 "resolution": resolution,
             })),
-        }
+        }?;
+        Ok(forged_types::with_work_twins(projected))
     })
     .await
 }
@@ -1062,7 +1536,10 @@ pub async fn overview(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
         let run = param_opt_str(&req.params, "run");
         let epic = param_opt_str(&req.params, "epic");
         let id = param_opt_str(&req.params, "id");
-        for key in ["run", "epic", "id"] {
+        let subject_kind = param_opt_str(&req.params, "subjectKind");
+        let detail = super::ops::projection_detail(req, "overview")?;
+        super::ops::projection_symptoms(req, "overview")?;
+        for key in ["run", "epic", "id", "subjectKind"] {
             if req.params.contains_key(key) && param_opt_str(&req.params, key).is_none() {
                 return Err(Failure::invalid(format!(
                     "overview param {key:?} must name a subject; omit it entirely \
@@ -1075,6 +1552,11 @@ pub async fn overview(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
                 "overview takes param \"id\" or an explicit \"run\"/\"epic\", never both",
             ));
         }
+        if subject_kind.is_some() && id.is_none() {
+            return Err(Failure::invalid(
+                "overview param \"subjectKind\" requires param \"id\"",
+            ));
+        }
         if run.is_some() && epic.is_some() {
             return Err(Failure::invalid(
                 "overview takes at most one of params \"run\", \"epic\", or \"id\"; \
@@ -1085,11 +1567,13 @@ pub async fn overview(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
         if after < 0 {
             return Err(Failure::invalid("overview after must be non-negative"));
         }
-        let limit = req
-            .params
-            .get("limit")
-            .and_then(Value::as_u64)
-            .unwrap_or(100);
+        let limit = req.params.get("limit").and_then(Value::as_u64).unwrap_or(
+            if detail == super::ops::ProjectionDetail::Full {
+                FULL_EVENT_PAGE_LIMIT
+            } else {
+                SUMMARY_EVENT_PAGE_LIMIT
+            },
+        );
         if limit == 0 || limit > 1_000 {
             return Err(Failure::invalid(
                 "overview limit must be between 1 and 1000",
@@ -1111,22 +1595,25 @@ pub async fn overview(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
                 }
             }
         }
-        match (run, epic, id) {
+        let projected = match (run, epic, id) {
             (None, None, None) => portfolio_overview(ctx, req).await,
-            (Some(run), None, None) => run_overview(ctx, run, after, limit).await,
-            (None, Some(epic), None) => epic_overview(ctx, epic, after, limit).await,
+            (Some(run), None, None) => run_overview(ctx, run, after, limit, detail).await,
+            (None, Some(epic), None) => epic_overview(ctx, epic, after, limit, detail).await,
             // A resolved id projects through the SAME call the explicit
             // param makes, so the two answers cannot drift.
-            (None, None, Some(id)) => match resolve(ctx, id).await? {
-                Resolved::Slice(run) => run_overview(ctx, &run, after, limit).await,
-                Resolved::Epic(epic) => epic_overview(ctx, &epic, after, limit).await,
-                Resolved::Unresolved(resolution) => Ok(json!({
+            (None, None, Some(id)) => match execution_target(ctx, id, subject_kind).await? {
+                ExecutionTarget::Run(run) => run_overview(ctx, &run, after, limit, detail).await,
+                ExecutionTarget::Epic(epic) => {
+                    epic_overview(ctx, &epic, after, limit, detail).await
+                }
+                ExecutionTarget::Unresolved(resolution) => Ok(json!({
                     "schema": "forged.overview/1",
                     "resolution": resolution,
                 })),
             },
             _ => unreachable!(),
-        }
+        }?;
+        Ok(forged_types::with_work_twins(projected))
     })
     .await
 }
@@ -1261,6 +1748,7 @@ fn result_json(result: &PacketResult) -> Value {
             "commitsAhead": commits_ahead,
             "summary": summary,
             "gateState": gate_state,
+            "seatChecks": gate_state,
             "note": note,
         }),
         Outcome::Review {
@@ -1549,15 +2037,16 @@ fn gate_rows(results: &BTreeMap<i64, PacketResult>) -> Vec<Value> {
                     _ => None,
                 };
                 Some(json!({
-                    "attemptId": attempt_id,
-                    "packetId": result.packet_id,
-                    "implemented": implemented,
-                    "commitsAhead": commits_ahead,
-                    "summary": summary,
-                    "gateState": gate_state,
-                    "passed": passed,
-                    "note": note,
-                }))
+                        "attemptId": attempt_id,
+                        "packetId": result.packet_id,
+                        "implemented": implemented,
+                        "commitsAhead": commits_ahead,
+                        "summary": summary,
+                        "gateState": gate_state,
+                "seatChecks": gate_state,
+                        "passed": passed,
+                        "note": note,
+                    }))
             }
             _ => None,
         })
@@ -2033,8 +2522,19 @@ async fn project_work_detail(
         })
         .count();
 
+    let subject = super::work_identity::projection_subject(
+        &snapshot.identity,
+        match snapshot.subject.kind {
+            forged_types::WorkIdentitySubjectKind::Run => forged_types::ProjectionSubjectKind::Run,
+            forged_types::WorkIdentitySubjectKind::Epic => {
+                forged_types::ProjectionSubjectKind::Epic
+            }
+        },
+        &snapshot.subject.id,
+    );
     Ok(json!({
         "schema": "forged.work-detail/1",
+        "subject": subject,
         // Compatibility aliases retained for the current App shell.
         "kind": if snapshot.subject.kind == forged_types::WorkIdentitySubjectKind::Epic {
             "epic"
@@ -2131,6 +2631,110 @@ async fn project_work_detail(
     }))
 }
 
+fn summarize_work_detail(full: &Value) -> Value {
+    let gate_items = full
+        .get("gates")
+        .and_then(|value| value.get("items"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let findings = full
+        .pointer("/reviews/latestFindings")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut finding_by_severity = BTreeMap::<String, usize>::new();
+    for finding in &findings {
+        let severity = finding
+            .get("severity")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_owned();
+        *finding_by_severity.entry(severity).or_default() += 1;
+    }
+    let attention = full
+        .get("attention")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut decisions = 0usize;
+    let mut symptoms = 0usize;
+    let mut acknowledged = 0usize;
+    // The summary keeps the typed `next` the driver reads (ADR-0036): every
+    // unresolved item's classed actions, deduplicated by (verb, args).
+    let mut next: Vec<Value> = Vec::new();
+    for item in &attention {
+        if item.get("state").and_then(Value::as_str) == Some("acknowledged") {
+            acknowledged += 1;
+        }
+        if item.get("state").and_then(Value::as_str) != Some("resolved") {
+            for action in item
+                .get("nextActions")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let duplicate = next.iter().any(|seen| {
+                    seen.get("verb") == action.get("verb") && seen.get("args") == action.get("args")
+                });
+                if !duplicate {
+                    next.push(action.clone());
+                }
+            }
+        }
+        let condition = item.get("condition").cloned().and_then(|value| {
+            serde_json::from_value::<forged_types::AttentionCondition>(value).ok()
+        });
+        match condition.map(super::attention::classification) {
+            Some(super::attention::AttentionClass::Decision) => decisions += 1,
+            Some(super::attention::AttentionClass::Symptom) => symptoms += 1,
+            None => {}
+        }
+    }
+    json!({
+        "schema": "forged.work-detail/1",
+        "subject": full.get("subject"),
+        "kind": full.get("kind"),
+        "id": full.get("id"),
+        "workRef": full.get("workRef"),
+        "identity": full.get("identity"),
+        "titleSource": full.get("titleSource"),
+        "status": full.get("status"),
+        "delivery": full.get("delivery"),
+        "deadlineKills": full.get("deadlineKills"),
+        "nextAction": attention
+            .first()
+            .and_then(|item| item.get("recommendedAction"))
+            .or_else(|| full.pointer("/status/nextAction")),
+        "next": next,
+        "desired": {"total": full.pointer("/desired/total")},
+        "admission": {
+            "decisionTotal": full.pointer("/admission/decisions/total"),
+            "reservationTotal": full.pointer("/admission/reservations/total"),
+        },
+        "children": {"total": full.pointer("/children/total")},
+        "workers": {"total": full.pointer("/workers/total")},
+        "usage": {"totals": full.pointer("/usage/totals")},
+        "effectCustody": {"total": full.pointer("/effectCustody/total")},
+        "gates": {
+            "total": full.pointer("/gates/total"),
+            "latest": gate_items.last(),
+        },
+        "reviews": {
+            "resultTotal": full.pointer("/reviews/resultTotal"),
+            "findingCounts": {"total": findings.len(), "bySeverity": finding_by_severity},
+        },
+        "attention": {
+            "counts": {
+                "decisions": decisions,
+                "symptoms": symptoms,
+                "acknowledged": acknowledged,
+            },
+            "total": full.get("attentionTotal"),
+        },
+    })
+}
+
 /// Work projection used by the Work Detail App.
 ///
 /// Addressed by EXACTLY one form: the canonical `subjectKind`/`subjectId`
@@ -2144,6 +2748,8 @@ async fn project_work_detail(
 /// with identical envelopes.
 pub async fn work_detail(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
     read_only("work_detail", req, || async {
+        let detail = super::ops::projection_detail(req, "work detail")?;
+        super::ops::projection_symptoms(req, "work detail")?;
         // A present addressing key must name a subject: `param_named_str`
         // reads `""`, whitespace, `null` and a non-string alike as absent,
         // and treating those as omitted would answer a caller's failed
@@ -2160,19 +2766,18 @@ pub async fn work_detail(ctx: &Ctx, req: &OperationRequest) -> OperationResponse
         let bare = param_named_str(&req.params, "id").map(str::to_owned);
         let subject_kind = param_named_str(&req.params, "subjectKind");
         let subject_id = param_named_str(&req.params, "subjectId").map(str::to_owned);
-        if bare.is_some() && (subject_kind.is_some() || subject_id.is_some()) {
+        if bare.is_some() && subject_id.is_some() {
             return Err(Failure::invalid(
-                "work detail takes param \"id\" or the exact \"subjectKind\"/\"subjectId\" \
-                 pair, never both",
+                "work detail takes param \"id\" or the exact \"subjectKind\"/\"subjectId\" pair, never both",
             ));
         }
-        if subject_kind.is_some() != subject_id.is_some() {
+        if bare.is_none() && subject_kind.is_some() != subject_id.is_some() {
             return Err(Failure::invalid(
                 "work detail params \"subjectKind\" and \"subjectId\" travel as a pair; \
-                 send both or address by bare \"id\"",
+                 send both or address by \"id\" with optional \"subjectKind\"",
             ));
         }
-        let exact = match (subject_kind, subject_id) {
+        let exact = match (subject_kind, subject_id.as_ref()) {
             (Some(kind), Some(id)) => {
                 let kind = match kind {
                     "run" => forged_types::WorkIdentitySubjectKind::Run,
@@ -2183,7 +2788,7 @@ pub async fn work_detail(ctx: &Ctx, req: &OperationRequest) -> OperationResponse
                         )))
                     }
                 };
-                Some((kind, id))
+                Some((kind, id.clone()))
             }
             (None, None) if bare.is_none() => {
                 return Err(Failure::invalid(
@@ -2191,7 +2796,7 @@ pub async fn work_detail(ctx: &Ctx, req: &OperationRequest) -> OperationResponse
                      \"subjectKind\"/\"subjectId\" pair",
                 ))
             }
-            (None, None) => None,
+            (_, None) if bare.is_some() => None,
             _ => unreachable!("a half pair is refused above"),
         };
         let after = req.params.get("after").and_then(Value::as_i64).unwrap_or(0);
@@ -2217,10 +2822,10 @@ pub async fn work_detail(ctx: &Ctx, req: &OperationRequest) -> OperationResponse
             // resolved by the first cannot vanish from the second, so the
             // two answers agree — the resolved kind is the inventory's,
             // never a guess.
-            (None, Some(bare)) => match resolve(ctx, &bare).await? {
-                Resolved::Slice(run) => (forged_types::WorkIdentitySubjectKind::Run, run),
-                Resolved::Epic(epic) => (forged_types::WorkIdentitySubjectKind::Epic, epic),
-                Resolved::Unresolved(resolution) => {
+            (None, Some(bare)) => match execution_target(ctx, &bare, subject_kind).await? {
+                ExecutionTarget::Run(run) => (forged_types::WorkIdentitySubjectKind::Run, run),
+                ExecutionTarget::Epic(epic) => (forged_types::WorkIdentitySubjectKind::Epic, epic),
+                ExecutionTarget::Unresolved(resolution) => {
                     return Ok(json!({
                         "schema": "forged.work-detail/1",
                         "resolution": resolution,
@@ -2233,9 +2838,81 @@ pub async fn work_detail(ctx: &Ctx, req: &OperationRequest) -> OperationResponse
             ledger.work_observation_snapshot(kind, &id, after, event_limit)
         })
         .await?;
-        project_work_detail(ctx, snapshot).await
+        let full = project_work_detail(ctx, snapshot).await?;
+        let projected = if detail == super::ops::ProjectionDetail::Full {
+            full
+        } else {
+            summarize_work_detail(&full)
+        };
+        Ok(forged_types::with_work_twins(projected))
     })
     .await
+}
+
+#[cfg(test)]
+mod rank_tests {
+    use forged_types::{ActionClass, OperationActionV1};
+    use serde_json::json;
+
+    use super::{rank_subject_actions, EXPLAIN_COLLECTION_CAP};
+
+    // Deserialized, not constructed: the relevance registry scans this
+    // crate for direct `OperationActionV1` construction sites, and a test
+    // helper is not an emitter.
+    fn action(verb: &str, run: &str, class: ActionClass) -> OperationActionV1 {
+        serde_json::from_value(json!({
+            "verb": verb,
+            "args": {"run": run},
+            "reason": "",
+            "class": class,
+        }))
+        .expect("test action deserializes")
+    }
+
+    #[test]
+    fn lifecycle_should_outranks_a_decision_should_which_demotes_to_can() {
+        let (ranked, total) = rank_subject_actions(vec![
+            action("run stop", "r", ActionClass::Should),
+            action("attention resolve", "r", ActionClass::Should),
+        ]);
+        assert_eq!(total, 2);
+        assert_eq!(ranked[0].verb, "run stop");
+        assert_eq!(ranked[0].class, ActionClass::Should);
+        assert_eq!(ranked[1].class, ActionClass::Can);
+    }
+
+    #[test]
+    fn a_decision_should_upgrades_the_same_lifecycle_can_instead_of_duplicating() {
+        let (ranked, total) = rank_subject_actions(vec![
+            action("run retry", "r", ActionClass::Can),
+            action("work supersede", "r", ActionClass::Can),
+            action("run retry", "r", ActionClass::Should),
+        ]);
+        assert_eq!(total, 2, "duplicates merge before ranking");
+        assert_eq!(ranked.len(), 2);
+        assert_eq!(ranked[0].verb, "run retry");
+        assert_eq!(ranked[0].class, ActionClass::Should);
+        assert_eq!(
+            ranked
+                .iter()
+                .filter(|action| action.class == ActionClass::Should)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn the_first_should_moves_to_the_front_and_the_cap_reports_the_total() {
+        let mut actions = (0..EXPLAIN_COLLECTION_CAP + 3)
+            .map(|index| action("can", &format!("r{index}"), ActionClass::Can))
+            .collect::<Vec<_>>();
+        actions.push(action("should", "r", ActionClass::Should));
+        let (ranked, total) = rank_subject_actions(actions);
+        assert_eq!(total, EXPLAIN_COLLECTION_CAP + 4);
+        assert_eq!(ranked.len(), EXPLAIN_COLLECTION_CAP);
+        assert_eq!(ranked[0].verb, "should");
+        assert!(ranked[0].args.contains_key("run"));
+    }
 }
 
 #[cfg(test)]

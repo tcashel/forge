@@ -117,6 +117,7 @@ pub(crate) fn projection_actions(
                     } else {
                         "choose the repository before starting the run"
                     },
+                    forged_types::ActionClass::Can,
                 ),
                 (
                     "work update",
@@ -127,6 +128,7 @@ pub(crate) fn projection_actions(
                     }),
                     "supply at least one spec field or priority under the \
                      current revision guard",
+                    forged_types::ActionClass::Can,
                 ),
             ]
         }
@@ -134,12 +136,13 @@ pub(crate) fn projection_actions(
             "work reopen",
             json!({"id": snapshot.work_id}),
             "reopen the work item before scheduling it",
+            forged_types::ActionClass::Repair,
         )],
         WorkStatus::InProgress | WorkStatus::Deferred => Vec::new(),
     };
     actions
         .into_iter()
-        .map(|(verb, args, reason)| {
+        .map(|(verb, args, reason, class)| {
             let Value::Object(args) = args else {
                 unreachable!("work next-action args are objects")
             };
@@ -147,6 +150,7 @@ pub(crate) fn projection_actions(
                 verb: verb.to_owned(),
                 args,
                 reason: reason.to_owned(),
+                class,
             }
         })
         .collect()
@@ -1023,12 +1027,19 @@ pub async fn work_show(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
             let id = id.clone();
             on_ledger(&ctx.ledger, move |l| l.work_note_count(&id)).await?
         };
-        Ok(json!({
+        Ok(forged_types::with_work_twins(json!({
+            "subject": {
+                "id": snapshot.work_id,
+                "kind": "work",
+                "title": snapshot.spec.title,
+                "repository": snapshot.metadata.get("repository"),
+                "revision": snapshot.revision.to_string(),
+            },
             "work": snapshot,
             "dependencies": deps,
             "notesCount": notes_count,
             "nextActions": projection_actions(&snapshot),
-        }))
+        })))
     })
     .await
 }
@@ -1077,6 +1088,12 @@ pub async fn work_note_list(ctx: &Ctx, req: &OperationRequest) -> OperationRespo
         Ok(json!({
             "filters": filters,
             "totals": {"shown": page.notes.len(), "total": page.total},
+            "coverage": {
+                "shown": page.notes.len(),
+                "total": page.total,
+                "truncated": u64::try_from(page.notes.len()).unwrap_or(u64::MAX) < page.total,
+                "nextCursor": Value::Null,
+            },
             "notes": page.notes,
         }))
     })
@@ -1085,16 +1102,27 @@ pub async fn work_note_list(ctx: &Ctx, req: &OperationRequest) -> OperationRespo
 
 /// `work_ready` — the ready frontier (read-only).
 pub async fn work_ready(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
-    crate::core::read_only("work_ready", req, || async {
+    let mut response = crate::core::read_only("work_ready", req, || async {
         let detail = match req.params.get("detail") {
             None => WorkReadyDetail::Summary,
+            Some(Value::String(value)) if value == "summary" => WorkReadyDetail::Summary,
             Some(Value::String(value)) if value == "full" => WorkReadyDetail::Full,
             Some(_) => {
                 return Err(Failure::invalid(
-                    "work_ready detail must be \"full\" when present",
+                    "work_ready detail must be \"summary\" or \"full\"",
                 ))
             }
         };
+        let all = match req.params.get("all") {
+            None => false,
+            Some(Value::Bool(value)) => *value,
+            Some(_) => return Err(Failure::invalid("work_ready all must be a boolean")),
+        };
+        if all && (req.params.contains_key("cursor") || req.params.contains_key("limit")) {
+            return Err(Failure::invalid(
+                "work_ready --all cannot be combined with --cursor or --limit",
+            ));
+        }
         let limit = req
             .params
             .get("limit")
@@ -1122,10 +1150,20 @@ pub async fn work_ready(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
             repository: repository.clone(),
             ..WorkItemFilters::default()
         };
+        let page_limit = if all { WORK_READY_MAX_LIMIT } else { limit };
         let page = on_ledger(&ctx.ledger, move |l| {
-            l.ready_work_items_page_filtered(filters, cursor, limit as usize)
+            l.ready_work_items_page_filtered(filters, cursor, page_limit as usize)
         })
         .await?;
+        if all && page.total > WORK_READY_MAX_LIMIT {
+            return Err(Failure::refused(
+                ErrorCode::FrontierTooLarge,
+                format!(
+                    "ready frontier contains {} items, above the 500-item --all cap; narrow it with --repo or request a page with --limit",
+                    page.total
+                ),
+            ));
+        }
         let next_cursor = if page.has_more {
             page.items
                 .last()
@@ -1141,6 +1179,13 @@ pub async fn work_ready(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
                 .into_iter()
                 .map(|item| {
                     json!({
+                        "subject": {
+                            "id": item.work_id,
+                            "kind": "work",
+                            "title": item.spec.title,
+                            "repository": item.metadata.get("repository"),
+                            "revision": item.revision.to_string(),
+                        },
                         "id": item.work_id,
                         "title": item.spec.title,
                         "kind": item.kind,
@@ -1154,25 +1199,74 @@ pub async fn work_ready(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
             WorkReadyDetail::Full => page
                 .items
                 .into_iter()
-                .map(|item| json!(item))
+                .map(|item| {
+                    let subject = json!({
+                        "id": item.work_id,
+                        "kind": "work",
+                        "title": item.spec.title,
+                        "repository": item.metadata.get("repository"),
+                        "revision": item.revision.to_string(),
+                    });
+                    let mut value = json!(item);
+                    value["subject"] = subject;
+                    value
+                })
                 .collect::<Vec<_>>(),
         };
         let mut applied_filters = json!({
             "detail": detail.as_str(),
-            "limit": limit,
+            "limit": page_limit,
+            "all": all,
         });
-        if let Some(repository) = repository {
+        if let Some(ref repository) = repository {
             applied_filters["repo"] = json!(repository);
         }
-        Ok(json!({
+        Ok(forged_types::with_work_twins(json!({
+            "subject": {
+                "id": "ready",
+                "kind": "portfolio",
+                "title": "Ready work",
+                "repository": repository,
+                "revision": Value::Null,
+            },
             "filters": applied_filters,
             "totals": {
                 "shown": ready.len(),
                 "total": total,
             },
+            "coverage": {
+                "shown": ready.len(),
+                "total": total,
+                "truncated": page.has_more,
+                "nextCursor": next_cursor,
+            },
             "ready": ready,
             "nextCursor": next_cursor,
-        }))
+        })))
     })
-    .await
+    .await;
+    if response
+        .error
+        .as_ref()
+        .is_some_and(|error| error.code == ErrorCode::FrontierTooLarge)
+    {
+        let Value::Object(args) = json!({
+            "repo": req.params.get("repo"),
+            "limit": WORK_READY_MAX_LIMIT,
+        }) else {
+            unreachable!("work ready remedy args are an object")
+        };
+        let remedy = forged_types::RemedyV1::from(forged_types::OperationActionV1 {
+            verb: "work ready".to_owned(),
+            args,
+            reason: "Narrow the frontier with --repo or request a bounded page with --limit"
+                .to_owned(),
+            class: forged_types::ActionClass::Repair,
+        });
+        if let Some(error) = response.error.as_mut() {
+            error.detail =
+                Some(serde_json::to_value(remedy).expect("forged.remedy/1 always serializes"));
+        }
+    }
+    response
 }

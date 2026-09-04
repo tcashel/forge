@@ -1,6 +1,99 @@
 {
+  "deprecatedKeys": [
+    {
+      "schema": "forged.work-identity/1",
+      "key": "bead",
+      "twin": "work",
+      "removeAt": "1.0"
+    },
+    {
+      "schema": "forged.packet/1",
+      "key": "beadId",
+      "twin": "workId",
+      "removeAt": "1.0"
+    },
+    {
+      "schema": "forged.admission-inputs/1",
+      "key": "beadId",
+      "twin": "workId",
+      "removeAt": "1.0"
+    },
+    {
+      "schema": "forged.admission-inputs/1",
+      "key": "beadRevision",
+      "twin": "workRevision",
+      "removeAt": "1.0"
+    },
+    {
+      "schema": "forged.admission-inputs/1",
+      "key": "beadStatus",
+      "twin": "workStatus",
+      "removeAt": "1.0"
+    },
+    {
+      "schema": "forged.admission-inputs/1",
+      "key": "beadRepository",
+      "twin": "workRepository",
+      "removeAt": "1.0"
+    },
+    {
+      "schema": "forged.projection/*",
+      "key": "bead",
+      "twin": "work",
+      "removeAt": "1.0"
+    },
+    {
+      "schema": "forged.projection/*",
+      "key": "bead_id",
+      "twin": "work_id",
+      "removeAt": "1.0"
+    },
+    {
+      "schema": "forged.projection/*",
+      "key": "beadId",
+      "twin": "workId",
+      "removeAt": "1.0"
+    },
+    {
+      "schema": "forged.projection/*",
+      "key": "beadTitle",
+      "twin": "workTitle",
+      "removeAt": "1.0"
+    },
+    {
+      "schema": "forged.projection/*",
+      "key": "beadRevision",
+      "twin": "workRevision",
+      "removeAt": "1.0"
+    },
+    {
+      "schema": "forged.projection/*",
+      "key": "beadSettlement",
+      "twin": "workSettlement",
+      "removeAt": "1.0"
+    },
+    {
+      "schema": "forged.projection/*",
+      "key": "beads",
+      "twin": "work",
+      "removeAt": "1.0"
+    },
+    {
+      "schema": "forged.projection/*",
+      "key": "beadsStatus",
+      "twin": "workStatus",
+      "removeAt": "1.0"
+    },
+    {
+      "schema": "forged.projection/*",
+      "key": "beadsInventory",
+      "twin": "workInventory",
+      "removeAt": "1.0"
+    }
+  ],
   "operations": [
     {
+      "audience": "machine",
       "class": "fenced",
       "cli": true,
       "cliVerb": "artifact compact",
@@ -10,6 +103,7 @@
       "name": "artifact_compact"
     },
     {
+      "audience": "machine",
       "class": "read_only",
       "cli": true,
       "cliVerb": "artifact verify",
@@ -19,6 +113,7 @@
       "name": "artifact_verify"
     },
     {
+      "audience": "lead",
       "class": "fenced",
       "cli": true,
       "cliVerb": "attention acknowledge",
@@ -28,6 +123,7 @@
       "name": "attention_acknowledge"
     },
     {
+      "audience": "lead",
       "class": "read_only",
       "cli": true,
       "cliVerb": "attention list",
@@ -37,6 +133,7 @@
       "name": "attention_list"
     },
     {
+      "audience": "lead",
       "class": "fenced",
       "cli": true,
       "cliVerb": "attention reopen",
@@ -46,6 +143,7 @@
       "name": "attention_reopen"
     },
     {
+      "audience": "lead",
       "class": "fenced",
       "cli": true,
       "cliVerb": "attention resolve",
@@ -55,6 +153,7 @@
       "name": "attention_resolve"
     },
     {
+      "audience": "machine",
       "class": "fenced",
       "cli": true,
       "cliVerb": "claim-next",
@@ -64,6 +163,7 @@
       "name": "claim_next"
     },
     {
+      "audience": "lead",
       "class": "read_only",
       "cli": true,
       "cliVerb": "definition validate",
@@ -73,6 +173,7 @@
       "name": "definition_validate"
     },
     {
+      "audience": "lead",
       "class": "read_only",
       "cli": true,
       "cliVerb": "doctor",
@@ -82,6 +183,7 @@
       "name": "doctor"
     },
     {
+      "audience": "lead",
       "class": "fenced",
       "cli": true,
       "cliVerb": "epic abandon",
@@ -91,6 +193,7 @@
       "name": "epic_abandon"
     },
     {
+      "audience": "lead",
       "class": "fenced",
       "cli": true,
       "cliVerb": "epic pause",
@@ -100,6 +203,7 @@
       "name": "epic_pause"
     },
     {
+      "audience": "lead",
       "class": "read_only",
       "cli": true,
       "cliVerb": "epic preflight",
@@ -109,6 +213,7 @@
       "name": "epic_preflight"
     },
     {
+      "audience": "lead",
       "class": "fenced",
       "cli": true,
       "cliVerb": "epic resolve",
@@ -118,6 +223,7 @@
       "name": "epic_resolve"
     },
     {
+      "audience": "lead",
       "class": "fenced",
       "cli": true,
       "cliVerb": "epic resume",
@@ -127,6 +233,7 @@
       "name": "epic_resume"
     },
     {
+      "audience": "lead",
       "class": "fenced",
       "cli": true,
       "cliVerb": "epic revise-policy",
@@ -136,6 +243,7 @@
       "name": "epic_revise_policy"
     },
     {
+      "audience": "lead",
       "class": "fenced",
       "cli": true,
       "cliVerb": "epic revise-roster",
@@ -145,6 +253,7 @@
       "name": "epic_revise_roster"
     },
     {
+      "audience": "lead",
       "class": "fenced",
       "cli": true,
       "cliVerb": "epic start",
@@ -154,6 +263,7 @@
       "name": "epic_start"
     },
     {
+      "audience": "lead",
       "class": "read_only",
       "cli": true,
       "cliVerb": "epic status",
@@ -163,6 +273,7 @@
       "name": "epic_status"
     },
     {
+      "audience": "lead",
       "class": "fenced",
       "cli": true,
       "cliVerb": "epic submit",
@@ -172,6 +283,7 @@
       "name": "epic_submit"
     },
     {
+      "audience": "operator",
       "class": "read_only",
       "cli": true,
       "cliVerb": "events",
@@ -181,6 +293,7 @@
       "name": "events_tail"
     },
     {
+      "audience": "lead",
       "class": "read_only",
       "cli": true,
       "cliVerb": "explain",
@@ -190,6 +303,7 @@
       "name": "explain"
     },
     {
+      "audience": "machine",
       "class": "fenced",
       "cli": true,
       "cliVerb": "gate run",
@@ -217,6 +331,17 @@
       "name": "mcp"
     },
     {
+      "audience": "lead",
+      "class": "read_only",
+      "cli": true,
+      "cliVerb": "next",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": true,
+      "name": "next"
+    },
+    {
+      "audience": "operator",
       "class": "read_only",
       "cli": true,
       "cliVerb": "operations overview",
@@ -226,6 +351,7 @@
       "name": "operations_overview"
     },
     {
+      "audience": "operator",
       "class": "read_only",
       "cli": true,
       "cliVerb": "overview",
@@ -235,6 +361,7 @@
       "name": "overview"
     },
     {
+      "audience": "machine",
       "class": "fenced",
       "cli": true,
       "cliVerb": "packet claim",
@@ -244,6 +371,7 @@
       "name": "packet_claim"
     },
     {
+      "audience": "machine",
       "class": "fenced",
       "cli": true,
       "cliVerb": "packet complete",
@@ -253,6 +381,7 @@
       "name": "packet_complete"
     },
     {
+      "audience": "machine",
       "class": "fenced",
       "cli": true,
       "cliVerb": "packet fail",
@@ -271,6 +400,7 @@
       "name": "packet_heartbeat"
     },
     {
+      "audience": "machine",
       "class": "read_only",
       "cli": true,
       "cliVerb": "packet show",
@@ -280,6 +410,7 @@
       "name": "packet_show"
     },
     {
+      "audience": "machine",
       "class": "fenced",
       "cli": true,
       "cliVerb": "reconcile",
@@ -289,6 +420,7 @@
       "name": "reconcile"
     },
     {
+      "audience": "operator",
       "class": "fenced",
       "cli": true,
       "cliVerb": "review publish",
@@ -298,6 +430,7 @@
       "name": "review_publish"
     },
     {
+      "audience": "lead",
       "class": "fenced",
       "cli": true,
       "cliVerb": "run accept-risk",
@@ -307,6 +440,7 @@
       "name": "run_accept_risk"
     },
     {
+      "audience": "lead",
       "class": "fenced",
       "cli": true,
       "cliVerb": "run adjudicate-settlement",
@@ -316,6 +450,7 @@
       "name": "run_adjudicate_settlement"
     },
     {
+      "audience": "machine",
       "class": "machine-fenced",
       "cli": true,
       "cliVerb": "run advance",
@@ -334,6 +469,7 @@
       "name": "run_drive"
     },
     {
+      "audience": "lead",
       "class": "fenced",
       "cli": true,
       "cliVerb": "run retry",
@@ -343,6 +479,7 @@
       "name": "run_retry"
     },
     {
+      "audience": "lead",
       "class": "fenced",
       "cli": true,
       "cliVerb": "run revise-policy",
@@ -352,6 +489,7 @@
       "name": "run_revise_policy"
     },
     {
+      "audience": "lead",
       "class": "fenced",
       "cli": true,
       "cliVerb": "run revise-roster",
@@ -361,6 +499,7 @@
       "name": "run_revise_roster"
     },
     {
+      "audience": "lead",
       "class": "fenced",
       "cli": true,
       "cliVerb": "run start",
@@ -370,6 +509,7 @@
       "name": "run_start"
     },
     {
+      "audience": "lead",
       "class": "read_only",
       "cli": true,
       "cliVerb": "run status",
@@ -379,6 +519,7 @@
       "name": "run_status"
     },
     {
+      "audience": "lead",
       "class": "fenced",
       "cli": true,
       "cliVerb": "run stop",
@@ -388,6 +529,7 @@
       "name": "run_stop"
     },
     {
+      "audience": "lead",
       "class": "fenced",
       "cli": true,
       "cliVerb": "run submit",
@@ -451,6 +593,7 @@
       "name": "service_uninstall"
     },
     {
+      "audience": "operator",
       "class": "read_only",
       "cli": true,
       "cliVerb": "session inventory",
@@ -460,6 +603,7 @@
       "name": "session_inventory"
     },
     {
+      "audience": "lead",
       "class": "read_only",
       "cli": true,
       "cliVerb": "session list",
@@ -469,6 +613,7 @@
       "name": "session_list"
     },
     {
+      "audience": "lead",
       "class": "fenced",
       "cli": true,
       "cliVerb": "session message",
@@ -478,6 +623,7 @@
       "name": "session_message"
     },
     {
+      "audience": "lead",
       "class": "read_only",
       "cli": true,
       "cliVerb": "session read",
@@ -487,6 +633,7 @@
       "name": "session_read"
     },
     {
+      "audience": "machine",
       "class": "fenced",
       "cli": true,
       "cliVerb": "session stop",
@@ -505,6 +652,7 @@
       "name": "supervise"
     },
     {
+      "audience": "operator",
       "class": "unfenced_write",
       "cli": true,
       "cliVerb": "usage ingest",
@@ -514,6 +662,7 @@
       "name": "usage_ingest"
     },
     {
+      "audience": "lead",
       "class": "read_only",
       "cli": true,
       "cliVerb": "usage",
@@ -523,6 +672,7 @@
       "name": "usage_report"
     },
     {
+      "audience": "lead",
       "class": "fenced",
       "cli": true,
       "cliVerb": "work close",
@@ -532,6 +682,7 @@
       "name": "work_close"
     },
     {
+      "audience": "lead",
       "class": "fenced",
       "cli": true,
       "cliVerb": "work create",
@@ -541,6 +692,7 @@
       "name": "work_create"
     },
     {
+      "audience": "operator",
       "class": "read_only",
       "cli": true,
       "cliVerb": "work detail",
@@ -550,6 +702,7 @@
       "name": "work_detail"
     },
     {
+      "audience": "operator",
       "class": "read_only",
       "cli": true,
       "cliVerb": "work history",
@@ -568,6 +721,7 @@
       "name": "work_import_beads"
     },
     {
+      "audience": "lead",
       "class": "fenced",
       "cli": true,
       "cliVerb": "work link",
@@ -577,6 +731,7 @@
       "name": "work_link"
     },
     {
+      "audience": "lead",
       "class": "read_only",
       "cli": true,
       "cliVerb": "work list",
@@ -586,6 +741,7 @@
       "name": "work_list"
     },
     {
+      "audience": "operator",
       "class": "read_only",
       "cli": true,
       "cliVerb": "work map",
@@ -595,6 +751,7 @@
       "name": "work_map"
     },
     {
+      "audience": "lead",
       "class": "fenced",
       "cli": true,
       "cliVerb": "work note add",
@@ -604,6 +761,7 @@
       "name": "work_note_add"
     },
     {
+      "audience": "lead",
       "class": "read_only",
       "cli": true,
       "cliVerb": "work note list",
@@ -613,6 +771,7 @@
       "name": "work_note_list"
     },
     {
+      "audience": "lead",
       "class": "fenced",
       "cli": true,
       "cliVerb": "work promote",
@@ -622,6 +781,7 @@
       "name": "work_promote"
     },
     {
+      "audience": "lead",
       "class": "read_only",
       "cli": true,
       "cliVerb": "work ready",
@@ -631,6 +791,7 @@
       "name": "work_ready"
     },
     {
+      "audience": "lead",
       "class": "fenced",
       "cli": true,
       "cliVerb": "work release",
@@ -640,6 +801,7 @@
       "name": "work_release"
     },
     {
+      "audience": "lead",
       "class": "fenced",
       "cli": true,
       "cliVerb": "work reopen",
@@ -649,6 +811,7 @@
       "name": "work_reopen"
     },
     {
+      "audience": "lead",
       "class": "fenced",
       "cli": true,
       "cliVerb": "work revert",
@@ -658,6 +821,7 @@
       "name": "work_revert"
     },
     {
+      "audience": "lead",
       "class": "read_only",
       "cli": true,
       "cliVerb": "work show",
@@ -667,6 +831,7 @@
       "name": "work_show"
     },
     {
+      "audience": "lead",
       "class": "fenced",
       "cli": true,
       "cliVerb": "work supersede",
@@ -676,6 +841,7 @@
       "name": "work_supersede"
     },
     {
+      "audience": "lead",
       "class": "fenced",
       "cli": true,
       "cliVerb": "work update",
@@ -685,6 +851,7 @@
       "name": "work_update"
     },
     {
+      "audience": "operator",
       "class": "fenced",
       "cli": true,
       "cliVerb": "worktree retire",

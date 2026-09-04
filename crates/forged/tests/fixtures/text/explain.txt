@@ -1,0 +1,9 @@
+EXPLAIN
+kind: work-item
+id: ore-1
+title: Ship the driver surface
+status: open
+verdict: blocked
+runs: 1 of 2 shown (truncated)
+next: 1
+  should work update --expected-revision 3 --id ore-1

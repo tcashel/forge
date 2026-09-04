@@ -12,6 +12,7 @@
 
 pub mod convergence;
 pub mod e2e_drive;
+pub mod operator_store;
 pub mod review_publish;
 pub mod supervise;
 
@@ -2535,8 +2536,12 @@ pub struct McpClient {
 impl McpClient {
     /// Spawn `forged mcp` in the environment and complete the initialize
     /// handshake.
-    pub fn new(env: &TestEnv) -> Self {
-        Self::from_command(env.forged_cmd(&["mcp"]))
+    pub fn new(env: &TestEnv, audience: Option<&str>) -> Self {
+        let mut command = env.forged_cmd(&["mcp"]);
+        if let Some(audience) = audience {
+            command.arg("--audience").arg(audience);
+        }
+        Self::from_command(command)
     }
 
     /// Spawn a prepared `forged mcp` command (e.g. over a bare HOME) and
@@ -2600,7 +2605,7 @@ impl McpClient {
         self.send(&json!({"jsonrpc": "2.0", "method": method, "params": params}));
     }
 
-    /// Call one tool with an operation envelope; return the parsed
+    /// Call one tool with its MCP arguments; return the parsed
     /// `OperationResponse` from the result's first text content block.
     pub fn call_tool(&mut self, name: &str, envelope: Value) -> Value {
         let reply = self.request("tools/call", json!({"name": name, "arguments": envelope}));

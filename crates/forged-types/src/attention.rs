@@ -8,7 +8,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::WorkTitleV1;
+use crate::{ProjectionSubjectV1, WorkTitleV1};
 
 pub const ATTENTION_ITEM_SCHEMA_V1: &str = "forged.attention-item/1";
 
@@ -34,6 +34,9 @@ pub enum AttentionCondition {
     RestartBudgetExhausted,
     FailedGate,
     RetryExhausted,
+    /// A stage was deadline-killed past its relaunch budget; the worktree
+    /// may still carry the seat's work.
+    DeadlineExhausted,
     ProviderDegraded,
     AdmissionDeferred,
     AmbiguousEffect,
@@ -95,6 +98,10 @@ pub enum AttentionActionCode {
     ReauthorizeWork,
     RepairGate,
     ReviseRoster,
+    /// Resume a deadline-killed stage from the work its seat left in the
+    /// worktree: retry when the tree is clean, steer the next attempt when
+    /// it is not.
+    ResumeSeat,
     WaitForProvider,
     WaitForCapacity,
     AdjudicateEffect,
@@ -164,6 +171,8 @@ pub struct AttentionItemV1 {
     pub occurrence_id: String,
     pub subject_kind: AttentionSubjectKind,
     pub subject_id: String,
+    #[serde(default)]
+    pub subject: Option<ProjectionSubjectV1>,
     /// Resolved display title for `subject_id`, never for a different
     /// subject. `None` where this surface could not resolve one.
     pub subject_title: Option<WorkTitleV1>,

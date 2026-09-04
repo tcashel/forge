@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use serde_json::{json, Value};
+use support::operator_store::{operator_store_fixture, SUBJECT_TOTAL};
 use support::{fabricate_epic, fabricate_run, TestEnv};
 
 fn entries(response: &Value) -> BTreeMap<String, Value> {
@@ -17,11 +18,78 @@ fn entries(response: &Value) -> BTreeMap<String, Value> {
         .flatten()
         .flat_map(|group| group["entries"].as_array().into_iter().flatten())
         .filter_map(|entry| {
-            entry["id"]
-                .as_str()
+            entry
+                .get("id")
+                .or_else(|| entry.pointer("/subject/id"))
+                .and_then(Value::as_str)
                 .map(|id| (id.to_owned(), entry.clone()))
         })
         .collect()
+}
+
+fn normalize_v071_golden(value: &mut Value, repository: &str, label: &str) {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                normalize_v071_golden(value, repository, label);
+            }
+        }
+        Value::Object(values) => {
+            for value in values.values_mut() {
+                normalize_v071_golden(value, repository, label);
+            }
+        }
+        Value::String(value) => {
+            *value = value
+                .replace(repository, "<repo>")
+                .replace(label, "<repo-label>");
+            if value.len() >= 20
+                && value.as_bytes().get(4) == Some(&b'-')
+                && value.as_bytes().get(7) == Some(&b'-')
+                && value.as_bytes().get(10) == Some(&b'T')
+                && value.ends_with('Z')
+            {
+                *value = "<timestamp>".to_owned();
+            }
+        }
+        _ => {}
+    }
+}
+
+fn assert_v071_golden(actual: &Value, expected: &Value, path: &str) {
+    match expected {
+        Value::Object(expected) => {
+            let actual = actual
+                .as_object()
+                .unwrap_or_else(|| panic!("{path} is not an object: {actual}"));
+            for (key, expected) in expected {
+                let next = format!("{path}/{key}");
+                let actual = actual
+                    .get(key)
+                    .unwrap_or_else(|| panic!("v0.7.1 key {next} disappeared: {actual:?}"));
+                assert_v071_golden(actual, expected, &next);
+            }
+        }
+        Value::Array(expected) => {
+            let actual = actual
+                .as_array()
+                .unwrap_or_else(|| panic!("{path} is not an array: {actual}"));
+            assert_eq!(
+                actual.len(),
+                expected.len(),
+                "v0.7.1 array length at {path}"
+            );
+            for (index, expected) in expected.iter().enumerate() {
+                assert_v071_golden(&actual[index], expected, &format!("{path}/{index}"));
+            }
+        }
+        Value::Number(expected) if actual.is_number() => assert_eq!(
+            actual.as_f64(),
+            expected.as_f64(),
+            "v0.7.1 numeric value changed at {path}"
+        ),
+        _ => assert_eq!(actual, expected, "v0.7.1 value changed at {path}"),
+    }
 }
 
 fn seed_packet(env: &TestEnv, run_id: &str, seq: i64, stage: forged_types::Stage) -> String {
@@ -56,6 +124,7 @@ fn seed_packet(env: &TestEnv, run_id: &str, seq: i64, stage: forged_types::Stage
             gate_commands: Vec::new(),
             deliverable: forged_types::Deliverable::CommitsInWorktree,
             budget_s: 60,
+            seat_commands: Vec::new(),
         },
         result_schema: "forged.result/1".to_owned(),
         provider_hints: forged_types::ProviderHints {
@@ -63,6 +132,7 @@ fn seed_packet(env: &TestEnv, run_id: &str, seq: i64, stage: forged_types::Stage
             model: "fixture".to_owned(),
             effort: None,
             sandbox: forged_types::Sandbox::ReadOnly,
+            env: Default::default(),
         },
         field_notes: Vec::new(),
     };
@@ -270,6 +340,7 @@ fn run_status_next_actions_execute_after_binding_declared_placeholders() {
     assert_eq!(code, 0, "active status: {active}");
     let action = &active["result"]["run"]["nextActions"][0];
     assert_eq!(action["verb"], json!("run stop"));
+    assert_eq!(action["class"], json!("can"));
     assert_eq!(
         action["args"],
         json!({"run": run_id, "outcome": null, "reason": null})
@@ -297,6 +368,7 @@ fn run_status_next_actions_execute_after_binding_declared_placeholders() {
     assert_eq!(code, 0, "stopped status: {terminal}");
     let retry = &terminal["result"]["run"]["nextActions"][0];
     assert_eq!(retry["verb"], json!("run retry"));
+    assert_eq!(retry["class"], json!("can"));
     assert_eq!(
         retry["args"],
         json!({"id": run_id, "runId": null}),
@@ -315,6 +387,7 @@ fn run_status_next_actions_execute_after_binding_declared_placeholders() {
 
     let action = &terminal["result"]["run"]["nextActions"][1];
     assert_eq!(action["verb"], json!("work supersede"));
+    assert_eq!(action["class"], json!("can"));
     assert_eq!(
         action["args"],
         json!({"id": work_id, "successor": null}),
@@ -377,11 +450,158 @@ fn run_status_next_actions_execute_after_binding_declared_placeholders() {
     ledger.close().expect("close ledger");
     let (code, held) = env.forged(&["run", "status", "--run", held_run]);
     assert_eq!(code, 0, "input-required status: {held}");
-    let held_retry = &held["result"]["run"]["nextActions"][0];
+    let held_update = &held["result"]["run"]["nextActions"][0];
+    assert_eq!(held_update["verb"], json!("work update"));
+    assert_eq!(held_update["class"], json!("should"));
+    let update_id = held_update["args"]["id"]
+        .as_str()
+        .expect("advertised work id");
+    let (code, shown) = env.forged(&["work", "show", "--id", update_id]);
+    assert_eq!(code, 0, "advertised work update precondition: {shown}");
+    let expected_revision = shown["result"]["work"]["revision"]
+        .as_u64()
+        .expect("current work revision")
+        .to_string();
+    let (code, updated) = env.forged(&[
+        "work",
+        "update",
+        "--id",
+        update_id,
+        "--expected-revision",
+        &expected_revision,
+        "--description",
+        "Apply the operator decision before retrying",
+    ]);
+    assert_eq!(code, 0, "advertised work update succeeds: {updated}");
+    let held_retry = &held["result"]["run"]["nextActions"][1];
     assert_eq!(held_retry["verb"], json!("run retry"));
+    assert_eq!(held_retry["class"], json!("can"));
     assert!(held_retry["reason"]
         .as_str()
         .is_some_and(|reason| reason.contains("decision or amendment")));
+}
+
+#[test]
+fn run_status_classes_each_terminal_outcome_by_relevance() {
+    let env = TestEnv::new("forged-run-status-action-classes");
+    env.forged(&["init"]);
+    for (run, outcome) in [
+        ("class-clean", forged_ledger::RunOutcome::Clean),
+        (
+            "class-accepted-risk",
+            forged_ledger::RunOutcome::AcceptedRisk,
+        ),
+        ("class-blocked", forged_ledger::RunOutcome::Blocked),
+        (
+            "class-input-required",
+            forged_ledger::RunOutcome::InputRequired,
+        ),
+        ("class-cancelled", forged_ledger::RunOutcome::Cancelled),
+    ] {
+        fabricate_run(&env, run);
+        let ledger = env.ledger();
+        if outcome == forged_ledger::RunOutcome::AcceptedRisk {
+            ledger
+                .append_event(
+                    Some(run),
+                    "run.protocol-terminal",
+                    json!({
+                        "schemaVersion": 1,
+                        "terminal": {
+                            "reviewBudgetExhausted": {
+                                "reviewRounds": 2,
+                                "finalVerdict": "requestChanges",
+                            }
+                        },
+                    }),
+                )
+                .expect("record review-budget evidence");
+            ledger
+                .settle_run(
+                    run,
+                    forged_ledger::RunOutcome::Blocked,
+                    "review budget exhausted after 2 rounds with verdict requestChanges".to_owned(),
+                    None,
+                    None,
+                    None,
+                )
+                .expect("settle review-budget fixture");
+            ledger
+                .accept_review_risk(
+                    run,
+                    2,
+                    forged_types::AcceptedRisk {
+                        accepted_by: "class-operator".to_owned(),
+                        rationale: "class fixture risk".to_owned(),
+                        findings: Vec::new(),
+                    },
+                )
+                .expect("accept fixture risk");
+        } else {
+            ledger
+                .settle_run(
+                    run,
+                    outcome,
+                    format!("classify {}", outcome.as_str()),
+                    None,
+                    None,
+                    None,
+                )
+                .expect("settle class fixture");
+        }
+        ledger.close().expect("close ledger");
+
+        let (code, status) = env.forged(&["run", "status", "--run", run]);
+        assert_eq!(code, 0, "{run}: {status}");
+        let actions = status["result"]["run"]["nextActions"]
+            .as_array()
+            .expect("next actions");
+        let should = actions
+            .iter()
+            .filter(|action| action["class"] == json!("should"))
+            .collect::<Vec<_>>();
+        match outcome {
+            forged_ledger::RunOutcome::Clean | forged_ledger::RunOutcome::AcceptedRisk => {
+                assert_eq!(should.len(), 1, "{status}");
+                assert_eq!(should[0]["verb"], json!("run stop"));
+                assert_eq!(should[0]["args"]["outcome"], json!("landed"));
+            }
+            forged_ledger::RunOutcome::Blocked | forged_ledger::RunOutcome::InputRequired => {
+                assert_eq!(should.len(), 1, "{status}");
+                assert_eq!(should[0]["verb"], json!("work update"));
+            }
+            forged_ledger::RunOutcome::Cancelled => assert!(should.is_empty(), "{status}"),
+            _ => unreachable!("fixture outcomes are closed above"),
+        }
+        assert!(actions.iter().any(|action| {
+            action["verb"] == json!("run retry") && action["class"] == json!("can")
+        }));
+        if matches!(
+            outcome,
+            forged_ledger::RunOutcome::Clean | forged_ledger::RunOutcome::AcceptedRisk
+        ) {
+            let delivery = should[0];
+            let sha = "a".repeat(40);
+            let (code, landed) = env.forged(&[
+                "run",
+                "stop",
+                "--run",
+                delivery["args"]["run"].as_str().expect("advertised run"),
+                "--outcome",
+                delivery["args"]["outcome"]
+                    .as_str()
+                    .expect("advertised outcome"),
+                "--reason",
+                "reviewed pull request was merged",
+                "--pr",
+                "42",
+                "--sha",
+                &sha,
+            ]);
+            assert_eq!(code, 0, "advertised landed stop succeeds: {landed}");
+            assert_eq!(landed["result"]["outcome"], json!("landed"));
+        }
+    }
 }
 
 #[test]
@@ -826,6 +1046,8 @@ fn operations_joins_one_bounded_live_plan_without_duplicate_durable_work() {
         &repository,
         "--limit",
         "50",
+        "--detail",
+        "full",
     ]);
     assert_eq!(code, 0, "operations overview: {response}");
     assert_eq!(
@@ -875,6 +1097,38 @@ fn operations_joins_one_bounded_live_plan_without_duplicate_durable_work() {
         "terminal plan rows are excluded"
     );
 
+    let (code, summary) = env.forged(&[
+        "operations",
+        "overview",
+        "--repo",
+        &repository,
+        "--limit",
+        "50",
+    ]);
+    assert_eq!(code, 0, "summary operations overview: {summary}");
+    let rows = entries(&summary);
+    assert_eq!(rows["plan-a"]["subject"]["kind"], json!("work"));
+    assert_eq!(rows["plan-a"]["subject"]["id"], json!("plan-a"));
+    assert_eq!(
+        rows["plan-a"]["subject"]["title"],
+        json!("Planned next slice")
+    );
+    assert_eq!(rows["plan-a"]["subject"]["repository"], json!(repository));
+    assert_eq!(rows["plan-a"]["subject"]["revision"], json!("2"));
+    assert_eq!(
+        rows["plan-a"]["plan"],
+        json!({
+            "status": "open",
+            "readiness": "ready",
+            "issueType": "task",
+            "priority": 1,
+            "assignee": Value::Null,
+            "parent": "epic-a",
+            "dependencyCount": 2,
+        }),
+        "the bounded producer retains enough plan facts for the App drawer: {summary}"
+    );
+
     // The bounded-read contract (one claim batch, one discovery, one
     // hydrate, never a graph walk) is structural in the in-process store
     // and no longer observable as argv.
@@ -903,7 +1157,14 @@ fn a_supersedes_edge_keeps_the_repository_plan_source_available() {
     env.set_work_field("plan-superseded", "status", "open");
     env.set_work_repository("plan-superseded", &repository);
 
-    let (code, response) = env.forged(&["operations", "overview", "--repo", &repository]);
+    let (code, response) = env.forged(&[
+        "operations",
+        "overview",
+        "--repo",
+        &repository,
+        "--detail",
+        "full",
+    ]);
     assert_eq!(code, 0, "operations overview: {response}");
     assert_eq!(
         response["result"]["sourceHealth"]["plan"],
@@ -958,7 +1219,7 @@ fn operations_reports_durable_rows_from_the_store() {
     env.forged(&["init"]);
     fabricate_run(&env, "durable-outage");
 
-    let (code, response) = env.forged(&["operations", "overview"]);
+    let (code, response) = env.forged(&["operations", "overview", "--detail", "full"]);
     assert_eq!(
         code, 0,
         "Beads degradation is data, not total failure: {response}"
@@ -993,7 +1254,7 @@ fn operations_filters_and_bounds_fail_closed() {
         vec!["operations", "overview", "--group", "mystery"],
         vec!["operations", "overview", "--source", "filesystem"],
         vec!["operations", "overview", "--limit", "0"],
-        vec!["operations", "overview", "--limit", "501"],
+        vec!["operations", "overview", "--limit", "201"],
     ] {
         let (code, response) = env.forged(&args);
         assert_ne!(
@@ -1004,6 +1265,399 @@ fn operations_filters_and_bounds_fail_closed() {
             response["error"]["code"],
             json!("INVALID_REQUEST"),
             "{response}"
+        );
+    }
+}
+
+#[test]
+fn full_projections_preserve_every_v071_golden_key_and_value() {
+    let env = TestEnv::new("forged-v071-projection-golden");
+    env.forged(&["init"]);
+    fabricate_run(&env, "golden-run");
+
+    let (code, operations) = env.forged(&[
+        "operations",
+        "overview",
+        "--detail",
+        "full",
+        "--limit",
+        "200",
+    ]);
+    assert_eq!(code, 0, "full Operations: {operations}");
+    let (code, detail) = env.forged(&[
+        "work",
+        "detail",
+        "--subject-kind",
+        "run",
+        "--subject-id",
+        "golden-run",
+        "--detail",
+        "full",
+    ]);
+    assert_eq!(code, 0, "full Work Detail: {detail}");
+    let (code, portfolio) = env.forged(&["overview", "--detail", "full"]);
+    assert_eq!(code, 0, "full portfolio: {portfolio}");
+
+    let repository = operations["result"]["queue"]["groups"]
+        .as_array()
+        .expect("queue groups")
+        .iter()
+        .flat_map(|group| group["entries"].as_array().into_iter().flatten())
+        .next()
+        .and_then(|entry| entry.pointer("/identity/repository/path"))
+        .and_then(Value::as_str)
+        .expect("fixture repository");
+    let label = operations["result"]["queue"]["groups"]
+        .as_array()
+        .expect("queue groups")
+        .iter()
+        .flat_map(|group| group["entries"].as_array().into_iter().flatten())
+        .next()
+        .and_then(|entry| entry.pointer("/identity/repository/label"))
+        .and_then(Value::as_str)
+        .expect("fixture repository label");
+    let mut actual = json!({
+        "operations": operations["result"],
+        "work-detail": detail["result"],
+        "portfolio": portfolio["result"],
+    });
+    normalize_v071_golden(&mut actual, repository, label);
+    let expected: Value = serde_json::from_str(include_str!("fixtures/v071-full-projections.json"))
+        .expect("v0.7.1 full-projection golden");
+    assert_v071_golden(&actual, &expected, "");
+}
+
+#[test]
+fn projection_defaults_are_bounded_and_full_preserves_the_v071_keys() {
+    let env = TestEnv::new("forged-bounded-projections");
+    env.forged(&["init"]);
+    let fixture = operator_store_fixture();
+    for subject in &fixture.subjects {
+        fabricate_run(&env, &subject.id);
+    }
+    let focus = fixture
+        .subjects
+        .last()
+        .expect("fixture subject")
+        .id
+        .as_str();
+    let overview_event_total = {
+        let ledger = env.ledger();
+        for ordinal in 0..125 {
+            ledger
+                .append_event(
+                    Some(focus),
+                    "projection.fixture",
+                    json!({"ordinal": ordinal}),
+                )
+                .expect("append overview event fixture");
+        }
+        let total = ledger
+            .count_events(Some(focus), 0)
+            .expect("count overview event fixture");
+        ledger.close().expect("close ledger");
+        total
+    };
+
+    let (code, operations) = env.forged(&["operations", "overview"]);
+    assert_eq!(code, 0, "operations summary: {operations}");
+    assert_eq!(operations["result"]["coverage"]["limit"], json!(30));
+    assert_eq!(operations["result"]["coverage"]["shown"], json!(30));
+    assert_eq!(
+        operations["result"]["coverage"]["total"],
+        json!(SUBJECT_TOTAL)
+    );
+    assert_eq!(operations["result"]["coverage"]["truncated"], json!(true));
+    assert_eq!(operations["result"]["coverage"]["nextCursor"], Value::Null);
+    let summary_entry = operations["result"]["queue"]["groups"]
+        .as_array()
+        .expect("summary groups")
+        .iter()
+        .flat_map(|group| group["entries"].as_array().into_iter().flatten())
+        .next()
+        .expect("summary entry");
+    assert_eq!(
+        summary_entry
+            .as_object()
+            .expect("summary object")
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from([
+            "attention",
+            "claimHealth",
+            "currentStage",
+            "delivery",
+            "executionHealth",
+            "liveSeats",
+            "next",
+            "nextAction",
+            "pr",
+            "spend",
+            "state",
+            "subject",
+        ])
+    );
+    assert!(operations["result"]["attention"]["counts"].is_object());
+    assert!(operations["result"]["attention"]["decisions"].is_array());
+    let operations_bytes = serde_json::to_vec(&operations)
+        .expect("serialize Operations")
+        .len();
+    assert!(
+        operations_bytes <= 20 * 1024,
+        "default Operations is {operations_bytes} bytes, above 20 KiB"
+    );
+    let (code, full_operations) = env.forged(&[
+        "operations",
+        "overview",
+        "--detail",
+        "full",
+        "--limit",
+        "200",
+    ]);
+    assert_eq!(code, 0, "operations full: {full_operations}");
+    assert!(full_operations["result"]["attention"].is_array());
+    let full_entry = full_operations["result"]["queue"]["groups"]
+        .as_array()
+        .expect("full groups")
+        .iter()
+        .flat_map(|group| group["entries"].as_array().into_iter().flatten())
+        .next()
+        .expect("full entry");
+    for key in [
+        "id",
+        "kind",
+        "beadId",
+        "repo",
+        "branch",
+        "state",
+        "createdAt",
+        "updatedAt",
+        "identity",
+        "controller",
+        "desired",
+        "admission",
+        "attentionItems",
+    ] {
+        assert!(
+            full_entry.get(key).is_some(),
+            "full Operations lost v0.7.1 entry key {key}: {full_entry}"
+        );
+    }
+
+    let (code, listed) = env.forged(&["work", "list"]);
+    assert_eq!(code, 0, "work list summary: {listed}");
+    assert_eq!(listed["result"]["coverage"]["limit"], json!(30));
+    assert_eq!(listed["result"]["coverage"]["shown"], json!(30));
+
+    let (code, portfolio) = env.forged(&["overview"]);
+    assert_eq!(code, 0, "portfolio summary: {portfolio}");
+    assert_eq!(portfolio["result"]["cap"], json!(30));
+    assert_eq!(
+        portfolio["result"]["entries"].as_array().map(Vec::len),
+        Some(30)
+    );
+    assert_eq!(portfolio["result"]["coverage"]["truncated"], json!(true));
+
+    let detail_args = [
+        "work",
+        "detail",
+        "--subject-kind",
+        "run",
+        "--subject-id",
+        focus,
+    ];
+    let (code, detail) = env.forged(&detail_args);
+    assert_eq!(code, 0, "work detail summary: {detail}");
+    for full_only in ["attempts", "artifacts", "packets", "events"] {
+        assert!(
+            detail["result"].get(full_only).is_none(),
+            "summary Work Detail leaked {full_only}: {detail}"
+        );
+    }
+    assert!(
+        serde_json::to_vec(&detail)
+            .expect("serialize Work Detail")
+            .len()
+            <= 8 * 1024,
+        "default Work Detail exceeds 8 KiB"
+    );
+    let mut full_detail_args = detail_args.to_vec();
+    full_detail_args.extend(["--detail", "full"]);
+    let (code, full_detail) = env.forged(&full_detail_args);
+    assert_eq!(code, 0, "work detail full: {full_detail}");
+    for key in [
+        "schema",
+        "kind",
+        "id",
+        "workRef",
+        "identity",
+        "titleSource",
+        "cursor",
+        "status",
+        "delivery",
+        "deadlineKills",
+        "desired",
+        "admission",
+        "children",
+        "packets",
+        "attempts",
+        "workers",
+        "artifacts",
+        "artifactCoverage",
+        "usage",
+        "effectCustody",
+        "gates",
+        "reviews",
+        "attention",
+        "attentionTotal",
+        "attentionLimit",
+        "attentionTruncated",
+        "attentionCoverage",
+        "events",
+    ] {
+        assert!(
+            full_detail["result"].get(key).is_some(),
+            "full Work Detail lost v0.7.1 key {key}: {full_detail}"
+        );
+    }
+    for shared in [
+        "schema",
+        "kind",
+        "id",
+        "workRef",
+        "identity",
+        "titleSource",
+        "status",
+        "delivery",
+        "deadlineKills",
+    ] {
+        assert_eq!(
+            detail["result"][shared], full_detail["result"][shared],
+            "full Work Detail changed v0.7.1 value for {shared}"
+        );
+    }
+
+    let (code, overview) = env.forged(&["overview", "--run", focus]);
+    assert_eq!(code, 0, "run overview summary: {overview}");
+    assert_eq!(
+        overview["result"]["events"].as_array().map(Vec::len),
+        Some(30),
+        "summary overview must read only its default event page: {overview}"
+    );
+    assert_eq!(
+        overview["result"]["coverage"],
+        json!({
+            "shown": 30,
+            "total": overview_event_total,
+            "truncated": true,
+            "nextCursor": overview["result"]["cursor"],
+        }),
+        "summary overview must state the bounded event page: {overview}"
+    );
+    for full_only in ["packetHistory", "artifacts", "interventions"] {
+        assert!(overview["result"].get(full_only).is_none(), "{overview}");
+    }
+    assert!(overview["result"]["reviews"].get("events").is_none());
+    assert!(
+        serde_json::to_vec(&overview)
+            .expect("serialize overview")
+            .len()
+            <= 8 * 1024,
+        "default run overview exceeds 8 KiB"
+    );
+    let (code, full_overview) = env.forged(&["overview", "--run", focus, "--detail", "full"]);
+    assert_eq!(code, 0, "run overview full: {full_overview}");
+    assert_eq!(
+        full_overview["result"]["events"]["events"]
+            .as_array()
+            .map(Vec::len),
+        Some(100),
+        "full overview preserves the v0.7.1 default event page: {full_overview}"
+    );
+    for key in [
+        "schema",
+        "kind",
+        "id",
+        "identity",
+        "events",
+        "cursor",
+        "status",
+        "workers",
+        "gates",
+        "reviews",
+        "packetHistory",
+        "artifacts",
+        "interventions",
+        "rosterRevisions",
+        "policyRevisions",
+        "admission",
+        "usage",
+    ] {
+        assert!(
+            full_overview["result"].get(key).is_some(),
+            "full overview lost v0.7.1 key {key}: {full_overview}"
+        );
+    }
+
+    let (code, explain) = env.forged(&["explain", "--id", "budget-34"]);
+    assert_eq!(code, 0, "explain summary: {explain}");
+    assert!(
+        serde_json::to_vec(&explain)
+            .expect("serialize explain")
+            .len()
+            <= 8 * 1024,
+        "default explain exceeds 8 KiB"
+    );
+
+    for args in [
+        vec!["attention", "list"],
+        vec!["session", "list", "--run", focus],
+        vec!["events", "--run", focus],
+        vec!["work", "history"],
+    ] {
+        let (code, listed) = env.forged(&args);
+        assert_eq!(code, 0, "{args:?}: {listed}");
+        if args.first() == Some(&"events") {
+            assert_eq!(
+                listed["result"]["summary"],
+                json!(false),
+                "omitting both events projection flags preserves full payloads: {listed}"
+            );
+            let projected = listed["result"]["events"]
+                .as_array()
+                .expect("event rows")
+                .iter()
+                .find(|event| event["kind"] == json!("projection.fixture"))
+                .expect("fixture event");
+            assert!(
+                projected["payload"]["ordinal"].is_number(),
+                "the no-flag event body is not summarized: {projected}"
+            );
+        }
+        for field in ["shown", "total", "truncated", "nextCursor"] {
+            assert!(
+                listed["result"]["coverage"].get(field).is_some(),
+                "{args:?} omits coverage.{field}: {listed}"
+            );
+        }
+    }
+
+    let created = env.forged(&[
+        "work",
+        "create",
+        "--id",
+        "budget-note",
+        "--title",
+        "Budget note item",
+    ]);
+    assert_eq!(created.0, 0, "work create: {}", created.1);
+    let (code, notes) = env.forged(&["work", "note", "list", "--id", "budget-note"]);
+    assert_eq!(code, 0, "work note list: {notes}");
+    for field in ["shown", "total", "truncated", "nextCursor"] {
+        assert!(
+            notes["result"]["coverage"].get(field).is_some(),
+            "work note list omits coverage.{field}: {notes}"
         );
     }
 }
@@ -1054,6 +1708,8 @@ fn work_detail_requires_an_exact_kind_and_projects_the_shared_subject_truth() {
         "detail-a",
         "--limit",
         "1",
+        "--detail",
+        "full",
     ]);
     assert_eq!(code, 0, "work detail: {response}");
     assert_eq!(response["result"]["schema"], json!("forged.work-detail/1"));
@@ -1104,6 +1760,8 @@ fn work_detail_requires_an_exact_kind_and_projects_the_shared_subject_truth() {
         &after,
         "--limit",
         "25",
+        "--detail",
+        "full",
     ]);
     assert_eq!(code, 0, "later page: {later_page}");
     assert_eq!(
@@ -1136,6 +1794,8 @@ fn work_detail_requires_an_exact_kind_and_projects_the_shared_subject_truth() {
         "missing",
         "--limit",
         "25",
+        "--detail",
+        "full",
     ]);
     assert_ne!(
         code, 0,
@@ -1205,6 +1865,8 @@ fn work_detail_captures_epic_children_from_the_atomic_ledger_subject() {
         "epic",
         "--subject-id",
         "detail-epic",
+        "--detail",
+        "full",
     ]);
     assert_eq!(code, 0, "epic detail: {response}");
     assert_eq!(response["result"]["workRef"]["kind"], "epic");
@@ -1331,6 +1993,8 @@ fn work_detail_bounds_history_uses_only_manifest_metadata_and_fails_closed_on_re
         "run",
         "--subject-id",
         "detail-many",
+        "--detail",
+        "full",
     ]);
     assert_eq!(code, 0, "bounded detail: {response}");
     assert_eq!(response["result"]["attempts"]["total"], 206);
@@ -1368,6 +2032,8 @@ fn work_detail_bounds_history_uses_only_manifest_metadata_and_fails_closed_on_re
         "run",
         "--subject-id",
         "detail-many",
+        "--detail",
+        "full",
     ]);
     assert_ne!(code, 0, "corrupt PacketResult must fail closed");
     assert_eq!(response["error"]["code"], "INTERNAL");
@@ -1431,6 +2097,8 @@ fn work_detail_projects_legacy_gate_prose_as_unknown_without_failed_gate_attenti
         "run",
         "--subject-id",
         "detail-legacy-gate",
+        "--detail",
+        "full",
     ]);
     assert_eq!(code, 0, "work detail: {response}");
     let gates = response["result"]["gates"]["items"]
@@ -1632,7 +2300,7 @@ fn two_runs_sharing_one_work_still_resolve_one_exact_claim_batch() {
     env.set_work_field("plan-only", "title", "Never executed");
     env.set_work_field("plan-only", "status", "open");
 
-    let (code, response) = env.forged(&["operations", "overview"]);
+    let (code, response) = env.forged(&["operations", "overview", "--detail", "full"]);
     assert_eq!(code, 0, "operations overview: {response}");
     assert_eq!(
         response["result"]["sourceHealth"]["beads"]["state"],
@@ -1679,7 +2347,7 @@ fn a_titleless_frozen_identity_gains_a_live_title_without_rewriting_launch_evide
     env.set_work_field("bead-titleless", "title", "Repair the bead read");
     env.set_work_field("bead-titleless", "status", "closed");
 
-    let (code, response) = env.forged(&["operations", "overview"]);
+    let (code, response) = env.forged(&["operations", "overview", "--detail", "full"]);
     assert_eq!(code, 0, "operations overview: {response}");
     let rows = entries(&response);
     let row = &rows["titleless"];
@@ -1803,6 +2471,8 @@ fn work_detail_titles_its_subject_and_never_titles_a_child_with_the_epic() {
         "epic",
         "--subject-id",
         "title-epic",
+        "--detail",
+        "full",
     ]);
     assert_eq!(code, 0, "work detail: {response}");
     let detail = &response["result"];
@@ -1850,6 +2520,8 @@ fn work_detail_titles_its_subject_and_never_titles_a_child_with_the_epic() {
         "run",
         "--subject-id",
         "title-child",
+        "--detail",
+        "full",
     ]);
     assert_eq!(code, 0, "work detail: {live}");
     assert_eq!(

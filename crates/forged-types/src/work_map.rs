@@ -124,6 +124,8 @@ pub struct WorkMapCapturedAtV1 {
     pub ledger: String,
     #[serde(rename = "beads")]
     pub work: Option<String>,
+    #[serde(default, rename = "work")]
+    pub work_twin: Option<String>,
     pub history: Option<String>,
 }
 

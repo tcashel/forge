@@ -12,7 +12,7 @@
   "mcpServers": {
     "forged": {
       "command": "forged",
-      "args": ["mcp"]
+      "args": ["mcp", "--audience", "all"]
     }
   }
 }

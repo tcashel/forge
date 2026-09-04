@@ -252,6 +252,22 @@ pub enum Terminal {
         /// Transport failures observed.
         attempts: u32,
     },
+    /// A stage was deadline-killed past its relaunch budget. The worktree
+    /// facts are filled by the driver at settlement; the engine reports
+    /// zero for both because it never reads the tree.
+    DeadlineExhausted {
+        /// Stage or seat identifier.
+        stage_id: String,
+        /// Deadline kills observed.
+        kills: u32,
+        /// Commits the worktree carries ahead of the base ref.
+        commits_ahead: u32,
+        /// Uncommitted paths in the worktree.
+        uncommitted: u32,
+        /// Whether the driver could read the tree. Unknown facts never
+        /// license a retry that could discard work.
+        facts_known: bool,
+    },
     /// The run's lifecycle column left `Active` outside the protocol — an
     /// operator stop or an external halt.
     ExternallyStopped {
@@ -330,6 +346,10 @@ pub enum FailureKind {
     /// The provider tried; the failure consumes what the stage's failure
     /// consumes.
     Semantic,
+    /// The attempt was killed at its stage deadline. Its work may still sit
+    /// in the worktree, so it is relaunched at once under its own bounded
+    /// budget and never charged as transport.
+    Deadline,
 }
 
 /// Classify a `fail_packet` note: byte-exact, case-sensitive, no trimming.
@@ -337,7 +357,9 @@ pub enum FailureKind {
 /// empty note are both `Semantic` — unknown shapes fail toward consuming the
 /// budget, the conservative direction.
 pub fn classify_failure(fail_note: &str) -> FailureKind {
-    if fail_note.starts_with("transport:") {
+    if fail_note.starts_with("deadline:") {
+        FailureKind::Deadline
+    } else if fail_note.starts_with("transport:") {
         FailureKind::Transport
     } else if fail_note.starts_with("unspawned:") {
         FailureKind::Unspawned
@@ -384,6 +406,11 @@ enum LegState<'v> {
     Exhausted {
         /// Transport failures observed.
         attempts: u32,
+    },
+    /// The packet was deadline-killed more times than its relaunch budget.
+    DeadlineExhausted {
+        /// Deadline kills observed.
+        kills: u32,
     },
     /// The last attempt failed with a semantic note — the provider tried.
     FailedSemantic,
@@ -450,6 +477,9 @@ pub fn advance(view: &RunView) -> NextAction {
                 stage: Stage::Implement,
                 attempts,
             })
+        }
+        LegState::DeadlineExhausted { kills } => {
+            return NextAction::Stop(deadline_terminal("implement", kills));
         }
         LegState::Completed {
             outcome: Some(Outcome::SpecAmendment { amendment }),
@@ -519,6 +549,9 @@ pub fn advance(view: &RunView) -> NextAction {
                 stage: Stage::Fix,
                 attempts,
             })
+        }
+        LegState::DeadlineExhausted { kills } => {
+            return NextAction::Stop(deadline_terminal("fix", kills));
         }
         // A semantically failed fix consumes the round; with the round spent
         // and no completed fix, no `ReReview` exists and the run stops as
@@ -1059,6 +1092,12 @@ fn adaptive_group(
                     },
                 ))
             }
+            LegState::DeadlineExhausted { kills } => {
+                return AdaptiveGroup::Action(NextAction::Stop(deadline_terminal(
+                    seat.id.as_str(),
+                    kills,
+                )))
+            }
             LegState::FailedSemantic => {
                 semantic_failure = true;
                 failed_without_result = failed_without_result.saturating_add(1);
@@ -1221,6 +1260,7 @@ fn adaptive_intent(
             model: candidate.model.clone(),
             effort: candidate.effort.clone(),
             sandbox: candidate.sandbox,
+            env: Default::default(),
         },
         execution: Some(SeatExecutionV1 {
             stage_id: seat.id.as_str().to_owned(),
@@ -1291,6 +1331,12 @@ fn eval_fanout(view: &RunView, seq: i64) -> FanoutJoin {
                 stage,
                 attempts: *attempts,
             }));
+        }
+        if let LegState::DeadlineExhausted { kills } = leg {
+            return FanoutJoin::NotDone(NextAction::Stop(deadline_terminal(
+                stage_str(stage),
+                *kills,
+            )));
         }
     }
 
@@ -1438,6 +1484,7 @@ fn packet_state<'v>(view: &'v RunView, packet: &'v PacketRow) -> LegState<'v> {
             FailureKind::Transport | FailureKind::Unspawned => {
                 transport_leg(view, packet_id, history)
             }
+            FailureKind::Deadline => deadline_leg(view, packet_id, history),
             FailureKind::Readmit => LegState::Pending {
                 packet_id,
                 not_before: None,
@@ -1475,6 +1522,54 @@ fn transport_leg<'v>(
             packet_id,
             not_before,
         }
+    }
+}
+
+/// A packet standing on its deadline-relaunch budget: claimable again at
+/// once while kills remain within the budget, exhausted past it. Deadline
+/// kills are counted from the packet's terminal history alone — they earn no
+/// `proto.retry` grant, so they never touch the transport count or backoff.
+fn deadline_leg<'v>(
+    view: &'v RunView,
+    packet_id: &'v str,
+    history: &[TerminalAttempt],
+) -> LegState<'v> {
+    let cutoff = view
+        .active_policy_revision
+        .as_ref()
+        .map(|revision| revision.created_at.as_str());
+    let kills = deadline_failures(history, cutoff);
+    if kills > view.policy.deadline_retry_budget {
+        LegState::DeadlineExhausted { kills }
+    } else {
+        LegState::Pending {
+            packet_id,
+            not_before: None,
+        }
+    }
+}
+
+/// Deadline kills charged to a packet since the policy cutoff.
+fn deadline_failures(history: &[TerminalAttempt], cutoff: Option<&str>) -> u32 {
+    let count = history
+        .iter()
+        .filter(|t| {
+            cutoff.is_none_or(|boundary| t.started_at.as_str() >= boundary)
+                && t.state == AttemptState::Failed
+                && classify_failure(t.fail_note.as_deref().unwrap_or("")) == FailureKind::Deadline
+        })
+        .count();
+    u32::try_from(count).unwrap_or(u32::MAX)
+}
+
+/// The engine's half of a deadline stop; the driver fills the worktree facts.
+fn deadline_terminal(stage_id: &str, kills: u32) -> Terminal {
+    Terminal::DeadlineExhausted {
+        stage_id: stage_id.to_owned(),
+        kills,
+        commits_ahead: 0,
+        uncommitted: 0,
+        facts_known: false,
     }
 }
 
@@ -1733,5 +1828,44 @@ mod tests {
     fn severity_orders_block_over_request_changes_over_approve() {
         assert!(severity(Verdict::Block) > severity(Verdict::RequestChanges));
         assert!(severity(Verdict::RequestChanges) > severity(Verdict::Approve));
+    }
+
+    #[test]
+    fn deadline_notes_are_their_own_class_and_stand_on_their_own_budget() {
+        assert_eq!(
+            classify_failure("deadline: stage deadline exceeded: attemptId=7"),
+            FailureKind::Deadline
+        );
+        assert_eq!(
+            classify_failure("transport: stage deadline exceeded: attemptId=7"),
+            FailureKind::Transport,
+            "legacy rows keep their legacy class"
+        );
+        let kill = |id: i64| TerminalAttempt {
+            attempt_id: id,
+            state: AttemptState::Failed,
+            outcome: None,
+            fail_note: Some("deadline: stage deadline exceeded: attemptId=1".to_owned()),
+            started_at: format!("2026-09-04T00:0{id}:00.000000000Z"),
+        };
+        let transport = TerminalAttempt {
+            attempt_id: 9,
+            state: AttemptState::Failed,
+            outcome: None,
+            fail_note: Some("transport: rate limit".to_owned()),
+            started_at: "2026-09-04T00:09:00.000000000Z".to_owned(),
+        };
+        let history = vec![kill(1), transport.clone(), kill(2)];
+        assert_eq!(deadline_failures(&history, None), 2);
+        assert_eq!(
+            deadline_failures(&history, Some("2026-09-04T00:02:00.000000000Z")),
+            1,
+            "a policy revision cutoff resets the count"
+        );
+        assert_eq!(
+            transport_failures(&history, None),
+            1,
+            "deadline kills never count as transport"
+        );
     }
 }
