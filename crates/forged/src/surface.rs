@@ -130,20 +130,11 @@ const MACHINE_MCP_OPERATIONS: &[&str] = &[
 ];
 
 pub(crate) fn mcp_audience(name: &str) -> Option<McpAudience> {
-    if LEAD_MCP_OPERATIONS
-        .iter()
-        .any(|candidate| *candidate == name)
-    {
+    if LEAD_MCP_OPERATIONS.contains(&name) {
         Some(McpAudience::Lead)
-    } else if OPERATOR_MCP_OPERATIONS
-        .iter()
-        .any(|candidate| *candidate == name)
-    {
+    } else if OPERATOR_MCP_OPERATIONS.contains(&name) {
         Some(McpAudience::Operator)
-    } else if MACHINE_MCP_OPERATIONS
-        .iter()
-        .any(|candidate| *candidate == name)
-    {
+    } else if MACHINE_MCP_OPERATIONS.contains(&name) {
         Some(McpAudience::Machine)
     } else {
         None
