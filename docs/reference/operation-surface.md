@@ -65,6 +65,7 @@ Generated from the dispatch table, clap tree, MCP router, and fenced-call audit.
 | `supervise` | `forged supervise` | yes | no | — | machine-fenced | no | yes |
 | `usage_ingest` | `forged usage ingest` | yes | yes | operator | unfenced_write | no | yes |
 | `usage_report` | `forged usage` | yes | yes | lead | read_only | no | yes |
+| `wait` | `forged wait` | yes | yes | lead | read_only | no | yes |
 | `work_adjudicate` | `forged work adjudicate` | yes | yes | lead | fenced | no | yes |
 | `work_close` | `forged work close` | yes | yes | lead | fenced | no | yes |
 | `work_create` | `forged work create` | yes | yes | lead | fenced | no | yes |

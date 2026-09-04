@@ -1038,6 +1038,77 @@ async fn explain_observation(
     .await
 }
 
+async fn complete_attention_observation(
+    ctx: &Ctx,
+    kind: forged_types::WorkIdentitySubjectKind,
+    id: &str,
+) -> Result<WorkObservationSnapshot, Failure> {
+    let mut observation = explain_observation(ctx, kind, id).await?;
+    while observation.events.has_more {
+        let after = observation.events.next_after_event_id.ok_or_else(|| {
+            Failure::internal("truncated work observation has no next event cursor")
+        })?;
+        let id = id.to_owned();
+        let page = on_ledger(&ctx.ledger, move |ledger| {
+            ledger.work_observation_snapshot(
+                kind,
+                &id,
+                after,
+                forged_ledger::WORK_OBSERVATION_MAX_EVENT_LIMIT,
+            )
+        })
+        .await?;
+        if page.events.rows.is_empty() {
+            return Err(Failure::internal(
+                "truncated work observation returned an empty next event page",
+            ));
+        }
+        observation.events.rows.extend(page.events.rows);
+        observation.events.next_after_event_id = page.events.next_after_event_id;
+        observation.events.has_more = page.events.has_more;
+    }
+    Ok(observation)
+}
+
+/// Fold attention from one exact observation instead of scanning the whole
+/// operator inventory. Blocking reads use this so their five-second decision
+/// cadence costs one subject, regardless of portfolio size.
+pub(crate) async fn subject_attention(
+    ctx: &Ctx,
+    kind: AttentionSubjectKind,
+    id: &str,
+) -> Result<Vec<AttentionItemV1>, Failure> {
+    let observation_kind = match kind {
+        AttentionSubjectKind::Run => forged_types::WorkIdentitySubjectKind::Run,
+        AttentionSubjectKind::Epic => forged_types::WorkIdentitySubjectKind::Epic,
+    };
+    let observation = complete_attention_observation(ctx, observation_kind, id).await?;
+    let live_work = crate::core::workstore::list_issues(
+        &ctx.ledger,
+        std::slice::from_ref(&observation.identity.work.id),
+    )
+    .await
+    .ok()
+    .and_then(|issues| {
+        issues
+            .into_iter()
+            .find(|issue| issue.id == observation.identity.work.id)
+    });
+    let title = forged_types::resolve_work_title(
+        &observation.identity,
+        live_work.as_ref().map(|issue| issue.title.as_str()),
+    );
+    let decoded = decode_packets_and_results(&observation)?;
+    let review = review_projection(&observation, &decoded.packets, &decoded.results);
+    super::attention::project_observation(
+        &observation,
+        &review.disagreements,
+        &decoded.results,
+        &title,
+        live_work.as_ref(),
+    )
+}
+
 fn run_observation_inputs<'a>(
     snapshot: &'a WorkObservationSnapshot,
     run: &forged_ledger::RunRow,
@@ -1193,7 +1264,7 @@ async fn projected_lifecycle(
         .ok_or_else(|| Failure::internal("lifecycle projection omitted its work item"))
 }
 
-async fn explain_work_item(
+pub(crate) async fn explain_work_item(
     ctx: &Ctx,
     work: WorkItemSnapshot,
     attention: &[AttentionItemV1],
@@ -1356,7 +1427,7 @@ fn next_coverage(shown: usize, total: usize) -> Value {
     })
 }
 
-async fn explain_run(
+pub(crate) async fn explain_run(
     ctx: &Ctx,
     id: String,
     attention: &[AttentionItemV1],
@@ -1433,7 +1504,7 @@ async fn explain_run(
     }))
 }
 
-async fn explain_epic(
+pub(crate) async fn explain_epic(
     ctx: &Ctx,
     id: String,
     attention: &[AttentionItemV1],
