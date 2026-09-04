@@ -40,6 +40,7 @@ pub(crate) fn review_packet(run_id: &str, seq: i64) -> WorkPacket {
             model: "fixture".to_owned(),
             effort: None,
             sandbox: Sandbox::ReadOnly,
+            env: Default::default(),
         },
         field_notes: Vec::new(),
     }

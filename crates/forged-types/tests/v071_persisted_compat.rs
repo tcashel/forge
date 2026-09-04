@@ -59,6 +59,7 @@ fn packet() -> WorkPacket {
             model: "opus".to_owned(),
             effort: Some("high".to_owned()),
             sandbox: Sandbox::WorkspaceWrite,
+            env: Default::default(),
         },
         field_notes: vec!["watch the seam".to_owned()],
     }

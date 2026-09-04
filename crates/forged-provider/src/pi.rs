@@ -44,6 +44,7 @@ impl ProviderDriver for PiDriver {
             packet.provider_hints.effort.as_deref(),
             None,
             None,
+            &packet.provider_hints.env,
         );
         Ok(Invocation {
             argv,
@@ -149,6 +150,7 @@ mod tests {
                 model: "anthropic/claude-sonnet-4-5".to_owned(),
                 effort: effort.map(str::to_owned),
                 sandbox,
+                env: Default::default(),
             },
             field_notes: Vec::new(),
         }

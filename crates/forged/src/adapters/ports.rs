@@ -1400,3 +1400,76 @@ mod tests {
         ledger.close().expect("close ledger");
     }
 }
+
+/// Commits the worktree carries ahead of `refs/remotes/origin/<base_ref>`,
+/// with up to five short SHAs newest first. Shells to git the way the port's
+/// `commits_ahead` does; a missing worktree or ref is an `Unavailable` error.
+pub(crate) async fn worktree_commits_ahead(
+    worktree: &Path,
+    base_ref: &str,
+) -> Result<(u32, Vec<String>), PortError> {
+    let range = format!("refs/remotes/origin/{base_ref}..HEAD");
+    let out = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["log", "--format=%h", "--max-count=5", &range])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await
+        .map_err(|e| PortError::Unavailable(format!("git log: {e}")))?;
+    if !out.status.success() {
+        return Err(PortError::Refused(format!(
+            "git log {range}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        )));
+    }
+    let shas = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let count_out = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["rev-list", "--count", &range])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await
+        .map_err(|e| PortError::Unavailable(format!("git rev-list: {e}")))?;
+    if !count_out.status.success() {
+        return Err(PortError::Refused(format!(
+            "git rev-list {range}: {}",
+            String::from_utf8_lossy(&count_out.stderr)
+        )));
+    }
+    let count = String::from_utf8_lossy(&count_out.stdout)
+        .trim()
+        .parse::<u32>()
+        .map_err(|e| PortError::Internal(format!("unparseable rev-list count: {e}")))?;
+    Ok((count, shas))
+}
+
+/// Paths `git status --porcelain` reports for the worktree: modified,
+/// staged, and untracked alike. Zero for a clean tree.
+pub(crate) async fn worktree_uncommitted_paths(worktree: &Path) -> Result<u32, PortError> {
+    let out = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["status", "--porcelain", "--untracked-files=all"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await
+        .map_err(|e| PortError::Unavailable(format!("git status: {e}")))?;
+    if !out.status.success() {
+        return Err(PortError::Refused(format!(
+            "git status: {}",
+            String::from_utf8_lossy(&out.stderr)
+        )));
+    }
+    let count = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count();
+    Ok(u32::try_from(count).unwrap_or(u32::MAX))
+}

@@ -55,6 +55,7 @@ fn packet_body(run_id: &str, packet_id: &str, provider: &str) -> String {
             model: "model".to_owned(),
             effort: None,
             sandbox: Sandbox::WorkspaceWrite,
+            env: Default::default(),
         },
         field_notes: Vec::new(),
     }

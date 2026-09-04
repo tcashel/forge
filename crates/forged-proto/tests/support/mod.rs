@@ -70,6 +70,7 @@ pub fn full_roster() -> HashMap<Stage, ProviderHints> {
         model: model.to_owned(),
         effort: None,
         sandbox: Sandbox::WorkspaceWrite,
+        env: Default::default(),
     };
     HashMap::from([
         (Stage::Implement, hint("claude", "fable")),

@@ -71,6 +71,7 @@ fn seed_live_attempt(env: &TestEnv, run_id: &str, ordinal: usize) {
             model: "fixture".to_owned(),
             effort: None,
             sandbox: Sandbox::ReadOnly,
+            env: Default::default(),
         },
         field_notes: Vec::new(),
     };

@@ -653,6 +653,8 @@ async fn honor(
                     &source,
                     &spec,
                     &view.policy.gate_commands,
+                    &view.policy.seat_commands,
+                    &view.policy.seat_env,
                     budget,
                     view.execution_package
                         .as_ref()
@@ -958,6 +960,7 @@ pub(crate) fn stored_packet_for_attempt(
             model: candidate.model.clone(),
             effort: candidate.effort.clone(),
             sandbox: candidate.sandbox,
+            env: Default::default(),
         };
     }
     Ok(packet)

@@ -1,6 +1,7 @@
 //! Work packets and packet results — the `forged.packet/1` wire contract
 //! between the orchestrator and provider-run stages.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -75,6 +76,11 @@ pub struct ProviderHints {
     pub model: String,
     pub effort: Option<String>,
     pub sandbox: Sandbox,
+    /// Operator environment applied to the provider process; an entry here
+    /// overrides the provider's own. Omitted when empty so stored packet
+    /// bodies keep their bytes.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
 }
 
 /// One unit of dispatched work, schema `forged.packet/1`.
@@ -358,6 +364,7 @@ mod tests {
                 model: "opus".to_owned(),
                 effort: Some("high".to_owned()),
                 sandbox: Sandbox::WorkspaceWrite,
+                env: BTreeMap::new(),
             },
             field_notes: vec!["watch the seam".to_owned()],
         }
@@ -455,6 +462,7 @@ mod tests {
             model: "gpt".to_owned(),
             effort: None,
             sandbox: Sandbox::ReadOnly,
+            env: BTreeMap::new(),
         });
     }
 

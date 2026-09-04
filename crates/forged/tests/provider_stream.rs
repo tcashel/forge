@@ -46,6 +46,7 @@ fn packet(provider: &str, worktree: &Path) -> WorkPacket {
             model: "model-1".to_owned(),
             effort: matches!(provider, "codex" | "pi").then(|| "high".to_owned()),
             sandbox: Sandbox::WorkspaceWrite,
+            env: Default::default(),
         },
         field_notes: Vec::new(),
     }

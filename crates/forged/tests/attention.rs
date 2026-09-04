@@ -886,6 +886,7 @@ fn open_implement_packet(env: &TestEnv, run: &str, seq: i64) -> (String, String)
             model: "fixture".to_owned(),
             effort: None,
             sandbox: forged_types::Sandbox::ReadOnly,
+            env: Default::default(),
         },
         field_notes: Vec::new(),
     };

@@ -62,6 +62,7 @@ fn seed(ledger: &Ledger) -> (String, i64, String) {
             model: "sonnet".into(),
             effort: None,
             sandbox: Sandbox::WorkspaceWrite,
+            env: Default::default(),
         },
         field_notes: vec![],
     };

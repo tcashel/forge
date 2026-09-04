@@ -1004,6 +1004,7 @@ async fn admit_packet_facts_once(
                     // is the conservative shape for a class that has no seat.
                     AdmissionResourceClass::Gate => Sandbox::ReadOnly,
                 },
+                env: Default::default(),
             }),
         });
     }
@@ -1109,6 +1110,7 @@ async fn admit_packet_facts_once(
                 // is the conservative shape for a class that has no seat.
                 AdmissionResourceClass::Gate => Sandbox::ReadOnly,
             },
+            env: Default::default(),
         }),
     })
 }

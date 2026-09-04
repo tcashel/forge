@@ -402,6 +402,7 @@ fn settlement_refreshes_siblings_after_whole_run_deadline_reconciliation() {
                 model: "fixture".to_owned(),
                 effort: None,
                 sandbox: forged_types::Sandbox::ReadOnly,
+                env: Default::default(),
             },
             field_notes: Vec::new(),
         };

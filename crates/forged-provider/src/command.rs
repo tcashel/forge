@@ -41,7 +41,7 @@ impl ProviderKindV1 {
 pub(crate) struct ProviderArgv {
     program: &'static str,
     args: Vec<String>,
-    env: Vec<(&'static str, &'static str)>,
+    env: Vec<(String, String)>,
 }
 
 impl ProviderArgv {
@@ -87,9 +87,10 @@ pub(crate) fn provider_argv(
     effort: Option<&str>,
     session_id: Option<&str>,
     last_message_path: Option<&Path>,
+    seat_env: &std::collections::BTreeMap<String, String>,
 ) -> ProviderArgv {
     let mut args = Vec::new();
-    let mut env = Vec::new();
+    let mut env: Vec<(String, String)> = Vec::new();
     match provider {
         ProviderKindV1::Claude => {
             push_args(
@@ -170,8 +171,13 @@ pub(crate) fn provider_argv(
             if sandbox == Sandbox::ReadOnly {
                 push_args(&mut args, &["--tools", "read,grep,find,ls"]);
             }
-            env.push(("FORGED_PI_WORKER", "1"));
+            env.push(("FORGED_PI_WORKER".to_owned(), "1".to_owned()));
         }
+    }
+    // The operator's seat environment wins over the provider's own entry.
+    for (key, value) in seat_env {
+        env.retain(|(existing, _)| existing != key);
+        env.push((key.clone(), value.clone()));
     }
     ProviderArgv {
         program: provider.program(),
@@ -228,6 +234,7 @@ mod tests {
             None,
             Some("session-1"),
             None,
+            &std::collections::BTreeMap::new(),
         );
         assert!(args(&claude)
             .windows(2)
@@ -240,6 +247,7 @@ mod tests {
             Some("high"),
             None,
             Some(Path::new("/tmp/last.txt")),
+            &std::collections::BTreeMap::new(),
         );
         let codex_args = args(&codex);
         assert!(codex_args
@@ -278,6 +286,7 @@ mod tests {
                     None,
                     Some("session-1"),
                     None,
+                    &std::collections::BTreeMap::new(),
                 ),
             ),
             (
@@ -290,6 +299,7 @@ mod tests {
                     Some("high"),
                     None,
                     Some(Path::new("/tmp/last.txt")),
+                    &std::collections::BTreeMap::new(),
                 ),
             ),
         ];

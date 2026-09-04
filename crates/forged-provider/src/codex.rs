@@ -52,6 +52,7 @@ impl ProviderDriver for CodexDriver {
             packet.provider_hints.effort.as_deref(),
             None,
             Some(&last_path),
+            &packet.provider_hints.env,
         );
         Ok(Invocation {
             argv,

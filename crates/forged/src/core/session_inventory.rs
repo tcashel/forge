@@ -1145,6 +1145,7 @@ mod tests {
                 model: "model-a".to_owned(),
                 effort: None,
                 sandbox: Sandbox::WorkspaceWrite,
+                env: Default::default(),
             },
             field_notes: Vec::new(),
         };

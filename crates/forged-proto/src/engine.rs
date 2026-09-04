@@ -1221,6 +1221,7 @@ fn adaptive_intent(
             model: candidate.model.clone(),
             effort: candidate.effort.clone(),
             sandbox: candidate.sandbox,
+            env: Default::default(),
         },
         execution: Some(SeatExecutionV1 {
             stage_id: seat.id.as_str().to_owned(),

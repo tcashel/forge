@@ -359,6 +359,67 @@ pub(crate) fn packet_keys(packet: &WorkPacket) -> Result<(String, i64), Failure>
     }
 }
 
+/// The line a relaunched attempt reads about the work its packet already
+/// holds: the last settled attempt of the same packet and the commits the
+/// worktree carries ahead of the base ref. `None` for a packet's first
+/// attempt on a clean tree, so the first prompt is byte-identical to today.
+async fn relaunch_note(
+    ctx: &Ctx,
+    run_id: &str,
+    packet: &WorkPacket,
+) -> Result<Option<String>, Failure> {
+    let prior = {
+        let run_id = run_id.to_owned();
+        let packet_id = packet.packet_id.clone();
+        on_ledger(&ctx.ledger, move |ledger| {
+            let mut prior: Vec<i64> = Vec::new();
+            for state in [
+                AttemptState::Completed,
+                AttemptState::Failed,
+                AttemptState::Reclaimed,
+            ] {
+                prior.extend(
+                    ledger
+                        .list_attempts_in_state(Some(&run_id), state)?
+                        .into_iter()
+                        .filter(|attempt| attempt.packet_id == packet_id)
+                        .map(|attempt| attempt.attempt_id),
+                );
+            }
+            Ok(prior.into_iter().max())
+        })
+        .await?
+    };
+    let (commits_ahead, shas) =
+        match super::ports::worktree_commits_ahead(&packet.worktree, &packet.base_ref).await {
+            Ok(value) => value,
+            // A worktree that does not exist yet has nothing to report.
+            Err(_) => (0, Vec::new()),
+        };
+    match (prior, commits_ahead) {
+        (None, 0) => Ok(None),
+        (prior, commits_ahead) => {
+            let attempt = prior.map_or_else(
+                || "A prior attempt".to_owned(),
+                |id| format!("Attempt {id} of this packet"),
+            );
+            let commits = if commits_ahead == 0 {
+                "no commits".to_owned()
+            } else {
+                format!(
+                    "{commits_ahead} commit(s) ({}) ahead of {}",
+                    shas.join(", "),
+                    packet.base_ref
+                )
+            };
+            Ok(Some(format!(
+                "{attempt} already ran here; the worktree carries {commits}. Continue \
+                 from the committed state: do not redo, re-baseline, or re-verify it."
+            )))
+        }
+    }
+}
+
 /// Fill every `WorkPacket` field the intent does not carry.
 ///
 /// A work-sourced packet reads its spec from the packet directory, where
@@ -372,6 +433,8 @@ pub fn build_packet(
     source: &SpecSource,
     spec: &ResolvedSpec,
     gate_commands: &[String],
+    seat_commands: &[String],
+    seat_env: &std::collections::BTreeMap<String, String>,
     budget_s: u64,
     protocol: Option<&forged_types::ProtocolRef>,
 ) -> Result<WorkPacket, Failure> {
@@ -473,10 +536,18 @@ pub fn build_packet(
             },
             deliverable,
             budget_s: u32::try_from(budget_s).unwrap_or(u32::MAX),
-            seat_commands: Vec::new(),
+            seat_commands: if planning {
+                Vec::new()
+            } else {
+                seat_commands.to_vec()
+            },
         },
         result_schema: prompt_stage.result_schema().to_owned(),
-        provider_hints: intent.hints.clone(),
+        provider_hints: {
+            let mut hints = intent.hints.clone();
+            hints.env = seat_env.clone();
+            hints
+        },
         field_notes: spec.work_context.clone(),
     };
     packet.spec.path = match source {
@@ -811,6 +882,7 @@ fn render_context(
             "base_ref": format!("origin/{}", packet.base_ref),
             "spec_path": packet.spec.path,
             "gate_commands": packet.contract.gate_commands,
+            "seat_commands": packet.contract.seat_commands,
             "field_notes": packet.field_notes,
             "packet_id": packet.packet_id,
             "result_schema": packet.result_schema,
@@ -846,6 +918,7 @@ fn render_context(
                 1
             },
             "gate_commands": packet.contract.gate_commands,
+            "seat_commands": packet.contract.seat_commands,
             "push_url": exec.push_url,
             "findings": forged_provider::normalize_findings(&exec.findings),
             "field_notes": packet.field_notes,
@@ -1058,10 +1131,13 @@ pub async fn execute_packet(
             recoverable: true,
         });
     }
-    let admitted_hints = admission
+    let mut admitted_hints = admission
         .packet_provider_hints
         .clone()
         .ok_or_else(|| Failure::internal("packet admission omitted provider launch facts"))?;
+    // Admission decides the launch facts (provider, model, sandbox); the
+    // operator's seat environment is frozen in the packet and rides along.
+    admitted_hints.env = packet.provider_hints.env.clone();
     let reservation_id = admission
         .reservation
         .ok_or_else(|| Failure::internal("admitted packet has no capacity reservation"))?
@@ -1502,6 +1578,9 @@ async fn run_attempt(
                     intervention.id, intervention.requested_by, intervention.message
                 )
             }));
+        if let Some(note) = relaunch_note(ctx, &run_id, &packet).await? {
+            packet.field_notes.push(note);
+        }
         // Renewal targets the lease that is actually held — renewal is
         // owner-only, and a renewal under a second, derived identity would
         // be refused and let the run's own lease lapse under it. Internal
@@ -3024,6 +3103,7 @@ mod tests {
                 } else {
                     Sandbox::ReadOnly
                 },
+                env: Default::default(),
             },
             field_notes: Vec::new(),
         }
@@ -3677,6 +3757,7 @@ mod settle_tests {
                 model: "claude-test".to_owned(),
                 effort: None,
                 sandbox: forged_types::Sandbox::WorkspaceWrite,
+                env: Default::default(),
             },
             execution: None,
             packet_id: None,
@@ -3688,8 +3769,19 @@ mod settle_tests {
             fence: forged_ledger::SpecFence::Sha256(spec_sha.clone()),
             work_context: Vec::new(),
         };
-        let packet = build_packet(&ctx, &run, &intent, &source, &resolved, &[], budget_s, None)
-            .expect("packet");
+        let packet = build_packet(
+            &ctx,
+            &run,
+            &intent,
+            &source,
+            &resolved,
+            &[],
+            &[],
+            &Default::default(),
+            budget_s,
+            None,
+        )
+        .expect("packet");
         std::fs::create_dir_all(&packet.worktree).expect("worktree");
         let packet_id = ledger
             .open_packet(forged_ledger::NewPacket {

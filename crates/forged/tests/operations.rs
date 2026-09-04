@@ -132,6 +132,7 @@ fn seed_packet(env: &TestEnv, run_id: &str, seq: i64, stage: forged_types::Stage
             model: "fixture".to_owned(),
             effort: None,
             sandbox: forged_types::Sandbox::ReadOnly,
+            env: Default::default(),
         },
         field_notes: Vec::new(),
     };

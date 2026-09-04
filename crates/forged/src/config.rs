@@ -233,6 +233,7 @@ fn hints(provider: &str, model: &str, effort: Option<&str>, sandbox: Sandbox) ->
         model: model.to_owned(),
         effort: effort.map(str::to_owned),
         sandbox,
+        env: BTreeMap::new(),
     }
 }
 
@@ -1336,6 +1337,7 @@ fn compatibility_projection(
                 model: value.model.clone(),
                 effort: value.effort.clone(),
                 sandbox: value.sandbox,
+                env: Default::default(),
             })
             .ok_or_else(|| DefinitionError {
                 path: format!("$.roster.roles.{}", seat.role.as_str()),

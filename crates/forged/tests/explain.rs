@@ -58,6 +58,7 @@ fn seed_live_attempt(env: &TestEnv, run_id: &str) -> i64 {
             model: "fixture".to_owned(),
             effort: None,
             sandbox: forged_types::Sandbox::ReadOnly,
+            env: Default::default(),
         },
         field_notes: Vec::new(),
     };

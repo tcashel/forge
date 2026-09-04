@@ -125,6 +125,11 @@ pub struct ProviderStreamRequestV1 {
     artifact_dir: String,
     session_id: Option<String>,
     render_mode: ProviderStreamRenderModeV1,
+    /// Operator seat environment frozen in the packet's provider hints.
+    /// Omitted when empty so requests written before the field existed
+    /// still parse.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    seat_env: std::collections::BTreeMap<String, String>,
 }
 
 impl ProviderStreamRequestV1 {
@@ -179,6 +184,7 @@ impl ProviderStreamRequestV1 {
             artifact_dir,
             session_id: invocation.session_hint.clone(),
             render_mode,
+            seat_env: packet.provider_hints.env.clone(),
         };
         request.validate_shape(&dirs.provider_stream_request(), false)?;
         Ok(request)
@@ -634,6 +640,7 @@ fn provider_command(request: &ProviderStreamRequestV1, override_path: Option<&Pa
         request.effort.as_deref(),
         request.session_id.as_deref(),
         request.last_message_path.as_deref(),
+        &request.seat_env,
     )
     .command(override_path)
 }
@@ -1395,6 +1402,7 @@ mod tests {
                 model: "model-1".to_owned(),
                 effort: matches!(provider, "codex" | "pi").then(|| "high".to_owned()),
                 sandbox: Sandbox::WorkspaceWrite,
+                env: Default::default(),
             },
             field_notes: Vec::new(),
         }

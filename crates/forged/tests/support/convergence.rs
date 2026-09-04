@@ -100,6 +100,7 @@ pub(crate) fn fabricate_live_attempt(env: &TestEnv, run: &str) {
             model: "fixture".to_owned(),
             effort: None,
             sandbox: forged_types::Sandbox::ReadOnly,
+            env: Default::default(),
         },
         field_notes: Vec::new(),
     };

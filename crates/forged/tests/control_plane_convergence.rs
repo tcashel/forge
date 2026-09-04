@@ -111,6 +111,7 @@ impl ControlPlaneFixture {
                 model: format!("{provider}-fixture"),
                 effort: None,
                 sandbox: forged_types::Sandbox::ReadOnly,
+                env: Default::default(),
             },
             field_notes: Vec::new(),
         };
