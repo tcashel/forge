@@ -429,6 +429,55 @@ impl ExplainArgs {
     }
 }
 
+fn default_wait_until() -> WaitUntilParam {
+    WaitUntilParam::Stage
+}
+
+fn default_wait_timeout() -> i64 {
+    240
+}
+
+/// Condition that releases `wait`.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(rename_all = "lowercase")]
+pub enum WaitUntilParam {
+    Decision,
+    Stage,
+    Terminal,
+}
+
+/// One blocking wait over an exact operator-visible subject.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars", inline)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WaitArgs {
+    #[serde(deserialize_with = "named_string")]
+    pub id: String,
+    /// Condition that releases the call; defaults to stage.
+    #[serde(default = "default_wait_until")]
+    pub until: WaitUntilParam,
+    /// Seconds before returning changed false; defaults to 240, maximum 3600.
+    #[serde(default = "default_wait_timeout")]
+    pub timeout: i64,
+}
+
+impl WaitArgs {
+    fn into_envelope(self) -> EnvelopeArgs {
+        let run_id = Some(self.id.clone());
+        let params = match serde_json::to_value(&self) {
+            Ok(Value::Object(map)) => map,
+            _ => serde_json::Map::new(),
+        };
+        EnvelopeArgs {
+            schema_version: 1,
+            idempotency_key: None,
+            run_id,
+            params,
+        }
+    }
+}
+
 /// Composable exact scopes for `work_list`.
 #[derive(Debug, Default, Deserialize, Serialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars", inline)]
@@ -1633,6 +1682,17 @@ impl ForgedServer {
     pub async fn explain(&self, args: Parameters<ExplainArgs>) -> CallToolResult {
         self.call_structured("explain", args.0.into_envelope())
             .await
+    }
+
+    /// Block until one subject reaches the requested condition.
+    #[tool(
+        name = "wait",
+        description = "Block on one work item, run, or epic until a decision opens, its packet stage changes, or it becomes terminal. until defaults to stage. timeout defaults to 240 seconds and must be between 1 and the maximum 3600 seconds. Returns the current explain projection with changed true when released, or changed false at timeout.",
+        annotations(read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false),
+        meta = lead_tool_meta()
+    )]
+    pub async fn wait(&self, args: Parameters<WaitArgs>) -> CallToolResult {
+        self.call_structured("wait", args.0.into_envelope()).await
     }
 
     /// Bounded decision-first lead driver surface.

@@ -26,6 +26,7 @@ pub(crate) mod settlement;
 pub(crate) mod spec;
 mod supervise;
 pub(crate) mod usage;
+mod wait;
 pub(crate) mod work_identity;
 mod work_import;
 mod work_map;
@@ -1501,6 +1502,7 @@ pub async fn dispatch(ctx: &Ctx, name: &str, mut req: OperationRequest) -> Opera
         "epic_revise_policy" => epic::epic_revise_policy(ctx, &mut req).await,
         "overview" => observe::overview(ctx, &req).await,
         "explain" => observe::explain(ctx, &req).await,
+        "wait" => wait::wait(ctx, &req).await,
         "next" => ops::next(ctx, &req).await,
         "operations_overview" => ops::operations_overview(ctx, &req).await,
         "work_detail" => observe::work_detail(ctx, &req).await,

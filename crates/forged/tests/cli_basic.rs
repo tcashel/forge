@@ -35,6 +35,7 @@ fn help_lists_every_command_and_subcommand_flags() {
         "usage",
         "events",
         "overview",
+        "wait",
         "work",
         "worktree",
         "mcp",
@@ -134,6 +135,10 @@ fn help_lists_every_command_and_subcommand_flags() {
             overview.contains(flag),
             "overview --help must document {flag}"
         );
+    }
+    let wait = help_text(&env, &["wait", "--help"]);
+    for flag in ["--id", "--until", "--timeout"] {
+        assert!(wait.contains(flag), "wait --help must document {flag}");
     }
 }
 

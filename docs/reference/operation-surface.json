@@ -673,6 +673,16 @@
     },
     {
       "audience": "lead",
+      "class": "read_only",
+      "cli": true,
+      "cliVerb": "wait",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": true,
+      "name": "wait"
+    },
+    {
+      "audience": "lead",
       "class": "fenced",
       "cli": true,
       "cliVerb": "work close",
