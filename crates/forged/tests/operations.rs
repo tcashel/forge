@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 use serde_json::{json, Value};
 use support::operator_store::{operator_store_fixture, SUBJECT_TOTAL};
-use support::{fabricate_epic, fabricate_run, git, TestEnv};
+use support::{fabricate_epic, fabricate_run, git, McpClient, TestEnv};
 
 fn entries(response: &Value) -> BTreeMap<String, Value> {
     response["result"]["queue"]["groups"]
@@ -151,6 +151,75 @@ fn seed_packet(env: &TestEnv, run_id: &str, seq: i64, stage: forged_types::Stage
         .expect("open packet");
     ledger.close().expect("close ledger");
     packet_id
+}
+
+fn critique_work_without_findings(env: &TestEnv, work_id: &str) -> String {
+    let revision = env.work_revision(work_id);
+    let path = env.root.join(format!("{work_id}-recommendation.json"));
+    std::fs::write(
+        &path,
+        serde_json::to_vec(&json!({
+            "schema": "forged.spec-recommendations/1",
+            "revision": revision.parse::<u64>().expect("numeric work revision"),
+            "workItem": work_id,
+            "repository": env.repos.repo.to_string_lossy(),
+            "reviewedAt": "2026-09-05T12:00:00Z",
+            "recommendations": [],
+            "cruxes": [],
+            "openQuestions": [],
+        }))
+        .expect("serialize recommendation"),
+    )
+    .expect("write recommendation");
+    let (code, response) = env.forged(&[
+        "work",
+        "note",
+        "add",
+        "--id",
+        work_id,
+        "--kind",
+        "recommendation",
+        "--body-file",
+        path.to_str().expect("UTF-8 recommendation path"),
+    ]);
+    assert_eq!(code, 0, "critique {work_id}: {response}");
+    response["result"]["note"]["noteId"]
+        .as_str()
+        .expect("recommendation note id")
+        .to_owned()
+}
+
+fn adjudicate_work_without_changes(env: &TestEnv, work_id: &str, note_id: &str) {
+    let revision = env.work_revision(work_id);
+    let path = env.root.join(format!("{work_id}-adjudication.json"));
+    std::fs::write(
+        &path,
+        serde_json::to_vec(&json!({
+            "schema": "forged.adjudication/1",
+            "revision": revision.parse::<u64>().expect("numeric work revision"),
+            "workItem": work_id,
+            "critiquedRevision": revision.parse::<u64>().expect("numeric work revision"),
+            "recommendationNoteId": note_id,
+            "resultingRevision": revision.parse::<u64>().expect("numeric work revision"),
+            "dispositions": [],
+            "cruxes": [],
+            "adjudicatedAt": "2026-09-05T12:01:00Z",
+            "actor": "lead-agent",
+        }))
+        .expect("serialize adjudication"),
+    )
+    .expect("write adjudication");
+    let (code, response) = env.forged(&[
+        "work",
+        "adjudicate",
+        "--id",
+        work_id,
+        "--expected-revision",
+        &revision,
+        "--dispositions-file",
+        path.to_str().expect("UTF-8 adjudication path"),
+    ]);
+    assert_eq!(code, 0, "adjudicate {work_id}: {response}");
 }
 
 fn settle_machine_operation(
@@ -858,6 +927,59 @@ fn run_retry_preserves_three_local_only_commits_and_projects_the_start_point() {
 }
 
 #[test]
+fn run_retry_requires_fresh_when_a_recorded_branch_cannot_be_resolved() {
+    let env = TestEnv::new("forged-run-retry-unresolved-recorded-branch");
+    env.forged(&["init"]);
+    let run_id = "retry-unresolved-recorded";
+    env.seed_work_spec(
+        run_id,
+        "Protect committed work on a recorded source branch.",
+        "- unresolved recorded branches require an explicit fresh retry",
+    );
+    let repository = env.repos.repo.to_string_lossy().into_owned();
+    let (code, started) = env.forged(&[
+        "run",
+        "start",
+        "--work",
+        run_id,
+        "--repo",
+        &repository,
+        "--base-ref",
+        "main",
+    ]);
+    assert_eq!(code, 0, "start source run: {started}");
+    let ledger = env.ledger();
+    ledger
+        .settle_run(
+            run_id,
+            forged_ledger::RunOutcome::Cancelled,
+            "recorded branch became unavailable".to_owned(),
+            None,
+            None,
+            None,
+        )
+        .expect("settle source run");
+    ledger.close().expect("close ledger");
+
+    let (code, refused) = env.forged(&["run", "retry", "--id", run_id]);
+    assert_ne!(code, 0, "unresolved recorded branch retried: {refused}");
+    assert_eq!(
+        refused["error"]["detail"],
+        json!({
+            "schema": "forged.remedy/1",
+            "verb": "run retry",
+            "args": {
+                "id": run_id,
+                "runId": null,
+                "because": "world-changed",
+                "fresh": true,
+            },
+            "reason": "retry from the base because the committed source branch cannot be resolved",
+        })
+    );
+}
+
+#[test]
 fn run_dispatch_is_one_fenced_approval_and_submission() {
     let env = TestEnv::new("forged-run-dispatch");
     env.forged(&["init"]);
@@ -882,6 +1004,46 @@ fn run_dispatch_is_one_fenced_approval_and_submission() {
         message.contains("recommendation") && message.contains("adjudicate"),
         "lifecycle refusal names the full remedy: {refused}"
     );
+    assert_eq!(
+        refused["error"]["detail"]["schema"],
+        json!("forged.remedy/1")
+    );
+    assert_eq!(refused["error"]["detail"]["verb"], json!("work note add"));
+
+    let recommendation = critique_work_without_findings(&env, work_id);
+    let (code, refused) = env.forged(&[
+        "run",
+        "dispatch",
+        "--id",
+        work_id,
+        "--basis",
+        "the specification and execution tuple are approved",
+    ]);
+    assert_ne!(code, 0, "critiqued work must not dispatch: {refused}");
+    assert_eq!(
+        refused["error"]["detail"]["schema"],
+        json!("forged.remedy/1")
+    );
+    assert_eq!(refused["error"]["detail"]["verb"], json!("work adjudicate"));
+    adjudicate_work_without_changes(&env, work_id, &recommendation);
+
+    let (code, shown) = env.forged(&["work", "show", "--id", work_id]);
+    assert_eq!(code, 0, "show adjudicated work: {shown}");
+    assert_eq!(shown["result"]["lifecycle"]["stage"], json!("ready"));
+    let dispatch_action = &shown["result"]["nextActions"][0];
+    assert_eq!(dispatch_action["verb"], json!("run dispatch"));
+    assert_eq!(dispatch_action["class"], json!("should"));
+    assert_eq!(
+        dispatch_action["args"],
+        json!({"id": work_id, "approvedBy": null, "basis": null})
+    );
+
+    let (code, overview) = env.forged(&["operations", "overview"]);
+    assert_eq!(code, 0, "overview adjudicated work: {overview}");
+    assert_eq!(
+        entries(&overview)[work_id]["nextAction"],
+        json!("run dispatch")
+    );
 
     let (code, dispatched) = env.forged(&[
         "run",
@@ -892,8 +1054,6 @@ fn run_dispatch_is_one_fenced_approval_and_submission() {
         "the specification and execution tuple are approved",
         "--approved-by",
         "lead-agent",
-        "--override",
-        "operator approved this bounded drafted fixture",
         "--base-ref",
         "main",
     ]);
@@ -916,7 +1076,7 @@ fn run_dispatch_is_one_fenced_approval_and_submission() {
     let notes = ledger
         .list_work_notes(work_id, Some(forged_ledger::WorkNoteKind::Decision), 100)
         .expect("decision notes");
-    assert_eq!(notes.notes.len(), 2, "override plus one approval decision");
+    assert_eq!(notes.notes.len(), 1, "one approval decision");
     let decisions = notes
         .notes
         .iter()
@@ -940,13 +1100,9 @@ fn run_dispatch_is_one_fenced_approval_and_submission() {
     );
     assert_eq!(approval["approval"]["baseRef"], json!("main"));
     assert!(approval["approval"]["observedRevision"].is_number());
-    assert_eq!(
-        decisions
-            .iter()
-            .filter(|decision| decision["kind"] == json!("lifecycle-override"))
-            .count(),
-        1
-    );
+    assert!(decisions
+        .iter()
+        .all(|decision| decision["kind"] != json!("lifecycle-override")));
     ledger.close().expect("close ledger");
 
     let (code, duplicate) = env.forged(&[
@@ -963,6 +1119,194 @@ fn run_dispatch_is_one_fenced_approval_and_submission() {
     ]);
     assert_ne!(code, 0, "duplicate dispatch must refuse: {duplicate}");
     assert_eq!(duplicate["error"]["detail"]["verb"], json!("run status"));
+}
+
+#[test]
+fn run_dispatch_refuses_held_and_closed_work_with_typed_recovery() {
+    let env = TestEnv::new("forged-run-dispatch-held-remedies");
+    env.forged(&["init"]);
+    for (work_id, status, expected_args) in [
+        (
+            "dispatch-blocked",
+            "blocked",
+            json!({"id": "dispatch-blocked"}),
+        ),
+        (
+            "dispatch-parked",
+            "deferred",
+            json!({"id": "dispatch-parked", "reason": null}),
+        ),
+        (
+            "dispatch-closed",
+            "closed",
+            json!({"id": "dispatch-closed"}),
+        ),
+    ] {
+        env.seed_work_spec(work_id, "Refuse held dispatch.", "- recovery is typed");
+        env.set_work_field(work_id, "status", status);
+        let (code, refused) = env.forged(&[
+            "run",
+            "dispatch",
+            "--id",
+            work_id,
+            "--basis",
+            "fixture dispatch basis",
+        ]);
+        assert_ne!(code, 0, "{status} work dispatched: {refused}");
+        assert_eq!(
+            refused["error"]["detail"]["schema"],
+            json!("forged.remedy/1")
+        );
+        assert_eq!(refused["error"]["detail"]["verb"], json!("work reopen"));
+        assert_eq!(refused["error"]["detail"]["args"], expected_args);
+    }
+}
+
+#[test]
+fn run_dispatch_rolls_back_run_when_the_atomic_seal_fails() {
+    let env = TestEnv::new("forged-run-dispatch-atomic-seal");
+    env.forged(&["init"]);
+    let work_id = "dispatch-atomic-seal";
+    env.seed_work_spec(
+        work_id,
+        "Seal dispatch in one ledger transaction.",
+        "- a failed note rolls back the run and authorization",
+    );
+    let connection =
+        rusqlite::Connection::open(env.anvil.join("state.db")).expect("open dispatch fixture db");
+    connection
+        .execute_batch(
+            "CREATE TRIGGER reject_dispatch_decision \
+             BEFORE INSERT ON work_notes BEGIN \
+             SELECT RAISE(ABORT, 'fixture rejects dispatch decision'); END;",
+        )
+        .expect("install dispatch note failure");
+    drop(connection);
+
+    let args = [
+        "run",
+        "dispatch",
+        "--id",
+        work_id,
+        "--basis",
+        "atomic dispatch fixture",
+        "--override",
+        "exercise rollback of the complete seal",
+        "--base-ref",
+        "main",
+    ];
+    let (code, refused) = env.forged(&args);
+    assert_ne!(code, 0, "failed seal unexpectedly dispatched: {refused}");
+    let ledger = env.ledger();
+    assert_eq!(
+        ledger
+            .get_run(work_id)
+            .expect_err("run must roll back")
+            .code(),
+        forged_types::ErrorCode::RunNotFound
+    );
+    assert!(ledger
+        .get_desired_work(forged_ledger::DesiredSubjectKind::Run, work_id)
+        .expect("desired lookup")
+        .is_none());
+    assert!(ledger
+        .list_work_notes(work_id, Some(forged_ledger::WorkNoteKind::Decision), 100)
+        .expect("decision notes")
+        .notes
+        .is_empty());
+    ledger.close().expect("close ledger");
+
+    let connection =
+        rusqlite::Connection::open(env.anvil.join("state.db")).expect("reopen dispatch fixture db");
+    connection
+        .execute_batch("DROP TRIGGER reject_dispatch_decision;")
+        .expect("remove dispatch note failure");
+    drop(connection);
+    let (code, dispatched) = env.forged(&args);
+    assert_eq!(code, 0, "corrected dispatch succeeds: {dispatched}");
+}
+
+#[test]
+fn dispatch_and_retry_refuse_non_string_mcp_execution_refs_with_remedies() {
+    let env = TestEnv::new("forged-strict-mcp-execution-refs");
+    env.forged(&["init"]);
+    let dispatch_work = "dispatch-strict-refs";
+    env.seed_work_spec(
+        dispatch_work,
+        "Reject malformed dispatch execution refs.",
+        "- defaults are never selected for malformed values",
+    );
+    let retry_run = "retry-strict-refs";
+    env.seed_work_spec(
+        &format!("bead-{retry_run}"),
+        "Reject malformed retry execution refs.",
+        "- defaults are never selected for malformed values",
+    );
+    fabricate_run(&env, retry_run);
+    let ledger = env.ledger();
+    ledger
+        .settle_run(
+            retry_run,
+            forged_ledger::RunOutcome::Cancelled,
+            "strict execution-ref fixture".to_owned(),
+            None,
+            None,
+            None,
+        )
+        .expect("settle retry source");
+    ledger.close().expect("close ledger");
+
+    let mut mcp = McpClient::new(&env, None);
+    for (field, malformed) in [
+        ("profile", json!({"not": "a string"})),
+        ("roster", json!(["not", "a", "string"])),
+    ] {
+        let mut dispatch_args = serde_json::Map::new();
+        dispatch_args.insert("id".to_owned(), json!(dispatch_work));
+        dispatch_args.insert("basis".to_owned(), json!("strict MCP fixture"));
+        dispatch_args.insert("override".to_owned(), json!("exercise strict parsing"));
+        dispatch_args.insert(field.to_owned(), malformed.clone());
+        let refused = mcp.call_tool("run_dispatch", Value::Object(dispatch_args));
+        assert_eq!(refused["ok"], json!(false), "{field}: {refused}");
+        assert!(refused["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains(field) && message.contains("string")));
+        assert_eq!(
+            refused["error"]["detail"]["schema"],
+            json!("forged.remedy/1")
+        );
+        assert_eq!(refused["error"]["detail"]["verb"], json!("run dispatch"));
+        assert_eq!(refused["error"]["detail"]["args"][field], Value::Null);
+
+        let mut retry_args = serde_json::Map::new();
+        retry_args.insert("id".to_owned(), json!(retry_run));
+        retry_args.insert(field.to_owned(), malformed);
+        let refused = mcp.call_tool("run_retry", Value::Object(retry_args));
+        assert_eq!(refused["ok"], json!(false), "{field}: {refused}");
+        assert!(refused["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains(field) && message.contains("string")));
+        assert_eq!(
+            refused["error"]["detail"]["schema"],
+            json!("forged.remedy/1")
+        );
+        assert_eq!(refused["error"]["detail"]["verb"], json!("run retry"));
+        assert_eq!(refused["error"]["detail"]["args"][field], Value::Null);
+    }
+    let ledger = env.ledger();
+    assert_eq!(
+        ledger
+            .get_run(dispatch_work)
+            .expect_err("malformed dispatch must not create a run")
+            .code(),
+        forged_types::ErrorCode::RunNotFound
+    );
+    assert!(ledger
+        .retry_chain_runs(retry_run, 10)
+        .expect("retry chain lookup")
+        .iter()
+        .all(|run| run.run_id == retry_run));
+    ledger.close().expect("close ledger");
 }
 
 #[test]

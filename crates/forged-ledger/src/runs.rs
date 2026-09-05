@@ -21,9 +21,16 @@ use crate::types::{
     PolicyRevisionRow, RosterRevisionBatch, RosterRevisionRow, RunDefinitionRow, RunOutcome,
     RunRow, RunSettlement, RunState,
 };
+use crate::work::{canonical_work_note_body, insert_work_note_tx, NewWorkNote};
 use crate::work_identity::{
     get_work_identity_tx, identity_replay_matches, insert_work_identity_tx, legacy_run_identity,
 };
+
+struct FirstRunDispatchSeal {
+    generation: u32,
+    notes: Vec<NewWorkNote>,
+    event: Value,
+}
 
 pub(crate) fn run_row(row: &rusqlite::Row<'_>) -> Result<RunRow, rusqlite::Error> {
     let state = row.get::<_, String>(6)?;
@@ -612,7 +619,7 @@ impl Ledger {
         spec_event: serde_json::Value,
         identity: WorkIdentityV1,
     ) -> Result<RunRow, LedgerError> {
-        self.create_run_with_identity_guarded(new_run, definition, spec_event, identity, None)
+        self.create_run_with_identity_guarded(new_run, definition, spec_event, identity, None, None)
     }
 
     /// Atomically create the first run for one work item only when its current
@@ -631,6 +638,36 @@ impl Ledger {
             spec_event,
             identity,
             Some(expected_work_revision),
+            None,
+        )
+    }
+
+    /// Atomically create a first run, bind its approval decisions to the
+    /// checked Work revision, and authorize generation zero. A failure in any
+    /// part rolls the complete dispatch seal back.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_first_run_with_identity_at_revision_authorizing(
+        &self,
+        new_run: NewRun,
+        definition: NewRunDefinition,
+        spec_event: serde_json::Value,
+        identity: WorkIdentityV1,
+        expected_work_revision: i64,
+        generation: u32,
+        notes: Vec<NewWorkNote>,
+        authorization_event: serde_json::Value,
+    ) -> Result<RunRow, LedgerError> {
+        self.create_run_with_identity_guarded(
+            new_run,
+            definition,
+            spec_event,
+            identity,
+            Some(expected_work_revision),
+            Some(FirstRunDispatchSeal {
+                generation,
+                notes,
+                event: authorization_event,
+            }),
         )
     }
 
@@ -641,7 +678,13 @@ impl Ledger {
         spec_event: serde_json::Value,
         identity: WorkIdentityV1,
         first_run_revision: Option<i64>,
+        mut dispatch_seal: Option<FirstRunDispatchSeal>,
     ) -> Result<RunRow, LedgerError> {
+        if let Some(seal) = dispatch_seal.as_mut() {
+            for note in &mut seal.notes {
+                note.body_json = canonical_work_note_body(&note.body_json)?;
+            }
+        }
         self.submit(move |conn| {
             identity.validate_for_storage().map_err(|error| {
                 refused(
@@ -900,6 +943,29 @@ impl Ledger {
             )?;
             append_event_tx(&tx, Some(&row.run_id), "forged.run.spec", &spec_event)?;
             insert_work_identity_tx(&tx, &identity)?;
+            if let Some(seal) = dispatch_seal {
+                crate::desired::authorize_tx(
+                    &tx,
+                    DesiredSubjectKind::Run,
+                    &row.run_id,
+                    seal.generation,
+                )?;
+                let written_at = now_iso();
+                for note in &seal.notes {
+                    insert_work_note_tx(
+                        &tx,
+                        note,
+                        uuid::Uuid::now_v7().to_string(),
+                        written_at.clone(),
+                    )?;
+                }
+                append_event_tx(
+                    &tx,
+                    Some(&row.run_id),
+                    "forged.run.dispatch.authorized",
+                    &seal.event,
+                )?;
+            }
             drop(profile_json);
             tx.commit()?;
             Ok(row)

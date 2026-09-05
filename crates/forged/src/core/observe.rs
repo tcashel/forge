@@ -1315,11 +1315,11 @@ pub(crate) async fn explain_work_item(
             })
         })
         .collect::<Vec<_>>();
-    let next = super::work_ops::projection_actions(&work);
     let lifecycle = super::lifecycle::project(ctx, std::slice::from_ref(&work), attention)
         .await?
         .remove(&work.work_id)
         .ok_or_else(|| Failure::internal("work lifecycle projection omitted its item"))?;
+    let next = super::work_ops::projection_actions(&work, lifecycle.stage);
     Ok(json!({
         "schema": "forged.explain/1",
         "subject": {

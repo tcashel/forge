@@ -911,7 +911,9 @@ mod tests {
             "dependencies": [{"id": "ore-0", "kind": "blocks", "status": "closed"}],
             "notesCount": 2,
             "nextActions": [{
-                "verb": "run start", "args": {"work": "ore-1"},
+                "verb": "run dispatch", "args": {
+                    "id": "ore-1", "approvedBy": null, "basis": null
+                },
                 "reason": "execute", "class": "should"
             }]
         }));

@@ -613,31 +613,14 @@ fn started_string<'a>(started: &'a Value, key: &str) -> Result<&'a str, Failure>
         .ok_or_else(|| Failure::internal(format!("run creation response omitted {key}")))
 }
 
-async fn dispatch_decisions(
-    ctx: &Ctx,
+fn dispatch_decisions(
     req: &OperationRequest,
-    run_id: &str,
+    work_id: &str,
+    revision_number: u64,
     started: &Value,
+    at: String,
 ) -> Result<(Value, Vec<NewWorkNote>), Failure> {
-    let event_run = run_id.to_owned();
-    let spec_event = on_ledger(&ctx.ledger, move |ledger| {
-        ledger.latest_event_of_kind(&event_run, "forged.run.spec")
-    })
-    .await?
-    .ok_or_else(|| Failure::internal("dispatched run has no frozen spec event"))?;
-    let spec_payload: Value = serde_json::from_str(&spec_event.payload_json)
-        .map_err(|error| Failure::internal(format!("stored dispatch spec event: {error}")))?;
-    let revision = spec_payload
-        .get("workRevision")
-        .or_else(|| spec_payload.get("beadRevision"))
-        .cloned()
-        .ok_or_else(|| Failure::internal("dispatched run spec has no revision"))?;
-    let revision_number = revision_number(&revision)?;
-    let work_id = spec_payload
-        .get("workId")
-        .or_else(|| spec_payload.get("beadId"))
-        .and_then(Value::as_str)
-        .ok_or_else(|| Failure::internal("dispatched run spec has no work id"))?;
+    let revision = json!(revision_number.to_string());
     let actor = dispatch_actor(&req.params)?;
     let approved_by =
         dispatch_optional_reason(&req.params, "approvedBy")?.unwrap_or_else(|| actor.clone());
@@ -672,7 +655,7 @@ async fn dispatch_decisions(
                 choice: "dispatch".to_owned(),
                 rationale: reason,
                 actor: actor.clone(),
-                at: spec_event.ts.clone(),
+                at: at.clone(),
                 cost_microusd_at_decision: None,
                 approval: None,
                 because_defaulted: None,
@@ -692,7 +675,7 @@ async fn dispatch_decisions(
             choice: "run-start-submit".to_owned(),
             rationale: basis,
             actor: approved_by,
-            at: spec_event.ts,
+            at,
             cost_microusd_at_decision: None,
             approval: Some(approval),
             because_defaulted: None,
@@ -719,29 +702,14 @@ fn dispatch_result(started: &Value, revision: Value, submission: Value) -> Value
     })
 }
 
-async fn record_dispatch_authorized(ctx: &Ctx, run_id: &str, event: Value) -> Result<(), Failure> {
-    let run_id = run_id.to_owned();
-    let operation_id = event
-        .get("operationId")
-        .and_then(Value::as_str)
-        .ok_or_else(|| Failure::internal("dispatch authorization event omitted operationId"))?
-        .to_owned();
-    on_ledger(&ctx.ledger, move |ledger| {
-        let already_recorded = ledger
-            .latest_event_of_kind(&run_id, "forged.run.dispatch.authorized")?
-            .map(|stored| {
-                serde_json::from_str::<Value>(&stored.payload_json)
-                    .map(|payload| payload.get("operationId") == Some(&json!(operation_id)))
-                    .map_err(forged_ledger::LedgerError::from)
-            })
-            .transpose()?
-            .unwrap_or(false);
-        if !already_recorded {
-            ledger.append_event(Some(&run_id), "forged.run.dispatch.authorized", event)?;
-        }
-        Ok(())
+fn queued_dispatch_submission() -> Value {
+    json!({
+        "submitted": true,
+        "phase": "queued",
+        "queued": true,
+        "alreadyRunning": false,
+        "controller": Value::Null,
     })
-    .await
 }
 
 /// `run dispatch` — validate the durable work lifecycle, freeze one execution
@@ -892,10 +860,44 @@ pub async fn run_dispatch(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
             )
         }
     };
-    let compiled = match ctx.config.compile_definition(
-        param_opt_str(&req.params, "profile"),
-        param_opt_str(&req.params, "roster"),
-    ) {
+    let profile = match param_opt_str_strict(&req.params, "profile") {
+        Ok(value) => value.map(str::to_owned),
+        Err(error) => {
+            return dispatch_remedy(
+                &req.idempotency_key,
+                error,
+                "run dispatch",
+                json!({
+                    "id": work_id,
+                    "approvedBy": approved_by,
+                    "basis": basis,
+                    "profile": Value::Null,
+                }),
+                "pass profile as a string or omit it",
+            )
+        }
+    };
+    let roster = match param_opt_str_strict(&req.params, "roster") {
+        Ok(value) => value.map(str::to_owned),
+        Err(error) => {
+            return dispatch_remedy(
+                &req.idempotency_key,
+                error,
+                "run dispatch",
+                json!({
+                    "id": work_id,
+                    "approvedBy": approved_by,
+                    "basis": basis,
+                    "roster": Value::Null,
+                }),
+                "pass roster as a string or omit it",
+            )
+        }
+    };
+    let compiled = match ctx
+        .config
+        .compile_definition(profile.as_deref(), roster.as_deref())
+    {
         Ok(compiled) => compiled,
         Err(errors) => {
             return err_response(
@@ -931,16 +933,41 @@ pub async fn run_dispatch(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
         Err(error) => return err_response(&req.idempotency_key, &error),
     }
 
-    if snapshot.status == WorkStatus::Deferred {
-        return dispatch_remedy(
-            &req.idempotency_key,
-            Failure::invalid(format!(
-                "work {work_id} is deferred and cannot be dispatched; use work reopen --reason"
-            )),
-            "work reopen",
-            json!({"id": work_id, "reason": Value::Null}),
-            "record why the deferred work is resuming before dispatching",
-        );
+    match snapshot.status {
+        WorkStatus::Deferred => {
+            return dispatch_remedy(
+                &req.idempotency_key,
+                Failure::invalid(format!(
+                    "work {work_id} is deferred and cannot be dispatched; use work reopen --reason"
+                )),
+                "work reopen",
+                json!({"id": work_id, "reason": Value::Null}),
+                "record why the deferred work is resuming before dispatching",
+            )
+        }
+        WorkStatus::Blocked => {
+            return dispatch_remedy(
+                &req.idempotency_key,
+                Failure::invalid(format!(
+                    "work {work_id} is blocked and cannot be dispatched; use work reopen"
+                )),
+                "work reopen",
+                json!({"id": work_id}),
+                "reopen the blocked work item before dispatching",
+            )
+        }
+        WorkStatus::Closed => {
+            return dispatch_remedy(
+                &req.idempotency_key,
+                Failure::invalid(format!(
+                    "work {work_id} is closed and cannot be dispatched; use work reopen"
+                )),
+                "work reopen",
+                json!({"id": work_id}),
+                "reopen the closed work item before dispatching",
+            )
+        }
+        WorkStatus::Open | WorkStatus::InProgress => {}
     }
     let attention = match all_attention(ctx).await {
         Ok(attention) => attention,
@@ -1046,12 +1073,16 @@ pub async fn run_dispatch(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
     let request_for_effect = req.clone();
     let work_for_effect = work_id.clone();
     let run_for_effect = run_id.clone();
-    fenced_dynamic_authorizing_desired(
+    let submission_for_effect = queued_dispatch_submission();
+    let revision_for_result = json!(snapshot.revision.to_string());
+    fenced(
         ctx,
         "run_dispatch",
         EffectClass::SafeRetry,
         req,
+        None,
         move |operation_id| async move {
+            let _submit_guard = submit_guard;
             let started = create_run_from_definition(
                 ctx,
                 &start_params,
@@ -1061,34 +1092,18 @@ pub async fn run_dispatch(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
                 operation_id.clone(),
                 RunProvenance {
                     first_run_revision: Some(snapshot.revision),
+                    dispatch_seal: Some(RunDispatchSeal {
+                        request: request_for_effect,
+                        submission: submission_for_effect.clone(),
+                    }),
                     ..RunProvenance::default()
                 },
             )
             .await?;
-            let (revision, notes) =
-                dispatch_decisions(ctx, &request_for_effect, run_for_effect.as_str(), &started)
-                    .await?;
-            let (submission, mut authorization) =
-                super::handoff::authorize_dispatch(ctx, run_for_effect.as_str(), &submit_guard)
-                    .await?;
-            record_dispatch_authorized(
-                ctx,
-                run_for_effect.as_str(),
-                json!({
-                    "schemaVersion": 1,
-                    "runId": run_for_effect.as_str(),
-                    "workId": started.get("bead_id"),
-                    "revision": revision,
-                    "packageSha256": started.get("package_sha256"),
-                    "operationId": operation_id,
-                    "submission": submission,
-                }),
-            )
-            .await?;
-            authorization.sealed_notes = notes;
-            Ok((
-                dispatch_result(&started, revision, submission),
-                authorization,
+            Ok(dispatch_result(
+                &started,
+                revision_for_result,
+                submission_for_effect,
             ))
         },
     )
@@ -1209,6 +1224,13 @@ pub(crate) struct RunProvenance {
     pub(crate) retry_of: Option<String>,
     pub(crate) started_from: Option<RunStartPoint>,
     pub(crate) first_run_revision: Option<i64>,
+    dispatch_seal: Option<RunDispatchSeal>,
+}
+
+#[derive(Debug)]
+struct RunDispatchSeal {
+    request: OperationRequest,
+    submission: Value,
 }
 
 async fn create_run_from_definition(
@@ -1224,6 +1246,7 @@ async fn create_run_from_definition(
         retry_of,
         started_from,
         first_run_revision,
+        dispatch_seal,
     } = provenance;
     let repo = super::work_identity::canonical_repository(param_str(params, "repo")?)?;
     let internal_protocol = match (
@@ -1383,21 +1406,9 @@ async fn create_run_from_definition(
     if let Some(started_from) = &started_from {
         payload["startedFrom"] = json!(started_from);
     }
-    let row = on_ledger(&ctx.ledger, move |ledger| match first_run_revision {
-        Some(expected_revision) => ledger.create_first_run_with_identity_at_revision(
-            new_run,
-            definition,
-            payload,
-            identity,
-            expected_revision,
-        ),
-        None => ledger.create_run_with_identity(new_run, definition, payload, identity),
-    })
-    .await?;
-    crate::failpoint::hit("run.start.bundle.after");
-    Ok(json!({
-        "run_id": row.run_id,
-        "bead_id": row.work_id,
+    let started = json!({
+        "run_id": run_id.as_str(),
+        "bead_id": work,
         "repo": repo,
         "branch": branch,
         "base_ref": base_ref,
@@ -1408,7 +1419,70 @@ async fn create_run_from_definition(
         "profile_sha256": package.profile_sha256,
         "roster_sha256": package.roster_sha256,
         "started_from": started_from,
-    }))
+    });
+    let dispatch_bundle = match dispatch_seal {
+        Some(dispatch) => {
+            let expected_revision = first_run_revision
+                .ok_or_else(|| Failure::internal("dispatch seal requires a checked revision"))?;
+            let revision_number = u64::try_from(expected_revision).map_err(|error| {
+                Failure::internal(format!("dispatch work revision is invalid: {error}"))
+            })?;
+            let (revision, notes) = dispatch_decisions(
+                &dispatch.request,
+                &work,
+                revision_number,
+                &started,
+                now_iso(),
+            )?;
+            let authorization_event = json!({
+                "schemaVersion": 1,
+                "runId": run_id.as_str(),
+                "workId": work,
+                "revision": revision,
+                "packageSha256": package_sha256,
+                "operationId": operation_id,
+                "submission": dispatch.submission,
+            });
+            Some((expected_revision, notes, authorization_event))
+        }
+        None => None,
+    };
+    let row = on_ledger(&ctx.ledger, move |ledger| {
+        if let Some((expected_revision, notes, authorization_event)) = dispatch_bundle {
+            ledger.create_first_run_with_identity_at_revision_authorizing(
+                new_run,
+                definition,
+                payload,
+                identity,
+                expected_revision,
+                0,
+                notes,
+                authorization_event,
+            )
+        } else {
+            match first_run_revision {
+                Some(expected_revision) => ledger.create_first_run_with_identity_at_revision(
+                    new_run,
+                    definition,
+                    payload,
+                    identity,
+                    expected_revision,
+                ),
+                None => ledger.create_run_with_identity(new_run, definition, payload, identity),
+            }
+        }
+    })
+    .await?;
+    crate::failpoint::hit("run.start.bundle.after");
+    debug_assert_eq!(
+        started.get("run_id").and_then(Value::as_str),
+        Some(row.run_id.as_str())
+    );
+    debug_assert_eq!(
+        started.get("bead_id").and_then(Value::as_str),
+        Some(row.work_id.as_str())
+    );
+    Ok(started)
 }
 
 const RETRY_CHAIN_LIMIT: usize = 4096;
@@ -1635,6 +1709,46 @@ pub async fn run_retry(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespon
             return err_response(
                 &derive_key("run_retry", Some(&source_id), None, None),
                 &error,
+            )
+        }
+    };
+    let profile = match param_opt_str_strict(&req.params, "profile") {
+        Ok(value) => value.map(str::to_owned),
+        Err(error) => {
+            return retry_refusal(
+                &derive_key("run_retry", Some(&source_id), None, None),
+                error,
+                action(
+                    "run retry",
+                    json!({
+                        "id": source_id,
+                        "runId": Value::Null,
+                        "because": because,
+                        "fresh": fresh,
+                        "profile": Value::Null,
+                    }),
+                    "pass profile as a string or omit it",
+                ),
+            )
+        }
+    };
+    let roster = match param_opt_str_strict(&req.params, "roster") {
+        Ok(value) => value.map(str::to_owned),
+        Err(error) => {
+            return retry_refusal(
+                &derive_key("run_retry", Some(&source_id), None, None),
+                error,
+                action(
+                    "run retry",
+                    json!({
+                        "id": source_id,
+                        "runId": Value::Null,
+                        "because": because,
+                        "fresh": fresh,
+                        "roster": Value::Null,
+                    }),
+                    "pass roster as a string or omit it",
+                ),
             )
         }
     };
@@ -1900,8 +2014,20 @@ pub async fn run_retry(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespon
     let because = param_str(&req.params, "because")
         .expect("run retry normalized because before fencing")
         .to_owned();
-    let started_from = if fresh {
-        None
+    let source_worktree = ctx.config.runs_root.join(&source_id).join("worktree");
+    let (started_from, started_from_value) = if fresh {
+        (None, json!("base"))
+    } else if source.branch.trim().is_empty() {
+        if source_worktree.exists() {
+            return retry_refusal(
+                &req.idempotency_key,
+                Failure::invalid(format!(
+                    "source run {source_id:?} has a recorded worktree but no resolvable branch"
+                )),
+                retry_fresh_action(&source_id, &because),
+            );
+        }
+        (None, json!("base"))
     } else {
         match retry_branch_start(
             &source.repo,
@@ -1912,7 +2038,12 @@ pub async fn run_retry(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespon
         )
         .await
         {
-            Ok(started_from) => started_from,
+            Ok(started_from) => {
+                let value = started_from
+                    .as_ref()
+                    .map_or_else(|| json!("base"), |start| json!(start));
+                (started_from, value)
+            }
             Err(error) => {
                 return retry_refusal(
                     &req.idempotency_key,
@@ -1922,10 +2053,10 @@ pub async fn run_retry(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespon
             }
         }
     };
-    let compiled = match ctx.config.compile_definition(
-        param_opt_str(&req.params, "profile"),
-        param_opt_str(&req.params, "roster"),
-    ) {
+    let compiled = match ctx
+        .config
+        .compile_definition(profile.as_deref(), roster.as_deref())
+    {
         Ok(compiled) => compiled,
         Err(errors) => {
             return err_response(
@@ -1951,6 +2082,7 @@ pub async fn run_retry(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespon
         .to_owned();
     let because_for_effect = because.clone();
     let started_from_for_effect = started_from.clone();
+    let started_from_value_for_effect = started_from_value.clone();
     let response = fenced_dynamic_authorizing_desired(
         ctx,
         "run_retry",
@@ -1968,6 +2100,7 @@ pub async fn run_retry(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespon
                     retry_of: Some(source_id_for_effect.clone()),
                     started_from: started_from_for_effect.clone(),
                     first_run_revision: None,
+                    dispatch_seal: None,
                 },
             )
             .await?;
@@ -2021,7 +2154,7 @@ pub async fn run_retry(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespon
                 "revision": revision,
                 "because": because_for_effect,
                 "becauseDefaulted": because_defaulted,
-                "startedFrom": started_from_for_effect,
+                "startedFrom": started_from_value_for_effect,
                 "packageSha256": started.get("package_sha256"),
                 "operationId": operation_id,
                 "submission": submitted,
@@ -2039,7 +2172,7 @@ pub async fn run_retry(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespon
                     "revision": revision,
                     "because": because_for_effect,
                     "becauseDefaulted": because_defaulted,
-                    "startedFrom": started_from_for_effect,
+                    "startedFrom": started_from_value_for_effect,
                     "packageSha256": started.get("package_sha256"),
                     "profileSha256": started.get("profile_sha256"),
                     "rosterSha256": started.get("roster_sha256"),
@@ -2164,42 +2297,47 @@ async fn recover_applied_run_dispatch(
     let Some(started) = replay_atomic_run_start(ctx, run_id, &row.operation_id).await? else {
         return Ok(None);
     };
-    let submit_guard = super::handoff::acquire_run_submit(ctx, run_id.as_str()).await?;
-    let (submission, authorization) =
-        super::handoff::authorize_dispatch(ctx, run_id.as_str(), &submit_guard).await?;
-    let (revision, notes) = dispatch_decisions(ctx, request, run_id.as_str(), &started).await?;
-    let result = dispatch_result(&started, revision, submission);
-    record_dispatch_authorized(
-        ctx,
-        run_id.as_str(),
-        json!({
-            "schemaVersion": 1,
-            "runId": run_id.as_str(),
-            "workId": started.get("bead_id"),
-            "revision": result.get("revision"),
-            "packageSha256": started.get("package_sha256"),
-            "operationId": row.operation_id,
-            "submission": result.get("submission"),
-        }),
-    )
+    let run_name = run_id.as_str().to_owned();
+    let operation_id = row.operation_id.clone();
+    let (revision, desired, authorized) = on_ledger(&ctx.ledger, move |ledger| {
+        let spec_event = ledger
+            .latest_event_of_kind(&run_name, "forged.run.spec")?
+            .ok_or_else(|| forged_ledger::LedgerError::Internal {
+                message: "dispatched run has no frozen spec event".to_owned(),
+            })?;
+        let spec_payload: Value = serde_json::from_str(&spec_event.payload_json)?;
+        let revision = spec_payload
+            .get("workRevision")
+            .or_else(|| spec_payload.get("beadRevision"))
+            .cloned()
+            .ok_or_else(|| forged_ledger::LedgerError::Internal {
+                message: "dispatched run spec has no revision".to_owned(),
+            })?;
+        let desired = ledger.get_desired_work(forged_ledger::DesiredSubjectKind::Run, &run_name)?;
+        let authorized = ledger
+            .latest_event_of_kind(&run_name, "forged.run.dispatch.authorized")?
+            .map(|event| serde_json::from_str::<Value>(&event.payload_json))
+            .transpose()?
+            .is_some_and(|payload| {
+                payload.get("operationId").and_then(Value::as_str) == Some(operation_id.as_str())
+            });
+        Ok((revision, desired, authorized))
+    })
     .await?;
+    if desired.is_none() || !authorized {
+        return Err(Failure::internal(
+            "atomic dispatch run is missing its desired authorization seal",
+        ));
+    }
+    let submission = queued_dispatch_submission();
+    let result = dispatch_result(&started, revision, submission);
     let response = ok_response(&row.operation_id, false, result);
     let operation_id = row.operation_id;
     let stored = response.clone();
-    let desired_id = authorization.id;
-    crate::failpoint::hit("submit.desired.before");
     on_ledger(&ctx.ledger, move |ledger| {
-        ledger.resolve_interrupted_operation_authorizing_desired_with_notes(
-            &operation_id,
-            &stored,
-            authorization.kind,
-            &desired_id,
-            authorization.generation,
-            notes,
-        )
+        ledger.resolve_interrupted_operation(&operation_id, &stored)
     })
     .await?;
-    crate::failpoint::hit("submit.desired.after");
     let mut replayed = response;
     replayed.reused = true;
     Ok(Some(replayed))
@@ -2471,6 +2609,7 @@ pub(crate) async fn run_provenance(ctx: &Ctx, run_id: &str) -> Result<RunProvena
         retry_of,
         started_from,
         first_run_revision: None,
+        dispatch_seal: None,
     })
 }
 
@@ -5357,13 +5496,10 @@ fn operations_claim_health(entry: &Value) -> Value {
 
 fn operations_next_action(entry: &Value) -> Value {
     match entry.get("queueGroup").and_then(Value::as_str) {
-        Some("Planned") => {
-            if entry.get("source").and_then(Value::as_str) == Some("live-plan") {
-                json!("run start")
-            } else {
-                json!("run submit")
-            }
+        Some("Planned") if entry.get("source").and_then(Value::as_str) == Some("live-plan") => {
+            json!("run dispatch")
         }
+        Some("Planned") => entry.get("nextAction").cloned().unwrap_or(Value::Null),
         Some("Stalled or recoverable") => json!("verify controller, then resubmit"),
         _ => entry.get("nextAction").cloned().unwrap_or(Value::Null),
     }

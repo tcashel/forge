@@ -106,7 +106,6 @@ fn an_open_work_item_points_to_work_show_and_existing_work_actions() {
         result(&response)["what"]["show"],
         json!({"verb": "work show", "args": {"id": "explain-work"}})
     );
-    assert_next(&response, "run start");
     assert_next(&response, "work update");
 }
 

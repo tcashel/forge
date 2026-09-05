@@ -136,7 +136,7 @@ fn require_token_tx(
     Ok(row)
 }
 
-fn authorize_tx(
+pub(crate) fn authorize_tx(
     conn: &Connection,
     kind: DesiredSubjectKind,
     id: &str,

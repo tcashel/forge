@@ -243,6 +243,9 @@ fn flat_envelope(
         }
     }
     for key in ["profile", "roster", "runId", "baseRef"] {
+        if matches!(name, "run_dispatch" | "run_retry") && matches!(key, "profile" | "roster") {
+            continue;
+        }
         match params.get(key) {
             None | Some(Value::Null | Value::String(_)) => {}
             Some(other) => {

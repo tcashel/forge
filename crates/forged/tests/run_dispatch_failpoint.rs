@@ -1,8 +1,8 @@
 #![cfg(feature = "failpoints")]
 
-//! Crash recovery for the one-verb dispatch fence. A crash on either side of
-//! desired authorization must converge to one run, one desired row, and one
-//! approval note.
+//! Crash recovery for the one-verb dispatch fence. The run, desired row, and
+//! approval note are one atomic bundle even when the process dies before the
+//! operation response is sealed.
 
 mod support;
 
@@ -12,9 +12,11 @@ use forged_ledger::{DesiredSubjectKind, WorkNoteKind};
 use serde_json::{json, Value};
 use support::TestEnv;
 
+const DISPATCH_CRASH_POINTS: &[&str] = &["run.start.bundle.after"];
+
 #[test]
-fn dispatch_crash_windows_resume_without_duplicate_approval_notes() {
-    for point in ["submit.desired.before", "submit.desired.after"] {
+fn dispatch_crash_after_atomic_bundle_resumes_without_duplicate_approval_notes() {
+    for &point in DISPATCH_CRASH_POINTS {
         let label = point.replace('.', "-");
         let env = TestEnv::new(&format!("km-run-dispatch-{label}"));
         assert_eq!(env.forged(&["init"]).0, 0);
@@ -53,17 +55,19 @@ fn dispatch_crash_windows_resume_without_duplicate_approval_notes() {
 
         let ledger = env.ledger();
         ledger.get_run(&work_id).expect("run effect committed");
-        if point.ends_with("before") {
-            assert!(ledger
-                .get_desired_work(DesiredSubjectKind::Run, &work_id)
-                .expect("desired lookup")
-                .is_none());
-            assert!(ledger
+        assert!(ledger
+            .get_desired_work(DesiredSubjectKind::Run, &work_id)
+            .expect("desired lookup")
+            .is_some());
+        assert_eq!(
+            ledger
                 .list_work_notes(&work_id, Some(WorkNoteKind::Decision), 100)
                 .expect("notes lookup")
                 .notes
-                .is_empty());
-        }
+                .len(),
+            2,
+            "the override and approval commit with the run"
+        );
         ledger.close().expect("close ledger");
 
         let (code, resumed) = env.forged(&args);
