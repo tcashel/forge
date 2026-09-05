@@ -885,6 +885,20 @@ check_handoff_block() {
   ' "$1"
 }
 
+check_fenced_command() {
+  awk -v verb="$2" '
+    function invokes(line, tail) {
+      sub(/^[[:space:]]+/, "", line)
+      if (index(line, verb) != 1) return 0
+      tail = substr(line, length(verb) + 1, 1)
+      return tail == "" || tail ~ /[[:space:]]/
+    }
+    /^[[:space:]]*```/ { fenced = !fenced; next }
+    fenced && invokes($0) { found = 1 }
+    END { exit !found }
+  ' "$1"
+}
+
 check_reconnect_surface() {
   local path=$1
   shift
@@ -1132,8 +1146,8 @@ for path in "${legacy[@]}"; do
   [[ ! -e "$path" ]] && pass "legacy path absent: $path" || fail "legacy path absent: $path"
 done
 
-check "slice handoff start then submit" check_handoff_block \
-  "$plugin/skills/dispatch/SKILL.md" "forged run start" "forged run submit"
+check "slice handoff dispatch" check_fenced_command \
+  "$plugin/skills/dispatch/SKILL.md" "forged run dispatch"
 check "epic handoff start then submit" check_handoff_block \
   "$plugin/skills/run-epic/SKILL.md" "forged epic start" "forged epic submit"
 check "slice reconnect command surface" check_reconnect_surface \

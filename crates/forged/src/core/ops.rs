@@ -824,7 +824,14 @@ pub async fn run_dispatch(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
         }
     };
     let revision = snapshot.revision.to_string();
-    let epoch = match super::released_retry_seq(ctx, &work_id, "run_dispatch").await {
+    let epoch = match super::released_retry_seq_staged(
+        ctx,
+        &work_id,
+        "run_dispatch",
+        Some(&revision),
+    )
+    .await
+    {
         Ok(epoch) => epoch,
         Err(error) => {
             return err_response(
@@ -906,6 +913,11 @@ pub async fn run_dispatch(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
         Value::String(compiled.package_sha256.clone()),
     );
 
+    match recover_applied_run_dispatch(ctx, req, &run_id).await {
+        Ok(Some(response)) => return response,
+        Ok(None) => {}
+        Err(error) => return err_response(&req.idempotency_key, &error),
+    }
     let replay = {
         let request = req.clone();
         on_ledger(&ctx.ledger, move |ledger| {
@@ -914,11 +926,6 @@ pub async fn run_dispatch(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
         .await
     };
     match replay {
-        Ok(Some(response)) => return response,
-        Ok(None) => {}
-        Err(error) => return err_response(&req.idempotency_key, &error),
-    }
-    match recover_applied_run_dispatch(ctx, req, &run_id).await {
         Ok(Some(response)) => return response,
         Ok(None) => {}
         Err(error) => return err_response(&req.idempotency_key, &error),
@@ -1052,7 +1059,10 @@ pub async fn run_dispatch(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
                 run_for_effect.clone(),
                 compiled,
                 operation_id.clone(),
-                RunProvenance::default(),
+                RunProvenance {
+                    first_run_revision: Some(snapshot.revision),
+                    ..RunProvenance::default()
+                },
             )
             .await?;
             let (revision, notes) =
@@ -1198,6 +1208,7 @@ pub(crate) async fn dispatch_frontier_run(
 pub(crate) struct RunProvenance {
     pub(crate) retry_of: Option<String>,
     pub(crate) started_from: Option<RunStartPoint>,
+    pub(crate) first_run_revision: Option<i64>,
 }
 
 async fn create_run_from_definition(
@@ -1212,6 +1223,7 @@ async fn create_run_from_definition(
     let RunProvenance {
         retry_of,
         started_from,
+        first_run_revision,
     } = provenance;
     let repo = super::work_identity::canonical_repository(param_str(params, "repo")?)?;
     let internal_protocol = match (
@@ -1371,8 +1383,15 @@ async fn create_run_from_definition(
     if let Some(started_from) = &started_from {
         payload["startedFrom"] = json!(started_from);
     }
-    let row = on_ledger(&ctx.ledger, move |ledger| {
-        ledger.create_run_with_identity(new_run, definition, payload, identity)
+    let row = on_ledger(&ctx.ledger, move |ledger| match first_run_revision {
+        Some(expected_revision) => ledger.create_first_run_with_identity_at_revision(
+            new_run,
+            definition,
+            payload,
+            identity,
+            expected_revision,
+        ),
+        None => ledger.create_run_with_identity(new_run, definition, payload, identity),
     })
     .await?;
     crate::failpoint::hit("run.start.bundle.after");
@@ -1527,7 +1546,9 @@ async fn retry_branch_start(
                 "source branch {branch:?} has a worktree but no resolvable ref"
             )));
         }
-        return Ok(None);
+        return Err(Failure::invalid(format!(
+            "source branch {branch:?} has no resolvable ref"
+        )));
     }
 
     let mut resolved = None;
@@ -1946,6 +1967,7 @@ pub async fn run_retry(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespon
                 RunProvenance {
                     retry_of: Some(source_id_for_effect.clone()),
                     started_from: started_from_for_effect.clone(),
+                    first_run_revision: None,
                 },
             )
             .await?;
@@ -2448,6 +2470,7 @@ pub(crate) async fn run_provenance(ctx: &Ctx, run_id: &str) -> Result<RunProvena
     Ok(RunProvenance {
         retry_of,
         started_from,
+        first_run_revision: None,
     })
 }
 

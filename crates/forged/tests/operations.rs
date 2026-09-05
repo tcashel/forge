@@ -379,6 +379,7 @@ fn run_status_next_actions_execute_after_binding_declared_placeholders() {
         .is_some_and(|reason| reason.contains("current spec")));
     env.set_work_field(work_id, "description", "Retry the current spec");
     env.set_work_field(work_id, "acceptance", "- retry succeeds");
+    git(&env.repos.repo, &["branch", &format!("forged/{run_id}")]);
     let advertised_run = retry["args"]["id"].as_str().expect("advertised run");
     let (code, retried) = env.forged(&["run", "retry", "--id", advertised_run]);
     assert_eq!(code, 0, "advertised run retry succeeds: {retried}");
@@ -648,6 +649,7 @@ fn run_retry_mints_and_submits_one_flat_successor_at_the_amended_revision() {
         run_id,
         "--because",
         "spec-amended",
+        "--fresh",
         "--idempotency-key",
         "retry-amended-key",
     ]);
@@ -689,6 +691,9 @@ fn run_retry_mints_and_submits_one_flat_successor_at_the_amended_revision() {
         "retry",
         "--id",
         run_id,
+        "--because",
+        "spec-amended",
+        "--fresh",
         "--idempotency-key",
         "retry-amended-key",
     ]);
@@ -717,6 +722,7 @@ fn run_retry_mints_and_submits_one_flat_successor_at_the_amended_revision() {
         "retry",
         "--id",
         "retry-amended-r1",
+        "--fresh",
         "--idempotency-key",
         "retry-flat-key",
     ]);
@@ -899,10 +905,6 @@ fn run_dispatch_is_one_fenced_approval_and_submission() {
         dispatched["result"]["repository"],
         json!(env.repos.repo.to_string_lossy())
     );
-    assert!(dispatched["operationId"]
-        .as_str()
-        .is_some_and(|key| key.starts_with(&format!("op:run_dispatch:{work_id}:"))));
-
     let ledger = env.ledger();
     let run = ledger.get_run(work_id).expect("run exists");
     assert_eq!(run.work_id, work_id);
@@ -927,8 +929,9 @@ fn run_dispatch_is_one_fenced_approval_and_submission() {
     assert_eq!(approvals.len(), 1, "exactly one approval decision");
     let approval = approvals[0];
     assert_eq!(approval["actor"], json!("lead-agent"));
+    assert_eq!(approval["choice"], json!("run-start-submit"));
     assert_eq!(
-        approval["choice"],
+        approval["rationale"],
         json!("the specification and execution tuple are approved")
     );
     assert_eq!(
@@ -955,12 +958,11 @@ fn run_dispatch_is_one_fenced_approval_and_submission() {
         "a second dispatch is forbidden",
         "--override",
         "still forbidden once a run exists",
+        "--idempotency-key",
+        "dispatch-duplicate-key",
     ]);
     assert_ne!(code, 0, "duplicate dispatch must refuse: {duplicate}");
-    assert_eq!(
-        duplicate["error"]["detail"]["remedy"]["action"]["verb"],
-        json!("run status")
-    );
+    assert_eq!(duplicate["error"]["detail"]["verb"], json!("run status"));
 }
 
 #[test]

@@ -612,6 +612,36 @@ impl Ledger {
         spec_event: serde_json::Value,
         identity: WorkIdentityV1,
     ) -> Result<RunRow, LedgerError> {
+        self.create_run_with_identity_guarded(new_run, definition, spec_event, identity, None)
+    }
+
+    /// Atomically create the first run for one work item only when its current
+    /// revision is the revision whose lifecycle the caller authorized.
+    pub fn create_first_run_with_identity_at_revision(
+        &self,
+        new_run: NewRun,
+        definition: NewRunDefinition,
+        spec_event: serde_json::Value,
+        identity: WorkIdentityV1,
+        expected_work_revision: i64,
+    ) -> Result<RunRow, LedgerError> {
+        self.create_run_with_identity_guarded(
+            new_run,
+            definition,
+            spec_event,
+            identity,
+            Some(expected_work_revision),
+        )
+    }
+
+    fn create_run_with_identity_guarded(
+        &self,
+        new_run: NewRun,
+        definition: NewRunDefinition,
+        spec_event: serde_json::Value,
+        identity: WorkIdentityV1,
+        first_run_revision: Option<i64>,
+    ) -> Result<RunRow, LedgerError> {
         self.submit(move |conn| {
             identity.validate_for_storage().map_err(|error| {
                 refused(
@@ -719,6 +749,46 @@ impl Ledger {
                 .transpose()?;
 
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if let Some(expected_revision) = first_run_revision {
+                let current_revision = tx
+                    .query_row(
+                        "SELECT current_revision FROM work_items WHERE work_id = ?1",
+                        [&new_run.work_id],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .optional()?;
+                let Some(current_revision) = current_revision else {
+                    return Err(refused(
+                        ErrorCode::InvalidRequest,
+                        format!("work item {:?} does not exist", new_run.work_id),
+                    ));
+                };
+                if current_revision != expected_revision {
+                    return Err(refused(
+                        ErrorCode::WorkContention,
+                        format!(
+                            "work item {:?} revision moved: expected {expected_revision}, current {current_revision}",
+                            new_run.work_id
+                        ),
+                    ));
+                }
+                let existing_run = tx
+                    .query_row(
+                        "SELECT run_id FROM runs WHERE bead_id = ?1 ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                        [&new_run.work_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?;
+                if let Some(existing_run) = existing_run {
+                    return Err(refused(
+                        ErrorCode::WorkContention,
+                        format!(
+                            "work item {:?} already has run {existing_run:?}",
+                            new_run.work_id
+                        ),
+                    ));
+                }
+            }
             let run_id = new_run.run_id.as_str();
             let existing = {
                 let sql = format!("SELECT {RUN_COLUMNS} FROM runs WHERE run_id = ?1");
