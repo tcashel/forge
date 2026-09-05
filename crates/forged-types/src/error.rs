@@ -39,13 +39,16 @@ pub enum ErrorCode {
     AdjudicationRequired,
     /// `work ready --all` cannot return more than the bounded frontier cap.
     FrontierTooLarge,
+    /// A provider-seat command did not carry the running attempt's exact
+    /// identity and claim token.
+    SeatFence,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const ALL: [(ErrorCode, &str); 21] = [
+    const ALL: [(ErrorCode, &str); 22] = [
         (ErrorCode::InvalidRequest, "INVALID_REQUEST"),
         (ErrorCode::RunNotFound, "RUN_NOT_FOUND"),
         (ErrorCode::PacketNotClaimable, "PACKET_NOT_CLAIMABLE"),
@@ -70,11 +73,12 @@ mod tests {
         (ErrorCode::Internal, "INTERNAL"),
         (ErrorCode::AdjudicationRequired, "ADJUDICATION_REQUIRED"),
         (ErrorCode::FrontierTooLarge, "FRONTIER_TOO_LARGE"),
+        (ErrorCode::SeatFence, "SEAT_FENCE"),
     ];
 
     #[test]
-    fn serializes_to_exactly_the_twenty_one_screaming_snake_strings() {
-        assert_eq!(ALL.len(), 21);
+    fn serializes_to_exactly_the_twenty_two_screaming_snake_strings() {
+        assert_eq!(ALL.len(), 22);
         for (code, expected) in ALL {
             let json = serde_json::to_value(code).expect("serializes");
             assert_eq!(json, serde_json::Value::String(expected.to_owned()));

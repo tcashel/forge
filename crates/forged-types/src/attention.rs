@@ -37,6 +37,12 @@ pub enum AttentionCondition {
     /// A stage was deadline-killed past its relaunch budget; the worktree
     /// may still carry the seat's work.
     DeadlineExhausted,
+    /// A delivered required message has not been acknowledged in time, or
+    /// the addressed attempt ended before delivery.
+    AckOverdue,
+    /// A running attempt is past half budget without a recent progress
+    /// snapshot.
+    SlowStage,
     ProviderDegraded,
     AdmissionDeferred,
     AmbiguousEffect,
@@ -102,6 +108,8 @@ pub enum AttentionActionCode {
     /// worktree: retry when the tree is clean, steer the next attempt when
     /// it is not.
     ResumeSeat,
+    /// Contact the running provider seat through durable direct mail.
+    MessageSeat,
     WaitForProvider,
     WaitForCapacity,
     AdjudicateEffect,

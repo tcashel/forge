@@ -1,12 +1,10 @@
 //! Durable provider-session observation and intervention. Herdr is an
 //! execution/visibility adapter; the ledger event stream remains truth.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
-use forged_ledger::{AttemptState, EffectClass, RevokeScope};
-use forged_types::{
-    Capability, OperationRequest, OperationResponse, WorkIdentitySubjectKind, WorkPacket,
-};
+use forged_ledger::{EffectClass, RevokeScope};
+use forged_types::{OperationRequest, OperationResponse, WorkIdentitySubjectKind};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -19,17 +17,6 @@ use crate::core::{
 
 const SESSION_STARTED: &str = "forged.session.started";
 const HOST_FALLBACK: &str = "forged.host.fallback";
-const INTERVENTION_QUEUED: &str = "forged.intervention.queued";
-const INTERVENTION_DELIVERED: &str = "forged.intervention.delivered";
-const INTERVENTION_LIVE_FAILED: &str = "forged.intervention.live_failed";
-
-/// One queued intervention not yet delivered live or at a packet boundary.
-#[derive(Debug, Clone)]
-pub(crate) struct PendingIntervention {
-    pub id: String,
-    pub message: String,
-    pub requested_by: String,
-}
 
 #[derive(Debug, Clone)]
 struct SessionRecord {
@@ -61,7 +48,10 @@ fn event_payload(row: &forged_ledger::EventRow) -> Option<Value> {
     serde_json::from_str(&row.payload_json).ok()
 }
 
-async fn run_events(ctx: &Ctx, run_id: &str) -> Result<Vec<forged_ledger::EventRow>, Failure> {
+pub(crate) async fn run_events(
+    ctx: &Ctx,
+    run_id: &str,
+) -> Result<Vec<forged_ledger::EventRow>, Failure> {
     let run_id = run_id.to_owned();
     on_ledger(&ctx.ledger, move |ledger| {
         ledger.list_events(Some(&run_id), 0, 16_384)
@@ -182,65 +172,9 @@ pub(crate) async fn record_host_fallback(
 }
 
 /// Pending interventions in ledger order.
-pub(crate) async fn pending_interventions(
-    ctx: &Ctx,
-    run_id: &str,
-) -> Result<Vec<PendingIntervention>, Failure> {
+async fn pending_message_count(ctx: &Ctx, run_id: &str) -> Result<usize, Failure> {
     let events = run_events(ctx, run_id).await?;
-    let delivered: BTreeSet<String> = events
-        .iter()
-        .filter(|row| row.kind == INTERVENTION_DELIVERED)
-        .filter_map(event_payload)
-        .filter_map(|payload| payload.get("interventionId")?.as_str().map(str::to_owned))
-        .collect();
-    let mut queued = BTreeMap::new();
-    for row in events.iter().filter(|row| row.kind == INTERVENTION_QUEUED) {
-        let Some(payload) = event_payload(row) else {
-            continue;
-        };
-        let (Some(id), Some(message), Some(requested_by)) = (
-            payload.get("interventionId").and_then(Value::as_str),
-            payload.get("message").and_then(Value::as_str),
-            payload.get("requestedBy").and_then(Value::as_str),
-        ) else {
-            continue;
-        };
-        if !delivered.contains(id) {
-            queued.entry(row.event_id).or_insert(PendingIntervention {
-                id: id.to_owned(),
-                message: message.to_owned(),
-                requested_by: requested_by.to_owned(),
-            });
-        }
-    }
-    Ok(queued.into_values().collect())
-}
-
-/// Record successful delivery after the provider/pane accepted it.
-pub(crate) async fn record_interventions_delivered(
-    ctx: &Ctx,
-    run_id: &str,
-    packet_id: &str,
-    attempt_id: i64,
-    interventions: &[PendingIntervention],
-    mode: &str,
-) -> Result<(), Failure> {
-    for intervention in interventions {
-        let run_id = run_id.to_owned();
-        let payload = json!({
-            "schemaVersion": 1,
-            "interventionId": intervention.id,
-            "packetId": packet_id,
-            "attemptId": attempt_id,
-            "mode": mode,
-        });
-        on_ledger(&ctx.ledger, move |ledger| {
-            ledger.append_event_once(&run_id, INTERVENTION_DELIVERED, payload)?;
-            Ok(())
-        })
-        .await?;
-    }
-    Ok(())
+    Ok(super::seat::pending_messages(&events).len())
 }
 
 fn param_attempt(params: &serde_json::Map<String, Value>) -> Result<i64, Failure> {
@@ -436,7 +370,7 @@ pub async fn session_list(ctx: &Ctx, req: &OperationRequest) -> OperationRespons
                                 eligible: 0,
                             });
                     let truncated = count.eligible > shown as u64;
-                    let pending = pending_interventions(ctx, &run_id).await?;
+                    let pending = pending_message_count(ctx, &run_id).await?;
                     let subject = super::work_identity::projection_subject(
                         identity,
                         forged_types::ProjectionSubjectKind::Run,
@@ -448,7 +382,7 @@ pub async fn session_list(ctx: &Ctx, req: &OperationRequest) -> OperationRespons
                         "runId": run_id,
                         "identity": identity,
                         "sessions": child_sessions,
-                        "pendingInterventions": pending.len(),
+                        "pendingInterventions": pending,
                         "coverage": {
                             "shown": shown,
                             "total": count.total,
@@ -506,7 +440,7 @@ pub async fn session_list(ctx: &Ctx, req: &OperationRequest) -> OperationRespons
         for record in records {
             sessions.push(session_json(ctx, &identity, record).await?);
         }
-        let pending = pending_interventions(ctx, &run_id).await?;
+        let pending = pending_message_count(ctx, &run_id).await?;
         let shown = sessions.len();
         let subject = super::work_identity::projection_subject(
             &identity,
@@ -519,7 +453,7 @@ pub async fn session_list(ctx: &Ctx, req: &OperationRequest) -> OperationRespons
             "runId": run_id,
             "identity": identity,
             "sessions": sessions,
-            "pendingInterventions": pending.len(),
+            "pendingInterventions": pending,
             "coverage": {
                 "shown": shown,
                 "total": total,
@@ -571,32 +505,14 @@ pub async fn session_read(ctx: &Ctx, req: &OperationRequest) -> OperationRespons
     .await
 }
 
-async fn interactive_capability(ctx: &Ctx, run_id: &str, attempt_id: i64) -> Result<bool, Failure> {
-    let view = super::drive::project(ctx, run_id).await?;
-    let attempt = on_ledger(&ctx.ledger, move |ledger| ledger.get_attempt(attempt_id)).await?;
-    let packet: WorkPacket = super::drive::stored_packet_for_attempt(&view, &attempt.packet_id)?;
-    let (Some(package), Some(execution)) = (&view.execution_package, &packet.execution) else {
-        return Ok(false);
+fn message_key(run_id: &str, message: &str, kind: &str, reply_to: Option<&str>) -> String {
+    let digest = if kind == "instruction" && reply_to.is_none() {
+        // Preserve the v0.7 operation identity for the pre-existing call.
+        Sha256::digest(message.as_bytes())
+    } else {
+        let key_material = json!({"body": message, "kind": kind, "replyTo": reply_to});
+        Sha256::digest(forged_types::canonical_json_bytes(&key_material).unwrap_or_default())
     };
-    Ok(package
-        .roster
-        .roles
-        .get(&execution.role_id)
-        .into_iter()
-        .flatten()
-        .find(|candidate| {
-            candidate.provider == packet.provider_hints.provider
-                && candidate.model == packet.provider_hints.model
-        })
-        .is_some_and(|candidate| {
-            candidate
-                .capabilities
-                .contains(&Capability::InteractiveMessaging)
-        }))
-}
-
-fn message_key(run_id: &str, message: &str) -> String {
-    let digest = Sha256::digest(message.as_bytes());
     let short = digest[..8]
         .iter()
         .map(|byte| format!("{byte:02x}"))
@@ -604,8 +520,8 @@ fn message_key(run_id: &str, message: &str) -> String {
     derive_key("session_message", Some(run_id), Some(&short), None)
 }
 
-/// `session message` — queue first, then deliver live only when both the
-/// roster capability and durable Herdr session say that is honest.
+/// `session message` — append one direct lead instruction. Hook-live
+/// delivery remains a later capability; this operation always queues.
 pub async fn session_message(ctx: &Ctx, req: &mut OperationRequest) -> OperationResponse {
     let run_id = match param_str(&req.params, "run") {
         Ok(value) => value.to_owned(),
@@ -628,12 +544,33 @@ pub async fn session_message(ctx: &Ctx, req: &mut OperationRequest) -> Operation
             )
         }
     };
-    default_key(req, message_key(&run_id, &message));
+    let params = req.params.clone();
+    let kind = param_opt_str(&params, "kind")
+        .unwrap_or("instruction")
+        .to_owned();
+    if kind != "instruction" {
+        return err_response(
+            &derive_key("session_message", Some(&run_id), None, None),
+            &Failure::invalid("session message kind must be instruction"),
+        );
+    }
+    let reply_to = param_opt_str(&params, "replyTo").map(str::to_owned);
+    default_key(
+        req,
+        message_key(&run_id, &message, &kind, reply_to.as_deref()),
+    );
     if req.run_id.is_none() {
         req.run_id = Some(run_id.clone());
     }
-    let params = req.params.clone();
     let target_attempt = params.get("attempt").and_then(Value::as_i64);
+    let urgent = params
+        .get("urgent")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let ack_required = params
+        .get("ackRequired")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let requested_by = param_opt_str(&params, "requestedBy")
         .unwrap_or("operator")
         .to_owned();
@@ -663,104 +600,39 @@ pub async fn session_message(ctx: &Ctx, req: &mut OperationRequest) -> Operation
                 };
                 on_ledger(&ctx.ledger, {
                     let run_id = run_id.clone();
-                    let intervention_id = operation_id.clone();
+                    let message_id = operation_id.clone();
                     let queued_message = message.clone();
                     let queued_by = requested_by.clone();
+                    let packet_id = attempt.as_ref().map(|attempt| attempt.packet_id.clone());
+                    let to = target_attempt.map_or_else(
+                        || json!({"kind": "run", "id": run_id}),
+                        |attempt| json!({"kind": "attempt", "id": attempt}),
+                    );
+                    let kind = kind.clone();
+                    let reply_to = reply_to.clone();
                     move |ledger| {
                         ledger.get_run(&run_id)?;
                         ledger.append_event_once(
                             &run_id,
-                            INTERVENTION_QUEUED,
+                            super::seat::MESSAGE_QUEUED,
                             json!({
                                 "schemaVersion": 1,
-                                "interventionId": intervention_id,
-                                "message": queued_message,
-                                "requestedBy": queued_by,
-                                "targetAttemptId": target_attempt,
+                                "messageId": message_id,
+                                "from": {"kind": "lead", "id": queued_by},
+                                "to": to,
+                                "packetId": packet_id,
+                                "kind": kind,
+                                "importance": if urgent { "urgent" } else { "normal" },
+                                "ackRequired": ack_required,
+                                "inReplyTo": reply_to,
+                                "body": queued_message,
                             }),
                         )?;
                         Ok(())
                     }
                 })
                 .await?;
-
-                let Some(attempt) = attempt else {
-                    return Ok(json!({"interventionId": operation_id, "delivery": "queued"}));
-                };
-                let attempt_id = attempt.attempt_id;
-                if attempt.state != AttemptState::Running
-                    || !interactive_capability(ctx, &run_id, attempt_id).await?
-                {
-                    return Ok(json!({"interventionId": operation_id, "delivery": "queued"}));
-                }
-                let events = run_events(ctx, &run_id).await?;
-                let record = session_records(&events)
-                    .into_iter()
-                    .rev()
-                    .find(|record| record.attempt_id == attempt_id);
-                let Some(record) = record.filter(|record| record.host == "herdr") else {
-                    return Ok(json!({"interventionId": operation_id, "delivery": "queued"}));
-                };
-                let Some(socket) = record.socket_path else {
-                    return Ok(json!({"interventionId": operation_id, "delivery": "queued"}));
-                };
-                let control = match forged_host::HerdrControl::connect(&socket).await {
-                    Ok(control) => control,
-                    Err(error) => {
-                        let run = run_id.clone();
-                        let detail = error.to_string();
-                        let intervention_id = operation_id.clone();
-                        on_ledger(&ctx.ledger, move |ledger| {
-                            ledger.append_event_once(
-                                &run,
-                                INTERVENTION_LIVE_FAILED,
-                                json!({
-                                    "schemaVersion": 1,
-                                    "interventionId": intervention_id,
-                                    "attemptId": attempt_id,
-                                    "reason": detail,
-                                }),
-                            )?;
-                            Ok(())
-                        })
-                        .await?;
-                        return Ok(json!({"interventionId": operation_id, "delivery": "queued"}));
-                    }
-                };
-                if let Err(error) = control.send_message(&record.session_id, &message).await {
-                    let run = run_id.clone();
-                    let detail = error.to_string();
-                    let intervention_id = operation_id.clone();
-                    on_ledger(&ctx.ledger, move |ledger| {
-                        ledger.append_event_once(
-                            &run,
-                            INTERVENTION_LIVE_FAILED,
-                            json!({
-                                "schemaVersion": 1,
-                                "interventionId": intervention_id,
-                                "attemptId": attempt_id,
-                                "reason": detail,
-                            }),
-                        )?;
-                        Ok(())
-                    })
-                    .await?;
-                    return Ok(json!({"interventionId": operation_id, "delivery": "queued"}));
-                }
-                record_interventions_delivered(
-                    ctx,
-                    &run_id,
-                    &attempt.packet_id,
-                    attempt_id,
-                    &[PendingIntervention {
-                        id: operation_id.clone(),
-                        message,
-                        requested_by,
-                    }],
-                    "live",
-                )
-                .await?;
-                Ok(json!({"interventionId": operation_id, "delivery": "live"}))
+                Ok(json!({"messageId": operation_id, "delivery": "queued"}))
             }
         },
     )

@@ -1088,6 +1088,7 @@ pub(crate) async fn subject_attention(
         &decoded.results,
         &title,
         live_work.as_ref(),
+        ctx.config.ack_window_s,
     )
 }
 
@@ -2433,6 +2434,7 @@ async fn project_work_detail(
         &decoded.results,
         &title_source,
         live_work.as_ref(),
+        ctx.config.ack_window_s,
     )?
     .into_iter()
     .map(|item| {

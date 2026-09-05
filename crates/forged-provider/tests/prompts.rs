@@ -152,6 +152,16 @@ fn render_succeeds_for_all_three_stages() {
         !flattened.contains("BEFORE your first commit"),
         "no baseline instruction: {implement}"
     );
+    for command in ["seat inbox", "seat ack", "seat progress", "seat note"] {
+        assert!(
+            flattened.contains(command),
+            "implement prompt names {command}: {implement}"
+        );
+    }
+    assert!(
+        flattened.contains("before every seat-check run, after every commit, and whenever blocked for more than five minutes"),
+        "implement prompt names the mail discipline points: {implement}"
+    );
 
     let review = templates
         .render(PromptStage::Review, &review_context())
@@ -176,6 +186,11 @@ fn render_succeeds_for_all_three_stages() {
         .expect("fix renders");
     assert!(fix.contains("[BLOCKER] src/lib.rs:10 — seam violated"));
     assert!(fix.contains("[HIGH] ? — unchecked exit"));
+    let flattened_fix = fix.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flattened_fix.contains("before every seat-check run, after every commit, and whenever blocked for more than five minutes"),
+        "fix prompt names the mail discipline points: {fix}"
+    );
     let listed = fix.matches("  - [").count();
     assert_eq!(listed, 2, "fix lists exactly the findings it was given");
 }

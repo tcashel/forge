@@ -548,6 +548,46 @@
       "name": "run_submit"
     },
     {
+      "audience": "machine",
+      "class": "fenced",
+      "cli": true,
+      "cliVerb": "seat ack",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": true,
+      "name": "seat_ack"
+    },
+    {
+      "audience": "machine",
+      "class": "fenced",
+      "cli": true,
+      "cliVerb": "seat inbox",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": true,
+      "name": "seat_inbox"
+    },
+    {
+      "audience": "machine",
+      "class": "fenced",
+      "cli": true,
+      "cliVerb": "seat note",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": true,
+      "name": "seat_note"
+    },
+    {
+      "audience": "machine",
+      "class": "fenced",
+      "cli": true,
+      "cliVerb": "seat progress",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": true,
+      "name": "seat_progress"
+    },
+    {
       "class": null,
       "cli": true,
       "cliVerb": "service install",

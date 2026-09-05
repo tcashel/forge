@@ -72,6 +72,12 @@ pub enum Command {
         #[command(subcommand)]
         command: SessionCmd,
     },
+    /// Attempt-fenced provider-seat messaging and progress.
+    Seat {
+        /// The seat subcommand.
+        #[command(subcommand)]
+        command: SeatCmd,
+    },
     /// Resume a ledger run or claim the next ready work (explicit
     /// idempotency key required).
     ClaimNext(ClaimNextArgs),
@@ -960,15 +966,115 @@ pub struct SessionMessageArgs {
     /// Run receiving the intervention.
     #[arg(long)]
     pub run: String,
-    /// Live attempt to target when interactive delivery is supported.
+    /// Exact attempt to receive this direct message.
     #[arg(long)]
     pub attempt: Option<i64>,
-    /// Message delivered live or at the next durable provider boundary.
+    /// Mark the instruction urgent without interrupting the provider turn.
+    #[arg(long)]
+    pub urgent: bool,
+    /// Require the receiving seat to acknowledge this message.
+    #[arg(long)]
+    pub ack_required: bool,
+    /// Message identity this instruction replies to.
+    #[arg(long)]
+    pub reply_to: Option<String>,
+    /// Closed lead message kind (instruction in this release).
+    #[arg(long, value_enum, default_value_t = LeadMessageKindArg::Instruction)]
+    pub kind: LeadMessageKindArg,
+    /// Direct instruction body (maximum 16 KiB).
     #[arg(long)]
     pub message: String,
     /// Human or agent identity requesting the intervention.
     #[arg(long, default_value = "operator")]
     pub requested_by: String,
+    /// Override the derived idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+/// Lead-originated message kinds available in this slice.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum LeadMessageKindArg {
+    Instruction,
+}
+
+impl LeadMessageKindArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Instruction => "instruction",
+        }
+    }
+}
+
+/// Attempt-fenced provider-seat commands.
+#[derive(Debug, Subcommand)]
+pub enum SeatCmd {
+    /// Pull bounded undelivered messages for this attempt.
+    Inbox(SeatInboxArgs),
+    /// Acknowledge one message addressed to this attempt.
+    Ack(SeatAckArgs),
+    /// Record the latest keyed-replace progress snapshot.
+    Progress(SeatProgressArgs),
+    /// Send one bounded note directly to the lead.
+    Note(SeatNoteArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct SeatInboxArgs {
+    /// Positive attempt identity injected into the provider environment.
+    #[arg(long)]
+    pub attempt: i64,
+    /// Return messages queued after this event id.
+    #[arg(long)]
+    pub since: Option<i64>,
+    /// Include message bodies and mark the shown messages read.
+    #[arg(long)]
+    pub bodies: bool,
+    /// Maximum messages (default 100, maximum 500).
+    #[arg(long)]
+    pub limit: Option<u64>,
+    /// Override the derived idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct SeatAckArgs {
+    /// Positive attempt identity injected into the provider environment.
+    #[arg(long)]
+    pub attempt: i64,
+    /// Message identity to acknowledge.
+    #[arg(long)]
+    pub message: String,
+    /// Optional acknowledgement note.
+    #[arg(long)]
+    pub note: Option<String>,
+    /// Override the derived idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct SeatProgressArgs {
+    /// Positive attempt identity injected into the provider environment.
+    #[arg(long)]
+    pub attempt: i64,
+    /// JSON snapshot file, or - for stdin.
+    #[arg(long)]
+    pub snapshot_file: PathBuf,
+    /// Override the derived idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct SeatNoteArgs {
+    /// Positive attempt identity injected into the provider environment.
+    #[arg(long)]
+    pub attempt: i64,
+    /// UTF-8 note file, or - for stdin.
+    #[arg(long)]
+    pub body_file: PathBuf,
     /// Override the derived idempotency key.
     #[arg(long)]
     pub idempotency_key: Option<String>,
@@ -2110,6 +2216,12 @@ pub fn command_name(command: &Command) -> &'static str {
             SessionCmd::Message(_) => "session_message",
             SessionCmd::Stop(_) => "session_stop",
         },
+        Command::Seat { command } => match command {
+            SeatCmd::Inbox(_) => "seat_inbox",
+            SeatCmd::Ack(_) => "seat_ack",
+            SeatCmd::Progress(_) => "seat_progress",
+            SeatCmd::Note(_) => "seat_note",
+        },
         Command::ClaimNext(_) => "claim_next",
         Command::Gate { command } => match command {
             GateCmd::Run(_) => "gate_run",
@@ -2577,6 +2689,10 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
                         "attempt": a.attempt,
                         "message": a.message,
                         "requestedBy": a.requested_by,
+                        "urgent": a.urgent,
+                        "ackRequired": a.ack_required,
+                        "replyTo": a.reply_to,
+                        "kind": a.kind.as_str(),
                     }),
                 ),
             ),
@@ -2586,6 +2702,57 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
                     a.idempotency_key,
                     None,
                     json!({"attempt": a.attempt, "reason": a.reason}),
+                ),
+            ),
+        },
+        Command::Seat { command } => match command {
+            SeatCmd::Inbox(a) => (
+                "seat_inbox",
+                request(
+                    a.idempotency_key,
+                    None,
+                    json!({
+                        "attempt": a.attempt,
+                        "since": a.since,
+                        "bodies": a.bodies,
+                        "limit": a.limit,
+                    }),
+                ),
+            ),
+            SeatCmd::Ack(a) => (
+                "seat_ack",
+                request(
+                    a.idempotency_key,
+                    None,
+                    json!({"attempt": a.attempt, "message": a.message, "note": a.note}),
+                ),
+            ),
+            SeatCmd::Progress(a) => {
+                let text = read_utf8_file_or_stdin(&a.snapshot_file, "--snapshot-file")?;
+                let snapshot = serde_json::from_str::<Value>(&text).map_err(|error| {
+                    format!(
+                        "parsing --snapshot-file {} as JSON: {error}",
+                        a.snapshot_file.display()
+                    )
+                })?;
+                (
+                    "seat_progress",
+                    request(
+                        a.idempotency_key,
+                        None,
+                        json!({"attempt": a.attempt, "snapshot": snapshot}),
+                    ),
+                )
+            }
+            SeatCmd::Note(a) => (
+                "seat_note",
+                request(
+                    a.idempotency_key,
+                    None,
+                    json!({
+                        "attempt": a.attempt,
+                        "body": read_utf8_file_or_stdin(&a.body_file, "--body-file")?,
+                    }),
                 ),
             ),
         },

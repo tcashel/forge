@@ -658,14 +658,18 @@ async fn project(ctx: &Ctx, request: MapRequest) -> Result<Value, Failure> {
         }
     }
     super::ops::decorate_titles(&mut entries, &work_summaries)?;
-    let attention = super::attention::project_active(&snapshot, &entries, &work_summaries)?
-        .into_iter()
-        .map(|item| {
-            serde_json::to_value(item).map_err(|error| {
-                Failure::internal(format!("serializing Work Map attention: {error}"))
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let attention = super::attention::project_active(
+        &snapshot,
+        &entries,
+        &work_summaries,
+        ctx.config.ack_window_s,
+    )?
+    .into_iter()
+    .map(|item| {
+        serde_json::to_value(item)
+            .map_err(|error| Failure::internal(format!("serializing Work Map attention: {error}")))
+    })
+    .collect::<Result<Vec<_>, _>>()?;
     super::ops::enrich_operations_facts(&snapshot, &attention, &mut entries)?;
     let work_read = plan_error
         .as_ref()

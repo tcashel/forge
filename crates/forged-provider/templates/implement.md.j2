@@ -15,8 +15,10 @@ Operator interventions recorded before this provider boundary:
    is silent, take the smallest choice consistent with the surrounding code —
    silence is not an invitation to widen the scope.
 2. Implement it inside the worktree above. That worktree is disposable and sits
-   outside the operator's own checkout; never edit the main checkout, and never
-   invoke the `forged` binary — you are the packet, not the orchestrator.
+   outside the operator's own checkout; never edit the main checkout. The only
+   `forged` commands you may run are `forged seat inbox`, `forged seat ack`,
+   `forged seat progress`, and `forged seat note` — you are the packet, not the
+   orchestrator.
 3. Before each commit run the seat checks, and nothing wider:
 {% if seat_commands %}{% for c in seat_commands %}     - `{{ c }}`
 {% endfor %}{% else %}     - the tests that cover the files you changed
@@ -24,6 +26,11 @@ Operator interventions recorded before this provider boundary:
    in your report, not a licence to go fixing unrelated code. Do NOT run the
    repository's full gate yourself: forged runs the gate commands after you
    return, and again after every fix round.
+   Run `forged seat inbox --attempt "$FORGED_SEAT_ATTEMPT" --bodies` before
+   every seat-check run, after every commit, and whenever blocked for more than
+   five minutes. Ack every message that asks for it. After each commit, send a
+   progress snapshot with `forged seat progress`; use `forged seat note` for
+   concise information the lead needs before you return.
 4. Own your commits: `git add <path>` on files you changed on purpose (never
    `git add -A`), conventional-commit messages, committed as you go. Do NOT
    push, do NOT open a PR, do NOT merge — forged does all three after you

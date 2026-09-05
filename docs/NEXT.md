@@ -550,8 +550,8 @@ forged session message --run <run-id> --attempt <attempt-id> \
   --message '<guidance>' --requested-by '<human-or-agent>'
 ```
 
-Messages without live-delivery capability are ledgered for the next provider
-boundary.
+Messages are ledgered for the addressed seat to pull with `forged seat inbox`,
+or for delivery at the next provider boundary.
 
 ## Forge plugin convergence — 2026-08-14
 
