@@ -23,9 +23,10 @@ use crate::error::LedgerError;
 use crate::events::{latest_event_per_run_tx, list_events_by_kind_tx};
 use crate::ledger::Ledger;
 use crate::operations::list_inflight_operations_tx;
+use crate::packets::{packet_row, PACKET_COLUMNS};
 use crate::runs::list_runs_tx;
 use crate::types::{
-    AdmissionReservationRow, AttemptRow, DesiredWorkRow, EventRow, OperationRow, RunRow,
+    AdmissionReservationRow, AttemptRow, DesiredWorkRow, EventRow, OperationRow, PacketRow, RunRow,
     UsageTotals,
 };
 use crate::usage::{latest_missing_usage_per_run_tx, usage_totals_per_run_tx};
@@ -92,6 +93,8 @@ pub struct InventorySnapshot {
     pub runs: Vec<RunRow>,
     /// Every `running`/`revoking` attempt, ordered by rowid ascending.
     pub live_attempts: Vec<AttemptRow>,
+    /// Packets owning the bounded live-attempt set, for frozen stage budgets.
+    pub live_packets: Vec<PacketRow>,
     /// Terminal attempts missing their immutable artifact join.
     pub attempts_missing_artifacts: Vec<AttemptRow>,
     /// Included usage evidence or an explicit statement that usage was not
@@ -154,6 +157,20 @@ impl Ledger {
             let snapshot = InventorySnapshot {
                 runs: list_runs_tx(&tx)?,
                 live_attempts: list_live_attempts_tx(&tx, None)?,
+                live_packets: {
+                    let sql = format!(
+                        "SELECT DISTINCT {} FROM packets p JOIN attempts a ON a.packet_id = p.packet_id \
+                         WHERE a.state IN ('running','revoking') ORDER BY p.packet_id",
+                        PACKET_COLUMNS
+                            .split(',')
+                            .map(|column| format!("p.{}", column.trim()))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                    let mut statement = tx.prepare(&sql)?;
+                    let rows = statement.query_map([], packet_row)?;
+                    rows.collect::<Result<Vec<_>, _>>()?
+                },
                 attempts_missing_artifacts: list_attempts_missing_artifacts_tx(&tx)?,
                 usage: inventory_usage_tx(&tx, usage_selection)?,
                 latest_event: latest_event_per_run_tx(&tx)?,

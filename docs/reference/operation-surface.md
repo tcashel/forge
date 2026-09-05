@@ -52,6 +52,10 @@ Generated from the dispatch table, clap tree, MCP router, and fenced-call audit.
 | `run_status` | `forged run status` | yes | yes | lead | read_only | no | yes |
 | `run_stop` | `forged run stop` | yes | yes | lead | fenced | no | yes |
 | `run_submit` | `forged run submit` | yes | yes | machine | fenced | no | yes |
+| `seat_ack` | `forged seat ack` | yes | yes | machine | fenced | no | yes |
+| `seat_inbox` | `forged seat inbox` | yes | yes | machine | fenced | no | yes |
+| `seat_note` | `forged seat note` | yes | yes | machine | fenced | no | yes |
+| `seat_progress` | `forged seat progress` | yes | yes | machine | fenced | no | yes |
 | `service_install` | `forged service install` | yes | no | — | — | no | no |
 | `service_restart` | `forged service restart` | yes | no | — | — | no | no |
 | `service_start` | `forged service start` | yes | no | — | — | no | no |

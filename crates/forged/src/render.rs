@@ -402,6 +402,18 @@ fn render_run_status(result: &Value, now: &str) -> String {
         &mut lines,
         format!("packets: {packets}  live attempts: {attempts}"),
     );
+    if let Some(progress) = run.get("progress").filter(|value| !value.is_null()) {
+        let phase = progress
+            .get("phase")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let commits = scalar(progress.get("commitsAhead").unwrap_or(&Value::Null));
+        let checks = scalar(progress.get("seatChecks").unwrap_or(&Value::Null));
+        push_line(
+            &mut lines,
+            format!("progress: {phase}  commits {commits}  seat checks {checks}"),
+        );
+    }
     if let Some(next) = run.get("nextAction") {
         let next = serde_json::to_string(next).unwrap_or_else(|_| "null".to_owned());
         push_line(&mut lines, format!("driver next: {next}"));
@@ -831,6 +843,11 @@ mod tests {
                 "delivery": {"pr": null, "sha": null},
                 "packets": [{"packetId": "run-1/implementation/0"}],
                 "liveAttempts": [{"attemptId": 7, "claimant": "codex:worker"}],
+                "progress": {
+                    "attemptId": 7, "phase": "seat-checks", "commitsAhead": 2,
+                    "seatChecks": "pass", "blockers": [], "etaMin": 0
+                },
+                "mail": {"undelivered": 0, "unacked": 1, "lastDeliveredAt": null},
                 "nextAction": {"awaitPacket": {"packetId": "run-1/implementation/0"}},
                 "nextActions": [{
                     "verb": "run status", "args": {"run": "run-1"},

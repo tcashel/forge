@@ -31,7 +31,7 @@ pub(crate) const WORK_SETTLEMENT_PENDING: &str = "run.bead-settlement.pending";
 pub(crate) const WORK_SETTLEMENT_SUCCEEDED: &str = "run.bead-settlement.succeeded";
 
 /// Event vocabulary needed in addition to the inventory lifecycle events.
-pub(crate) const ATTENTION_EVENT_KINDS: [&str; 13] = [
+pub(crate) const ATTENTION_EVENT_KINDS: [&str; 20] = [
     epic::INPUT_REQUIRED,
     epic::INPUT_RESOLVED,
     "proto.quarantine",
@@ -45,6 +45,13 @@ pub(crate) const ATTENTION_EVENT_KINDS: [&str; 13] = [
     ACKNOWLEDGED,
     RESOLVED,
     REOPENED,
+    super::seat::MESSAGE_QUEUED,
+    super::seat::MESSAGE_DELIVERED,
+    super::seat::MESSAGE_READ,
+    super::seat::MESSAGE_ACKED,
+    super::seat::SEAT_PROGRESS,
+    super::seat::INTERVENTION_QUEUED,
+    super::seat::INTERVENTION_DELIVERED,
 ];
 
 #[derive(Debug, Clone)]
@@ -88,6 +95,7 @@ impl ProjectionSurface<'_> {
 struct ProjectionInput<'a> {
     runs: &'a [forged_ledger::RunRow],
     attempts: &'a [forged_ledger::AttemptRow],
+    packets: &'a [forged_ledger::PacketRow],
     attempts_missing_artifacts: Vec<&'a forged_ledger::AttemptRow>,
     events: Vec<&'a EventRow>,
     desired_work: &'a [forged_ledger::DesiredWorkRow],
@@ -97,6 +105,7 @@ struct ProjectionInput<'a> {
     usage: ProjectionUsage<'a>,
     entries: &'a [Value],
     work: &'a [IssueSummary],
+    ack_window_s: u64,
     surface: ProjectionSurface<'a>,
 }
 
@@ -191,6 +200,18 @@ pub(crate) fn policy(
             Owner::LeadAgent,
             Action::ResumeSeat,
             "Resume the deadline-killed stage from the worktree the seat left",
+        ),
+        Condition::AckOverdue => (
+            Severity::Medium,
+            Owner::LeadAgent,
+            Action::MessageSeat,
+            "Prompt the running seat to read and acknowledge its required message",
+        ),
+        Condition::SlowStage => (
+            Severity::Medium,
+            Owner::LeadAgent,
+            Action::MessageSeat,
+            "Ask the running seat for a progress update",
         ),
         Condition::ProviderDegraded => (
             Severity::Medium,
@@ -404,6 +425,26 @@ pub(crate) fn recommendation_actions(
             }
             AttentionSubjectKind::Epic => Vec::new(),
         },
+        Action::MessageSeat => {
+            let attempt = evidence
+                .and_then(|evidence| evidence.get("attemptId"))
+                .and_then(Value::as_i64);
+            let class = if evidence
+                .and_then(|evidence| evidence.get("should"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                forged_types::ActionClass::Should
+            } else {
+                forged_types::ActionClass::Can
+            };
+            vec![classified_action(
+                "session message",
+                json!({"run": subject_id, "attempt": attempt, "message": Value::Null}),
+                &recommendation.text,
+                class,
+            )]
+        }
         Action::AdjudicateReview => {
             if subject_kind == AttentionSubjectKind::Run && risk_acceptance_allowed {
                 let mut actions = vec![classified_action(
@@ -1053,6 +1094,168 @@ fn collect_domain_sources(input: &ProjectionInput<'_>) -> Result<Vec<RawAttentio
             attempt.attempt_id.to_string(),
         );
     }
+
+    // Direct-mail acknowledgement and progress cadence. Both conditions are
+    // derived from the run stream plus the immutable attempt/packet facts;
+    // there is no mailbox or timer table to reconcile.
+    let coordination_events = input
+        .events
+        .iter()
+        .filter(|event| super::seat::COORDINATION_EVENT_KINDS.contains(&event.kind.as_str()))
+        .map(|event| (*event).clone())
+        .collect::<Vec<_>>();
+    let message_run = input
+        .events
+        .iter()
+        .filter_map(|event| {
+            event
+                .run_id
+                .as_ref()
+                .map(|run| (event.event_id, run.clone()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let delivered = super::seat::delivered_at(&coordination_events);
+    let acked = super::seat::acked_ids(&coordination_events);
+    let as_of = now_iso();
+    for message in super::seat::messages(&coordination_events)
+        .into_iter()
+        .filter(|message| message.ack_required && !acked.contains(&message.message_id))
+    {
+        let delivered_fact = delivered.get(&message.message_id);
+        let attempt_id = delivered_fact
+            .map(|(attempt, _)| *attempt)
+            .or_else(|| super::seat::message_attempt(&message));
+        let Some(attempt_id) = attempt_id else {
+            continue;
+        };
+        let attempt = input
+            .attempts
+            .iter()
+            .find(|attempt| attempt.attempt_id == attempt_id);
+        let running = attempt.is_some_and(|attempt| attempt.state == AttemptState::Running);
+        let overdue = match delivered_fact {
+            Some((_, delivered_at)) => {
+                super::supervise::deadline_after(delivered_at, input.ack_window_s)?.as_str()
+                    <= as_of.as_str()
+            }
+            None => !running,
+        };
+        if !overdue {
+            continue;
+        }
+        let run_id = attempt
+            .and_then(|attempt| split_packet_key(&attempt.packet_id).ok())
+            .map(|(run, _, _)| run)
+            .or_else(|| message_run.get(&message.event_id).cloned());
+        let Some(run_id) = run_id else { continue };
+        let opened_at = delivered_fact
+            .map(|(_, delivered_at)| delivered_at.as_str())
+            .or_else(|| attempt.map(|attempt| attempt.updated_at.as_str()))
+            .unwrap_or(message.queued_at.as_str());
+        add_raw(
+            &mut raw,
+            &run_id,
+            AttentionCondition::AckOverdue,
+            opened_at,
+            opened_at,
+            message.event_id,
+            format!("message:{}:attempt:{attempt_id}", message.message_id),
+            if delivered_fact.is_some() {
+                format!(
+                    "message {} was delivered to attempt {attempt_id} but remains unacknowledged",
+                    message.message_id
+                )
+            } else {
+                format!(
+                    "message {} was not delivered before attempt {attempt_id} ended",
+                    message.message_id
+                )
+            },
+            json!({
+                "messageId": message.message_id,
+                "attemptId": attempt_id,
+                "deliveredAt": delivered_fact.map(|(_, at)| at),
+                "should": running,
+            }),
+            AttentionEvidenceKind::Event,
+            message.event_id.to_string(),
+        );
+    }
+
+    let mut latest_progress = BTreeMap::<i64, (&EventRow, Value)>::new();
+    for event in input
+        .events
+        .iter()
+        .filter(|event| event.kind == super::seat::SEAT_PROGRESS)
+    {
+        let progress = event_value(&event.payload_json);
+        let Some(attempt_id) = progress.get("attemptId").and_then(Value::as_i64) else {
+            continue;
+        };
+        latest_progress.insert(attempt_id, (*event, progress));
+    }
+    for attempt in input
+        .attempts
+        .iter()
+        .filter(|attempt| attempt.state == AttemptState::Running)
+    {
+        let Some(packet) = input
+            .packets
+            .iter()
+            .find(|packet| packet.packet_id == attempt.packet_id)
+        else {
+            continue;
+        };
+        // Historical and manually fabricated ledgers can contain packet
+        // bodies that predate the current WorkPacket schema. One unreadable
+        // packet must not take down every projection backed by attention;
+        // it simply cannot contribute a slow-stage budget observation.
+        let Ok(stored) = forged_proto::stored_packet(packet) else {
+            continue;
+        };
+        let half_budget = super::supervise::deadline_after(
+            &attempt.started_at,
+            u64::from(stored.contract.budget_s) / 2,
+        )?;
+        let progress_anchor = latest_progress
+            .get(&attempt.attempt_id)
+            .map(|(event, _)| event.ts.as_str())
+            .unwrap_or(attempt.started_at.as_str());
+        let stale_at = super::supervise::deadline_after(progress_anchor, 30 * 60)?;
+        if half_budget.as_str() > as_of.as_str() || stale_at.as_str() > as_of.as_str() {
+            continue;
+        }
+        let (run_id, _, _) = split_packet_key(&attempt.packet_id)?;
+        let source_cursor = latest_progress
+            .get(&attempt.attempt_id)
+            .map_or(attempt.attempt_id, |(event, _)| event.event_id);
+        add_raw(
+            &mut raw,
+            &run_id,
+            AttentionCondition::SlowStage,
+            stale_at.clone(),
+            stale_at.clone(),
+            source_cursor,
+            format!(
+                "attempt:{}:slow-stage:{progress_anchor}",
+                attempt.attempt_id
+            ),
+            format!(
+                "attempt {} is past half its stage budget with no progress snapshot in 30 minutes",
+                attempt.attempt_id
+            ),
+            json!({
+                "attemptId": attempt.attempt_id,
+                "packetId": attempt.packet_id,
+                "budgetS": stored.contract.budget_s,
+                "lastProgressAt": latest_progress.get(&attempt.attempt_id).map(|(event, _)| &event.ts),
+                "should": false,
+            }),
+            AttentionEvidenceKind::Attempt,
+            attempt.attempt_id.to_string(),
+        );
+    }
+
     let mut latest_quarantine: BTreeMap<String, &forged_ledger::EventRow> = BTreeMap::new();
     for event in events(input, "proto.quarantine") {
         if let Some(id) = event.run_id.as_ref() {
@@ -1461,19 +1664,27 @@ fn collect_domain_sources(input: &ProjectionInput<'_>) -> Result<Vec<RawAttentio
         } else {
             event_value(&event.payload_json)
         };
-        let (condition, detail) = if payload.pointer("/terminal/providerUnavailable").is_some() {
+        let (condition, mut detail) = if payload.pointer("/terminal/providerUnavailable").is_some()
+        {
             (
                 AttentionCondition::RetryExhausted,
-                "provider retry budget is exhausted",
+                "provider retry budget is exhausted".to_owned(),
             )
         } else if payload.pointer("/terminal/deadlineExhausted").is_some() {
             (
                 AttentionCondition::DeadlineExhausted,
-                "stage deadline relaunch budget is exhausted",
+                "stage deadline relaunch budget is exhausted".to_owned(),
             )
         } else {
             continue;
         };
+        let undelivered = super::seat::undelivered_ids(&coordination_events, &id);
+        if !undelivered.is_empty() {
+            detail.push_str(&format!(
+                "; undelivered messages: {}",
+                undelivered.join(", ")
+            ));
+        }
         add_raw(
             &mut raw,
             &id,
@@ -2068,7 +2279,9 @@ pub(crate) fn classification(condition: AttentionCondition) -> AttentionClass {
         | Condition::ControllerDead
         | Condition::FailedGate
         | Condition::ProviderDegraded
-        | Condition::AdmissionDeferred => AttentionClass::Symptom,
+        | Condition::AdmissionDeferred
+        | Condition::AckOverdue
+        | Condition::SlowStage => AttentionClass::Symptom,
     }
 }
 
@@ -2292,10 +2505,12 @@ pub(crate) fn project_all(
     snapshot: &InventorySnapshot,
     entries: &[Value],
     work: &[IssueSummary],
+    ack_window_s: u64,
 ) -> Result<Vec<AttentionItemV1>, Failure> {
     project(ProjectionInput {
         runs: &snapshot.runs,
         attempts: &snapshot.live_attempts,
+        packets: &snapshot.live_packets,
         attempts_missing_artifacts: snapshot.attempts_missing_artifacts.iter().collect(),
         events: snapshot.events_by_kind.values().flatten().collect(),
         desired_work: &snapshot.desired_work,
@@ -2305,6 +2520,7 @@ pub(crate) fn project_all(
         usage: ProjectionUsage::Inventory(&snapshot.usage),
         entries,
         work,
+        ack_window_s,
         surface: ProjectionSurface::Inventory,
     })
 }
@@ -2319,6 +2535,7 @@ pub(crate) fn project_observation(
     results: &BTreeMap<i64, PacketResult>,
     subject_title: &WorkTitleV1,
     live_work: Option<&IssueSummary>,
+    ack_window_s: u64,
 ) -> Result<Vec<AttentionItemV1>, Failure> {
     let artifacts = observed
         .attempt_artifacts
@@ -2349,6 +2566,7 @@ pub(crate) fn project_observation(
     Ok(project(ProjectionInput {
         runs: &observed.runs,
         attempts: &observed.attempts,
+        packets: &observed.packets,
         attempts_missing_artifacts: observed
             .attempts
             .iter()
@@ -2367,6 +2585,7 @@ pub(crate) fn project_observation(
         usage: ProjectionUsage::Observation(observed),
         entries: &entries,
         work: &work,
+        ack_window_s,
         surface: ProjectionSurface::Observation {
             snapshot: observed,
             review_disagreements,
@@ -2383,8 +2602,9 @@ pub(crate) fn project_active(
     snapshot: &InventorySnapshot,
     entries: &[Value],
     work: &[IssueSummary],
+    ack_window_s: u64,
 ) -> Result<Vec<AttentionItemV1>, Failure> {
-    Ok(project_all(snapshot, entries, work)?
+    Ok(project_all(snapshot, entries, work, ack_window_s)?
         .into_iter()
         .filter(|item| item.state != AttentionState::Resolved)
         .collect())
@@ -2402,10 +2622,19 @@ mod tests {
         ADMISSION_DECISION_SCHEMA_V1,
     };
 
+    fn project_active(
+        snapshot: &InventorySnapshot,
+        entries: &[Value],
+        work: &[IssueSummary],
+    ) -> Result<Vec<AttentionItemV1>, Failure> {
+        super::project_active(snapshot, entries, work, crate::config::DEFAULT_ACK_WINDOW_S)
+    }
+
     fn snapshot() -> InventorySnapshot {
         InventorySnapshot {
             runs: Vec::new(),
             live_attempts: Vec::new(),
+            live_packets: Vec::new(),
             attempts_missing_artifacts: Vec::new(),
             usage: InventoryUsage::Included {
                 totals: BTreeMap::new(),

@@ -130,6 +130,45 @@ fn deadline_reason(
     )))
 }
 
+fn deadline_warning_due(
+    started_at: &str,
+    budget_s: u64,
+    warning_s: u64,
+    as_of: &str,
+) -> Result<bool, Failure> {
+    forged_proto::stage_deadline_reached(started_at, budget_s.saturating_sub(warning_s), as_of)
+        .map_err(|error| Failure::internal(error.to_string()))
+}
+
+async fn latch_deadline_warning<F, Fut>(recorded: &mut bool, append: F)
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<(), Failure>>,
+{
+    if *recorded {
+        return;
+    }
+    match append().await {
+        Ok(()) => *recorded = true,
+        Err(error) => {
+            tracing::warn!(%error, "deadline warning append failed; retrying on a later beat");
+        }
+    }
+}
+
+pub(crate) async fn record_deadline_warning_once(
+    ctx: &Ctx,
+    run_id: &str,
+    packet_id: &str,
+    attempt_id: i64,
+    recorded: &mut bool,
+) {
+    latch_deadline_warning(recorded, || {
+        crate::core::seat::record_deadline_warning(ctx, run_id, packet_id, attempt_id)
+    })
+    .await;
+}
+
 async fn settle_deadline_retry(
     ctx: &Ctx,
     run_id: &str,
@@ -1570,15 +1609,20 @@ async fn run_attempt(
     let packet = packet.clone();
     let prepared = async {
         let mut packet = packet;
-        let interventions = crate::core::sessions::pending_interventions(ctx, &run_id).await?;
-        packet
-            .field_notes
-            .extend(interventions.iter().map(|intervention| {
-                format!(
-                    "Intervention {} from {}: {}",
-                    intervention.id, intervention.requested_by, intervention.message
-                )
-            }));
+        let message_events = crate::core::sessions::run_events(ctx, &run_id).await?;
+        let messages =
+            crate::core::seat::pending_for_boundary(&message_events, &run_id, attempt_id);
+        packet.field_notes.extend(messages.iter().map(|message| {
+            let from = message
+                .from
+                .get("id")
+                .map(|value| value.to_string().trim_matches('"').to_owned())
+                .unwrap_or_else(|| "lead".to_owned());
+            format!(
+                "Message {} ({}) from {}: {}",
+                message.message_id, message.kind, from, message.body
+            )
+        }));
         if let Some(note) = relaunch_note(ctx, &run_id, &packet).await? {
             packet.field_notes.push(note);
         }
@@ -1646,10 +1690,10 @@ async fn run_attempt(
         let prompt_stage = prompt_stage_of(&packet, exec.protocol.as_ref())?;
         let prompt = templates.render(prompt_stage, &context)?;
         crate::core::artifacts::materialize_prompt(&run_root, &dirs, prompt.as_bytes())?;
-        Ok::<_, Failure>((packet, interventions, holder, lease_is_ours, packet_dir))
+        Ok::<_, Failure>((packet, messages, holder, lease_is_ours, packet_dir))
     }
     .await;
-    let (packet, interventions, holder, lease_is_ours, packet_dir) = match prepared {
+    let (packet, messages, holder, lease_is_ours, packet_dir) = match prepared {
         Ok(prepared) => prepared,
         Err(failure) => {
             let as_of = now_iso();
@@ -1991,6 +2035,7 @@ async fn run_attempt(
         &dirs,
         &run_root,
         attempt_id,
+        &claim_token,
         render_mode,
     )
     .map_err(Failure::from)
@@ -2355,15 +2400,8 @@ async fn run_attempt(
         }
         return Err(error);
     }
-    crate::core::sessions::record_interventions_delivered(
-        ctx,
-        &run_id,
-        &packet_id,
-        attempt_id,
-        &interventions,
-        "boundary",
-    )
-    .await?;
+    crate::core::seat::record_boundary_delivered(ctx, &run_id, attempt_id, &claim_token, &messages)
+        .await?;
     ports
         .adopt_session(attempt_id, Arc::clone(&host), session.clone())
         .await;
@@ -2499,6 +2537,7 @@ async fn run_attempt(
     // Await completion by polling the host; the sentinel status file is the
     // only exit-code truth.
     let mut beats: u32 = 0;
+    let mut deadline_warning_recorded = false;
     let mut session_scanner =
         forged_provider::ProviderSessionScanner::new(&packet.provider_hints.provider);
     let liveness = loop {
@@ -2572,6 +2611,21 @@ async fn run_attempt(
         }
         match observed {
             forged_host::Liveness::Running => {
+                if deadline_warning_due(
+                    &attempt_started_at,
+                    u64::from(packet.contract.budget_s),
+                    ctx.config.deadline_warning_s,
+                    &as_of,
+                )? {
+                    record_deadline_warning_once(
+                        ctx,
+                        &run_id,
+                        &packet_id,
+                        attempt_id,
+                        &mut deadline_warning_recorded,
+                    )
+                    .await;
+                }
                 beats += 1;
                 if beats.is_multiple_of(25) {
                     // Heartbeats prove liveness but never renew the frozen
@@ -3630,6 +3684,8 @@ mod settle_tests {
             transport_retry_budget: 3,
             seat_commands: Vec::new(),
             deadline_retry_budget: 1,
+            deadline_warning_s: crate::config::DEFAULT_DEADLINE_WARNING_S,
+            ack_window_s: crate::config::DEFAULT_ACK_WINDOW_S,
             seat_env: Default::default(),
             transport_patterns: Vec::new(),
             provider_transport_patterns: Default::default(),
@@ -4080,6 +4136,50 @@ mod settle_tests {
         )
         .expect("at deadline")
         .is_some());
+    }
+
+    #[test]
+    fn deadline_warning_becomes_due_at_budget_minus_warning_without_moving_deadline() {
+        let started = "2026-09-04T00:00:00.000000123Z";
+        assert!(
+            !deadline_warning_due(started, 3_600, 900, "2026-09-04T00:45:00.000000122Z",)
+                .expect("before warning")
+        );
+        assert!(
+            deadline_warning_due(started, 3_600, 900, "2026-09-04T00:45:00.000000123Z",)
+                .expect("at warning")
+        );
+        assert!(!forged_proto::stage_deadline_reached(
+            started,
+            3_600,
+            "2026-09-04T00:45:00.000000123Z",
+        )
+        .expect("warning is before deadline"));
+    }
+
+    #[tokio::test]
+    async fn deadline_warning_latch_retries_failure_then_appends_once_across_many_beats() {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let appends = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut recorded = false;
+
+        for _ in 0..20 {
+            let attempts = Arc::clone(&attempts);
+            let appends = Arc::clone(&appends);
+            latch_deadline_warning(&mut recorded, move || async move {
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    return Err(Failure::internal("transient warning write failure"));
+                }
+                appends.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .await;
+        }
+
+        assert!(recorded, "a later beat records the warning after a failure");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(appends.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

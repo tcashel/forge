@@ -1757,8 +1757,8 @@ fn interventions_cross_a_durable_boundary_and_sessions_stay_observable() {
         .filter_map(|event| event["kind"].as_str())
         .collect();
     for kind in [
-        "forged.intervention.queued",
-        "forged.intervention.delivered",
+        "forged.message.queued",
+        "forged.message.delivered",
         "forged.host.fallback",
         "forged.session.started",
     ] {
@@ -1821,7 +1821,7 @@ fn a_rejected_cross_run_intervention_never_enters_the_target_queue() {
         .as_array()
         .expect("events")
         .iter()
-        .all(|event| event["kind"] != json!("forged.intervention.queued")));
+        .all(|event| event["kind"] != json!("forged.message.queued")));
 }
 
 #[test]

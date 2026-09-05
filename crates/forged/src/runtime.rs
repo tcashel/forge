@@ -3422,6 +3422,8 @@ mod tests {
             transport_retry_budget: 3,
             seat_commands: Vec::new(),
             deadline_retry_budget: 1,
+            deadline_warning_s: crate::config::DEFAULT_DEADLINE_WARNING_S,
+            ack_window_s: crate::config::DEFAULT_ACK_WINDOW_S,
             seat_env: Default::default(),
             transport_patterns: Vec::new(),
             provider_transport_patterns: Default::default(),
