@@ -4,6 +4,29 @@ This file records user-visible changes to Forge.
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-09-05
+
+### Fixed
+
+- Repair failed gates within the configured fix-round budget before opening
+  another review. Clean delivery requires a green gate on the delivered commit;
+  a gate failure no longer expands the default review profile.
+- Recover eligible stopped runs through `run retry` without manual work-item
+  reopen and release steps. Replaying an interrupted retry reuses its successor.
+- Reuse completed implementation after an interrupted first machine push when
+  the committed work, spec, base, policy, and roster evidence still match.
+  `world-changed` retries still require a fresh green gate and independent
+  review; missing or changed evidence falls back to implementation.
+- Show stopped-run reasons, delivery evidence, and recovery actions in `next`
+  and `explain`. Readiness responses now account for dispatch blockers, and
+  work without an explicit priority schedules at normal priority.
+
+### Changed
+
+- Seats honor repository-required checks and can repair blocking failures
+  within their assigned scope. Dispatch skills reuse existing execution
+  authority and keep driving when the operator requested completion.
+
 ## [0.8.0] - 2026-09-05
 
 Wave 2 of the agent driver surface (epic ore-080, ADR-0036, PRs #266
@@ -519,7 +542,8 @@ historical TypeScript `v0.4.0` product has been replaced and is unsupported.
 - Refuses non-normalized or root-equivalent install prefixes before touching a
   live path.
 
-[Unreleased]: https://github.com/tcashel/forge/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/tcashel/forge/compare/v0.8.1...HEAD
+[0.8.1]: https://github.com/tcashel/forge/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/tcashel/forge/compare/v0.7.2...v0.8.0
 [0.7.2]: https://github.com/tcashel/forge/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/tcashel/forge/compare/v0.7.0...v0.7.1
