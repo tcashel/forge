@@ -469,6 +469,16 @@
       "name": "run_advance"
     },
     {
+      "audience": "lead",
+      "class": "fenced",
+      "cli": true,
+      "cliVerb": "run dispatch",
+      "dispatch": true,
+      "explicitKey": false,
+      "mcp": true,
+      "name": "run_dispatch"
+    },
+    {
       "class": "machine-fenced",
       "cli": true,
       "cliVerb": "run drive",
@@ -508,7 +518,7 @@
       "name": "run_revise_roster"
     },
     {
-      "audience": "lead",
+      "audience": "machine",
       "class": "fenced",
       "cli": true,
       "cliVerb": "run start",
@@ -538,7 +548,7 @@
       "name": "run_stop"
     },
     {
-      "audience": "lead",
+      "audience": "machine",
       "class": "fenced",
       "cli": true,
       "cliVerb": "run submit",

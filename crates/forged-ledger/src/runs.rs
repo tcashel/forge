@@ -74,7 +74,7 @@ pub(crate) const RUN_COLUMNS: &str = "run_id, bead_id, repo, base_ref, branch, p
 const EFFECTIVE_DEFINITION_COLUMNS: &str = "d.run_id, d.protocol_ref_json, d.profile_ref_json, \
     d.roster_ref_json, COALESCE(m.package_sha256, d.package_sha256), d.profile_sha256, \
     d.roster_sha256, COALESCE(m.package_json, d.package_json), d.compatibility_roster_json, \
-    d.created_at";
+    d.started_from_json, d.created_at";
 const EXECUTION_POLICY_MIGRATION: &str = "forged.run.execution-policy/1";
 const CONTROLLER_REVOKED: &str = "forged.controller.revoked";
 
@@ -204,6 +204,17 @@ fn append_controller_revocation_tx(
 }
 
 fn definition_row(row: &rusqlite::Row<'_>) -> Result<RunDefinitionRow, rusqlite::Error> {
+    let started_from_json = row.get::<_, Option<String>>(9)?;
+    let started_from = started_from_json
+        .map(|value| serde_json::from_str(&value))
+        .transpose()
+        .map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                9,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?;
     Ok(RunDefinitionRow {
         run_id: row.get(0)?,
         protocol_ref_json: row.get(1)?,
@@ -214,7 +225,8 @@ fn definition_row(row: &rusqlite::Row<'_>) -> Result<RunDefinitionRow, rusqlite:
         roster_sha256: row.get(6)?,
         package_json: row.get(7)?,
         compatibility_roster_json: row.get(8)?,
-        created_at: row.get(9)?,
+        started_from,
+        created_at: row.get(10)?,
     })
 }
 
@@ -542,6 +554,11 @@ impl Ledger {
             let (profile_ref_json, _) = canonical(&package.profile_ref)?;
             let (roster_ref_json, _) = canonical(&package.roster_ref)?;
             let (compatibility_roster_json, _) = canonical(&definition.compatibility_roster)?;
+            let started_from_json = definition
+                .started_from
+                .as_ref()
+                .map(|value| canonical(value).map(|(json, _)| json))
+                .transpose()?;
 
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let now = now_iso();
@@ -549,8 +566,8 @@ impl Ledger {
             tx.execute(
                 "INSERT INTO run_definitions (run_id, protocol_ref_json, profile_ref_json, \
                  roster_ref_json, package_sha256, profile_sha256, roster_sha256, package_json, \
-                 compatibility_roster_json, created_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                 compatibility_roster_json, started_from_json, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 rusqlite::params![
                     row.run_id,
                     protocol_ref_json,
@@ -561,6 +578,7 @@ impl Ledger {
                     roster_sha256,
                     package_json,
                     compatibility_roster_json,
+                    started_from_json,
                     now,
                 ],
             )?;
@@ -694,6 +712,11 @@ impl Ledger {
             let (profile_ref_json, _) = canonical(&package.profile_ref)?;
             let (roster_ref_json, _) = canonical(&package.roster_ref)?;
             let (compatibility_roster_json, _) = canonical(&definition.compatibility_roster)?;
+            let started_from_json = definition
+                .started_from
+                .as_ref()
+                .map(|value| canonical(value).map(|(json, _)| json))
+                .transpose()?;
 
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let run_id = new_run.run_id.as_str();
@@ -710,7 +733,7 @@ impl Ledger {
                     .query_row(
                         "SELECT run_id, protocol_ref_json, profile_ref_json, roster_ref_json, \
                          package_sha256, profile_sha256, roster_sha256, package_json, \
-                         compatibility_roster_json, created_at FROM run_definitions \
+                         compatibility_roster_json, started_from_json, created_at FROM run_definitions \
                          WHERE run_id = ?1",
                         [run_id],
                         definition_row,
@@ -725,6 +748,7 @@ impl Ledger {
                         && stored.roster_sha256 == roster_sha256
                         && stored.package_json == package_json
                         && stored.compatibility_roster_json == compatibility_roster_json
+                        && stored.started_from == definition.started_from
                 });
                 let revision_matches: bool = tx.query_row(
                     "SELECT EXISTS(SELECT 1 FROM roster_revisions WHERE run_id = ?1 \
@@ -778,8 +802,8 @@ impl Ledger {
             tx.execute(
                 "INSERT INTO run_definitions (run_id, protocol_ref_json, profile_ref_json, \
                  roster_ref_json, package_sha256, profile_sha256, roster_sha256, package_json, \
-                 compatibility_roster_json, created_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                 compatibility_roster_json, started_from_json, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 rusqlite::params![
                     row.run_id,
                     protocol_ref_json,
@@ -790,6 +814,7 @@ impl Ledger {
                     roster_sha256,
                     package_json,
                     compatibility_roster_json,
+                    started_from_json,
                     now,
                 ],
             )?;

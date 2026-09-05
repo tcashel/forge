@@ -273,6 +273,8 @@ pub struct ServiceStopArgs {
 /// `run` subcommands.
 #[derive(Debug, Subcommand)]
 pub enum RunCmd {
+    /// Approve, create, and submit one ready work item atomically.
+    Dispatch(RunDispatchArgs),
     /// Create a run for a work item.
     Start(RunStartArgs),
     /// Re-execute a terminal run on its current Work revision.
@@ -693,6 +695,60 @@ pub struct RunStartArgs {
     pub idempotency_key: Option<String>,
 }
 
+/// `run dispatch` flags. The work item's own fields are the immutable spec;
+/// this lead-facing command deliberately has no spec-file escape hatch.
+#[derive(Debug, Args)]
+pub struct RunDispatchArgs {
+    /// Ready work item to approve and dispatch.
+    #[arg(long)]
+    pub id: String,
+    /// Why this exact revision and execution tuple are approved.
+    #[arg(long)]
+    pub basis: String,
+    /// Approval actor; defaults to the current operation actor.
+    #[arg(long)]
+    pub approved_by: Option<String>,
+    /// Explicit reason to bypass a pre-adjudication lifecycle gate.
+    #[arg(long = "override")]
+    pub override_reason: Option<String>,
+    /// Named assurance profile; defaults from config.
+    #[arg(long)]
+    pub profile: Option<String>,
+    /// Named model roster; defaults from config.
+    #[arg(long)]
+    pub roster: Option<String>,
+    /// Absolute target checkout; defaults from work metadata.repository.
+    #[arg(long)]
+    pub repo: Option<String>,
+    /// Base ref; defaults to the repository's default branch.
+    #[arg(long)]
+    pub base_ref: Option<String>,
+    /// Override the run id minted from the work id.
+    #[arg(long)]
+    pub run_id: Option<String>,
+    /// Override the derived idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+/// Why a terminal run needs a successor.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum RunRetryBecause {
+    SpecAmended,
+    WorldChanged,
+    Rebase,
+}
+
+impl RunRetryBecause {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::SpecAmended => "spec-amended",
+            Self::WorldChanged => "world-changed",
+            Self::Rebase => "rebase",
+        }
+    }
+}
+
 /// `run retry` flags. A fresh successor desired row also receives a fresh
 /// default restart budget; retry never resets budgets on the terminal run.
 #[derive(Debug, Args)]
@@ -703,6 +759,12 @@ pub struct RunRetryArgs {
     /// Override the flat `<root>-r<N>` successor id.
     #[arg(long)]
     pub run_id: Option<String>,
+    /// Why the successor is required; defaults to world-changed for one release.
+    #[arg(long, value_enum)]
+    pub because: Option<RunRetryBecause>,
+    /// Start from the base ref instead of preserving committed source work.
+    #[arg(long)]
+    pub fresh: bool,
     /// Named assurance profile; defaults from current config.
     #[arg(long)]
     pub profile: Option<String>,
@@ -2147,6 +2209,7 @@ pub fn command_name(command: &Command) -> &'static str {
             DefinitionCmd::Validate(_) => "definition_validate",
         },
         Command::Run { command } => match command {
+            RunCmd::Dispatch(_) => "run_dispatch",
             RunCmd::Start(_) => "run_start",
             RunCmd::Retry(_) => "run_retry",
             RunCmd::Advance(_) => "run_advance",
@@ -2288,6 +2351,24 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
             ),
         },
         Command::Run { command } => match command {
+            RunCmd::Dispatch(a) => (
+                "run_dispatch",
+                request(
+                    a.idempotency_key,
+                    Some(a.id.clone()),
+                    json!({
+                        "id": a.id,
+                        "basis": a.basis,
+                        "approvedBy": a.approved_by,
+                        "override": a.override_reason,
+                        "profile": a.profile,
+                        "roster": a.roster,
+                        "repo": a.repo,
+                        "baseRef": a.base_ref,
+                        "runId": a.run_id,
+                    }),
+                ),
+            ),
             RunCmd::Start(a) => (
                 "run_start",
                 request(
@@ -2313,6 +2394,8 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
                     json!({
                         "id": a.id,
                         "runId": a.run_id,
+                        "because": a.because.map(RunRetryBecause::as_str),
+                        "fresh": a.fresh,
                         "profile": a.profile,
                         "roster": a.roster,
                     }),

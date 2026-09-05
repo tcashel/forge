@@ -78,6 +78,7 @@ fn definition() -> NewRunDefinition {
         package_sha256: digest(&package),
         package,
         compatibility_roster: HashMap::new(),
+        started_from: None,
     }
 }
 
@@ -479,7 +480,7 @@ DROP TRIGGER admission_revision_desired_work_insert;
         .expect("seed v14");
     }
     let ledger = Ledger::open(&path).expect("migrate 015");
-    assert_eq!(ledger.pragmas().expect("pragmas").user_version, 28);
+    assert_eq!(ledger.pragmas().expect("pragmas").user_version, 29);
     let epic = ledger
         .get_work_identity(WorkIdentitySubjectKind::Epic, "epic-one")
         .expect("read")

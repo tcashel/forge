@@ -59,6 +59,7 @@ const LEAD_MCP_OPERATIONS: &[&str] = &[
     "definition_validate",
     "explain",
     "next",
+    "run_dispatch",
     "run_retry",
     "run_status",
     "run_stop",
@@ -66,8 +67,6 @@ const LEAD_MCP_OPERATIONS: &[&str] = &[
     "run_adjudicate_settlement",
     "run_revise_roster",
     "run_revise_policy",
-    "run_start",
-    "run_submit",
     "epic_preflight",
     "epic_start",
     "epic_submit",
@@ -119,6 +118,8 @@ const OPERATOR_MCP_OPERATIONS: &[&str] = &[
 ];
 
 const MACHINE_MCP_OPERATIONS: &[&str] = &[
+    "run_start",
+    "run_submit",
     "run_advance",
     "packet_show",
     "packet_claim",
@@ -205,6 +206,7 @@ const OPERATION_CLASSES: &[(&str, OperationClass)] = &[
     ("run_adjudicate_settlement", OperationClass::Fenced),
     ("run_advance", OperationClass::MachineFenced),
     ("run_drive", OperationClass::MachineFenced),
+    ("run_dispatch", OperationClass::Fenced),
     ("run_retry", OperationClass::Fenced),
     ("run_revise_roster", OperationClass::Fenced),
     ("run_revise_policy", OperationClass::Fenced),

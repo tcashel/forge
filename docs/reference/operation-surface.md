@@ -43,14 +43,15 @@ Generated from the dispatch table, clap tree, MCP router, and fenced-call audit.
 | `run_accept_risk` | `forged run accept-risk` | yes | yes | lead | fenced | no | yes |
 | `run_adjudicate_settlement` | `forged run adjudicate-settlement` | yes | yes | lead | fenced | no | yes |
 | `run_advance` | `forged run advance` | yes | yes | machine | machine-fenced | no | yes |
+| `run_dispatch` | `forged run dispatch` | yes | yes | lead | fenced | no | yes |
 | `run_drive` | `forged run drive` | yes | no | — | machine-fenced | no | yes |
 | `run_retry` | `forged run retry` | yes | yes | lead | fenced | no | yes |
 | `run_revise_policy` | `forged run revise-policy` | yes | yes | lead | fenced | no | yes |
 | `run_revise_roster` | `forged run revise-roster` | yes | yes | lead | fenced | no | yes |
-| `run_start` | `forged run start` | yes | yes | lead | fenced | no | yes |
+| `run_start` | `forged run start` | yes | yes | machine | fenced | no | yes |
 | `run_status` | `forged run status` | yes | yes | lead | read_only | no | yes |
 | `run_stop` | `forged run stop` | yes | yes | lead | fenced | no | yes |
-| `run_submit` | `forged run submit` | yes | yes | lead | fenced | no | yes |
+| `run_submit` | `forged run submit` | yes | yes | machine | fenced | no | yes |
 | `service_install` | `forged service install` | yes | no | — | — | no | no |
 | `service_restart` | `forged service restart` | yes | no | — | — | no | no |
 | `service_start` | `forged service start` | yes | no | — | — | no | no |

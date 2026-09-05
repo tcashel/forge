@@ -2162,6 +2162,7 @@ mod tests {
                     package: compiled.package.clone(),
                     package_sha256: compiled.package_sha256.clone(),
                     compatibility_roster: compiled.compatibility_roster.clone(),
+                    started_from: None,
                 },
             )
             .expect("atomic create");
@@ -2196,6 +2197,7 @@ mod tests {
                     package: compiled.package,
                     package_sha256: "0".repeat(64),
                     compatibility_roster: compiled.compatibility_roster,
+                    started_from: None,
                 },
             )
             .expect_err("mismatch must refuse");
@@ -2228,6 +2230,7 @@ mod tests {
                     package: compiled.package.clone(),
                     package_sha256: compiled.package_sha256,
                     compatibility_roster: compiled.compatibility_roster,
+                    started_from: None,
                 },
             )
             .expect("create run");
@@ -2352,6 +2355,7 @@ mod tests {
                     package: compiled.package.clone(),
                     package_sha256: compiled.package_sha256,
                     compatibility_roster: compiled.compatibility_roster,
+                    started_from: None,
                 },
             )
             .expect("create child");

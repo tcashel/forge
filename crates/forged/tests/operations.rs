@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 use serde_json::{json, Value};
 use support::operator_store::{operator_store_fixture, SUBJECT_TOTAL};
-use support::{fabricate_epic, fabricate_run, TestEnv};
+use support::{fabricate_epic, fabricate_run, git, TestEnv};
 
 fn entries(response: &Value) -> BTreeMap<String, Value> {
     response["result"]["queue"]["groups"]
@@ -646,12 +646,16 @@ fn run_retry_mints_and_submits_one_flat_successor_at_the_amended_revision() {
         "retry",
         "--id",
         run_id,
+        "--because",
+        "spec-amended",
         "--idempotency-key",
         "retry-amended-key",
     ]);
     assert_eq!(code, 0, "retry amended run: {retried}");
     assert_eq!(retried["result"]["runId"], json!("retry-amended-r1"));
     assert_eq!(retried["result"]["retryOf"], json!(run_id));
+    assert_eq!(retried["result"]["because"], json!("spec-amended"));
+    assert_eq!(retried["result"]["becauseDefaulted"], json!(false));
     assert_eq!(retried["result"]["workId"], json!(run_id));
     assert_eq!(retried["result"]["revision"], json!("4"));
     assert_eq!(retried["result"]["submission"]["phase"], json!("queued"));
@@ -719,6 +723,244 @@ fn run_retry_mints_and_submits_one_flat_successor_at_the_amended_revision() {
     assert_eq!(code, 0, "retry retry-generation: {flat}");
     assert_eq!(flat["result"]["runId"], json!("retry-amended-r2"));
     assert_eq!(flat["result"]["retryOf"], json!("retry-amended-r1"));
+    assert_eq!(flat["result"]["because"], json!("world-changed"));
+    assert_eq!(flat["result"]["becauseDefaulted"], json!(true));
+}
+
+#[test]
+fn run_retry_preserves_three_local_only_commits_and_projects_the_start_point() {
+    let env = TestEnv::new("forged-run-retry-preserve-local");
+    env.forged(&["init"]);
+    let run_id = "retry-preserve-local";
+    env.seed_work_spec(
+        run_id,
+        "Preserve committed implementation work.",
+        "- the successor starts at the source head",
+    );
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let (code, started) = env.forged(&[
+        "run",
+        "start",
+        "--work",
+        run_id,
+        "--repo",
+        &repo,
+        "--base-ref",
+        "main",
+    ]);
+    assert_eq!(code, 0, "start source run: {started}");
+
+    let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+    let prepared = runtime
+        .block_on(forged_git::prepare_worktree(&forged_git::WorktreeSpec {
+            repo: env.repos.repo.clone(),
+            runs_root: env.anvil.join("runs"),
+            run_id: run_id.to_owned(),
+            branch: format!("forged/{run_id}"),
+            base: "main".to_owned(),
+            expected_base_sha: None,
+            start_sha: None,
+        }))
+        .expect("prepare source worktree");
+    for number in 1..=3 {
+        let name = format!("local-{number}.txt");
+        std::fs::write(prepared.worktree.join(&name), format!("local {number}\n"))
+            .expect("write local commit");
+        git(&prepared.worktree, &["add", &name]);
+        git(
+            &prepared.worktree,
+            &["commit", "-m", &format!("local commit {number}")],
+        );
+    }
+    let source_sha = git(&prepared.worktree, &["rev-parse", "HEAD"])
+        .trim()
+        .to_owned();
+    let ledger = env.ledger();
+    ledger
+        .settle_run(
+            run_id,
+            forged_ledger::RunOutcome::Cancelled,
+            "retry committed work".to_owned(),
+            None,
+            None,
+            None,
+        )
+        .expect("settle source run");
+    ledger.close().expect("close ledger");
+    runtime
+        .block_on(forged_git::retire_worktree(
+            &env.repos.repo,
+            &env.anvil.join("runs"),
+            run_id,
+            &forged_git::RetireOptions {
+                force: false,
+                run_state_terminal: true,
+            },
+        ))
+        .expect("retire source worktree without deleting its branch");
+
+    let (code, retried) = env.forged(&["run", "retry", "--id", run_id, "--because", "rebase"]);
+    assert_eq!(code, 0, "retry committed source: {retried}");
+    let successor = retried["result"]["runId"].as_str().expect("successor id");
+    assert_eq!(
+        retried["result"]["startedFrom"],
+        json!({"branch": format!("forged/{run_id}"), "sha": source_sha})
+    );
+
+    let ledger = env.ledger();
+    let definition = ledger
+        .get_run_definition(successor)
+        .expect("successor definition lookup")
+        .expect("successor definition");
+    assert_eq!(
+        definition.started_from,
+        Some(forged_ledger::RunStartPoint {
+            branch: format!("forged/{run_id}"),
+            sha: source_sha.clone(),
+        })
+    );
+    ledger.close().expect("close ledger");
+
+    let (code, status) = env.forged(&["run", "status", "--run", successor]);
+    assert_eq!(code, 0, "successor status: {status}");
+    assert_eq!(
+        status["result"]["run"]["startedFrom"]["sha"],
+        json!(source_sha)
+    );
+    let (code, explained) = env.forged(&["explain", "--id", successor]);
+    assert_eq!(code, 0, "successor explain: {explained}");
+    assert_eq!(
+        explained["result"]["what"]["startedFrom"]["sha"],
+        json!(source_sha)
+    );
+
+    let (code, advanced) = env.forged(&["run", "advance", "--run", successor]);
+    assert_eq!(code, 0, "resolve successor worktree: {advanced}");
+    let successor_worktree = env.anvil.join("runs").join(successor).join("worktree");
+    assert_eq!(
+        git(&successor_worktree, &["rev-parse", "HEAD"]).trim(),
+        source_sha
+    );
+    assert_eq!(
+        git(
+            &successor_worktree,
+            &["rev-list", "--count", "origin/main..HEAD"],
+        )
+        .trim(),
+        "3"
+    );
+}
+
+#[test]
+fn run_dispatch_is_one_fenced_approval_and_submission() {
+    let env = TestEnv::new("forged-run-dispatch");
+    env.forged(&["init"]);
+    let work_id = "dispatch-one-verb";
+    env.seed_work_spec(
+        work_id,
+        "Dispatch one immutable work revision.",
+        "- one run and one desired row exist",
+    );
+
+    let (code, refused) = env.forged(&[
+        "run",
+        "dispatch",
+        "--id",
+        work_id,
+        "--basis",
+        "the specification and execution tuple are approved",
+    ]);
+    assert_ne!(code, 0, "drafted work must not dispatch: {refused}");
+    let message = refused["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("recommendation") && message.contains("adjudicate"),
+        "lifecycle refusal names the full remedy: {refused}"
+    );
+
+    let (code, dispatched) = env.forged(&[
+        "run",
+        "dispatch",
+        "--id",
+        work_id,
+        "--basis",
+        "the specification and execution tuple are approved",
+        "--approved-by",
+        "lead-agent",
+        "--override",
+        "operator approved this bounded drafted fixture",
+        "--base-ref",
+        "main",
+    ]);
+    assert_eq!(code, 0, "dispatch succeeds: {dispatched}");
+    assert_eq!(dispatched["result"]["runId"], json!(work_id));
+    assert_eq!(dispatched["result"]["workId"], json!(work_id));
+    assert_eq!(dispatched["result"]["submission"]["phase"], json!("queued"));
+    assert_eq!(
+        dispatched["result"]["repository"],
+        json!(env.repos.repo.to_string_lossy())
+    );
+    assert!(dispatched["operationId"]
+        .as_str()
+        .is_some_and(|key| key.starts_with(&format!("op:run_dispatch:{work_id}:"))));
+
+    let ledger = env.ledger();
+    let run = ledger.get_run(work_id).expect("run exists");
+    assert_eq!(run.work_id, work_id);
+    let desired = ledger
+        .get_desired_work(forged_ledger::DesiredSubjectKind::Run, work_id)
+        .expect("desired lookup")
+        .expect("generation-zero desired work exists");
+    assert_eq!(desired.controller_generation, 0);
+    let notes = ledger
+        .list_work_notes(work_id, Some(forged_ledger::WorkNoteKind::Decision), 100)
+        .expect("decision notes");
+    assert_eq!(notes.notes.len(), 2, "override plus one approval decision");
+    let decisions = notes
+        .notes
+        .iter()
+        .map(|note| serde_json::from_str::<Value>(&note.body_json).expect("decision JSON"))
+        .collect::<Vec<_>>();
+    let approvals = decisions
+        .iter()
+        .filter(|decision| decision["kind"] == json!("approval"))
+        .collect::<Vec<_>>();
+    assert_eq!(approvals.len(), 1, "exactly one approval decision");
+    let approval = approvals[0];
+    assert_eq!(approval["actor"], json!("lead-agent"));
+    assert_eq!(
+        approval["choice"],
+        json!("the specification and execution tuple are approved")
+    );
+    assert_eq!(
+        approval["approval"]["repository"],
+        json!(env.repos.repo.to_string_lossy())
+    );
+    assert_eq!(approval["approval"]["baseRef"], json!("main"));
+    assert!(approval["approval"]["observedRevision"].is_number());
+    assert_eq!(
+        decisions
+            .iter()
+            .filter(|decision| decision["kind"] == json!("lifecycle-override"))
+            .count(),
+        1
+    );
+    ledger.close().expect("close ledger");
+
+    let (code, duplicate) = env.forged(&[
+        "run",
+        "dispatch",
+        "--id",
+        work_id,
+        "--basis",
+        "a second dispatch is forbidden",
+        "--override",
+        "still forbidden once a run exists",
+    ]);
+    assert_ne!(code, 0, "duplicate dispatch must refuse: {duplicate}");
+    assert_eq!(
+        duplicate["error"]["detail"]["remedy"]["action"]["verb"],
+        json!("run status")
+    );
 }
 
 #[test]

@@ -31,7 +31,7 @@ pub(crate) enum LifecycleStage {
 }
 
 impl LifecycleStage {
-    fn is_at_least_adjudicated(self) -> bool {
+    pub(crate) fn is_at_least_adjudicated(self) -> bool {
         matches!(
             self,
             Self::Adjudicated
@@ -42,6 +42,22 @@ impl LifecycleStage {
                 | Self::Landed
                 | Self::Closed
         )
+    }
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Drafted => "drafted",
+            Self::Critiqued => "critiqued",
+            Self::Adjudicated => "adjudicated",
+            Self::Ready => "ready",
+            Self::Dispatched => "dispatched",
+            Self::Deciding => "deciding",
+            Self::Reviewed => "reviewed",
+            Self::Landed => "landed",
+            Self::Closed => "closed",
+            Self::Blocked => "blocked",
+            Self::Parked => "parked",
+        }
     }
 }
 

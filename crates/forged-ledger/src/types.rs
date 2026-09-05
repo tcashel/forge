@@ -1376,7 +1376,17 @@ pub struct RunDefinitionRow {
     pub package_json: String,
     /// Temporary v0 executor projection, frozen with the package.
     pub compatibility_roster_json: String,
+    /// Optional committed branch head preserved by `run retry`.
+    pub started_from: Option<RunStartPoint>,
     pub created_at: String,
+}
+
+/// The committed source branch head from which a retry successor starts.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RunStartPoint {
+    pub branch: String,
+    pub sha: String,
 }
 
 /// One append-only `roster_revisions` row.
@@ -1714,6 +1724,7 @@ pub struct NewRunDefinition {
     pub package: ExecutionPackageV1,
     pub package_sha256: String,
     pub compatibility_roster: HashMap<Stage, ProviderHints>,
+    pub started_from: Option<RunStartPoint>,
 }
 
 /// Input to [`crate::Ledger::open_packet`].

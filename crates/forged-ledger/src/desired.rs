@@ -13,6 +13,7 @@ use crate::types::{
     DesiredReconcileOutcome, DesiredReconcileUpdate, DesiredRestartReservation, DesiredState,
     DesiredSubjectKind, DesiredWorkRow,
 };
+use crate::work::{canonical_work_note_body, insert_work_note_tx, NewWorkNote};
 
 use forged_types::{ErrorCode, OperationResponse};
 
@@ -396,6 +397,7 @@ impl Ledger {
             generation,
             None,
             None,
+            Vec::new(),
         )
     }
 
@@ -410,7 +412,11 @@ impl Ledger {
         generation: u32,
         queued_until: Option<String>,
         admission_reason: Option<String>,
+        mut sealed_notes: Vec<NewWorkNote>,
     ) -> Result<(), LedgerError> {
+        for note in &mut sealed_notes {
+            note.body_json = canonical_work_note_body(&note.body_json)?;
+        }
         let operation_id = operation_id.to_owned();
         let response = response.clone();
         let id = id.to_owned();
@@ -424,6 +430,15 @@ impl Ledger {
                     "UPDATE desired_work SET next_wake_at = ?1, last_error = ?2, updated_at = ?3 \
                      WHERE subject_kind = ?4 AND subject_id = ?5",
                     rusqlite::params![wake, admission_reason, now, kind.as_str(), id],
+                )?;
+            }
+            let written_at = now_iso();
+            for note in &sealed_notes {
+                insert_work_note_tx(
+                    &tx,
+                    note,
+                    uuid::Uuid::now_v7().to_string(),
+                    written_at.clone(),
                 )?;
             }
             tx.commit()?;
@@ -440,6 +455,29 @@ impl Ledger {
         id: &str,
         generation: u32,
     ) -> Result<(), LedgerError> {
+        self.resolve_interrupted_operation_authorizing_desired_with_notes(
+            operation_id,
+            response,
+            kind,
+            id,
+            generation,
+            Vec::new(),
+        )
+    }
+
+    /// Crash-recovery settlement that also seals immutable work decisions.
+    pub fn resolve_interrupted_operation_authorizing_desired_with_notes(
+        &self,
+        operation_id: &str,
+        response: &OperationResponse,
+        kind: DesiredSubjectKind,
+        id: &str,
+        generation: u32,
+        mut sealed_notes: Vec<NewWorkNote>,
+    ) -> Result<(), LedgerError> {
+        for note in &mut sealed_notes {
+            note.body_json = canonical_work_note_body(&note.body_json)?;
+        }
         let operation_id = operation_id.to_owned();
         let response = response.clone();
         let id = id.to_owned();
@@ -447,6 +485,15 @@ impl Ledger {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             settle_operation(&tx, &operation_id, &response, false)?;
             authorize_tx(&tx, kind, &id, generation)?;
+            let written_at = now_iso();
+            for note in &sealed_notes {
+                insert_work_note_tx(
+                    &tx,
+                    note,
+                    uuid::Uuid::now_v7().to_string(),
+                    written_at.clone(),
+                )?;
+            }
             tx.commit()?;
             Ok(())
         })

@@ -5,7 +5,7 @@ description: "Submit one complete ready ledger-native ore work item to Forged fo
 
 # /forged:dispatch
 
-Position: reviewed ready slice -> immutable run start and submit. Next: Forged
+Position: reviewed ready slice -> atomic approval and dispatch. Next: Forged
 drives the run to a reviewed draft PR or an explicit input-required stop.
 
 Boundary: the lead session selects, verifies, and explicitly hands off one work
@@ -64,7 +64,7 @@ open question must have an explicit disposition. Each accepted item must be
 folded into the normative fields; each rejected item must retain its reason.
 Checkbox-free critique prose is not evidence of adjudication. Any critique
 output without those dispositions makes the record nondispatchable: return it
-to `/forged:adjudicate` before any run start. Keep the unchecked-checkbox gate
+to `/forged:adjudicate` before dispatch. Keep the unchecked-checkbox gate
 in addition to this disposition check.
 
 Do not dispatch a record merely because its status text says open.
@@ -84,24 +84,27 @@ search of unanimity.
 
 ## Typed handoff
 
-Use the current installed CLI help if flags differ. The current ordered pair
-has no spec-file argument. Its run-start work-item flag is named `--work`;
-the persisted operation-envelope key remains the historical `bead` contract:
+Use the current installed CLI help if flags differ. `run dispatch` has no
+spec-file argument. It records the approval and atomically seals the immutable
+run plus generation-zero desired work, so there is no state to mutate between
+start and submit:
 
 ```bash
 PROFILE="${PROFILE:-standard}"
 ROSTER="${ROSTER:-default}"
-START_JSON="$(
-  forged run start --work "$WORK_ID" --repo "$TARGET_REPO" \
+APPROVED_BY="${APPROVED_BY:-operator}"
+DISPATCH_JSON="$(
+  forged run dispatch --id "$WORK_ID" --basis "$BASIS" \
+    --approved-by "$APPROVED_BY" --repo "$TARGET_REPO" \
     --profile "$PROFILE" --roster "$ROSTER"
 )"
-RUN_ID="$(printf '%s' "$START_JSON" | jq -er '.result.run_id')"
-forged run submit --run "$RUN_ID"
+RUN_ID="$(printf '%s' "$DISPATCH_JSON" | jq -er '.result.runId')"
 ```
 
-Capture the immutable run id returned by `start`; submit that exact id. Do not
-modify the work item or repository between freeze and submit. A successful
-submit is detached: do not poll in this turn.
+`BASIS` states why this exact revision, repository, base, profile, and roster
+are approved; `APPROVED_BY` identifies the approving actor. Capture the
+immutable run id returned by `dispatch`. A successful dispatch is detached:
+do not poll in this turn.
 
 ## Return to the operator
 
@@ -124,7 +127,8 @@ forged session read --attempt "$ATTEMPT_ID" --lines 120
 Explain the terminal contract: a reviewed draft PR or an explicit
 input-required stop. A slice has no generic `resolve` command; report the exact
 blocker and typed remedy instead of blindly resubmitting. After the requested
-decision or an in-place Work amendment, `forged run retry --id "$RUN_ID"`
+decision or an in-place Work amendment,
+`forged run retry --id "$RUN_ID" --because spec-amended`
 mints and submits a fresh successor on that same Work. Use `work supersede`
 only when a new Work item must replace the specification; never reconstruct the
 old stop/create/supersede/start/submit dance for a same-Work retry.
@@ -133,5 +137,6 @@ old stop/create/supersede/start/submit dance for a same-Work retry.
 
 - Do not auto-route, synchronize an external tracker, install software, add a
   background watch loop, or change protocol.
-- Do not mutate the work item between start and submit.
+- Do not bypass the lifecycle gate without an explicit operator-owned
+  `--override <reason>`.
 - Do not approve or merge the default branch.

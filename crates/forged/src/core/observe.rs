@@ -1452,7 +1452,7 @@ pub(crate) async fn explain_run(
         .iter()
         .filter(|attempt| attempt.state == AttemptState::Running)
         .count();
-    let retry_of = super::ops::run_retry_of(ctx, &run.run_id).await?;
+    let provenance = super::ops::run_provenance(ctx, &run.run_id).await?;
     let policy_revision = {
         let run_id = run.run_id.clone();
         on_ledger(&ctx.ledger, move |ledger| {
@@ -1484,7 +1484,8 @@ pub(crate) async fn explain_run(
         "what": {
             "identity": observation.identity,
             "workId": run.work_id,
-            "retryOf": retry_of,
+            "retryOf": provenance.retry_of,
+            "startedFrom": provenance.started_from,
             "policyRevision": policy_revision,
             "state": run.state.as_str(),
             "outcome": run.terminal_outcome.map(RunOutcome::as_str),

@@ -1466,6 +1466,13 @@ BEGIN
 END;
 ";
 
+/// Migration 029: immutable retry branch-head provenance. The base ref stays
+/// on `runs`; this optional definition field changes only the successor's
+/// initial checkout commit.
+const MIGRATION_029: &str = "
+ALTER TABLE run_definitions ADD COLUMN started_from_json TEXT;
+";
+
 /// Embedded ordered migrations; `user_version` records the last applied index.
 const MIGRATIONS: &[&str] = &[
     MIGRATION_001,
@@ -1496,6 +1503,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_026,
     MIGRATION_027,
     MIGRATION_028,
+    MIGRATION_029,
 ];
 
 /// Configure pragmas and apply pending migrations on a fresh connection.
@@ -1739,7 +1747,7 @@ mod tests {
         }
 
         let ledger = Ledger::open(&path).expect("upgrade v27 database");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 28);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 29);
         let approval = ledger
             .list_work_notes("noted-work", Some(crate::work::WorkNoteKind::Approval), 10)
             .expect("list migrated approval");
@@ -1810,7 +1818,7 @@ mod tests {
         assert_eq!(pragmas.synchronous, 2);
         assert!(pragmas.foreign_keys);
         assert_eq!(pragmas.busy_timeout_ms, 5000);
-        assert_eq!(pragmas.user_version, 28);
+        assert_eq!(pragmas.user_version, 29);
         ledger.close().expect("close");
 
         // Table names via a separate connection: sqlite_master is data, and
@@ -1981,7 +1989,7 @@ mod tests {
         }
 
         let ledger = Ledger::open(&path).expect("upgrade v23 database");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 28);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 29);
         ledger.close().expect("close");
 
         let conn = rusqlite::Connection::open(&path).expect("raw migrated database");
@@ -2030,7 +2038,7 @@ mod tests {
         }
 
         let ledger = Ledger::open(&path).expect("upgrade v24 database");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 28);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 29);
         ledger.close().expect("close");
 
         let conn = rusqlite::Connection::open(path).expect("raw migrated database");
@@ -2098,7 +2106,7 @@ mod tests {
         }
 
         let ledger = Ledger::open(&path).expect("open migration-013 database");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 28);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 29);
         ledger.close().expect("close");
 
         let conn = rusqlite::Connection::open(&path).expect("open upgraded database");
@@ -2158,7 +2166,7 @@ mod tests {
 
             let ledger = Ledger::open(&path)
                 .unwrap_or_else(|error| panic!("upgrade from v{version} failed: {error}"));
-            assert_eq!(ledger.pragmas().expect("pragmas").user_version, 28);
+            assert_eq!(ledger.pragmas().expect("pragmas").user_version, 29);
             assert_eq!(
                 ledger
                     .list_events_by_kind("legacy.progress")
@@ -2258,7 +2266,7 @@ mod tests {
         }
 
         let ledger = Ledger::open(&path).expect("upgrade owned v20 database");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 28);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 29);
         assert!(ledger
             .get_owned_herdr_session("migration-owned")
             .expect("owned row")
@@ -2302,7 +2310,7 @@ mod tests {
             .close()
             .expect("close");
         let ledger = Ledger::open(&path).expect("second open");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 28);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 29);
         ledger.close().expect("close");
     }
 
@@ -2363,7 +2371,7 @@ mod tests {
                 .expect("mark v0");
         }
         let ledger = Ledger::open(&path).expect("migrate");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 28);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 29);
         let old = ledger.get_run("old-run").expect("old run");
         assert_eq!(old.work_id, "old-bead");
         assert_eq!(old.stop_reason.as_deref(), Some("legacy stop"));
@@ -2406,7 +2414,7 @@ mod tests {
         }
 
         let ledger = Ledger::open(&path).expect("migrate");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 28);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 29);
         let first = ledger.get_attempt(1).expect("attempt 1 survived");
         assert_eq!(first.claim_token, "tok-1");
         assert_eq!(first.state, crate::AttemptState::Reclaimed);

@@ -258,8 +258,8 @@ Named skills remain available as explicit power-user and debugging surfaces:
 - `/forged:dispatch`
 - `/forged:run-epic`
 
-The dispatch skills call `forged run start` followed by `forged run submit`, or
-the corresponding epic commands, and return immediately with durable
+The slice dispatch skill calls the single fenced `forged run dispatch` verb;
+epic dispatch uses the corresponding epic commands. Both return immediately with durable
 inspection commands. They do not shell-detach jobs or keep the lead session
 alive. Slice work stops at a reviewed draft pull request. An epic may integrate
 mechanically clean children, but default-branch merge remains human-owned.

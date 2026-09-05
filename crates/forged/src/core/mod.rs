@@ -1126,6 +1126,7 @@ pub(crate) struct DesiredAuthorization {
     pub(crate) generation: u32,
     pub(crate) queued_until: Option<String>,
     pub(crate) admission_reason: Option<String>,
+    pub(crate) sealed_notes: Vec<forged_ledger::NewWorkNote>,
 }
 
 impl OnEffectError {
@@ -1384,6 +1385,7 @@ where
                         authorization.generation,
                         authorization.queued_until,
                         authorization.admission_reason,
+                        authorization.sealed_notes,
                     ),
                     None => l.complete_operation(&operation_id, &resp),
                 })
@@ -1484,6 +1486,7 @@ pub async fn dispatch(ctx: &Ctx, name: &str, mut req: OperationRequest) -> Opera
         "doctor" => ops::doctor(ctx, &req).await,
         "init" => ops::init(ctx, &mut req).await,
         "definition_validate" => ops::definition_validate(ctx, &req).await,
+        "run_dispatch" => ops::run_dispatch(ctx, &mut req).await,
         "run_start" => ops::run_start(ctx, &mut req).await,
         "run_retry" => ops::run_retry(ctx, &mut req).await,
         "run_advance" => drive::run_advance(ctx, &req).await,

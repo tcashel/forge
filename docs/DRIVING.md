@@ -90,7 +90,7 @@ ledger, and a closed item lists `work reopen` only as `repair`. Treat
 | idea → `drafted` | research read-only, draft the four fields, one slice or an epic with honest stubs | `work create`, `work update --expected-revision`, `work link` |
 | `drafted` → `critiqued` | run one independent critic per the risk (one pass, one delegate, or a small cross-family panel); verify every cited path; synthesize | `work note add --kind recommendation --schema forged.spec-recommendations/1` |
 | `critiqued` → `adjudicated` | disposition every recommendation and crux; fold accepted ones into the normative fields; remove resolved checkboxes | `work adjudicate --id --expected-revision --dispositions-file …` |
-| `adjudicated` → `dispatched` | confirm the tuple (id, revision, repository, base, profile, roster) with the operator, then one verb | `run dispatch --id --approved-by --basis` (**today:** `run start --work … --repo … --profile … --roster …` then `run submit --run …`) |
+| `adjudicated` → `dispatched` | confirm the tuple (id, revision, repository, base, profile, roster) with the operator, then one verb | `run dispatch --id --approved-by --basis` |
 | epic `adjudicated` → `dispatched` | `epic preflight`, show the identity tuple, then start and submit | `epic start … --rolling`, `epic submit` |
 
 The lifecycle is a total order at every boundary, including stub
