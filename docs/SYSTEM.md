@@ -113,11 +113,10 @@ names what breaks the crash-safety story if violated (see `CLAUDE.md`).
   `~/.anvil/runs/<id>/`.
 - **Read:** `run status --run`, `explain --id`, `session list | read |
   inventory`, `usage`.
-- **Write:** `run start`, `run submit`, `run retry`, `run stop`,
+- **Write:** `run dispatch`, `run retry`, `run stop`,
   `run accept-risk`, `run adjudicate-settlement`, `run revise-roster`,
-  `run revise-policy`; **(ADR-0036)** `run dispatch` (start + authorize
-  + approval record in one fenced verb; `start`/`submit` move to the
-  machine audience) and `run remediate --grant`.
+  `run revise-policy`; machine-facing `run start` and `run submit`; and
+  **(ADR-0036)** `run remediate --grant`.
 - **Agent need:** one verdict, one stage, one next. Not seven state
   fields.
 

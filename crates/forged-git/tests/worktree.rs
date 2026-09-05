@@ -22,6 +22,7 @@ fn spec(repos: &common::Repos, run_id: &str, branch: &str) -> WorktreeSpec {
         branch: branch.to_owned(),
         base: repos.base.clone(),
         expected_base_sha: None,
+        start_sha: None,
     }
 }
 
@@ -58,6 +59,54 @@ async fn prepare_creates_worktree_at_remote_base() {
     assert_eq!(rev_parse(&prepared.worktree, "HEAD"), origin_sha);
     let branch = git(&prepared.worktree, &["rev-parse", "--abbrev-ref", "HEAD"]);
     assert_eq!(branch.trim(), "feat/run-1");
+}
+
+#[tokio::test]
+async fn retry_worktree_starts_from_a_local_only_committed_branch_head() {
+    let repos = setup_repos(BASE);
+    let base_sha = rev_parse(&repos.origin, "HEAD");
+    let source = prepare(&repos, "run-source", "forged/run-source").await;
+    for number in 1..=3 {
+        commit_file(
+            &source.worktree,
+            &format!("commit-{number}.txt"),
+            &format!("commit {number}\n"),
+            &format!("source commit {number}"),
+        );
+    }
+    let source_sha = rev_parse(&source.worktree, "HEAD");
+    retire_worktree(
+        &repos.repo,
+        &repos.runs_root,
+        "run-source",
+        &RetireOptions {
+            force: false,
+            run_state_terminal: true,
+        },
+    )
+    .await
+    .expect("retire preserves the local branch");
+    assert_eq!(rev_parse(&repos.repo, "forged/run-source"), source_sha);
+
+    let mut successor = spec(&repos, "run-successor", "forged/run-successor");
+    successor.start_sha = Some(source_sha.clone());
+    let prepared = prepare_worktree(&successor)
+        .await
+        .expect("prepare successor from committed source head");
+
+    assert_eq!(
+        prepared.base_sha, base_sha,
+        "base remains the original base"
+    );
+    assert_eq!(rev_parse(&prepared.worktree, "HEAD"), source_sha);
+    assert_eq!(
+        git(
+            &prepared.worktree,
+            &["rev-list", "--count", &format!("origin/{BASE}..HEAD")]
+        )
+        .trim(),
+        "3"
+    );
 }
 
 #[tokio::test]

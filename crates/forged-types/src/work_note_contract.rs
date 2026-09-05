@@ -166,6 +166,8 @@ pub struct DecisionV1 {
     pub cost_microusd_at_decision: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval: Option<DecisionApprovalV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub because_defaulted: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -514,6 +516,17 @@ fn validate_decision(value: &Value) -> Result<(), WorkNoteContractError> {
         None | Some(Value::Null) => {}
         Some(value) => validate_decision_approval(value_object(value, "approval")?)?,
     }
+    match object.get("becauseDefaulted") {
+        None | Some(Value::Null) => {}
+        Some(Value::Bool(_)) if kind == "retry" => {}
+        Some(Value::Bool(_)) => {
+            return Err(violation(
+                "becauseDefaulted",
+                "is supported only when kind is retry",
+            ));
+        }
+        Some(_) => return Err(violation("becauseDefaulted", "must be a boolean")),
+    }
     known_fields(
         object,
         &[
@@ -527,6 +540,7 @@ fn validate_decision(value: &Value) -> Result<(), WorkNoteContractError> {
             "at",
             "costMicrousdAtDecision",
             "approval",
+            "becauseDefaulted",
         ],
         "payload",
     )

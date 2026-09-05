@@ -2099,6 +2099,7 @@ async fn submit(ctx: &Ctx, req: &mut OperationRequest, scope: Scope) -> Operatio
                 generation: max_generation,
                 queued_until: Some(now_iso()),
                 admission_reason: Some("loop-mode epic awaits the supervisor ore pass".to_owned()),
+                sealed_notes: Vec::new(),
             },
             move |_operation| async move {
                 Ok(json!({
@@ -2181,6 +2182,7 @@ async fn submit(ctx: &Ctx, req: &mut OperationRequest, scope: Scope) -> Operatio
                     generation: max_generation,
                     queued_until,
                     admission_reason: Some(reason),
+                    sealed_notes: Vec::new(),
                 },
                 move |_operation| async move {
                     Ok(json!({
@@ -2346,6 +2348,7 @@ async fn submit(ctx: &Ctx, req: &mut OperationRequest, scope: Scope) -> Operatio
             generation: spawn_generation,
             queued_until: None,
             admission_reason: None,
+            sealed_notes: Vec::new(),
         },
         {
             move |_operation| async move {
@@ -2393,7 +2396,7 @@ pub async fn run_submit(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespo
 /// Prepare a fresh retry successor for the ordinary supervisor path while the
 /// caller holds its run-scoped submit guard. The caller's fence atomically
 /// seals this authorization and therefore mints the default restart budget.
-pub(crate) async fn authorize_retry_successor(
+pub(crate) async fn authorize_dispatch(
     ctx: &Ctx,
     run_id: &str,
     _guard: &SubmitGuard,
@@ -2409,13 +2412,13 @@ pub(crate) async fn authorize_retry_successor(
     if run.state != forged_ledger::RunState::Active {
         return Err(Failure::refused(
             ErrorCode::InvalidRequest,
-            format!("retry successor {run_id} is already terminal"),
+            format!("run {run_id} is already terminal"),
         ));
     }
     if desired.is_some() {
         return Err(Failure::refused(
             ErrorCode::InvalidRequest,
-            format!("retry successor {run_id} is already submitted"),
+            format!("run {run_id} is already submitted"),
         ));
     }
     Ok((
@@ -2432,8 +2435,9 @@ pub(crate) async fn authorize_retry_successor(
             generation: 0,
             queued_until: None,
             admission_reason: Some(
-                "retry successor awaits ordinary supervisor admission".to_owned(),
+                "dispatched run awaits ordinary supervisor admission".to_owned(),
             ),
+            sealed_notes: Vec::new(),
         },
     ))
 }
@@ -2472,6 +2476,7 @@ pub(crate) async fn authorize_frontier_run(
         generation: 0,
         queued_until: None,
         admission_reason: Some("frontier child awaits ordinary supervisor admission".to_owned()),
+        sealed_notes: Vec::new(),
     })
 }
 

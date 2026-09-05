@@ -174,7 +174,7 @@ pub struct LeadWriteArgs {
 fn flat_run_id(name: &str, params: &serde_json::Map<String, Value>) -> Option<String> {
     let key = match name {
         "run_start" => return None,
-        "run_retry" => "id",
+        "run_dispatch" | "run_retry" => "id",
         "run_status"
         | "run_stop"
         | "run_submit"
@@ -243,6 +243,9 @@ fn flat_envelope(
         }
     }
     for key in ["profile", "roster", "runId", "baseRef"] {
+        if matches!(name, "run_dispatch" | "run_retry") && matches!(key, "profile" | "roster") {
+            continue;
+        }
         match params.get(key) {
             None | Some(Value::Null | Value::String(_)) => {}
             Some(other) => {
@@ -1504,6 +1507,15 @@ impl ForgedServer {
     )]
     pub async fn definition_validate(&self, args: Parameters<LeadReadArgs>) -> CallToolResult {
         self.call_lead_read("definition_validate", args.0).await
+    }
+
+    /// Approve, create, and submit one ready work item behind one fence.
+    #[tool(
+        name = "run_dispatch",
+        description = "Approve, create, and submit one ready work item atomically. Requires id and basis; defaults repository from work metadata."
+    )]
+    pub async fn run_dispatch(&self, args: Parameters<LeadWriteArgs>) -> CallToolResult {
+        self.call_lead_write("run_dispatch", args.0).await
     }
 
     /// Start a run for a work item.

@@ -338,6 +338,12 @@ fn restart_exhaustion_advertises_stop_then_retry_and_clears_durably() {
         "- the advertised verb executes",
     );
     fabricate_run(&env, run);
+    let connection = rusqlite::Connection::open(env.anvil.join("state.db"))
+        .expect("open branchless legacy fixture");
+    connection
+        .execute("UPDATE runs SET branch = '' WHERE run_id = ?1", [run])
+        .expect("remove the fabricated branch record");
+    drop(connection);
     env.authorize_run(run);
     exhaust_restart_budget(&env, run);
 
@@ -404,6 +410,7 @@ fn restart_exhaustion_advertises_stop_then_retry_and_clears_durably() {
     ]);
     assert_eq!(code, 0, "advertised run retry succeeds: {retried}");
     assert_eq!(retried["result"]["retryOf"], json!(run));
+    assert_eq!(retried["result"]["startedFrom"], json!("base"));
     assert!(
         attention(&overview(&env), run, "restart-budget-exhausted").is_none(),
         "a terminal exhausted source with a live same-work successor clears"

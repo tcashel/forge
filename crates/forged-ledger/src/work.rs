@@ -799,7 +799,7 @@ fn require_snapshot_tx(conn: &Connection, work_id: &str) -> Result<WorkItemSnaps
     })
 }
 
-fn canonical_work_note_body(raw: &str) -> Result<String, LedgerError> {
+pub(crate) fn canonical_work_note_body(raw: &str) -> Result<String, LedgerError> {
     let value = parse_canonical(raw).map_err(|error| {
         refused(
             ErrorCode::InvalidRequest,
@@ -835,7 +835,7 @@ fn work_note_body_revision(value: &serde_json::Value) -> Result<Option<i64>, Led
     })
 }
 
-fn insert_work_note_tx(
+pub(crate) fn insert_work_note_tx(
     conn: &Connection,
     new: &NewWorkNote,
     note_id: String,
@@ -2198,6 +2198,7 @@ impl Ledger {
                 at: written_at.clone(),
                 cost_microusd_at_decision: None,
                 approval: None,
+                because_defaulted: None,
             };
             let decision_json = serde_json::to_string(&decision)?;
             let note = NewWorkNote {
@@ -2481,6 +2482,7 @@ impl Ledger {
                     at: written_at.clone(),
                     cost_microusd_at_decision: None,
                     approval: None,
+                    because_defaulted: None,
                 };
                 let note = NewWorkNote {
                     work_id: work_id.clone(),

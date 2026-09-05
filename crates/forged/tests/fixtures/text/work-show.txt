@@ -11,4 +11,4 @@ notes count: 2
 dependencies: 1
   blocks ore-0  closed
 next actions: 1
-  should run start --work ore-1
+  should run dispatch --id ore-1

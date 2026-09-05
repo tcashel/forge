@@ -32,7 +32,7 @@ without matching evidence drops the item back to `drafted`.
 | `critiqued` | An independent critic has produced findings. | a `recommendation` note (`forged.spec-recommendations/1`) captured at N | `/forged:critique` → `work note add --kind recommendation` |
 | `adjudicated` | Every recommendation, crux, and question has a disposition; the spec reflects the accepted ones. | the newest `adjudication` note has `resultingRevision: N`, names its recommendation note, covers every recommendation and crux in that note, and `notes` has no unchecked `- [ ]` | `/forged:adjudicate` → `work adjudicate` |
 | `ready` | Adjudicated, `open`, unassigned, unleased, every `blocks` target closed. | the frontier query | dependency closure |
-| `dispatched` | A nonterminal run exists for this item. | run row in a nonterminal state | `run dispatch` (**ADR-0036**) / `run start` + `run submit` |
+| `dispatched` | A nonterminal run exists for this item. | run row in a nonterminal state | `run dispatch` (**ADR-0036**) |
 | `deciding` | A run is parked on a decision only the lead or human can make. | an open decision-class attention item on the current run | the protocol (spec amendment, seat question, lead adjudication, merge conflict, gate failure, restart budget, input required) |
 | `reviewed` | The protocol reached a draft PR and a terminal verdict; awaiting landing. | `run.protocol-terminal` with `delivery.pr` | the protocol |
 | `landed` | The change is merged where the run's base says it should be. | `delivery {pr, sha}` recorded | `run stop --outcome landed`, the ore pass (epic children), `run adjudicate-settlement` |
@@ -95,7 +95,8 @@ not only what.
   with `remedy.verb` naming the missing stage (`work note add --kind
   recommendation` or `work adjudicate`). `--override "<reason>"` is
   accepted and recorded as a `decision` of kind `lifecycle-override`.
-  Today `run start` checks readiness only.
+  Machine-facing `run start` retains its narrower readiness-only compatibility
+  contract.
 - `work adjudicate` compares `expectedRevision` with the current revision in
   the same transaction. If any spec field changes it mints N+1 and requires
   the adjudication body's `resultingRevision` to be N+1; if no field changes,

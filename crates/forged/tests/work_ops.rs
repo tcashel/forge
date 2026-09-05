@@ -251,23 +251,15 @@ fn work_show_next_actions_execute_for_open_blocked_and_closed_states() {
     let shown = result(&env, &["work", "show", "--id", "action-open"]);
     assert_eq!(
         shown["nextActions"],
-        json!([
-            {
-                "verb": "run start",
-                "args": {"work": "action-open", "repo": repository},
-                "reason": "start a run once the work specification is complete",
-                "class": "can",
-            },
-            {
-                "verb": "work update",
-                "args": {"id": "action-open", "expectedRevision": 1, "description": null},
-                "reason": "supply at least one spec field or priority under the current revision guard",
-                "class": "can",
-            },
-        ])
+        json!([{
+            "verb": "work update",
+            "args": {"id": "action-open", "expectedRevision": 1, "description": null},
+            "reason": "supply at least one spec field or priority under the current revision guard",
+            "class": "can",
+        }])
     );
 
-    let update = &shown["nextActions"][1];
+    let update = &shown["nextActions"][0];
     let expected = update["args"]["expectedRevision"]
         .as_i64()
         .expect("expected revision")
@@ -286,58 +278,6 @@ fn work_show_next_actions_execute_for_open_blocked_and_closed_states() {
         ],
     );
     assert_eq!(updated["work"]["revision"], json!(2));
-
-    let start = &shown["nextActions"][0];
-    let (code, started) = env.forged(&[
-        "run",
-        "start",
-        "--work",
-        start["args"]["work"].as_str().expect("start work"),
-        "--repo",
-        start["args"]["repo"].as_str().expect("start repo"),
-    ]);
-    assert_eq!(code, 0, "advertised run start succeeds: {started}");
-
-    result(
-        &env,
-        &[
-            "work",
-            "create",
-            "--id",
-            "action-repo-placeholder",
-            "--title",
-            "Repository placeholder fixture",
-            "--description",
-            "complete description",
-            "--acceptance",
-            "complete acceptance",
-            "--design",
-            "complete design",
-            "--notes",
-            "complete notes",
-            "--priority",
-            "3",
-        ],
-    );
-    let shown = result(&env, &["work", "show", "--id", "action-repo-placeholder"]);
-    let start = &shown["nextActions"][0];
-    assert_eq!(start["args"]["repo"], Value::Null);
-    assert_eq!(
-        start["reason"],
-        json!("choose the repository before starting the run")
-    );
-    let (code, started) = env.forged(&[
-        "run",
-        "start",
-        "--work",
-        start["args"]["work"].as_str().expect("start work"),
-        "--repo",
-        &repository,
-    ]);
-    assert_eq!(
-        code, 0,
-        "advertised run start succeeds after binding repo: {started}"
-    );
 
     result(
         &env,

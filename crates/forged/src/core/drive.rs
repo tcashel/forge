@@ -1560,16 +1560,26 @@ async fn machine_effect(
 ) -> Result<Value, Failure> {
     match step {
         MachineStage::Resolve => {
-            let (base, expected_base_sha) = match internal {
+            let (base, expected_base_sha, start_sha) = match internal {
                 InternalRunMode::Planning => (
                     run.base_ref.clone(),
                     super::epic::planning_base_sha(ctx, &run.run_id).await?,
+                    None,
                 ),
                 InternalRunMode::Assurance => (
                     run.branch.clone(),
                     super::epic::assurance_base_sha(ctx, &run.run_id).await?,
+                    None,
                 ),
-                InternalRunMode::Ordinary => (run.base_ref.clone(), None),
+                InternalRunMode::Ordinary => {
+                    let definition_run = run.run_id.clone();
+                    let start_sha = on_ledger(&ctx.ledger, move |ledger| {
+                        ledger.get_run_definition(&definition_run)
+                    })
+                    .await?
+                    .and_then(|definition| definition.started_from.map(|start| start.sha));
+                    (run.base_ref.clone(), None, start_sha)
+                }
             };
             let spec = forged_git::WorktreeSpec {
                 repo: PathBuf::from(&run.repo),
@@ -1578,6 +1588,7 @@ async fn machine_effect(
                 branch: run.branch.clone(),
                 base,
                 expected_base_sha,
+                start_sha,
             };
             let prepared = match forged_git::prepare_worktree(&spec).await {
                 Ok(prepared) => Some(prepared),

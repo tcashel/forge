@@ -77,7 +77,8 @@ pub use types::{
     ReviewFindingDeliveryClaim, ReviewFindingDeliveryKey, ReviewFindingDeliveryOutcome,
     ReviewFindingDeliveryRow, ReviewFindingDeliveryState, ReviewPublicationSource, RevokeScope,
     RosterRevisionBatch, RosterRevisionRow, RunDefinitionRow, RunOutcome, RunRow, RunSettlement,
-    RunState, SlotOutcome, SpecFence, UsageRecord, UsageTotals, WorkSettlementRetryRow,
+    RunStartPoint, RunState, SlotOutcome, SpecFence, UsageRecord, UsageTotals,
+    WorkSettlementRetryRow,
 };
 pub use work::{
     ImportedWorkItem, NewWorkItem, NewWorkNote, WorkDepKind, WorkDepRow, WorkDependencyStatus,

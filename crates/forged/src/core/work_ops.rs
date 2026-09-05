@@ -102,36 +102,39 @@ fn snapshot_json(snapshot: &WorkItemSnapshot, next_steps: &[&str]) -> Value {
 
 pub(crate) fn projection_actions(
     snapshot: &WorkItemSnapshot,
+    lifecycle: super::lifecycle::LifecycleStage,
 ) -> Vec<forged_types::OperationActionV1> {
     let actions = match snapshot.status {
         WorkStatus::Open => {
-            let repository = snapshot.metadata.get("repository");
-            vec![
-                (
-                    "run start",
-                    json!({
-                        "work": snapshot.work_id,
-                        "repo": repository,
-                    }),
-                    if repository.is_some() {
-                        "start a run once the work specification is complete"
-                    } else {
-                        "choose the repository before starting the run"
-                    },
-                    forged_types::ActionClass::Can,
-                ),
-                (
-                    "work update",
+            let mut actions = Vec::new();
+            if matches!(
+                lifecycle,
+                super::lifecycle::LifecycleStage::Adjudicated
+                    | super::lifecycle::LifecycleStage::Ready
+            ) {
+                actions.push((
+                    "run dispatch",
                     json!({
                         "id": snapshot.work_id,
-                        "expectedRevision": snapshot.revision,
-                        "description": Value::Null,
+                        "approvedBy": Value::Null,
+                        "basis": Value::Null,
                     }),
-                    "supply at least one spec field or priority under the \
-                     current revision guard",
-                    forged_types::ActionClass::Can,
-                ),
-            ]
+                    "bind the approving actor and basis for this adjudicated revision",
+                    forged_types::ActionClass::Should,
+                ));
+            }
+            actions.push((
+                "work update",
+                json!({
+                    "id": snapshot.work_id,
+                    "expectedRevision": snapshot.revision,
+                    "description": Value::Null,
+                }),
+                "supply at least one spec field or priority under the \
+                 current revision guard",
+                forged_types::ActionClass::Can,
+            ));
+            actions
         }
         WorkStatus::Blocked | WorkStatus::Closed => vec![(
             "work reopen",
@@ -1320,6 +1323,7 @@ pub async fn work_show(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
             .await?
             .remove(&snapshot.work_id)
             .ok_or_else(|| Failure::internal("work lifecycle projection omitted its item"))?;
+        let next_actions = projection_actions(&snapshot, lifecycle.stage);
         Ok(forged_types::with_work_twins(json!({
             "subject": {
                 "id": snapshot.work_id,
@@ -1333,7 +1337,7 @@ pub async fn work_show(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
             "notesCount": notes_count,
             "noteCounts": note_counts,
             "lifecycle": lifecycle,
-            "nextActions": projection_actions(&snapshot),
+            "nextActions": next_actions,
         })))
     })
     .await

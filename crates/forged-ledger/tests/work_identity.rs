@@ -1,7 +1,10 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 
-use forged_ledger::{InventoryUsageSelection, Ledger, NewRun, NewRunDefinition};
+use forged_ledger::{
+    InventoryUsageSelection, Ledger, NewRun, NewRunDefinition, NewWorkItem, WorkKind,
+    WorkRevisionCause, WorkSpecFields, WorkStatus,
+};
 use forged_types::{
     canonical_json_bytes, repository_label, work_display_title, ErrorCode, ExecutionPackageV1,
     ExecutionPolicyV1, HostPolicyV1, ProfileDefinitionV1, ProfileRef, ProtocolRef,
@@ -78,6 +81,7 @@ fn definition() -> NewRunDefinition {
         package_sha256: digest(&package),
         package,
         compatibility_roster: HashMap::new(),
+        started_from: None,
     }
 }
 
@@ -244,6 +248,104 @@ fn complete_run_bundle_is_atomic_and_exactly_replayable() {
 }
 
 #[test]
+fn first_run_creation_is_guarded_by_work_revision_and_existing_runs() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ledger = Ledger::open(&dir.path().join("state.db")).expect("ledger");
+    let new_work = |work_id: &str| NewWorkItem {
+        work_id: work_id.to_owned(),
+        kind: WorkKind::Task,
+        status: WorkStatus::Open,
+        priority: None,
+        metadata: BTreeMap::new(),
+        spec: WorkSpecFields {
+            title: format!("Work {work_id}"),
+            description: "dispatch guard".to_owned(),
+            acceptance_criteria: "one first run".to_owned(),
+            design: String::new(),
+            notes: String::new(),
+        },
+        cause: WorkRevisionCause::Authored,
+    };
+    let launch = |run_id: &str, work_id: &str, revision: i64| {
+        let mut frozen_identity = identity(
+            WorkIdentitySubjectKind::Run,
+            run_id,
+            work_id,
+            Some(&format!("Work {work_id}")),
+            "2026-09-04T00:00:00.000000000Z",
+            WorkIdentitySource::Durable,
+        );
+        frozen_identity.work.revision = Some(revision.to_string());
+        (
+            NewRun {
+                run_id: RunId::new(run_id).expect("run id"),
+                work_id: work_id.to_owned(),
+                repo: "/Users/tripp/repositories/forge".to_owned(),
+                base_ref: "main".to_owned(),
+                branch: format!("forged/{run_id}"),
+            },
+            definition(),
+            json!({
+                "runId": run_id,
+                "source": "bead",
+                "beadId": work_id,
+                "beadTitle": format!("Work {work_id}"),
+                "beadRevision": revision.to_string(),
+                "repo": "/Users/tripp/repositories/forge"
+            }),
+            frozen_identity,
+        )
+    };
+
+    ledger
+        .create_work_item(new_work("guarded-work"))
+        .expect("create work");
+    let (run, definition, event, identity) = launch("guarded-run-a", "guarded-work", 1);
+    ledger
+        .create_first_run_with_identity_at_revision(run, definition, event, identity, 1)
+        .expect("first dispatch");
+    let (run, definition, event, identity) = launch("guarded-run-b", "guarded-work", 1);
+    let duplicate = ledger
+        .create_first_run_with_identity_at_revision(run, definition, event, identity, 1)
+        .expect_err("second first run must lose the work-scoped fence");
+    assert_eq!(duplicate.code(), ErrorCode::WorkContention);
+    assert_eq!(
+        ledger
+            .get_run("guarded-run-b")
+            .expect_err("duplicate run was not inserted")
+            .code(),
+        ErrorCode::RunNotFound
+    );
+
+    let stale = ledger
+        .create_work_item(new_work("stale-work"))
+        .expect("create stale work");
+    ledger
+        .update_work_spec(
+            "stale-work",
+            stale.revision,
+            WorkSpecFields {
+                title: "Amended work".to_owned(),
+                ..stale.spec
+            },
+            WorkRevisionCause::Authored,
+        )
+        .expect("amend work");
+    let (run, definition, event, identity) = launch("stale-run", "stale-work", 2);
+    let moved = ledger
+        .create_first_run_with_identity_at_revision(run, definition, event, identity, 1)
+        .expect_err("stale lifecycle revision must not dispatch");
+    assert_eq!(moved.code(), ErrorCode::WorkContention);
+    assert_eq!(
+        ledger
+            .get_run("stale-run")
+            .expect_err("stale run was not inserted")
+            .code(),
+        ErrorCode::RunNotFound
+    );
+}
+
+#[test]
 fn epic_start_and_identity_commit_once_and_replay_together() {
     let dir = tempfile::tempdir().expect("tempdir");
     let ledger = Ledger::open(&dir.path().join("state.db")).expect("ledger");
@@ -386,6 +488,7 @@ fn migration_015_uses_only_durable_events_and_child_epic_context() {
             r#"DROP INDEX policy_revision_operation;
              DROP TABLE policy_revisions;
              ALTER TABLE packets DROP COLUMN policy_revision;
+             ALTER TABLE run_definitions DROP COLUMN started_from_json;
 DROP TRIGGER admission_revision_desired_work_insert;
              DROP TRIGGER admission_revision_desired_work_update;
              DROP TRIGGER admission_revision_desired_work_delete;
@@ -479,7 +582,7 @@ DROP TRIGGER admission_revision_desired_work_insert;
         .expect("seed v14");
     }
     let ledger = Ledger::open(&path).expect("migrate 015");
-    assert_eq!(ledger.pragmas().expect("pragmas").user_version, 28);
+    assert_eq!(ledger.pragmas().expect("pragmas").user_version, 29);
     let epic = ledger
         .get_work_identity(WorkIdentitySubjectKind::Epic, "epic-one")
         .expect("read")

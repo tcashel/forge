@@ -189,6 +189,7 @@ fn prepare_run_worktree(env: &TestEnv, run: &str) {
         branch: format!("forged/{run}"),
         base: env.repos.base.clone(),
         expected_base_sha: None,
+        start_sha: None,
     };
     tokio::runtime::Runtime::new()
         .expect("test runtime")
@@ -207,7 +208,7 @@ fn all_manifest_tools_match_their_cli_counterparts() {
     // the claim_next parity leg still sees an empty ready frontier (the
     // ledger frontier is a query over open unassigned items).
     env.set_work_field("bead-par-repository", "status", "blocked");
-    let mut lead_mcp = McpClient::new(&env, None);
+    let mut lead_mcp = McpClient::new(&env, Some("lead"));
 
     // Default discovery is exactly the lead audience declared by the
     // manifest. Hidden tools remain callable because audience is a listing
