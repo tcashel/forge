@@ -3,10 +3,10 @@
 You are a lead agent with the forged plugin loaded, in a target
 repository, and the operator has handed you an outcome. This is how to
 drive from operation responses alone. It is written for a reader with
-no memory of the last session. Where the target verb from
+no memory of the last session. Every verb here is on `main` unless a
+line is marked *not landed*; those are the wave 3 verbs from
 [ADR-0036](adr/0036-agent-is-the-operator-one-id-one-lifecycle-one-next.md)
-is not yet on `main`, the **Today** line gives the closest shipped
-substitute.
+and have no substitute yet: the decision stays with the lead.
 
 ## The loop
 
@@ -104,8 +104,8 @@ Every decision on `next` names its verbs. The full table is in
 ```sh
 forged run retry --id <run> --because spec-amended|world-changed|rebase
 forged run accept-risk --run <run> --accepted-by <actor> --rationale "…"
-forged run remediate --run <run> --grant 1          # ADR-0036
-forged decide --id <attention> --answer "…"          # ADR-0036, seat questions
+forged run remediate --run <run> --grant 1          # not landed (wave 3)
+forged decide --id <attention> --answer "…"          # not landed (wave 3)
 forged epic resolve --epic <epic> --child <child> --note "…"
 forged run stop --run <run> --outcome landed --pr <n> --sha <full-sha>
 ```

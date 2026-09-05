@@ -56,7 +56,10 @@ recommendation and CRUX:
   "critiquedRevision": 4,
   "recommendationNoteId": "<note-id>",
   "resultingRevision": 5,
-  "dispositions": [{"ref": {"noteId": "<note-id>", "index": 0}, "disposition": "accept", "reason": "<evidence>"}],
+  "dispositions": [
+    {"ref": {"noteId": "<note-id>", "index": 0}, "disposition": "accept", "reason": "<evidence>"},
+    {"ref": {"noteId": "<note-id>", "cruxId": "CRUX-1"}, "disposition": "accept", "reason": "<choice basis>"}
+  ],
   "cruxes": [{"id": "CRUX-1", "choice": "<choice>", "rationale": "<reason>"}],
   "adjudicatedAt": "<ISO-8601 UTC>",
   "actor": "<operator or lead>"

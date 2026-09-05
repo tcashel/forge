@@ -121,4 +121,3 @@ Legacy inputs remain accepted by the CLI until their named replacement lands.
 
 | Operation | Parameter | Value | Replacement | Remove at |
 | --- | --- | --- | --- | --- |
-| `work_note_add` | `kind` | `approval` | `run_dispatch` | `ore-080.11` |
