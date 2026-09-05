@@ -1009,7 +1009,7 @@ impl LeadMessageKindArg {
 /// Attempt-fenced provider-seat commands.
 #[derive(Debug, Subcommand)]
 pub enum SeatCmd {
-    /// Pull bounded undelivered messages for this attempt.
+    /// Pull a bounded page; pass its nextSince to --since for later mail.
     Inbox(SeatInboxArgs),
     /// Acknowledge one message addressed to this attempt.
     Ack(SeatAckArgs),
@@ -1024,10 +1024,10 @@ pub struct SeatInboxArgs {
     /// Positive attempt identity injected into the provider environment.
     #[arg(long)]
     pub attempt: i64,
-    /// Return messages queued after this event id.
+    /// Seat cursor: pass the preceding response's nextSince to discover later mail.
     #[arg(long)]
     pub since: Option<i64>,
-    /// Include message bodies and mark the shown messages read.
+    /// Include bodies and mark shown messages read; metadata-only delivery stays unread.
     #[arg(long)]
     pub bodies: bool,
     /// Maximum messages (default 100, maximum 500).

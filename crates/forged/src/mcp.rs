@@ -1817,7 +1817,9 @@ impl ForgedServer {
     /// Pull one bounded page of messages for the environment-fenced seat.
     #[tool(
         name = "seat_inbox",
-        description = "Pull undelivered messages for the running provider attempt."
+        description = "Pull one stored page for the running provider attempt. Identical \
+                       attempt/since/bodies/limit values replay that page verbatim; pass \
+                       nextSince as since to discover later mail."
     )]
     pub async fn seat_inbox(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
         self.call("seat_inbox", args.0).await

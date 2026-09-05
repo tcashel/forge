@@ -49,6 +49,7 @@ pub(crate) struct MessageRecord {
     pub in_reply_to: Option<String>,
     pub body: String,
     delivery_point: DeliveryPoint,
+    legacy_boundary_after_attempt: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,6 +116,7 @@ fn message_record(row: &EventRow) -> Option<MessageRecord> {
                 .map(str::to_owned),
             body: payload.get("body")?.as_str()?.to_owned(),
             delivery_point,
+            legacy_boundary_after_attempt: None,
         });
     }
     if row.kind != INTERVENTION_QUEUED {
@@ -147,6 +149,7 @@ fn message_record(row: &EventRow) -> Option<MessageRecord> {
         // Legacy interventions were injected at provider boundaries. Keep
         // that delivery contract when projecting their stored bytes.
         delivery_point: DeliveryPoint::Boundary,
+        legacy_boundary_after_attempt: payload.get("targetAttemptId").and_then(Value::as_i64),
     })
 }
 
@@ -215,18 +218,30 @@ fn targets_attempt(message: &MessageRecord, run_id: &str, attempt_id: i64) -> bo
         || value_id(&message.to, "attempt").as_deref() == Some(attempt_id.as_str())
 }
 
+fn targets_boundary(message: &MessageRecord, run_id: &str, attempt_id: i64) -> bool {
+    message.legacy_boundary_after_attempt.map_or_else(
+        || targets_attempt(message, run_id, attempt_id),
+        |target| attempt_id > target,
+    )
+}
+
 pub(crate) fn pending_for_boundary(
     events: &[EventRow],
     run_id: &str,
     attempt_id: i64,
 ) -> Vec<MessageRecord> {
-    let delivered = delivered(events);
-    messages(events)
+    let scoped = events
+        .iter()
+        .filter(|event| event.run_id.as_deref() == Some(run_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    let delivered = delivered(&scoped);
+    messages(&scoped)
         .into_iter()
         .filter(|message| {
             !delivered.contains(&message.message_id)
                 && message.delivery_point == DeliveryPoint::Boundary
-                && targets_attempt(message, run_id, attempt_id)
+                && targets_boundary(message, run_id, attempt_id)
         })
         .collect()
 }
@@ -499,7 +514,7 @@ pub async fn seat_inbox(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespo
                         attempt_id,
                         &json!({"since": req.params.get("since")}),
                     ),
-                    &Failure::invalid("seat inbox since must be a non-negative event id"),
+                    &Failure::invalid("seat inbox since must be a non-negative cursor"),
                 )
             }
         },
@@ -520,7 +535,6 @@ pub async fn seat_inbox(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespo
             &Failure::invalid("seat inbox limit must be between 1 and 500"),
         );
     }
-    let derived_key = super::key_absent(req);
     let request_material = json!({"since": since, "bodies": bodies, "limit": limit});
     default_key(req, seat_key("inbox", attempt_id, &request_material));
     req.run_id = None;
@@ -534,50 +548,23 @@ pub async fn seat_inbox(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespo
         Err(failure) => return super::err_response(&operation_id, &failure),
     };
     let mut pending = poll_for_attempt(&events, attempt_id, bodies);
-    pending.retain(|message| message.event_id > since);
-    let pending_frontier = pending
-        .iter()
-        .map(|message| message.event_id)
-        .max()
-        .unwrap_or(0);
-    if derived_key {
-        req.idempotency_key = seat_key(
-            "inbox",
-            attempt_id,
-            &json!({
-                "since": since,
-                "bodies": bodies,
-                "limit": limit,
-                "pendingFrontier": pending_frontier,
-                "pendingCount": pending.len(),
-            }),
-        );
-    }
     pending.sort_by_key(|message| (message.importance != "urgent", message.event_id));
     let total = pending.len();
-    let remaining_floor = pending
-        .iter()
-        .skip(limit as usize)
-        .map(|message| message.event_id)
-        .min();
     pending.truncate(limit as usize);
     let shown = pending.len();
     let truncated = shown < total;
-    // Urgent mail may leapfrog older normal mail. The numeric cursor is
-    // therefore the greatest safe event frontier before the oldest unshown
-    // message, rather than the maximum event id in this page. Delivered/read
-    // effects remove shown rows from the next evaluation, so bounded pages
-    // progress without skipping the older row.
-    let next_cursor = if let Some(remaining_floor) = remaining_floor {
-        remaining_floor.saturating_sub(1).max(since)
-    } else {
-        events
-            .iter()
-            .map(|event| event.event_id)
-            .max()
-            .unwrap_or(since)
-            .max(since)
-    };
+    // `since` is a refresh cursor, while delivered/read markers are the
+    // consumption state. Always advance beyond the observed event frontier,
+    // including on an empty page, so a later request has a fresh operation
+    // key. Pending rows stay eligible even when urgent mail leapfrogs an older
+    // normal row; the markers, not the cursor, prevent duplicate consumption.
+    let next_since = events
+        .iter()
+        .map(|event| event.event_id)
+        .max()
+        .unwrap_or(since)
+        .saturating_add(1)
+        .max(since.saturating_add(1));
     let page = pending
         .iter()
         .map(|message| message_json(message, bodies))
@@ -623,11 +610,12 @@ pub async fn seat_inbox(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespo
                 "attemptId": attempt_id,
                 "packetId": packet_id,
                 "messages": page,
+                "nextSince": next_since,
                 "coverage": {
                     "shown": shown,
                     "total": total,
                     "truncated": truncated,
-                    "nextCursor": next_cursor,
+                    "nextCursor": next_since,
                 },
             }))
         },
@@ -1020,6 +1008,10 @@ mod tests {
         assert_eq!(projected[0].kind, "instruction");
         assert_eq!(projected[0].importance, "normal");
         assert_eq!(projected[0].to, json!({"kind": "attempt", "id": 7}));
+        assert!(pending_for_boundary(std::slice::from_ref(&queued), "legacy-run", 7).is_empty());
+        let successor = pending_for_boundary(std::slice::from_ref(&queued), "legacy-run", 8);
+        assert_eq!(successor.len(), 1);
+        assert_eq!(successor[0].message_id, "op:legacy-message");
 
         let delivered = EventRow {
             event_id: 42,

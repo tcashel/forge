@@ -1000,14 +1000,14 @@ async fn wait_for_pid_or_deadline(
             return Ok(true);
         }
         if !warned && now >= warning_at {
-            super::seat::record_deadline_warning(
+            crate::adapters::execute::record_deadline_warning_once(
                 ctx,
                 warning.run_id,
                 warning.packet_id,
                 warning.attempt_id,
+                &mut warned,
             )
-            .await?;
-            warned = true;
+            .await;
         }
         let remaining_ns = deadline.as_nanosecond() - now.as_nanosecond();
         let remaining_ns = u64::try_from(remaining_ns)

@@ -140,6 +140,35 @@ fn deadline_warning_due(
         .map_err(|error| Failure::internal(error.to_string()))
 }
 
+async fn latch_deadline_warning<F, Fut>(recorded: &mut bool, append: F)
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<(), Failure>>,
+{
+    if *recorded {
+        return;
+    }
+    match append().await {
+        Ok(()) => *recorded = true,
+        Err(error) => {
+            tracing::warn!(%error, "deadline warning append failed; retrying on a later beat");
+        }
+    }
+}
+
+pub(crate) async fn record_deadline_warning_once(
+    ctx: &Ctx,
+    run_id: &str,
+    packet_id: &str,
+    attempt_id: i64,
+    recorded: &mut bool,
+) {
+    latch_deadline_warning(recorded, || {
+        crate::core::seat::record_deadline_warning(ctx, run_id, packet_id, attempt_id)
+    })
+    .await;
+}
+
 async fn settle_deadline_retry(
     ctx: &Ctx,
     run_id: &str,
@@ -2508,6 +2537,7 @@ async fn run_attempt(
     // Await completion by polling the host; the sentinel status file is the
     // only exit-code truth.
     let mut beats: u32 = 0;
+    let mut deadline_warning_recorded = false;
     let mut session_scanner =
         forged_provider::ProviderSessionScanner::new(&packet.provider_hints.provider);
     let liveness = loop {
@@ -2587,10 +2617,14 @@ async fn run_attempt(
                     ctx.config.deadline_warning_s,
                     &as_of,
                 )? {
-                    crate::core::seat::record_deadline_warning(
-                        ctx, &run_id, &packet_id, attempt_id,
+                    record_deadline_warning_once(
+                        ctx,
+                        &run_id,
+                        &packet_id,
+                        attempt_id,
+                        &mut deadline_warning_recorded,
                     )
-                    .await?;
+                    .await;
                 }
                 beats += 1;
                 if beats.is_multiple_of(25) {
@@ -4121,6 +4155,31 @@ mod settle_tests {
             "2026-09-04T00:45:00.000000123Z",
         )
         .expect("warning is before deadline"));
+    }
+
+    #[tokio::test]
+    async fn deadline_warning_latch_retries_failure_then_appends_once_across_many_beats() {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let appends = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut recorded = false;
+
+        for _ in 0..20 {
+            let attempts = Arc::clone(&attempts);
+            let appends = Arc::clone(&appends);
+            latch_deadline_warning(&mut recorded, move || async move {
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    return Err(Failure::internal("transient warning write failure"));
+                }
+                appends.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .await;
+        }
+
+        assert!(recorded, "a later beat records the warning after a failure");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(appends.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

@@ -162,6 +162,10 @@ fn render_succeeds_for_all_three_stages() {
         flattened.contains("before every seat-check run, after every commit, and whenever blocked for more than five minutes"),
         "implement prompt names the mail discipline points: {implement}"
     );
+    assert!(
+        flattened.contains("`nextSince` in each response as the seat cursor"),
+        "implement prompt explains how to advance the inbox cursor: {implement}"
+    );
 
     let review = templates
         .render(PromptStage::Review, &review_context())

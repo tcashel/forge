@@ -28,7 +28,9 @@ Operator interventions recorded before this provider boundary:
    return, and again after every fix round.
    Run `forged seat inbox --attempt "$FORGED_SEAT_ATTEMPT" --bodies` before
    every seat-check run, after every commit, and whenever blocked for more than
-   five minutes. Ack every message that asks for it. After each commit, send a
+   five minutes. Treat `nextSince` in each response as the seat cursor and pass
+   it with `--since` on the next poll; an identical request replays the same
+   stored page. Ack every message that asks for it. After each commit, send a
    progress snapshot with `forged seat progress`; use `forged seat note` for
    concise information the lead needs before you return.
 4. Own your commits: `git add <path>` on files you changed on purpose (never

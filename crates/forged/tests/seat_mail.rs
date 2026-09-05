@@ -271,6 +271,10 @@ fn queued_mail_polls_reads_and_acks_once_with_urgent_first() {
     assert_eq!(page["result"]["coverage"]["total"], json!(2));
     assert_eq!(page["result"]["coverage"]["truncated"], json!(false));
     assert!(page["result"]["coverage"]["nextCursor"].is_number());
+    assert_eq!(
+        page["result"]["nextSince"],
+        page["result"]["coverage"]["nextCursor"]
+    );
     assert_eq!(page["result"]["messages"][0]["importance"], json!("urgent"));
     assert_eq!(
         page["result"]["messages"][0]["body"],
@@ -281,7 +285,7 @@ fn queued_mail_polls_reads_and_acks_once_with_urgent_first() {
         json!("normal instruction")
     );
 
-    let (_, drained) = seat_call(
+    let (_, replayed_page) = seat_call(
         &env,
         &seat,
         &[
@@ -294,9 +298,8 @@ fn queued_mail_polls_reads_and_acks_once_with_urgent_first() {
             "10",
         ],
     );
-    assert_eq!(drained["reused"], json!(false));
-    assert_eq!(drained["result"]["coverage"]["shown"], json!(0));
-    assert!(drained["result"]["coverage"]["nextCursor"].is_number());
+    assert_eq!(replayed_page["reused"], json!(true));
+    assert_eq!(replayed_page["result"], page["result"]);
     assert_eq!(
         event_payloads(&env, RUN, "forged.message.delivered").len(),
         2
@@ -304,6 +307,10 @@ fn queued_mail_polls_reads_and_acks_once_with_urgent_first() {
     assert_eq!(event_payloads(&env, RUN, "forged.message.read").len(), 2);
 
     let later = queue(&env, seat.attempt_id, "later instruction", false);
+    let next_since = page["result"]["nextSince"]
+        .as_i64()
+        .expect("numeric nextSince")
+        .to_string();
     let (_, advanced) = seat_call(
         &env,
         &seat,
@@ -312,6 +319,8 @@ fn queued_mail_polls_reads_and_acks_once_with_urgent_first() {
             "inbox",
             "--attempt",
             &attempt,
+            "--since",
+            &next_since,
             "--bodies",
             "--limit",
             "10",
@@ -416,6 +425,11 @@ fn metadata_poll_does_not_consume_the_unread_body() {
         json!("read me after metadata")
     );
     assert_eq!(event_payloads(&env, RUN, "forged.message.read").len(), 1);
+    assert_eq!(
+        event_payloads(&env, RUN, "forged.message.delivered").len(),
+        1,
+        "fetching an unread body does not duplicate its delivered marker"
+    );
 }
 
 #[test]

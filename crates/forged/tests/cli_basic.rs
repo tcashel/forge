@@ -122,6 +122,11 @@ fn help_lists_every_command_and_subcommand_flags() {
     for sub in ["inbox", "ack", "progress", "note"] {
         assert!(seat.contains(sub), "seat --help must list {sub}");
     }
+    let inbox = help_text(&env, &["seat", "inbox", "--help"]);
+    assert!(
+        inbox.contains("nextSince"),
+        "seat inbox help names its cursor"
+    );
     let retire = help_text(&env, &["worktree", "retire", "--help"]);
     for flag in [
         "--run",

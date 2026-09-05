@@ -505,12 +505,36 @@ pub async fn session_read(ctx: &Ctx, req: &OperationRequest) -> OperationRespons
     .await
 }
 
-fn message_key(run_id: &str, message: &str, kind: &str, reply_to: Option<&str>) -> String {
-    let digest = if kind == "instruction" && reply_to.is_none() {
+fn message_key(
+    run_id: &str,
+    message: &str,
+    kind: &str,
+    reply_to: Option<&str>,
+    target_attempt: Option<i64>,
+    urgent: bool,
+    ack_required: bool,
+) -> String {
+    let digest = if kind == "instruction"
+        && reply_to.is_none()
+        && target_attempt.is_none()
+        && !urgent
+        && !ack_required
+    {
         // Preserve the v0.7 operation identity for the pre-existing call.
         Sha256::digest(message.as_bytes())
     } else {
-        let key_material = json!({"body": message, "kind": kind, "replyTo": reply_to});
+        let to = target_attempt.map_or_else(
+            || json!({"kind": "run", "id": run_id}),
+            |attempt| json!({"kind": "attempt", "id": attempt}),
+        );
+        let key_material = json!({
+            "body": message,
+            "kind": kind,
+            "replyTo": reply_to,
+            "to": to,
+            "importance": if urgent { "urgent" } else { "normal" },
+            "ackRequired": ack_required,
+        });
         Sha256::digest(forged_types::canonical_json_bytes(&key_material).unwrap_or_default())
     };
     let short = digest[..8]
@@ -555,13 +579,6 @@ pub async fn session_message(ctx: &Ctx, req: &mut OperationRequest) -> Operation
         );
     }
     let reply_to = param_opt_str(&params, "replyTo").map(str::to_owned);
-    default_key(
-        req,
-        message_key(&run_id, &message, &kind, reply_to.as_deref()),
-    );
-    if req.run_id.is_none() {
-        req.run_id = Some(run_id.clone());
-    }
     let target_attempt = params.get("attempt").and_then(Value::as_i64);
     let urgent = params
         .get("urgent")
@@ -571,6 +588,21 @@ pub async fn session_message(ctx: &Ctx, req: &mut OperationRequest) -> Operation
         .get("ackRequired")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    default_key(
+        req,
+        message_key(
+            &run_id,
+            &message,
+            &kind,
+            reply_to.as_deref(),
+            target_attempt,
+            urgent,
+            ack_required,
+        ),
+    );
+    if req.run_id.is_none() {
+        req.run_id = Some(run_id.clone());
+    }
     let requested_by = param_opt_str(&params, "requestedBy")
         .unwrap_or("operator")
         .to_owned();
@@ -739,4 +771,36 @@ pub async fn session_stop(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
         },
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn message_key_fences_recipient_urgency_and_ack_with_legacy_plain_compatibility() {
+        let run_id = "run-message-key";
+        let body = "same instruction";
+        let legacy = message_key(run_id, body, "instruction", None, None, false, false);
+        let digest = Sha256::digest(body.as_bytes());
+        let short = digest[..8]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        assert_eq!(
+            legacy,
+            derive_key("session_message", Some(run_id), Some(&short), None)
+        );
+
+        let attempt_7 = message_key(run_id, body, "instruction", None, Some(7), false, false);
+        let attempt_8 = message_key(run_id, body, "instruction", None, Some(8), false, false);
+        let urgent = message_key(run_id, body, "instruction", None, None, true, false);
+        let ack_required = message_key(run_id, body, "instruction", None, None, false, true);
+
+        assert_ne!(attempt_7, attempt_8, "attempt recipient is key material");
+        assert_ne!(legacy, attempt_7, "run and attempt recipients differ");
+        assert_ne!(legacy, urgent, "importance is key material");
+        assert_ne!(legacy, ack_required, "ackRequired is key material");
+        assert_ne!(urgent, ack_required, "escalation modes remain distinct");
+    }
 }
