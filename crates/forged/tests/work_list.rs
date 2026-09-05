@@ -360,9 +360,31 @@ fn the_operator_queue_is_human_named_grouped_and_honest_about_unknowns() {
         in_group("Running", "q-running")["currentStage"],
         json!("implement")
     );
-    let stalled = in_group("Stalled or recoverable", "q-stalled");
+    // An unsettled stop needs an operator decision, while its stale claim
+    // remains visible as evidence for recovery.
+    let stalled = in_group("Needs me", "q-stalled");
     assert_eq!(stalled["claimHealth"]["staleInProgress"], json!(true));
     assert!(stalled["blocker"].as_str().is_some());
+    let stopped_attention = response["result"]["attention"]
+        .as_array()
+        .expect("attention items")
+        .iter()
+        .find(|item| item["subjectId"] == json!("q-stalled"))
+        .expect("unsettled stop attention");
+    assert_eq!(stopped_attention["condition"], json!("input-required"));
+    assert_eq!(
+        stopped_attention["detail"],
+        json!("driver exited before settlement")
+    );
+    assert_eq!(
+        stopped_attention["nextActions"],
+        json!([{
+            "verb": "run retry",
+            "class": "should",
+            "args": {"id": "q-stalled", "runId": null, "because": "world-changed"},
+            "reason": "correct the recorded stop condition, then retry: driver exited before settlement",
+        }])
+    );
     let planned = in_group("Planned", "q-planned");
     assert_eq!(planned["title"], planned["identity"]["displayTitle"]);
     assert_ne!(

@@ -3752,22 +3752,29 @@ fn implementer_spec_amendment_stops_before_gate_or_review() {
 }
 
 #[test]
-fn gate_failure_escalates_once_but_standard_review_never_escalates_topology() {
-    // Gate failure raises lean to its stored standard edge and survives
-    // repeated projection/drive without duplicating the transition.
-    let gate = TestEnv::new("forged-escalate-gate");
-    gate.forged(&["init"]);
+fn failed_gate_repairs_before_review_without_expanding_standard_topology() {
+    let gate = TestEnv::new("forged-gate-before-review");
+    assert_eq!(gate.forged(&["init"]).0, 0);
     gate.seed_frontier("bead-gate-edge");
+    // Match the new provider contract: commit locally; the controller owns
+    // publication after the repaired candidate passes its machine gate.
+    for provider in ["claude", "codex"] {
+        let path = gate.shim_bin.join(provider);
+        let shim = std::fs::read_to_string(&path).expect("provider shim");
+        assert!(shim.contains("    git push -q origin HEAD\n"));
+        std::fs::write(&path, shim.replace("    git push -q origin HEAD\n", ""))
+            .expect("local-commit-only remediation shim");
+    }
     let config_path = gate.anvil.join("config.json");
     let mut config: Value =
         serde_json::from_str(&std::fs::read_to_string(&config_path).expect("gate config"))
             .expect("gate config json");
-    config["gate_commands"] = json!(["false"]);
+    config["gate_commands"] = json!(["test -f fix-0.txt"]);
     std::fs::write(
         &config_path,
         serde_json::to_string_pretty(&config).expect("gate config json"),
     )
-    .expect("write failing gate");
+    .expect("write gate that requires the committed repair");
     let repo = gate.repos.repo.to_string_lossy().into_owned();
     let spec = gate.spec.to_string_lossy().into_owned();
     assert_eq!(
@@ -3783,31 +3790,109 @@ fn gate_failure_escalates_once_but_standard_review_never_escalates_topology() {
             "--base-ref",
             "main",
             "--profile",
-            "lean",
+            "standard",
         ])
         .0,
         0
     );
     gate.authorize_run("bead-gate-edge");
+    let (code, driven) = gate.forged(&["run", "drive", "--run", "bead-gate-edge"]);
+    assert_eq!(code, 0, "bounded gate repair: {driven}");
+    assert_eq!(
+        driven["result"]["terminal"]["done"]["reviewRounds"],
+        json!(1)
+    );
+    let first_log = gate.provider_log();
     assert_eq!(
         gate.forged(&["run", "drive", "--run", "bead-gate-edge"]).0,
         0
     );
     assert_eq!(
-        gate.forged(&["run", "drive", "--run", "bead-gate-edge"]).0,
-        0
+        gate.provider_log(),
+        first_log,
+        "completed drive never reruns a seat"
     );
-    let (_, events) = gate.forged(&["events", "--run", "bead-gate-edge"]);
-    let escalations: Vec<_> = events["result"]["events"]
-        .as_array()
-        .expect("events")
+
+    let ledger = gate.ledger();
+    let events = ledger
+        .list_events(Some("bead-gate-edge"), 0, 4096)
+        .expect("events");
+    assert!(!events
         .iter()
-        .filter(|event| event["kind"] == json!("forged.profile.escalated"))
-        .collect();
-    assert_eq!(escalations.len(), 1, "one durable gate escalation");
-    assert_eq!(escalations[0]["payload"]["from"], json!("lean"));
-    assert_eq!(escalations[0]["payload"]["to"], json!("standard"));
-    assert_eq!(escalations[0]["payload"]["trigger"], json!("gateFailure"));
+        .any(|event| event.kind == "forged.profile.escalated"));
+    let gates = events
+        .iter()
+        .filter(|event| event.kind == "proto.gate")
+        .map(|event| {
+            (
+                event,
+                serde_json::from_str::<Value>(&event.payload_json).expect("gate event"),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        gates.len(),
+        2,
+        "exactly the initial gate and one bounded regate"
+    );
+    assert_eq!(gates[0].1["phase"], json!("gate"));
+    assert_eq!(gates[0].1["passed"], json!(false));
+    assert_eq!(gates[1].1["phase"], json!("regate"));
+    assert_eq!(gates[1].1["seq"], json!(1));
+    assert_eq!(gates[1].1["passed"], json!(true));
+    let packets = ledger.list_packets("bead-gate-edge").expect("packets");
+    let repairs = packets
+        .iter()
+        .filter(|packet| packet.stage == forged_types::Stage::Fix)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        repairs.len(),
+        1,
+        "the gate consumes the existing single repair round"
+    );
+    assert_eq!(repairs[0].packet_id, "bead-gate-edge/remediation/0");
+    let reviews = packets
+        .iter()
+        .filter(|packet| {
+            matches!(
+                packet.stage,
+                forged_types::Stage::ReviewClaude | forged_types::Stage::ReviewCodex
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(reviews.len(), 1, "only the selected standard reviewer runs");
+    assert_eq!(reviews[0].packet_id, "bead-gate-edge/review-1/1");
+    assert!(
+        reviews[0].created_at > gates[1].0.ts,
+        "no review packet opens before its candidate passes the machine gate"
+    );
+    assert!(ledger
+        .find_operation("push", "bead-gate-edge/push/0")
+        .expect("push0")
+        .is_none());
+    for (name, key) in [
+        ("gate", "bead-gate-edge/gate/0"),
+        ("regate", "bead-gate-edge/regate/1"),
+        ("push", "bead-gate-edge/push/1"),
+        ("draftpr", "bead-gate-edge/draftpr/0"),
+    ] {
+        let operation = ledger
+            .find_operation(name, key)
+            .expect("operation")
+            .expect("durable step");
+        assert_eq!(
+            operation.state,
+            forged_ledger::OperationState::Terminal,
+            "{key}"
+        );
+    }
+    ledger.close().expect("close ledger");
+    let (_, status) = gate.forged(&["run", "status", "--run", "bead-gate-edge"]);
+    assert_eq!(status["result"]["run"]["outcome"], json!("clean"));
+    assert_eq!(
+        status["result"]["run"]["execution"]["activeProfileRef"]["name"],
+        json!("standard")
+    );
 
     // Standard is deliberately one repo-aware reviewer and never raises
     // itself into the high-assurance panel after a review result.

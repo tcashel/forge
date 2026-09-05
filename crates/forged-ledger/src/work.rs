@@ -348,7 +348,7 @@ pub struct WorkItemSnapshot {
     pub kind: WorkKind,
     /// Current status.
     pub status: WorkStatus,
-    /// Native numeric scheduling priority; `None` defers fail-closed.
+    /// Native numeric scheduling priority; omission remains `None` in storage.
     pub priority: Option<i64>,
     /// Custody: the holder of record, when any.
     pub assignee: Option<String>,
@@ -2372,6 +2372,132 @@ impl Ledger {
         })
     }
 
+    /// Prepare a stopped run's work for its successor without changing the
+    /// spec. The caller has confirmed death of `contained_generation` and
+    /// finished the attempt revocation saga before entering this transaction.
+    /// Run state fences new machine tickets; this transaction rechecks live
+    /// attempts, existing tickets, competing runs, status, and exact custody.
+    /// The work-scoped holder is shared by retries, so matching it alone is
+    /// never sufficient authority to release a successor's claim.
+    pub fn release_retry_work_item(
+        &self,
+        source_run: &str,
+        actor: &str,
+        contained_generation: Option<u32>,
+    ) -> Result<WorkItemSnapshot, LedgerError> {
+        let source_run = source_run.to_owned();
+        let actor = actor.to_owned();
+        self.submit(move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let source = crate::runs::get_run_tx(&tx, &source_run)?;
+            if source.state != crate::RunState::Stopped
+                || source.terminal_outcome == Some(crate::RunOutcome::Landed)
+                || source.superseded_by.is_some()
+            {
+                return Err(refused(
+                    ErrorCode::InvalidRequest,
+                    format!("run {source_run:?} no longer admits a retry"),
+                ));
+            }
+            let work_id = source.work_id;
+            if actor != format!("forged:{work_id}:0") {
+                return Err(refused(
+                    ErrorCode::WorkLeaseHeld,
+                    "retry may release only its derived work holder",
+                ));
+            }
+            let latest: String = tx.query_row(
+                "SELECT run_id FROM runs WHERE bead_id = ?1 \
+                 ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                [&work_id],
+                |row| row.get(0),
+            )?;
+            if latest != source_run {
+                return Err(refused(
+                    ErrorCode::WorkLeaseHeld,
+                    format!(
+                        "work item {work_id:?} has newer run {latest:?}; retry that run instead"
+                    ),
+                ));
+            }
+            if let Some(active) = active_work_run_tx(&tx, &work_id)? {
+                return Err(refused(
+                    ErrorCode::WorkLeaseHeld,
+                    format!("work item {work_id:?} has active run {active:?}"),
+                ));
+            }
+            let live: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM attempts a \
+                 JOIN packets p ON p.packet_id = a.packet_id \
+                 JOIN runs r ON r.run_id = p.run_id \
+                 WHERE r.bead_id = ?1 AND a.state IN ('running', 'revoking'))",
+                [&work_id],
+                |row| row.get(0),
+            )?;
+            if live {
+                return Err(refused(
+                    ErrorCode::OperationInProgress,
+                    format!("work item {work_id:?} still has live attempts"),
+                ));
+            }
+            let uncontained = crate::operations::uncontained_machine_operations_tx(
+                &tx,
+                &source_run,
+                contained_generation,
+            )?;
+            if !uncontained.is_empty() {
+                return Err(refused(
+                    ErrorCode::OperationInProgress,
+                    format!(
+                        "run {source_run:?} still has uncontained machine operations: {}",
+                        uncontained.join(", ")
+                    ),
+                ));
+            }
+            let before = require_snapshot_tx(&tx, &work_id)?;
+            if !matches!(before.status, WorkStatus::Open | WorkStatus::InProgress) {
+                return Err(refused(
+                    ErrorCode::InvalidRequest,
+                    format!(
+                        "work item {work_id:?} must be reopened before retrying; status is {}",
+                        before.status.as_str()
+                    ),
+                ));
+            }
+            if before
+                .assignee
+                .as_deref()
+                .is_some_and(|holder| holder != actor)
+            {
+                return Err(refused(
+                    ErrorCode::WorkLeaseHeld,
+                    format!(
+                        "work item {work_id:?} is held by {:?}, not {actor:?}",
+                        before.assignee
+                    ),
+                ));
+            }
+            if before.status == WorkStatus::Open && before.assignee.is_none() {
+                tx.commit()?;
+                return Ok(before);
+            }
+            set_coordination_tx(&tx, &work_id, WorkStatus::Open, None)?;
+            clear_lease_tx(&tx, &work_id)?;
+            coordination_event_tx(
+                &tx,
+                &work_id,
+                "release-unresolved",
+                &before,
+                WorkStatus::Open,
+                None,
+                &actor,
+            )?;
+            let snapshot = require_snapshot_tx(&tx, &work_id)?;
+            tx.commit()?;
+            Ok(snapshot)
+        })
+    }
+
     /// Terminal-run settlement release: custody clears under the actor CAS
     /// and status becomes `Blocked` (blocked/input-required) or `Open`
     /// (cancelled/superseded). REFUSES on a closed item — the preserved
@@ -3228,6 +3354,216 @@ mod tests {
             spec: spec(id),
             cause: WorkRevisionCause::Authored,
         }
+    }
+
+    fn retry_source(l: &Ledger, run: &str, work: &str) {
+        l.create_run(crate::NewRun {
+            run_id: forged_types::RunId::new(run).unwrap(),
+            work_id: work.to_owned(),
+            repo: "repo".to_owned(),
+            base_ref: "main".to_owned(),
+            branch: format!("forged/{run}"),
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn retry_custody_cas_cannot_release_a_successors_shared_holder() {
+        let (_dir, l) = ledger();
+        let work = "retry-custody";
+        let actor = "forged:retry-custody:0";
+        l.create_work_item(item(work, WorkStatus::Open)).unwrap();
+        retry_source(&l, "retry-source", work);
+        l.claim_specific_work(work, actor, 300).unwrap();
+        l.set_run_state(
+            "retry-source",
+            crate::RunState::Stopped,
+            Some("retry".to_owned()),
+        )
+        .unwrap();
+        retry_source(&l, "retry-successor", work);
+
+        let before = l.work_item(work).unwrap().unwrap();
+        let error = l
+            .release_retry_work_item("retry-source", actor, None)
+            .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::WorkLeaseHeld);
+        assert!(error.to_string().contains("retry-successor"));
+        assert_eq!(l.work_item(work).unwrap().unwrap(), before);
+        assert!(l.work_lease(work).unwrap().is_some());
+
+        let request = OperationRequest {
+            schema_version: 1,
+            idempotency_key: "retry-successor/push/0".to_owned(),
+            run_id: Some("retry-successor".to_owned()),
+            params: serde_json::Map::new(),
+        };
+        l.begin_controller_operation("push", &request, crate::EffectClass::ObserveOnly, 2)
+            .unwrap();
+        l.set_run_state(
+            "retry-successor",
+            crate::RunState::Stopped,
+            Some("push pending".to_owned()),
+        )
+        .unwrap();
+        let error = l
+            .release_retry_work_item("retry-source", actor, None)
+            .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::WorkLeaseHeld);
+        assert!(error.to_string().contains("retry-successor"));
+        assert_eq!(l.work_item(work).unwrap().unwrap(), before);
+        assert!(l.work_lease(work).unwrap().is_some());
+        assert_eq!(
+            l.find_operation("push", &request.idempotency_key)
+                .unwrap()
+                .unwrap()
+                .state,
+            crate::OperationState::InProgress
+        );
+    }
+
+    #[test]
+    fn retry_custody_refuses_foreign_holders_and_deliberate_statuses() {
+        let (_dir, l) = ledger();
+        let work = "retry-guarded";
+        let actor = "forged:retry-guarded:0";
+        l.create_work_item(item(work, WorkStatus::Open)).unwrap();
+        retry_source(&l, "retry-guarded-source", work);
+        l.claim_specific_work(work, "foreign", 300).unwrap();
+        l.set_run_state(
+            "retry-guarded-source",
+            crate::RunState::Stopped,
+            Some("retry".to_owned()),
+        )
+        .unwrap();
+        assert_eq!(
+            l.release_retry_work_item("retry-guarded-source", actor, None)
+                .unwrap_err()
+                .code(),
+            ErrorCode::WorkLeaseHeld
+        );
+        assert_eq!(
+            l.work_item(work).unwrap().unwrap().assignee.as_deref(),
+            Some("foreign")
+        );
+        l.release_unresolved_work_item(work, "foreign", true)
+            .unwrap();
+        assert_eq!(
+            l.release_retry_work_item("retry-guarded-source", actor, None)
+                .unwrap_err()
+                .code(),
+            ErrorCode::InvalidRequest
+        );
+        assert_eq!(
+            l.work_item(work).unwrap().unwrap().status,
+            WorkStatus::Blocked
+        );
+        l.close_work_item(work, "operator", "deliberately closed")
+            .unwrap();
+        assert_eq!(
+            l.release_retry_work_item("retry-guarded-source", actor, None)
+                .unwrap_err()
+                .code(),
+            ErrorCode::InvalidRequest
+        );
+        assert_eq!(
+            l.work_item(work).unwrap().unwrap().status,
+            WorkStatus::Closed
+        );
+    }
+
+    #[test]
+    fn retry_custody_requires_exact_machine_generation_containment() {
+        let (_dir, l) = ledger();
+        let work = "retry-effect";
+        let actor = "forged:retry-effect:0";
+        l.create_work_item(item(work, WorkStatus::Open)).unwrap();
+        retry_source(&l, "retry-effect-source", work);
+        l.claim_specific_work(work, actor, 300).unwrap();
+        let request = OperationRequest {
+            schema_version: 1,
+            idempotency_key: "retry-effect-source/push/0".to_owned(),
+            run_id: Some("retry-effect-source".to_owned()),
+            params: serde_json::Map::new(),
+        };
+        l.begin_controller_operation("push", &request, crate::EffectClass::ObserveOnly, 4)
+            .unwrap();
+        l.set_run_state(
+            "retry-effect-source",
+            crate::RunState::Stopped,
+            Some("push failed".to_owned()),
+        )
+        .unwrap();
+        for generation in [None, Some(3)] {
+            let error = l
+                .release_retry_work_item("retry-effect-source", actor, generation)
+                .unwrap_err();
+            assert_eq!(error.code(), ErrorCode::OperationInProgress);
+            assert!(l.work_lease(work).unwrap().is_some());
+        }
+        let after = l
+            .release_retry_work_item("retry-effect-source", actor, Some(4))
+            .unwrap();
+        assert_eq!(after.status, WorkStatus::Open);
+        assert_eq!(after.assignee, None);
+        assert_eq!(after.revision, 1);
+        assert_eq!(
+            l.find_operation("push", &request.idempotency_key)
+                .unwrap()
+                .unwrap()
+                .state,
+            crate::OperationState::InProgress
+        );
+    }
+
+    #[test]
+    fn retry_custody_refuses_running_and_revoking_attempts() {
+        let (_dir, l) = ledger();
+        let work = "retry-attempt";
+        let actor = "forged:retry-attempt:0";
+        l.create_work_item(item(work, WorkStatus::Open)).unwrap();
+        retry_source(&l, "retry-attempt-source", work);
+        l.claim_specific_work(work, actor, 300).unwrap();
+        let packet = l
+            .open_packet(crate::NewPacket {
+                run_id: "retry-attempt-source".to_owned(),
+                stage: forged_types::Stage::Implement,
+                seq: 0,
+                spec_path: "spec.md".to_owned(),
+                spec_sha256: "sha".to_owned(),
+                spec_revision: None,
+                policy_revision: None,
+                body_json: "{}".to_owned(),
+            })
+            .unwrap();
+        let attempt = l
+            .claim_packet(
+                &packet,
+                "codex:retry-attempt:1",
+                &crate::SpecFence::Sha256("sha".to_owned()),
+            )
+            .unwrap();
+        l.set_run_state(
+            "retry-attempt-source",
+            crate::RunState::Stopped,
+            Some("retry".to_owned()),
+        )
+        .unwrap();
+        assert_eq!(
+            l.release_retry_work_item("retry-attempt-source", actor, None)
+                .unwrap_err()
+                .code(),
+            ErrorCode::OperationInProgress
+        );
+        l.revoke_attempt(attempt.attempt_id, "death still unconfirmed")
+            .unwrap();
+        assert_eq!(
+            l.release_retry_work_item("retry-attempt-source", actor, None)
+                .unwrap_err()
+                .code(),
+            ErrorCode::OperationInProgress
+        );
+        assert!(l.work_lease(work).unwrap().is_some());
     }
 
     #[test]

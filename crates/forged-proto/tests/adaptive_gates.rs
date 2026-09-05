@@ -1,4 +1,4 @@
-//! Transition contract for the internal `epic-assurance/v1` protocol.
+//! Machine failures spend repair budget before any new review or publication.
 
 mod support;
 
@@ -9,8 +9,8 @@ use forged_proto::{advance, GatePhase, MachineStage, NextAction, Terminal, Termi
 use forged_types::{
     Capability, Deliverable, ExecutionPackageV1, Finding, HostPolicyV1, Outcome,
     ProfileDefinitionV1, ProfileRef, ProtocolRef, ProviderCandidateV1, ResolvedRosterV1, RoleId,
-    RosterRef, Sandbox, SeatDefinitionV1, SeatId, SeatPurpose, Severity, Stage, StageContract,
-    Verdict, WorkPacket,
+    RosterRef, Sandbox, SeatDefinitionV1, SeatId, SeatPurpose, Stage, StageContract, Verdict,
+    WorkPacket,
 };
 use support::{ViewBuilder, T0};
 
@@ -20,14 +20,19 @@ fn role(value: &str) -> RoleId {
 
 fn package() -> ExecutionPackageV1 {
     let protocol = ProtocolRef {
-        name: "epic-assurance".to_owned(),
+        name: "slice".to_owned(),
         version: 1,
     };
     let profile = ProfileDefinitionV1 {
         schema: "forged.profile/1".to_owned(),
-        name: "test-assurance".to_owned(),
+        name: "test-slice".to_owned(),
         protocol: protocol.clone(),
         seats: vec![
+            SeatDefinitionV1 {
+                id: SeatId::new("implement").expect("seat"),
+                role: role("implementation"),
+                purpose: SeatPurpose::Implement,
+            },
             SeatDefinitionV1 {
                 id: SeatId::new("review").expect("seat"),
                 role: role("review.primary"),
@@ -80,6 +85,10 @@ fn package() -> ExecutionPackageV1 {
             roster_ref,
             roles: BTreeMap::from([
                 (
+                    role("implementation"),
+                    vec![candidate("codex", Sandbox::WorkspaceWrite)],
+                ),
+                (
                     role("review.primary"),
                     vec![candidate("codex", Sandbox::ReadOnly)],
                 ),
@@ -121,7 +130,7 @@ fn complete(
     let deliverable = match execution.purpose {
         SeatPurpose::Review | SeatPurpose::Synthesis => Deliverable::ReviewBlock,
         SeatPurpose::Fix => Deliverable::FixCommitsPushed,
-        SeatPurpose::Implement => panic!("assurance must never open implementation"),
+        SeatPurpose::Implement => Deliverable::CommitsInWorktree,
     };
     let packet = WorkPacket {
         schema: "forged.packet/1".to_owned(),
@@ -198,28 +207,75 @@ fn after_initial_gate(run_id: &str, passed: bool) -> forged_proto::RunView {
         .gate_event(GatePhase::Gate, passed)
         .build();
     view.execution_package = Some(package());
+    let implement = one_intent(advance(&view));
+    complete(
+        &mut view,
+        &implement,
+        Outcome::Implement {
+            implemented: true,
+            commits_ahead: 1,
+            summary: "candidate committed".to_owned(),
+            gate_state: None,
+            note: None,
+        },
+    );
     view
 }
 
-#[test]
-fn assurance_starts_with_gate_and_clean_review_completes_without_publish_steps() {
-    let mut before_gate = ViewBuilder::new("assure-clean")
-        .op_done(MachineStage::Resolve, 0)
+fn settle_machine(view: &mut forged_proto::RunView, step: MachineStage, round: u32, passed: bool) {
+    let additions = ViewBuilder::new(&view.run.run_id)
+        .op_done(step, round)
         .build();
-    before_gate.execution_package = Some(package());
-    assert_eq!(
-        advance(&before_gate),
-        NextAction::RunMachine(MachineStage::Gate),
-        "there is no implementation or initial push/PR step"
-    );
+    view.settled_operations.extend(additions.settled_operations);
+    if matches!(step, MachineStage::Gate | MachineStage::ReGate) {
+        view.proto_events.push(forged_proto::ProtoEvent::Gate {
+            phase: if step == MachineStage::Gate {
+                GatePhase::Gate
+            } else {
+                GatePhase::Regate
+            },
+            seq: i64::from(round),
+            passed,
+            rows: vec![support::gate_row(if passed { 0 } else { 1 })],
+        });
+    }
+}
 
-    let mut view = after_initial_gate("assure-clean", true);
+#[test]
+fn failed_gate_repairs_before_push_pr_or_review_without_escalating() {
+    let mut view = after_initial_gate("slice-gate-repair", false);
+    let profile = &mut view.execution_package.as_mut().unwrap().profile;
+    profile.escalate_on = vec![forged_types::EscalationTrigger::GateFailure];
+    profile.escalate_to = Some(ProfileRef {
+        name: "high".to_owned(),
+        version: 1,
+    });
+    let fix = one_intent(advance(&view));
+    assert_eq!(fix.execution.as_ref().unwrap().purpose, SeatPurpose::Fix);
+    assert_eq!(fix.execution.as_ref().unwrap().round, 0);
+    complete(
+        &mut view,
+        &fix,
+        Outcome::Fix {
+            applied: true,
+            summary: "repaired gate".to_owned(),
+        },
+    );
+    assert_eq!(advance(&view), NextAction::RunMachine(MachineStage::ReGate));
+    settle_machine(&mut view, MachineStage::ReGate, 1, true);
+    assert_eq!(advance(&view), NextAction::RunMachine(MachineStage::Push));
+    settle_machine(&mut view, MachineStage::Push, 1, true);
+    assert_eq!(
+        advance(&view),
+        NextAction::RunMachine(MachineStage::DraftPr)
+    );
+    settle_machine(&mut view, MachineStage::DraftPr, 0, true);
     let review_intent = one_intent(advance(&view));
-    assert_eq!(review_intent.execution.as_ref().unwrap().round, 0);
     assert_eq!(
         review_intent.execution.as_ref().unwrap().purpose,
         SeatPurpose::Review
     );
+    assert_eq!(review_intent.execution.as_ref().unwrap().round, 1);
     complete(
         &mut view,
         &review_intent,
@@ -237,8 +293,45 @@ fn assurance_starts_with_gate_and_clean_review_completes_without_publish_steps()
 }
 
 #[test]
-fn failed_gate_repairs_before_the_first_review() {
-    let mut view = after_initial_gate("assure-repair", false);
+fn failed_or_missing_gate_evidence_cannot_spend_review_tokens_with_no_repair_budget() {
+    for missing in [false, true] {
+        let mut view = after_initial_gate("slice-gate-stop", false);
+        view.execution_package
+            .as_mut()
+            .unwrap()
+            .profile
+            .fix_round_budget = 0;
+        if missing {
+            view.proto_events.clear();
+        }
+        assert_eq!(
+            advance(&view),
+            NextAction::Stop(Terminal::ReviewBudgetExhausted {
+                review_rounds: 0,
+                final_verdict: None,
+                final_verdict_is_durable: false,
+                failed_review_seats: 0,
+            })
+        );
+    }
+}
+
+#[test]
+fn persisted_approval_against_failed_gate_cannot_complete_clean() {
+    let mut view = after_initial_gate("slice-old-approval", true);
+    settle_machine(&mut view, MachineStage::Push, 0, true);
+    settle_machine(&mut view, MachineStage::DraftPr, 0, true);
+    let review_intent = one_intent(advance(&view));
+    complete(
+        &mut view,
+        &review_intent,
+        review(Verdict::Approve, Vec::new()),
+    );
+    for event in &mut view.proto_events {
+        if let forged_proto::ProtoEvent::Gate { passed, .. } = event {
+            *passed = false;
+        }
+    }
     let fix = one_intent(advance(&view));
     assert_eq!(fix.execution.as_ref().unwrap().purpose, SeatPurpose::Fix);
     complete(
@@ -246,103 +339,83 @@ fn failed_gate_repairs_before_the_first_review() {
         &fix,
         Outcome::Fix {
             applied: true,
-            summary: "fixed gate".to_owned(),
+            summary: "attempted fix".to_owned(),
         },
     );
-    assert_eq!(advance(&view), NextAction::RunMachine(MachineStage::ReGate));
-
-    view = {
-        let mut rebuilt = view.clone();
-        let additions = ViewBuilder::new("assure-repair")
-            .op_done(MachineStage::ReGate, 1)
-            .gate_event(GatePhase::Regate, true)
-            .build();
-        rebuilt
-            .settled_operations
-            .extend(additions.settled_operations);
-        rebuilt.proto_events.extend(additions.proto_events);
-        rebuilt
-    };
-    assert_eq!(advance(&view), NextAction::RunMachine(MachineStage::Push));
-    let additions = ViewBuilder::new("assure-repair")
-        .op_done(MachineStage::Push, 1)
-        .build();
-    view.settled_operations.extend(additions.settled_operations);
-    view.proto_events.extend(additions.proto_events);
-
-    let second_review = one_intent(advance(&view));
-    assert_eq!(second_review.execution.as_ref().unwrap().round, 1);
-    complete(
-        &mut view,
-        &second_review,
-        review(Verdict::Approve, Vec::new()),
-    );
-    assert!(matches!(
+    settle_machine(&mut view, MachineStage::ReGate, 1, false);
+    assert_eq!(
         advance(&view),
-        NextAction::Stop(Terminal::Done {
+        NextAction::Stop(Terminal::ReviewBudgetExhausted {
             review_rounds: 1,
             final_verdict: Some(Verdict::Approve),
             final_verdict_is_durable: true,
+            failed_review_seats: 0,
+        })
+    );
+}
+
+#[test]
+fn every_failed_gate_consumes_the_same_bounded_repair_budget() {
+    let mut view = after_initial_gate("slice-budget", false);
+    view.execution_package
+        .as_mut()
+        .unwrap()
+        .profile
+        .fix_round_budget = 2;
+    for round in 0..2 {
+        let fix = one_intent(advance(&view));
+        assert_eq!(fix.execution.as_ref().unwrap().purpose, SeatPurpose::Fix);
+        assert_eq!(fix.execution.as_ref().unwrap().round, round);
+        complete(
+            &mut view,
+            &fix,
+            Outcome::Fix {
+                applied: true,
+                summary: "attempted repair".to_owned(),
+            },
+        );
+        assert_eq!(advance(&view), NextAction::RunMachine(MachineStage::ReGate));
+        settle_machine(&mut view, MachineStage::ReGate, u32::from(round) + 1, false);
+    }
+    assert!(matches!(
+        advance(&view),
+        NextAction::Stop(Terminal::ReviewBudgetExhausted {
+            review_rounds: 0,
             ..
         })
     ));
 }
 
 #[test]
-fn blocker_or_high_finding_is_not_a_clean_approval() {
-    let mut view = after_initial_gate("assure-severe", true);
+fn old_pending_review_is_drained_without_opening_synthesis_or_a_writer() {
+    let mut view = after_initial_gate("slice-old-live-review", true);
+    settle_machine(&mut view, MachineStage::Push, 0, true);
+    settle_machine(&mut view, MachineStage::DraftPr, 0, true);
     let review_intent = one_intent(advance(&view));
     complete(
         &mut view,
         &review_intent,
-        review(
-            Verdict::Approve,
-            vec![Finding {
-                severity: Severity::High,
-                file: Some("src/lib.rs".to_owned()),
-                line: Some(7),
-                message: "unresolved data-loss path".to_owned(),
-            }],
-        ),
+        review(Verdict::Approve, Vec::new()),
     );
-    let fix = one_intent(advance(&view));
-    assert_eq!(fix.execution.as_ref().unwrap().purpose, SeatPurpose::Fix);
-}
-
-#[test]
-fn approval_cannot_complete_against_a_failed_regate() {
-    let mut view = after_initial_gate("assure-regate-failed", true);
-    let first_review = one_intent(advance(&view));
-    complete(
-        &mut view,
-        &first_review,
-        review(Verdict::RequestChanges, Vec::new()),
-    );
-    let fix = one_intent(advance(&view));
-    complete(
-        &mut view,
-        &fix,
-        Outcome::Fix {
-            applied: true,
-            summary: "attempted repair".to_owned(),
-        },
-    );
-
-    let additions = ViewBuilder::new("assure-regate-failed")
-        .op_done(MachineStage::ReGate, 1)
-        .gate_event(GatePhase::Regate, false)
-        .op_done(MachineStage::Push, 1)
-        .build();
-    view.settled_operations.extend(additions.settled_operations);
-    view.proto_events.extend(additions.proto_events);
-
-    assert_eq!(
-        advance(&view),
-        NextAction::Stop(Terminal::ReviewBudgetExhausted {
-            review_rounds: 1,
-            final_verdict: Some(Verdict::RequestChanges),
-            final_verdict_is_durable: true,
-            failed_review_seats: 0,
-        })
+    view.terminal_attempts
+        .remove(review_intent.packet_id.as_ref().unwrap());
+    for event in &mut view.proto_events {
+        if let forged_proto::ProtoEvent::Gate { passed, .. } = event {
+            *passed = false;
+        }
+    }
+    view.execution_package
+        .as_mut()
+        .unwrap()
+        .profile
+        .seats
+        .push(SeatDefinitionV1 {
+            id: SeatId::new("synthesis").unwrap(),
+            role: role("synthesis"),
+            purpose: SeatPurpose::Synthesis,
+        });
+    assert!(
+        matches!(advance(&view), NextAction::AwaitPacket { packet_id, .. }
+        if Some(&packet_id) == review_intent.packet_id.as_ref())
     );
 }

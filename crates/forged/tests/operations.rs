@@ -675,6 +675,85 @@ fn run_status_classes_each_terminal_outcome_by_relevance() {
 }
 
 #[test]
+fn run_retry_recovers_its_own_stopped_custody_without_manual_work_edits() {
+    let env = TestEnv::new("forged-run-retry-own-custody");
+    env.forged(&["init"]);
+    let run_id = "retry-own-custody";
+    env.seed_work_spec(
+        run_id,
+        "Recover a stopped controller.",
+        "- preserve the work revision",
+    );
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    assert_eq!(
+        env.forged(&[
+            "run",
+            "start",
+            "--work",
+            run_id,
+            "--repo",
+            &repo,
+            "--base-ref",
+            "main",
+        ])
+        .0,
+        0
+    );
+    env.authorize_run(run_id);
+    let (code, resolved) = env.forged(&["run", "advance", "--run", run_id]);
+    assert_eq!(code, 0, "resolve claims the source work: {resolved}");
+    let ledger = env.ledger();
+    let before = ledger.work_item(run_id).unwrap().unwrap();
+    assert_eq!(before.status, forged_ledger::WorkStatus::InProgress);
+    assert_eq!(
+        before.assignee.as_deref(),
+        Some("forged:retry-own-custody:0")
+    );
+    ledger
+        .set_run_state(
+            run_id,
+            forged_ledger::RunState::Stopped,
+            Some("input-required: corrected external condition".to_owned()),
+        )
+        .unwrap();
+    ledger.close().unwrap();
+
+    let args = [
+        "run",
+        "retry",
+        "--id",
+        run_id,
+        "--because",
+        "world-changed",
+        "--fresh",
+    ];
+    let (code, retried) = env.forged(&args);
+    assert_eq!(
+        code, 0,
+        "retry must perform its own custody recovery: {retried}"
+    );
+    assert_eq!(retried["result"]["runId"], json!("retry-own-custody-r1"));
+    let ledger = env.ledger();
+    let after = ledger.work_item(run_id).unwrap().unwrap();
+    assert_eq!(after.status, forged_ledger::WorkStatus::Open);
+    assert_eq!(after.assignee, None);
+    assert_eq!(after.revision, before.revision);
+    assert!(ledger.work_lease(run_id).unwrap().is_none());
+    assert_eq!(
+        ledger.get_run(run_id).unwrap().state,
+        forged_ledger::RunState::Stopped
+    );
+    ledger.close().unwrap();
+    let (code, replayed) = env.forged(&args);
+    assert_eq!(
+        code, 0,
+        "retry is replayable despite successor now being active: {replayed}"
+    );
+    assert_eq!(replayed["reused"], json!(true));
+    assert_eq!(replayed["result"], retried["result"]);
+}
+
+#[test]
 fn run_retry_mints_and_submits_one_flat_successor_at_the_amended_revision() {
     let env = TestEnv::new("forged-run-retry-amended");
     env.forged(&["init"]);

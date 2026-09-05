@@ -89,7 +89,7 @@ terminal regardless of `next`.
 | idea → `drafted` | research read-only, draft the four fields, one slice or an epic with honest stubs | `work create`, `work update --expected-revision`, `work link` |
 | `drafted` → `critiqued` | run one independent critic per the risk (one pass, one delegate, or a small cross-family panel); verify every cited path; synthesize | `work note add --kind recommendation --schema forged.spec-recommendations/1` |
 | `critiqued` → `adjudicated` | disposition every recommendation and crux; fold accepted ones into the normative fields; remove resolved checkboxes | `work adjudicate --id --expected-revision --dispositions-file …` |
-| `adjudicated` → `dispatched` | confirm the tuple (id, revision, repository, base, profile, roster) with the operator, then one verb | `run dispatch --id --approved-by --basis` |
+| `adjudicated` → `dispatched` | verify the tuple (id, revision, repository, base, profile, roster) against the operator's execution authority, then one verb | `run dispatch --id --approved-by --basis` |
 | epic `adjudicated` → `dispatched` | `epic preflight`, show the identity tuple, then start and submit | `epic start … --rolling`, `epic submit` |
 
 The lifecycle is a total order at every boundary, including stub promotions.
@@ -112,6 +112,16 @@ forged run stop --run <run> --outcome landed --pr <n> --sha <full-sha>
 
 `retry` mints a successor run on the same work item from its current
 revision with a fresh package; it never un-settles the source.
+
+With `--because world-changed` (the default), it can reuse a completed
+implementation only when the machine stopped at its first push, before any
+PR request or manual settlement. The recorded gate head, requested push head,
+and clean successor HEAD must match, with the spec revision, base, and original
+policy and roster unchanged. The successor runs a fresh gate and, once green,
+fresh review; it never inherits their verdicts. Changed or missing evidence
+prevents reuse, as do `--fresh`, `spec-amended`, and `rebase`. An implementation
+seat then continues from preserved commits when available.
+
 `supersede` is for when the spec must be replaced by a new item.
 `adjudicate-settlement` is the destructive door for a run the normal
 fence cannot settle; it refuses everything the fence can.
@@ -127,16 +137,18 @@ Refusals carry `error.detail.remedy`. Run the remedy, not a guess.
 | `BEADS_CONTENTION` | the ore pass holds the epic's desired row | back off; observe `epic status`; retry the control verb only |
 | `ADJUDICATION_REQUIRED` | no durable driver identity to fence | `run adjudicate-settlement` after confirming the evidence gap |
 | `SPEC_DRIFT` | the packet's pinned body no longer matches | re-read `work show`; the next packet re-pins |
-| `INVALID_REQUEST` with field names | admission preflight refused | fix the named fields (priority, repository) and dispatch again |
+| `INVALID_REQUEST` with field names | admission preflight refused | fix the named required fields (such as repository) and dispatch again |
 
 ### Seats, gates, and deadlines
 
-A seat runs the repository's **seat checks** (`seat_commands` in the operator
-config) before each commit and never the full gate: the controller runs the
-gate commands after every seat returns and again after each fix round, one
-machine gate at a time per daemon (`admission.gate_active`). A relaunched
-attempt reads one field note naming the prior attempt and the commits its
-worktree already carries, so it continues instead of re-verifying. A stage
+A seat runs **seat checks** (`seat_commands` in the operator config) and any
+repository-required checks before each commit. The controller runs the
+authoritative gate after implementation and after each fix round,
+one machine gate at a time per daemon (`admission.gate_active`). Seats avoid
+duplicating that gate unless repository instructions or a concrete failure
+require it. A relaunched attempt reads the prior attempt and carried commits
+as context, not proof that checks passed: it continues the work, repairs
+reported failures within its stage's authority, and runs required checks. A stage
 deadline kill is its own failure class (`deadline:` note, counted against
 `deadline_retry_budget`, never transport). Past that budget the run stops
 with `deadlineExhausted` naming the stage, the kill count, and the
@@ -146,8 +158,10 @@ uncommitted. The seat's `gateState` result field is the seat-check outcome
 and projects as `seatChecks`; the gate verdict lives in the gate stage.
 
 Direct messaging uses the run event stream as both mailbox and archive.
-`session message` addresses one running attempt or the run's next packet
-boundary; seats pull with `seat inbox`, explicitly `ack` required messages,
+`session message --attempt <id>` addresses one exact attempt. Without
+`--attempt`, the message goes to the run's next packet boundary, which may be
+a reviewer; urgency does not change the recipient or grant write authority.
+Seats pull with `seat inbox`, explicitly `ack` required messages,
 publish replace-keyed `progress`, and send bounded `note` messages to the
 lead. `run status` and `next` project progress and unacknowledged mail, so the
 lead does not need a separate inbox or a remembered polling loop.
@@ -167,9 +181,9 @@ polling loop.
 - The roster is a budget dial. Read the current usage window before
   dispatching; move implementation and remediation seats to the
   provider with headroom; keep one cross-family reviewer.
-- `next` shows spend so far and the cost of each option from
-  `work history`. A retry costs roughly the last attempt again; a
-  remediation grant costs one fix round plus one review.
+- Read recorded spend from `next` and `work history`. Retry cost depends on
+  whether implementation can be reused and which gate, repair, and review
+  stages remain; past spend is not a quote for another attempt.
 - Delegate mechanical work to cheaper seats or subagents; spend the
   lead's context on specs, adjudication, diff review, and cross-stream
   decisions.
@@ -182,8 +196,8 @@ polling loop.
   responses classify work.
 - Never dispatch below `adjudicated` without recording why.
 - Never mutate a work item between dispatch and submit.
-- Never merge the default branch; never mark a PR ready that the
-  protocol did not.
+- Never merge the default branch without human authority; never mark a PR
+  ready that the protocol did not.
 - Never create files, hooks, or stores in the target repository.
 - Never install software or run package managers.
 - Never store authority only in conversation: dispatch records approval

@@ -35,6 +35,15 @@ Source: `crates/forged-gate/src/runner.rs`.
   attempted, not that it passed. `run status` reports the latest implementation
   attempt as `gateState: passed|failed`; Work Detail retains the underlying
   gate evidence.
+- A failed gate spends the selected profile's existing remediation budget before
+  opening review or publishing the candidate. Exhausting that budget blocks the
+  run; `lean` has no remediation rounds. A gate failure never expands the review
+  panel. Historical profile transitions remain part of their run's frozen history.
+- Every new gate operation requires a clean worktree and index before
+  and after the suite, records the checked HEAD, and rejects commands that change
+  it. Git-ignored build artifacts do not fail this guard. Clean settlement requires
+  the same clean tree and a passed gate for the current HEAD; older gate evidence
+  without a head identity requires fresh validation.
 
 ## Environment contracts
 

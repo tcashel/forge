@@ -20,6 +20,7 @@ pub(crate) mod lifecycle;
 mod observe;
 mod ops;
 mod ore;
+mod retry_continuation;
 mod review;
 pub(crate) mod seat;
 mod session_inventory;

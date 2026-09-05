@@ -113,10 +113,12 @@ become visible input-required evidence and are never retried automatically.
 
 ## Execution boundary
 
-Before requesting execution approval, validate the intended profile and roster
-and show id, title, revision, repository, base, profile, roster, actor, and
-effect. A short answer is valid only when it immediately and unambiguously
-approves that tuple. Approval of planning or adjudication does not dispatch.
+Validate the intended profile and roster, then verify id, title, revision,
+repository, base, actor, and effect against the operator's explicit execution
+authority. Use authority already granted for the outcome without another
+approval prompt. Ask when authority is missing or the action exceeds its
+scope, cost, or risk limits. Approval of a specific tuple does not cover a
+changed tuple; approval of planning or adjudication does not dispatch.
 
 ```bash
 forged definition validate --profile "$PROFILE" --roster "$ROSTER"
@@ -127,9 +129,11 @@ forged wait --id "$RUN_ID" --until decision --timeout 240
 ```
 
 The fenced `run dispatch` operation records approval and immutable handoff
-together. Epic execution uses `../run-epic/SKILL.md`. No repository or work-item
-mutation occurs between approval and handoff. Return durable ids, then stop;
-waiting is one `wait` call, never a polling loop.
+together. Epic execution uses `../run-epic/SKILL.md`. After approval of an exact
+dispatch tuple, keep its repository and work-item inputs unchanged until
+handoff. Return durable ids promptly. If the operator asked you to drive
+through completion, continue from `wait`; detached submission alone ends at
+handoff. Waiting is one `wait` call, never a polling loop.
 
 Check unattended capability without changing it:
 

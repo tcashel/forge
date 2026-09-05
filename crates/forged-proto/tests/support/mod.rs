@@ -584,6 +584,8 @@ pub struct FakePorts {
     pub pr_script: Mutex<VecDeque<Option<PrSnapshot>>>,
     /// Scripted remote shas; default `None`.
     pub sha_script: Mutex<VecDeque<Option<String>>>,
+    /// A failed remote observation must not be interpreted as no branch.
+    pub sha_failure: Mutex<Option<PortError>>,
     /// Scripted resolve states; default worktree present, no lease holder.
     pub resolve_script: Mutex<VecDeque<ResolveState>>,
     /// Called at the TOP of `kill_confirmed` and `reclaim_lease` with that
@@ -769,6 +771,9 @@ impl ReconcilePorts for FakePorts {
             run_id: run_id.to_owned(),
             branch: branch.to_owned(),
         });
+        if let Some(error) = self.sha_failure.lock().expect("lock").clone() {
+            return Err(error);
+        }
         Ok(self
             .sha_script
             .lock()

@@ -12,11 +12,10 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 use forged_types::{
-    canonical_json_bytes, Capability, DefinitionError, EscalationTrigger, ExecutionPackageV1,
-    ExecutionPolicyV1, HostPolicyV1, ProfileDefinitionV1, ProfileRef, ProtocolRef,
-    ProviderCandidateV1, ProviderHints, ResolvedRosterV1, RosterDefinitionV1, RosterRef, Sandbox,
-    SeatDefinitionV1, SeatId, SeatPurpose, Stage, EXECUTION_PACKAGE_SCHEMA_V1, PROFILE_SCHEMA_V1,
-    ROSTER_SCHEMA_V1,
+    canonical_json_bytes, Capability, DefinitionError, ExecutionPackageV1, ExecutionPolicyV1,
+    HostPolicyV1, ProfileDefinitionV1, ProfileRef, ProtocolRef, ProviderCandidateV1, ProviderHints,
+    ResolvedRosterV1, RosterDefinitionV1, RosterRef, Sandbox, SeatDefinitionV1, SeatId,
+    SeatPurpose, Stage, EXECUTION_PACKAGE_SCHEMA_V1, PROFILE_SCHEMA_V1, ROSTER_SCHEMA_V1,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -311,17 +310,10 @@ fn profile(name: &str, review_roles: &[&str], synthesis: bool) -> ProfileDefinit
         }
         .to_owned(),
         fix_round_budget: if name == "lean" { 0 } else { 1 },
-        escalate_on: match name {
-            "lean" => vec![EscalationTrigger::GateFailure],
-            _ => Vec::new(),
-        },
-        escalate_to: match name {
-            "lean" => Some(ProfileRef {
-                name: "standard".to_owned(),
-                version: 1,
-            }),
-            _ => None,
-        },
+        // Gate failures spend the existing repair budget and then block;
+        // they never purchase an expanded review panel.
+        escalate_on: Vec::new(),
+        escalate_to: None,
     }
 }
 
@@ -2026,7 +2018,14 @@ mod tests {
 
     #[test]
     fn epic_assurance_refuses_a_writable_escalation_reviewer() {
-        let mut base = config()
+        let mut cfg = config();
+        let lean = cfg.profiles.get_mut("lean").expect("lean profile");
+        lean.escalate_on = vec![forged_types::EscalationTrigger::ReviewConflict];
+        lean.escalate_to = Some(ProfileRef {
+            name: "standard".to_owned(),
+            version: 1,
+        });
+        let mut base = cfg
             .compile_definition(Some("lean"), None)
             .expect("compile")
             .package;
@@ -2436,6 +2435,10 @@ mod tests {
         );
         assert!(standard.escalate_on.is_empty());
         assert!(standard.escalate_to.is_none());
+        let lean = cfg.profiles.get("lean").expect("lean");
+        assert_eq!(lean.fix_round_budget, 0);
+        assert!(lean.escalate_on.is_empty());
+        assert!(lean.escalate_to.is_none());
 
         let high = cfg.profiles.get("high").expect("high");
         assert_eq!(
@@ -2454,6 +2457,12 @@ mod tests {
     #[test]
     fn reachable_profile_names_must_match_their_map_keys() {
         let mut cfg = config();
+        let lean = cfg.profiles.get_mut("lean").expect("lean profile");
+        lean.escalate_on = vec![forged_types::EscalationTrigger::ReviewConflict];
+        lean.escalate_to = Some(ProfileRef {
+            name: "standard".to_owned(),
+            version: 1,
+        });
         cfg.profiles
             .get_mut("standard")
             .expect("standard profile")

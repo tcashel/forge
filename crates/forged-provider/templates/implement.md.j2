@@ -10,22 +10,22 @@ Operator interventions recorded before this provider boundary:
 {% for note in field_notes %}  - {{ note }}
 {% endfor %}{% endif %}
 
-1. Read {{ spec_path }} in full, first. It is your SOLE source of requirements:
-   build what it says rather than what you would have designed. Where the spec
-   is silent, take the smallest choice consistent with the surrounding code —
-   silence is not an invitation to widen the scope.
+1. Read {{ spec_path }} in full, first, then the repository's agent instructions.
+   The spec defines the task; repository constraints still apply. Where the
+   spec is silent, take the smallest choice consistent with the surrounding
+   code — silence is not an invitation to widen the scope.
 2. Implement it inside the worktree above. That worktree is disposable and sits
    outside the operator's own checkout; never edit the main checkout. The only
    `forged` commands you may run are `forged seat inbox`, `forged seat ack`,
    `forged seat progress`, and `forged seat note` — you are the packet, not the
    orchestrator.
-3. Before each commit run the seat checks, and nothing wider:
+3. Before each commit run the seat checks and any checks required by the repository:
 {% if seat_commands %}{% for c in seat_commands %}     - `{{ c }}`
 {% endfor %}{% else %}     - the tests that cover the files you changed
 {% endif %}   Fix whatever YOUR change broke. A failure that was already there is a line
-   in your report, not a licence to go fixing unrelated code. Do NOT run the
-   repository's full gate yourself: forged runs the gate commands after you
-   return, and again after every fix round.
+   in your report, not a licence to go fixing unrelated code. Forged runs the
+   authoritative gate after you return and after every fix round; do not
+   duplicate it unless repository instructions or a concrete failure require it.
    Run `forged seat inbox --attempt "$FORGED_SEAT_ATTEMPT" --bodies` before
    every seat-check run, after every commit, and whenever blocked for more than
    five minutes. Treat `nextSince` in each response as the seat cursor and pass
@@ -35,8 +35,8 @@ Operator interventions recorded before this provider boundary:
    concise information the lead needs before you return.
 4. Own your commits: `git add <path>` on files you changed on purpose (never
    `git add -A`), conventional-commit messages, committed as you go. Do NOT
-   push, do NOT open a PR, do NOT merge — forged does all three after you
-   return.
+   push, open a PR, or merge. Forged owns publication; default-branch merge
+   requires human authority.
 5. Report honestly. implemented=true only if the spec is actually built AND
    committed — check `git -C {{ worktree }} rev-list --count {{ base_ref }}..HEAD`
    and put that number in commitsAhead. If you could not finish, say so with

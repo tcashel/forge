@@ -107,12 +107,10 @@ fn round_of(view: &RunView, step: MachineStage) -> u32 {
         MachineStage::ReGate => (1..=33)
             .find(|round| !op_settled_in(view, MachineStage::ReGate, *round))
             .unwrap_or(33),
-        MachineStage::Push if op_settled_in(view, MachineStage::Push, 0) => (1..=33)
-            .find(|round| {
-                op_settled_in(view, MachineStage::ReGate, *round)
-                    && !op_settled_in(view, MachineStage::Push, *round)
-            })
-            .unwrap_or(33),
+        MachineStage::Push => (1..=33)
+            .rev()
+            .find(|round| op_settled_in(view, MachineStage::ReGate, *round))
+            .unwrap_or(0),
         _ => 0,
     }
 }
@@ -649,10 +647,38 @@ async fn with_worktree_facts(ctx: &Ctx, run_id: &str, terminal: &Terminal) -> Te
     }
 }
 
-async fn settle_terminal(ctx: &Ctx, run_id: &str, terminal: &Terminal) -> Result<(), Failure> {
-    let enriched = with_worktree_facts(ctx, run_id, terminal).await;
-    let terminal = &enriched;
-    if let Some(settlement) = automatic_settlement(terminal) {
+async fn settle_terminal(
+    ctx: &Ctx,
+    run_id: &str,
+    terminal: &Terminal,
+) -> Result<Terminal, Failure> {
+    let mut terminal = with_worktree_facts(ctx, run_id, terminal).await;
+    if let Some(mut settlement) = automatic_settlement(&terminal) {
+        if matches!(terminal, Terminal::ReviewBudgetExhausted { .. }) {
+            let view = project(ctx, run_id).await?;
+            if internal_run_mode(&view) != InternalRunMode::Planning {
+                if let Some(reason) = gate_budget_reason(&view.proto_events) {
+                    settlement.reason = reason;
+                }
+            }
+        }
+        if settlement.outcome == forged_ledger::RunOutcome::Clean {
+            let view = project(ctx, run_id).await?;
+            if internal_run_mode(&view) != InternalRunMode::Planning {
+                let worktree = ctx.config.worktree(run_id);
+                let live_head = rev_parse_head(&worktree).await?;
+                let reason = if committed_tree_is_clean(&worktree).await? {
+                    clean_gate_failure(&view, &live_head)
+                } else {
+                    Some("worktree contains changes or untracked content beyond the reviewed HEAD; commit the intended changes and retry the run".to_owned())
+                };
+                if let Some(reason) = reason {
+                    settlement.outcome = forged_ledger::RunOutcome::Blocked;
+                    settlement.reason.clone_from(&reason);
+                    terminal = Terminal::ExternallyStopped { reason };
+                }
+            }
+        }
         // `settle_run` deliberately makes the protocol project as externally
         // stopped. Preserve the terminal that caused automatic settlement so
         // status remains a faithful (and backwards-compatible) projection of
@@ -660,7 +686,7 @@ async fn settle_terminal(ctx: &Ctx, run_id: &str, terminal: &Terminal) -> Result
         // evidence behind that lifecycle guard. Kind-once makes the first
         // terminal immutable across controller races and crash replay.
         let event_run = run_id.to_owned();
-        let terminal = terminal_json(terminal);
+        let terminal = terminal_json(&terminal);
         on_ledger(&ctx.ledger, move |ledger| {
             ledger.append_event_kind_once(
                 &event_run,
@@ -675,7 +701,160 @@ async fn settle_terminal(ctx: &Ctx, run_id: &str, terminal: &Terminal) -> Result
         .await?;
         super::settlement::settle(ctx, run_id, settlement).await?;
     }
-    Ok(())
+    Ok(terminal)
+}
+
+fn gate_budget_reason(events: &[ProtoEvent]) -> Option<String> {
+    let evidence = events.iter().rev().find_map(|event| match event {
+        ProtoEvent::Gate { passed, rows, .. } => Some((*passed, rows)),
+        _ => None,
+    });
+    match evidence {
+        Some((true, _)) => None,
+        Some((false, rows)) => {
+            let detail = rows
+                .iter()
+                .find(|row| row.timed_out || row.exit_code != Some(0))
+                .map(|row| {
+                    let preview = format!("{}{}", row.stdout_preview, row.stderr_preview)
+                        .chars()
+                        .take(400)
+                        .collect::<String>();
+                    format!(
+                        "command {:?} (exit {:?}, timedOut={}): {}; full evidence: {}",
+                        row.command,
+                        row.exit_code,
+                        row.timed_out,
+                        preview.trim(),
+                        row.artifact_path
+                    )
+                })
+                .unwrap_or_else(|| "failed gate has no command detail".to_owned());
+            Some(format!(
+                "machine gate failed after the remediation budget was exhausted; {detail}"
+            ))
+        }
+        None => Some(
+            "machine gate validation evidence is missing and the remediation budget is exhausted"
+                .to_owned(),
+        ),
+    }
+}
+
+/// Review approval applies only to the candidate whose machine gate passed.
+/// Old operations without a head identity remain readable but cannot prove a
+/// clean delivery; recovery must produce fresh evidence for the current head.
+fn clean_gate_failure(view: &RunView, live_head: &str) -> Option<String> {
+    let (step, round) = view
+        .proto_events
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            ProtoEvent::Gate { phase, seq, .. } => Some((
+                if *phase == forged_proto::GatePhase::Gate {
+                    MachineStage::Gate
+                } else {
+                    MachineStage::ReGate
+                },
+                *seq,
+            )),
+            _ => None,
+        })
+        .unwrap_or((MachineStage::Gate, 0));
+    let Ok(round) = u32::try_from(round) else {
+        return Some(
+            "machine gate has an invalid round; retry the run to validate the preserved work"
+                .to_owned(),
+        );
+    };
+    let key = machine_idempotency_key(&view.run.run_id, step, round);
+    let result = view
+        .settled_operations
+        .iter()
+        .find(|operation| operation.name == step.as_str() && operation.idempotency_key == key)
+        .and_then(|operation| operation.response_json.as_deref())
+        .and_then(|response| serde_json::from_str::<Value>(response).ok());
+    gate_head_failure(
+        result.as_ref().and_then(|response| response.get("result")),
+        live_head,
+    )
+}
+
+fn gate_head_failure(result: Option<&Value>, live_head: &str) -> Option<String> {
+    let passed = result
+        .and_then(|value| value.get("passed"))
+        .and_then(Value::as_bool);
+    let gated_head = result
+        .and_then(|value| value.get("headSha"))
+        .and_then(Value::as_str);
+    if passed == Some(true) && gated_head == Some(live_head) {
+        None
+    } else {
+        Some(format!(
+            "machine gate does not validate current HEAD {live_head}: passed={}, gated HEAD={}; retry the run to validate the preserved work",
+            passed.map(|value| value.to_string()).unwrap_or_else(|| "unknown".to_owned()),
+            gated_head.unwrap_or("unknown"),
+        ))
+    }
+}
+
+const TRACKED_TREE_GATE: &str = "git diff --exit-code --no-ext-diff HEAD --";
+const INDEX_TREE_GATE: &str = "git diff --cached --exit-code --no-ext-diff HEAD --";
+const UNTRACKED_TREE_GATE: &str = "forged_untracked_paths=$(git ls-files --others --exclude-standard) && if [ -n \"$forged_untracked_paths\" ]; then printf '%s\\n' \"$forged_untracked_paths\"; exit 1; fi";
+
+async fn committed_tree_is_clean(worktree: &std::path::Path) -> Result<bool, Failure> {
+    let output = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["status", "--porcelain=v1", "--untracked-files=all"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await
+        .map_err(|error| Failure::internal(format!("checking committed worktree: {error}")))?;
+    if output.status.success() {
+        Ok(output.stdout.is_empty())
+    } else {
+        Err(Failure::internal(format!(
+            "checking committed worktree: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )))
+    }
+}
+
+/// A green suite certifies committed contents, not a worker's uncommitted fix
+/// or a formatter's side effects. Only Git-ignored build artifacts are exempt;
+/// untracked source/content must not make a committed candidate pass locally.
+async fn committed_gate_suite(
+    commands: &[String],
+    worktree: &std::path::Path,
+    artifacts: &std::path::Path,
+) -> Result<forged_gate::GateOutcome, Failure> {
+    let guard = |phase: &str| {
+        GateRequest::new(
+            vec![
+                TRACKED_TREE_GATE.to_owned(),
+                INDEX_TREE_GATE.to_owned(),
+                UNTRACKED_TREE_GATE.to_owned(),
+            ],
+            worktree.to_owned(),
+            artifacts.join(phase),
+        )
+    };
+    let mut outcome = forged_gate::run_gates(&guard("tracked-before")).await?;
+    if outcome.passed {
+        let suite = forged_gate::run_gates(&GateRequest::new(
+            commands.to_vec(),
+            worktree.to_owned(),
+            artifacts.join("commands"),
+        ))
+        .await?;
+        outcome.passed = suite.passed;
+        outcome.rows.extend(suite.rows);
+        let after = forged_gate::run_gates(&guard("tracked-after")).await?;
+        outcome.passed &= after.passed;
+        outcome.rows.extend(after.rows);
+    }
+    Ok(outcome)
 }
 
 /// What honoring one action produced.
@@ -1256,7 +1435,20 @@ async fn assurance_evidence(
             |error| Failure::internal(format!("sealing assurance evidence read-only: {error}")),
         )?;
     }
-    let failed_gate_findings = if passed {
+    let failed_gate_findings = failed_gate_findings(passed, &rows);
+    Ok(Some(crate::adapters::execute::AssuranceEvidence {
+        path,
+        sha256,
+        head_sha: gate_head,
+        failed_gate_findings,
+    }))
+}
+
+fn failed_gate_findings(
+    passed: bool,
+    rows: &[forged_types::GateRow],
+) -> Vec<forged_types::Finding> {
+    if passed {
         Vec::new()
     } else {
         rows.iter()
@@ -1275,13 +1467,7 @@ async fn assurance_evidence(
                 ),
             })
             .collect()
-    };
-    Ok(Some(crate::adapters::execute::AssuranceEvidence {
-        path,
-        sha256,
-        head_sha: gate_head,
-        failed_gate_findings,
-    }))
+    }
 }
 
 async fn execution_context(ctx: &Ctx, view: &RunView) -> Result<ExecutionContext, Failure> {
@@ -1296,13 +1482,27 @@ async fn execution_context(ctx: &Ctx, view: &RunView) -> Result<ExecutionContext
             .get(name)
             .unwrap_or(&package.profile)
     });
+    let mut findings = latest_review_findings(view);
+    if internal_run_mode(view) == InternalRunMode::Ordinary {
+        if let Some((passed, rows)) = view
+            .proto_events
+            .iter()
+            .rev()
+            .find_map(|event| match event {
+                ProtoEvent::Gate { passed, rows, .. } => Some((*passed, rows)),
+                _ => None,
+            })
+        {
+            findings.extend(failed_gate_findings(passed, rows));
+        }
+    }
     Ok(ExecutionContext {
         protocol: view
             .execution_package
             .as_ref()
             .map(|package| package.protocol_ref.clone()),
         pr_number: pr_number_of(view),
-        findings: latest_review_findings(view),
+        findings,
         review_evidence: latest_review_evidence(view),
         plan_candidate: latest_plan_candidate(view),
         assurance_evidence: assurance_evidence(ctx, view).await?,
@@ -1604,14 +1804,19 @@ async fn machine_effect(
             // differing one: the store refuses a claim by any other actor outright
             // ("issue already claimed by …"), which is how a driver used to
             // wedge on BEAD_LEASE_HELD against its own frontier claim.
+            let mut implementation_reuse = None;
             let holder = if internal != InternalRunMode::Ordinary {
                 None
             } else {
                 let holder =
                     crate::core::lease_identity(&ctx.ledger, &run.work_id, &run.run_id).await?;
                 failpoint::hit("work.claim.before");
-                crate::core::workstore::claim_specific(&ctx.ledger, &run.work_id, &holder).await?;
+                let claimed =
+                    crate::core::workstore::claim_specific(&ctx.ledger, &run.work_id, &holder)
+                        .await?;
                 failpoint::hit("work.claim.after");
+                implementation_reuse =
+                    super::retry_continuation::resolve(ctx, run, &claimed).await?;
                 Some(holder)
             };
             let mut result = obj(json!({
@@ -1621,36 +1826,33 @@ async fn machine_effect(
             if let Some(holder) = holder {
                 result.insert("leaseHolder".to_owned(), Value::String(holder));
             }
+            if let Some(evidence) = implementation_reuse {
+                result.insert("implementationReuse".to_owned(), evidence);
+            }
             Ok(Value::Object(result))
         }
         MachineStage::Gate | MachineStage::ReGate => {
-            let head_before = if internal == InternalRunMode::Assurance {
-                Some(rev_parse_head(&ctx.config.worktree(&run.run_id)).await?)
-            } else {
-                None
-            };
+            let head_before = rev_parse_head(&ctx.config.worktree(&run.run_id)).await?;
             let artifacts = ctx
                 .config
                 .run_dir(&run.run_id)
                 .join("artifacts")
                 .join(format!("{}-{op_id}", step.as_str()));
-            let request = GateRequest::new(
-                policy.gate_commands.clone(),
-                ctx.config.worktree(&run.run_id),
-                artifacts,
-            );
             // One machine gate at a time on this daemon: the slot is held
             // for the whole suite and released on drop, so a crashed
             // controller frees it through its dead pid on the next try.
             let _gate_slot = acquire_gate_slot(ctx, &run.run_id).await?;
-            let outcome = forged_gate::run_gates(&request).await?;
-            if let Some(expected) = head_before.as_deref() {
-                let observed = rev_parse_head(&ctx.config.worktree(&run.run_id)).await?;
-                if observed != expected {
-                    return Err(Failure::invalid(format!(
-                        "assurance gate mutated HEAD: expected {expected}, observed {observed}"
-                    )));
-                }
+            let outcome = committed_gate_suite(
+                &policy.gate_commands,
+                &ctx.config.worktree(&run.run_id),
+                &artifacts,
+            )
+            .await?;
+            let observed = rev_parse_head(&ctx.config.worktree(&run.run_id)).await?;
+            if observed != head_before {
+                return Err(Failure::invalid(format!(
+                    "machine gate mutated HEAD: expected {head_before}, observed {observed}"
+                )));
             }
             let phase = if step == MachineStage::ReGate {
                 forged_proto::GatePhase::Regate
@@ -1892,7 +2094,8 @@ async fn advance_once(
     };
     let honored = honor(ctx, ports, &view, &action, wait_allowed).await?;
     if let Honored::Stopped(terminal) = honored {
-        settle_terminal(ctx, run_id, &terminal).await?;
+        let terminal = settle_terminal(ctx, run_id, &terminal).await?;
+        return Ok((action_json(&NextAction::Stop(terminal)), machine_key));
     }
     Ok((action_json(&action), machine_key))
 }
@@ -1954,9 +2157,10 @@ async fn run_drive_loop(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
         }
         match honor(ctx, &ports, &view, &action, true).await {
             Ok(Honored::Stopped(terminal)) => {
-                if let Err(failure) = settle_terminal(ctx, &run_id, &terminal).await {
-                    return err_response(&echo, &failure);
-                }
+                let terminal = match settle_terminal(ctx, &run_id, &terminal).await {
+                    Ok(terminal) => terminal,
+                    Err(failure) => return err_response(&echo, &failure),
+                };
                 return ok_response(
                     &echo,
                     false,
@@ -2114,7 +2318,9 @@ mod adaptive_tests {
     use forged_types::{Finding, Severity};
 
     use super::{
-        classify_push_failure, deduplicate_findings, transport_fallback_index, PushFailureKind,
+        classify_push_failure, committed_gate_suite, committed_tree_is_clean, deduplicate_findings,
+        failed_gate_findings, gate_budget_reason, gate_head_failure, transport_fallback_index,
+        PushFailureKind,
     };
 
     fn failed(note: &str) -> TerminalAttempt {
@@ -2125,6 +2331,182 @@ mod adaptive_tests {
             fail_note: Some(note.to_owned()),
             started_at: "2026-08-12T00:00:00.000000000Z".to_owned(),
         }
+    }
+
+    #[tokio::test]
+    async fn gates_reject_uncommitted_inputs_and_formatter_side_effects() {
+        let target_tmp = std::env::var_os("CARGO_TARGET_TMPDIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp")
+            });
+        std::fs::create_dir_all(&target_tmp).unwrap();
+        let dir = tempfile::Builder::new()
+            .prefix("forged-committed-gate-")
+            .tempdir_in(std::fs::canonicalize(target_tmp).unwrap())
+            .unwrap();
+        let worktree = dir.path().join("repo");
+        std::fs::create_dir(&worktree).unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&worktree)
+                .args([
+                    "-c",
+                    "user.name=Gate Test",
+                    "-c",
+                    "user.email=gate@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                ])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "--quiet"]);
+        std::fs::write(worktree.join("tracked"), "committed\n").unwrap();
+        std::fs::write(worktree.join(".gitignore"), "ignored-build-output\n").unwrap();
+        git(&["add", "tracked", ".gitignore"]);
+        git(&["commit", "--quiet", "-m", "fixture"]);
+        std::fs::write(worktree.join("ignored-build-output"), "artifact").unwrap();
+        assert!(committed_tree_is_clean(&worktree).await.unwrap());
+        assert!(
+            committed_gate_suite(&["true".to_owned()], &worktree, &dir.path().join("clean"))
+                .await
+                .unwrap()
+                .passed
+        );
+
+        std::fs::write(
+            worktree.join("required-source.rs"),
+            "pub fn required() {}\n",
+        )
+        .unwrap();
+        assert!(!committed_tree_is_clean(&worktree).await.unwrap());
+        let untracked = committed_gate_suite(
+            &["touch should-not-run".to_owned()],
+            &worktree,
+            &dir.path().join("untracked-source"),
+        )
+        .await
+        .unwrap();
+        assert!(!untracked.passed);
+        assert!(!worktree.join("should-not-run").exists());
+        assert!(failed_gate_findings(false, &untracked.rows)[0]
+            .message
+            .contains("required-source.rs"));
+        std::fs::remove_file(worktree.join("required-source.rs")).unwrap();
+
+        std::fs::write(worktree.join("tracked"), "uncommitted fix\n").unwrap();
+        assert!(!committed_tree_is_clean(&worktree).await.unwrap());
+        let failed = committed_gate_suite(
+            &["touch should-not-run".to_owned()],
+            &worktree,
+            &dir.path().join("dirty"),
+        )
+        .await
+        .unwrap();
+        assert!(!failed.passed);
+        assert!(!worktree.join("should-not-run").exists());
+        assert!(failed_gate_findings(false, &failed.rows)[0]
+            .message
+            .contains("uncommitted fix"));
+        git(&["add", "tracked"]);
+        std::fs::write(worktree.join("tracked"), "committed\n").unwrap();
+        git(&["diff", "--exit-code", "HEAD", "--"]);
+        assert!(!committed_tree_is_clean(&worktree).await.unwrap());
+        let staged = committed_gate_suite(
+            &["touch should-not-run".to_owned()],
+            &worktree,
+            &dir.path().join("staged-only"),
+        )
+        .await
+        .unwrap();
+        assert!(!staged.passed);
+        assert!(!worktree.join("should-not-run").exists());
+        assert!(failed_gate_findings(false, &staged.rows)[0]
+            .message
+            .contains("uncommitted fix"));
+        git(&["reset", "--hard", "HEAD"]);
+        let mutating = committed_gate_suite(
+            &["printf changed > tracked".to_owned()],
+            &worktree,
+            &dir.path().join("mutating"),
+        )
+        .await
+        .unwrap();
+        assert!(!mutating.passed);
+        assert!(!committed_tree_is_clean(&worktree).await.unwrap());
+        git(&["reset", "--hard", "HEAD"]);
+        let staging = committed_gate_suite(
+            &[
+                "printf changed > tracked && git add tracked && printf 'committed\\n' > tracked"
+                    .to_owned(),
+            ],
+            &worktree,
+            &dir.path().join("staging-command"),
+        )
+        .await
+        .unwrap();
+        assert!(!staging.passed);
+        git(&["diff", "--exit-code", "HEAD", "--"]);
+        assert!(!committed_tree_is_clean(&worktree).await.unwrap());
+    }
+
+    #[test]
+    fn clean_delivery_requires_a_passed_gate_for_the_current_head() {
+        let result = serde_json::json!({"passed": true, "headSha": "tested-head"});
+        assert!(gate_head_failure(Some(&result), "tested-head").is_none());
+        assert!(gate_head_failure(Some(&result), "changed-head")
+            .expect("head drift must block")
+            .contains("gated HEAD=tested-head"));
+        for unverified in [
+            serde_json::json!({"passed": false, "headSha": "tested-head"}),
+            serde_json::json!({"passed": true, "headSha": null}),
+            serde_json::json!({"headSha": "tested-head"}),
+        ] {
+            assert!(gate_head_failure(Some(&unverified), "tested-head").is_some());
+        }
+        assert!(gate_head_failure(None, "tested-head").is_some());
+    }
+
+    #[test]
+    fn remediation_gets_failed_command_output_without_a_review() {
+        let row = forged_types::GateRow {
+            command: "bun run check".to_owned(),
+            cwd: "/work".to_owned(),
+            exit_code: Some(1),
+            duration_ms: 1,
+            timed_out: false,
+            stdout_preview: "formatter rejected test.ts\n".to_owned(),
+            stderr_preview: "line 207 needs formatting".to_owned(),
+            artifact_path: "gate.log".to_owned(),
+        };
+        let findings = failed_gate_findings(false, std::slice::from_ref(&row));
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].file.as_deref(), Some("gate:bun run check"));
+        assert!(findings[0].message.contains("formatter rejected test.ts"));
+        assert!(findings[0].message.contains("line 207 needs formatting"));
+        let events = [forged_proto::ProtoEvent::Gate {
+            phase: forged_proto::GatePhase::Gate,
+            seq: 0,
+            passed: false,
+            rows: vec![row.clone()],
+        }];
+        let reason = gate_budget_reason(&events).expect("failed gate is the blocker");
+        assert!(reason.contains("machine gate failed"));
+        assert!(reason.contains("bun run check"));
+        assert!(reason.contains("line 207 needs formatting"));
+        assert!(reason.contains("gate.log"));
+        assert!(!reason.contains("review budget"));
+        assert!(failed_gate_findings(true, &[row]).is_empty());
     }
 
     #[test]

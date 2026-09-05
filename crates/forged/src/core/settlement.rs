@@ -142,6 +142,48 @@ async fn stop_live_attempts(ctx: &Ctx, run_id: &str, reason: &str) -> Result<Vec
     }
 }
 
+/// Retry keeps the source terminal while reclaiming only its own residue.
+/// The stopped state already fences new machine tickets. Existing controller
+/// effects must die before the guarded work release; attempt custody follows
+/// the same revocation/confirmed-death saga as ordinary settlement. The caller
+/// holds the source submit singleton through successor creation.
+pub(super) async fn prepare_retry(ctx: &Ctx, source: &RunRow) -> Result<(), Failure> {
+    let controller = super::handoff::controller_fence_target(ctx, &source.run_id).await?;
+    if let Some(target) = &controller {
+        super::handoff::kill_controller_confirmed(target).await?;
+    }
+    stop_live_attempts(ctx, &source.run_id, "preparing authorized successor retry").await?;
+    let generation = controller
+        .as_ref()
+        .filter(|target| target.effects_excluded())
+        .map(|target| target.generation);
+    let run_id = source.run_id.clone();
+    let uncontained = on_ledger(&ctx.ledger, move |ledger| {
+        ledger.uncontained_machine_operations(&run_id, generation)
+    })
+    .await?;
+    if !uncontained.is_empty() {
+        return Err(Failure::refused(
+            ErrorCode::OperationInProgress,
+            format!(
+                "run {:?} still has uncontained machine operations: {}",
+                source.run_id,
+                uncontained.join(", ")
+            ),
+        ));
+    }
+    let ports = ForgedPorts::new(ctx.ledger.clone(), ctx.config.clone());
+    forged_proto::reconcile::reconcile_machine_operations(&ctx.ledger, &source.run_id, &ports)
+        .await?;
+    let run_id = source.run_id.clone();
+    let actor = run_holder(&source.work_id);
+    on_ledger(&ctx.ledger, move |ledger| {
+        ledger.release_retry_work_item(&run_id, &actor, generation)
+    })
+    .await?;
+    Ok(())
+}
+
 /// The settlement note: the bd-era `comment_once` marker as an idempotent
 /// ledger event in the SAME store as the run — the cross-store idempotence
 /// dance it existed for no longer has two stores to bridge.

@@ -450,10 +450,35 @@ async fn reconcile_inner(
         };
         let proto_events = parse_proto_events(&events)?;
 
-        settle_operations(ledger, ports, &run, &proto_events, &mut report).await?;
+        settle_operations(ledger, ports, &run, &proto_events, &mut report, false).await?;
         harvest_and_verify(ledger, ports, run_id, &proto_events, &mut report).await?;
     }
 
+    Ok(report)
+}
+
+/// Reconcile only a stopped controller's machine effects after the caller
+/// has confirmed that controller's death. Control operations such as the
+/// enclosing `run_retry` remain held; provider results are not harvested.
+/// An unavailable observation remains an error and never proves absence.
+pub async fn reconcile_machine_operations(
+    ledger: &Ledger,
+    run_id: &str,
+    ports: &dyn ReconcilePorts,
+) -> Result<ReconcileReport, ProtoError> {
+    let run_id = run_id.to_owned();
+    let (run, events) = on_ledger(ledger, move |ledger| {
+        Ok((ledger.get_run(&run_id)?, fetch_all_events(ledger, &run_id)?))
+    })
+    .await?;
+    if run.state != forged_ledger::RunState::Stopped {
+        return Err(ProtoError::Projection(
+            "machine recovery requires a stopped source run".to_owned(),
+        ));
+    }
+    let events = parse_proto_events(&events)?;
+    let mut report = ReconcileReport::default();
+    settle_operations(ledger, ports, &run, &events, &mut report, true).await?;
     Ok(report)
 }
 
@@ -695,6 +720,7 @@ async fn settle_operations(
     run: &RunRow,
     proto_events: &[ProtoEvent],
     report: &mut ReconcileReport,
+    machine_only: bool,
 ) -> Result<(), ProtoError> {
     let inflight = {
         let run_id = run.run_id.clone();
@@ -705,6 +731,13 @@ async fn settle_operations(
         .await?
     };
     for op in inflight {
+        if machine_only
+            && !crate::engine::MACHINE_STEPS
+                .iter()
+                .any(|(step, _)| step.as_str() == op.name)
+        {
+            continue;
+        }
         match op.effect_class {
             EffectClass::SafeRetry => {
                 let operation_id = op.operation_id.clone();

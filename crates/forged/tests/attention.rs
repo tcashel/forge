@@ -764,10 +764,27 @@ fn delivery_requires_the_durably_observed_exact_pr_base() {
     let exact = overview(&env);
     let merge =
         attention(&exact, "attention-pr-base", "merge-approval").expect("merge approval attention");
+    let landing = merge["nextActions"]
+        .as_array()
+        .expect("merge actions")
+        .iter()
+        .find(|action| action["class"] == json!("should"))
+        .expect("record delivery after the human merges");
     assert_eq!(
-        merge["nextActions"],
-        json!([]),
-        "merging a pull request has no in-surface domain verb"
+        landing,
+        &json!({
+            "verb": "run stop",
+            "class": "should",
+            "args": {
+                "run": "attention-pr-base",
+                "outcome": "landed",
+                "pr": 18,
+                "sha": null,
+                "reason": null,
+            },
+            "reason": "merge the reviewed PR on GitHub first",
+        }),
+        "only the exact-base PR is bound; merge and its SHA still require evidence"
     );
     assert!(attention(&exact, "attention-pr-base", "missing-evidence").is_none());
 }
