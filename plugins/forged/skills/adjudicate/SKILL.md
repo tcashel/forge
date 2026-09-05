@@ -12,6 +12,18 @@ Boundary: the lead owns evidence checks, CRUX choices, and operator dialogue.
 The ledger performs the guarded field, note, and status transition as one
 operation; execution still requires a later explicit handoff.
 
+## Load the critique
+
+```bash
+forged explain --id "$WORK_ID"
+forged work note list --id "$WORK_ID" --kind recommendation --limit 500
+```
+
+Require lifecycle stage `critiqued`, then load the exact recommendation row
+whose `noteId` is named by `lifecycle.basis.noteIds`; do not substitute another
+recommendation. Decode its `bodyJson`. If the named row is absent from this
+bounded result, stop instead of guessing or scanning another source.
+
 ## Resolve every finding
 
 Use the newest `forged.spec-recommendations/1` note named by the lifecycle

@@ -61,12 +61,14 @@ forged work update --id "$WORK_ID" --expected-revision "$OBSERVED_REVISION" \
   --notes-file "$NOTES_PATH"
 ```
 
-Promote a completed blocked stub atomically with the same file set:
+`work promote` preserves the existing title. To change it, first use the
+revision-fenced `work update` above, then read the resulting revision before
+promoting the completed blocked stub atomically with the four body files:
 
 ```bash
 forged work promote --id "$WORK_ID" --expected-revision "$OBSERVED_REVISION" \
-  --title "$TITLE" --description-file "$DESCRIPTION_PATH" \
-  --design-file "$DESIGN_PATH" --acceptance-file "$ACCEPTANCE_PATH" \
+  --description-file "$DESCRIPTION_PATH" --design-file "$DESIGN_PATH" \
+  --acceptance-file "$ACCEPTANCE_PATH" \
   --notes-file "$NOTES_PATH"
 ```
 

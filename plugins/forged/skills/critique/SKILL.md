@@ -14,6 +14,14 @@ GitHub, or execution state.
 
 ## Gate and topology
 
+```bash
+forged explain --id "$WORK_ID"
+forged work show --id "$WORK_ID" --full
+```
+
+Require lifecycle stage `drafted` and use the full work record as the critique
+contract. Do not substitute the summary returned by `explain`.
+
 Read every native spec field, repository identity, dependency, revision, and
 unchecked question. A missing field, wrong repository, unresolved question, or
 later-wave stub blocks critique.

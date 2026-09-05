@@ -1098,6 +1098,7 @@ for needle in 'WORK_ID="ore-' 'metadata.repository' 'description' 'design' \
   '--notes-file "$NOTES_PATH"' 'missing, unreadable' 'non-UTF-8' 'empty' \
   'Each file flag conflicts with its corresponding' \
   'forged work create' 'forged work update' 'forged work link' 'forged work promote' \
+  'work promote` preserves the existing title' \
   'forged work ready' 'forged explain --id' 'forged next --repo' 'parent-child'; do
   grep -Fq -- "$needle" "$plugin/skills/plan/SKILL.md" \
     && pass "native plan contract: $needle" || fail "native plan contract: $needle"
@@ -1107,6 +1108,17 @@ if grep -Fq 'forged work reopen' "$plugin/skills/plan/SKILL.md"; then
 else
   pass "native plan uses atomic promotion instead of work reopen"
 fi
+if awk '
+  /^```bash$/ { fenced = 1; next }
+  /^```$/ { fenced = 0; promote = 0; next }
+  fenced && /^forged work promote([[:space:]]|$)/ { promote = 1 }
+  promote && /--title([=[:space:]]|$)/ { found = 1 }
+  END { exit !found }
+' "$plugin/skills/plan/SKILL.md"; then
+  fail "native plan promotion preserves title"
+else
+  pass "native plan promotion preserves title"
+fi
 for needle in 'newly created id' 'ore-' 'existing or' \
   'imported stored id is preserved verbatim'; do
   grep -Fq -- "$needle" "$plugin/skills/plan/checklist.md" \
@@ -1115,11 +1127,15 @@ done
 for needle in 'forged work note add' '--kind recommendation' \
   '--schema forged.spec-recommendations/1' '--body-file "$RECOMMENDATIONS_PATH"' \
   'RECOMMENDATIONS_PATH' 'unreadable or empty payload' \
-  'critique seat writes kind `recommendation`' 'forged explain --id' 'forged next --repo'; do
+  'critique seat writes kind `recommendation`' \
+  'forged work show --id "$WORK_ID" --full' 'forged explain --id' \
+  'forged next --repo'; do
   grep -Fq -- "$needle" "$plugin/skills/critique/SKILL.md" \
     && pass "ledger critique contract: $needle" || fail "ledger critique contract: $needle"
 done
 for needle in 'forged.spec-recommendations/1' 'forged.adjudication/1' \
+  'forged work note list' '--kind recommendation' '--limit 500' \
+  'lifecycle.basis.noteIds' \
   'forged work adjudicate' '--expected-revision "$OBSERVED_REVISION"' \
   '--dispositions-file "$DISPOSITIONS_PATH"' 'forged explain --id' 'forged next --repo'; do
   grep -Fq -- "$needle" "$plugin/skills/adjudicate/SKILL.md" \
