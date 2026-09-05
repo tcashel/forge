@@ -980,6 +980,17 @@ async fn wait_for_pid_or_deadline(
     let deadline: jiff::Timestamp = deadline
         .parse()
         .map_err(|error| Failure::internal(format!("invalid stage deadline: {error}")))?;
+    let warning_at = forged_proto::stage_deadline_at(
+        warning.started_at,
+        warning
+            .budget_s
+            .saturating_sub(ctx.config.deadline_warning_s),
+    )
+    .map_err(|error| Failure::internal(error.to_string()))?;
+    let warning_at: jiff::Timestamp = warning_at
+        .parse()
+        .map_err(|error| Failure::internal(format!("invalid warning deadline: {error}")))?;
+    let mut warned = false;
     loop {
         if !pid_alive(pid) {
             return Ok(false);
@@ -988,17 +999,7 @@ async fn wait_for_pid_or_deadline(
         if now >= deadline {
             return Ok(true);
         }
-        let warning_at = forged_proto::stage_deadline_at(
-            warning.started_at,
-            warning
-                .budget_s
-                .saturating_sub(ctx.config.deadline_warning_s),
-        )
-        .map_err(|error| Failure::internal(error.to_string()))?;
-        let warning_at: jiff::Timestamp = warning_at
-            .parse()
-            .map_err(|error| Failure::internal(format!("invalid warning deadline: {error}")))?;
-        if now >= warning_at {
+        if !warned && now >= warning_at {
             super::seat::record_deadline_warning(
                 ctx,
                 warning.run_id,
@@ -1006,6 +1007,7 @@ async fn wait_for_pid_or_deadline(
                 warning.attempt_id,
             )
             .await?;
+            warned = true;
         }
         let remaining_ns = deadline.as_nanosecond() - now.as_nanosecond();
         let remaining_ns = u64::try_from(remaining_ns)

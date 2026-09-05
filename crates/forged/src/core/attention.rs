@@ -1206,9 +1206,13 @@ fn collect_domain_sources(input: &ProjectionInput<'_>) -> Result<Vec<RawAttentio
         else {
             continue;
         };
-        let stored = forged_proto::stored_packet(packet).map_err(|error| {
-            Failure::internal(format!("stored packet progress budget: {error}"))
-        })?;
+        // Historical and manually fabricated ledgers can contain packet
+        // bodies that predate the current WorkPacket schema. One unreadable
+        // packet must not take down every projection backed by attention;
+        // it simply cannot contribute a slow-stage budget observation.
+        let Ok(stored) = forged_proto::stored_packet(packet) else {
+            continue;
+        };
         let half_budget = super::supervise::deadline_after(
             &attempt.started_at,
             u64::from(stored.contract.budget_s) / 2,

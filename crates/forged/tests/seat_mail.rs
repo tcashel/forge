@@ -281,7 +281,7 @@ fn queued_mail_polls_reads_and_acks_once_with_urgent_first() {
         json!("normal instruction")
     );
 
-    let (_, replay) = seat_call(
+    let (_, drained) = seat_call(
         &env,
         &seat,
         &[
@@ -294,13 +294,35 @@ fn queued_mail_polls_reads_and_acks_once_with_urgent_first() {
             "10",
         ],
     );
-    assert_eq!(replay["reused"], json!(true));
-    assert_eq!(replay["result"], page["result"]);
+    assert_eq!(drained["reused"], json!(false));
+    assert_eq!(drained["result"]["coverage"]["shown"], json!(0));
+    assert!(drained["result"]["coverage"]["nextCursor"].is_number());
     assert_eq!(
         event_payloads(&env, RUN, "forged.message.delivered").len(),
         2
     );
     assert_eq!(event_payloads(&env, RUN, "forged.message.read").len(), 2);
+
+    let later = queue(&env, seat.attempt_id, "later instruction", false);
+    let (_, advanced) = seat_call(
+        &env,
+        &seat,
+        &[
+            "seat",
+            "inbox",
+            "--attempt",
+            &attempt,
+            "--bodies",
+            "--limit",
+            "10",
+        ],
+    );
+    assert_eq!(advanced["reused"], json!(false));
+    assert_eq!(advanced["result"]["coverage"]["shown"], json!(1));
+    assert_eq!(
+        advanced["result"]["messages"][0]["messageId"],
+        later["result"]["messageId"]
+    );
 
     let (code, ack) = seat_call(
         &env,
@@ -356,7 +378,7 @@ fn queued_mail_polls_reads_and_acks_once_with_urgent_first() {
     );
 
     let queued = event_payloads(&env, RUN, "forged.message.queued");
-    assert_eq!(queued.len(), 2);
+    assert_eq!(queued.len(), 3);
     assert_eq!(queued[1]["from"]["kind"], json!("lead"));
     assert_eq!(
         queued[1]["to"],
@@ -365,6 +387,111 @@ fn queued_mail_polls_reads_and_acks_once_with_urgent_first() {
     assert_eq!(queued[1]["kind"], json!("instruction"));
     assert_eq!(queued[1]["importance"], json!("urgent"));
     assert_eq!(queued[1]["ackRequired"], json!(true));
+}
+
+#[test]
+fn metadata_poll_does_not_consume_the_unread_body() {
+    let (env, seat) = setup("forged-seat-mail-unread-body");
+    queue(&env, seat.attempt_id, "read me after metadata", false);
+    let attempt = seat.attempt_id.to_string();
+
+    let (code, metadata) = seat_call(&env, &seat, &["seat", "inbox", "--attempt", &attempt]);
+    assert_eq!(code, 0, "metadata inbox: {metadata}");
+    assert_eq!(metadata["result"]["coverage"]["shown"], json!(1));
+    assert!(metadata["result"]["messages"][0].get("body").is_none());
+    assert_eq!(
+        event_payloads(&env, RUN, "forged.message.delivered").len(),
+        1
+    );
+    assert!(event_payloads(&env, RUN, "forged.message.read").is_empty());
+
+    let (code, body) = seat_call(
+        &env,
+        &seat,
+        &["seat", "inbox", "--attempt", &attempt, "--bodies"],
+    );
+    assert_eq!(code, 0, "body inbox: {body}");
+    assert_eq!(
+        body["result"]["messages"][0]["body"],
+        json!("read me after metadata")
+    );
+    assert_eq!(event_payloads(&env, RUN, "forged.message.read").len(), 1);
+}
+
+#[test]
+fn run_addressed_boundary_mail_is_not_polled_by_the_current_attempt() {
+    let (env, seat) = setup("forged-seat-mail-boundary-only");
+    let (code, queued) = env.forged(&[
+        "session",
+        "message",
+        "--run",
+        RUN,
+        "--message",
+        "next attempt only",
+    ]);
+    assert_eq!(code, 0, "queue boundary message: {queued}");
+    let attempt = seat.attempt_id.to_string();
+    let (code, inbox) = seat_call(
+        &env,
+        &seat,
+        &["seat", "inbox", "--attempt", &attempt, "--bodies"],
+    );
+    assert_eq!(code, 0, "poll current attempt: {inbox}");
+    assert_eq!(inbox["result"]["coverage"]["shown"], json!(0));
+    assert!(event_payloads(&env, RUN, "forged.message.delivered").is_empty());
+}
+
+#[test]
+fn urgent_first_truncated_pages_do_not_skip_older_normal_mail() {
+    let (env, seat) = setup("forged-seat-mail-cursor");
+    let normal = queue(&env, seat.attempt_id, "older normal", false);
+    let urgent = queue(&env, seat.attempt_id, "newer urgent", true);
+    let attempt = seat.attempt_id.to_string();
+    let (code, first) = seat_call(
+        &env,
+        &seat,
+        &[
+            "seat",
+            "inbox",
+            "--attempt",
+            &attempt,
+            "--bodies",
+            "--limit",
+            "1",
+        ],
+    );
+    assert_eq!(code, 0, "first page: {first}");
+    assert_eq!(first["result"]["coverage"]["truncated"], json!(true));
+    assert_eq!(
+        first["result"]["messages"][0]["messageId"],
+        urgent["result"]["messageId"]
+    );
+    let cursor = first["result"]["coverage"]["nextCursor"]
+        .as_i64()
+        .expect("numeric cursor")
+        .to_string();
+
+    let (code, second) = seat_call(
+        &env,
+        &seat,
+        &[
+            "seat",
+            "inbox",
+            "--attempt",
+            &attempt,
+            "--since",
+            &cursor,
+            "--bodies",
+            "--limit",
+            "1",
+        ],
+    );
+    assert_eq!(code, 0, "second page: {second}");
+    assert_eq!(second["result"]["coverage"]["truncated"], json!(false));
+    assert_eq!(
+        second["result"]["messages"][0]["messageId"],
+        normal["result"]["messageId"]
+    );
 }
 
 #[test]
@@ -420,7 +547,7 @@ fn progress_projects_latest_snapshot_into_status_and_next() {
     );
 
     let repository = env.repos.repo.to_string_lossy().into_owned();
-    let (code, next) = env.forged(&["next", "--repository", &repository]);
+    let (code, next) = env.forged(&["next", "--repo", &repository]);
     assert_eq!(code, 0, "next: {next}");
     let running = next["result"]["sections"]["running"]
         .as_array()

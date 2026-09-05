@@ -12,8 +12,11 @@
 
 mod support;
 
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, path::PathBuf};
 
+use forged_types::{
+    Deliverable, ProviderHints, Sandbox, SpecRef, Stage, StageContract, WorkPacket,
+};
 use serde_json::{json, Value};
 use support::{fabricate_epic, fabricate_run, TestEnv};
 
@@ -41,16 +44,50 @@ fn fabricate_live_seats(env: &TestEnv, run_id: &str, count: i64) {
     let ledger = env.ledger();
     let sha = sha256_hex(&env.spec);
     for seq in 1..=count {
+        let packet_id = format!("{run_id}/implement/{seq}");
+        let packet = WorkPacket {
+            schema: "forged.packet/1".to_owned(),
+            packet_id: packet_id.clone(),
+            run_id: run_id.to_owned(),
+            work_id: format!("bead-{run_id}"),
+            stage: Stage::Implement,
+            execution: None,
+            lane_seq: None,
+            spec: SpecRef {
+                path: env.spec.to_string_lossy().into_owned(),
+                sha256: sha.clone(),
+                revision: None,
+            },
+            worktree: PathBuf::from("/unread/work-list-worktree"),
+            branch: format!("forged/{run_id}"),
+            base_ref: "main".to_owned(),
+            contract: StageContract {
+                instructions: "count the live seat".to_owned(),
+                gate_commands: Vec::new(),
+                deliverable: Deliverable::CommitsInWorktree,
+                budget_s: 3_600,
+                seat_commands: Vec::new(),
+            },
+            result_schema: "forged.result/1".to_owned(),
+            provider_hints: ProviderHints {
+                provider: "fixture".to_owned(),
+                model: "fixture".to_owned(),
+                effort: None,
+                sandbox: Sandbox::ReadOnly,
+                env: Default::default(),
+            },
+            field_notes: Vec::new(),
+        };
         let packet_id = ledger
             .open_packet(forged_ledger::NewPacket {
                 run_id: run_id.to_owned(),
-                stage: forged_types::Stage::Implement,
+                stage: Stage::Implement,
                 seq,
                 spec_path: env.spec.to_string_lossy().into_owned(),
                 spec_sha256: sha.clone(),
                 spec_revision: None,
                 policy_revision: None,
-                body_json: json!({"fabricated": true}).to_string(),
+                body_json: packet.stored_body().expect("stored packet"),
             })
             .expect("open packet");
         ledger
@@ -61,6 +98,31 @@ fn fabricate_live_seats(env: &TestEnv, run_id: &str, count: i64) {
             )
             .expect("claim packet");
     }
+    ledger.close().expect("close");
+}
+
+fn fabricate_malformed_live_seat(env: &TestEnv, run_id: &str) {
+    let ledger = env.ledger();
+    let sha = sha256_hex(&env.spec);
+    let packet_id = ledger
+        .open_packet(forged_ledger::NewPacket {
+            run_id: run_id.to_owned(),
+            stage: Stage::Implement,
+            seq: 1,
+            spec_path: env.spec.to_string_lossy().into_owned(),
+            spec_sha256: sha.clone(),
+            spec_revision: None,
+            policy_revision: None,
+            body_json: json!({"fabricated": true}).to_string(),
+        })
+        .expect("open malformed packet fixture");
+    ledger
+        .claim_packet(
+            &packet_id,
+            &format!("forged:{packet_id}:0"),
+            &forged_ledger::SpecFence::Sha256(sha),
+        )
+        .expect("claim malformed packet fixture");
     ledger.close().expect("close");
 }
 
@@ -590,6 +652,21 @@ fn live_seats_are_counted_per_run() {
     assert_eq!(code, 0, "work list: {response}");
     assert_eq!(entry(&response, "wl-busy")["liveSeats"], json!(2));
     assert_eq!(entry(&response, "wl-idle")["liveSeats"], json!(0));
+}
+
+#[test]
+fn malformed_live_packet_does_not_break_work_list_attention_projection() {
+    let env = TestEnv::new("forged-work-list-malformed-live-packet");
+    env.forged(&["init"]);
+    fabricate_run(&env, "wl-malformed");
+    fabricate_malformed_live_seat(&env, "wl-malformed");
+
+    let (code, response) = env.forged(&["work", "list", "--detail", "full"]);
+    assert_eq!(
+        code, 0,
+        "work list degrades per malformed packet: {response}"
+    );
+    assert_eq!(entry(&response, "wl-malformed")["liveSeats"], json!(1));
 }
 
 /// The production path, end to end: `epic start` appends

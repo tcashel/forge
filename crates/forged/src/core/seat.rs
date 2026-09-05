@@ -48,6 +48,13 @@ pub(crate) struct MessageRecord {
     pub ack_required: bool,
     pub in_reply_to: Option<String>,
     pub body: String,
+    delivery_point: DeliveryPoint,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeliveryPoint {
+    Poll,
+    Boundary,
 }
 
 #[derive(Debug)]
@@ -76,12 +83,18 @@ fn payload(row: &EventRow) -> Option<Value> {
 fn message_record(row: &EventRow) -> Option<MessageRecord> {
     let payload = payload(row)?;
     if row.kind == MESSAGE_QUEUED {
+        let to = payload.get("to")?.clone();
+        let delivery_point = if value_id(&to, "attempt").is_some() {
+            DeliveryPoint::Poll
+        } else {
+            DeliveryPoint::Boundary
+        };
         return Some(MessageRecord {
             event_id: row.event_id,
             queued_at: row.ts.clone(),
             message_id: payload.get("messageId")?.as_str()?.to_owned(),
             from: payload.get("from")?.clone(),
-            to: payload.get("to")?.clone(),
+            to,
             packet_id: payload
                 .get("packetId")
                 .and_then(Value::as_str)
@@ -101,6 +114,7 @@ fn message_record(row: &EventRow) -> Option<MessageRecord> {
                 .and_then(Value::as_str)
                 .map(str::to_owned),
             body: payload.get("body")?.as_str()?.to_owned(),
+            delivery_point,
         });
     }
     if row.kind != INTERVENTION_QUEUED {
@@ -130,6 +144,9 @@ fn message_record(row: &EventRow) -> Option<MessageRecord> {
         ack_required: false,
         in_reply_to: None,
         body: payload.get("message")?.as_str()?.to_owned(),
+        // Legacy interventions were injected at provider boundaries. Keep
+        // that delivery contract when projecting their stored bytes.
+        delivery_point: DeliveryPoint::Boundary,
     })
 }
 
@@ -174,6 +191,15 @@ fn delivered(events: &[EventRow]) -> BTreeSet<String> {
         .collect()
 }
 
+fn read(events: &[EventRow]) -> BTreeSet<String> {
+    events
+        .iter()
+        .filter(|row| row.kind == MESSAGE_READ)
+        .filter_map(payload)
+        .filter_map(|payload| payload.get("messageId")?.as_str().map(str::to_owned))
+        .collect()
+}
+
 fn acked(events: &[EventRow]) -> BTreeSet<String> {
     events
         .iter()
@@ -183,33 +209,42 @@ fn acked(events: &[EventRow]) -> BTreeSet<String> {
         .collect()
 }
 
-fn targets_attempt(
-    message: &MessageRecord,
-    run_id: &str,
-    _packet_id: &str,
-    attempt_id: i64,
-) -> bool {
+fn targets_attempt(message: &MessageRecord, run_id: &str, attempt_id: i64) -> bool {
     let attempt_id = attempt_id.to_string();
     value_id(&message.to, "run").as_deref() == Some(run_id)
         || value_id(&message.to, "attempt").as_deref() == Some(attempt_id.as_str())
 }
 
-pub(crate) fn pending_for_attempt(
+pub(crate) fn pending_for_boundary(
     events: &[EventRow],
     run_id: &str,
-    packet_id: &str,
     attempt_id: i64,
 ) -> Vec<MessageRecord> {
     let delivered = delivered(events);
-    let mut pending = messages(events)
+    messages(events)
         .into_iter()
         .filter(|message| {
             !delivered.contains(&message.message_id)
-                && targets_attempt(message, run_id, packet_id, attempt_id)
+                && message.delivery_point == DeliveryPoint::Boundary
+                && targets_attempt(message, run_id, attempt_id)
         })
-        .collect::<Vec<_>>();
-    pending.sort_by_key(|message| (message.importance != "urgent", message.event_id));
-    pending
+        .collect()
+}
+
+fn poll_for_attempt(events: &[EventRow], attempt_id: i64, bodies: bool) -> Vec<MessageRecord> {
+    let seen = if bodies {
+        read(events)
+    } else {
+        delivered(events)
+    };
+    messages(events)
+        .into_iter()
+        .filter(|message| {
+            message.delivery_point == DeliveryPoint::Poll
+                && message_attempt(message) == Some(attempt_id)
+                && !seen.contains(&message.message_id)
+        })
+        .collect()
 }
 
 pub(crate) fn latest_progress(events: &[EventRow], attempt_id: Option<i64>) -> Option<Value> {
@@ -485,8 +520,9 @@ pub async fn seat_inbox(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespo
             &Failure::invalid("seat inbox limit must be between 1 and 500"),
         );
     }
-    let key_material = json!({"since": since, "bodies": bodies, "limit": limit});
-    default_key(req, seat_key("inbox", attempt_id, &key_material));
+    let derived_key = super::key_absent(req);
+    let request_material = json!({"since": since, "bodies": bodies, "limit": limit});
+    default_key(req, seat_key("inbox", attempt_id, &request_material));
     req.run_id = None;
     let operation_id = req.idempotency_key.clone();
     let seat = match fence(ctx, attempt_id, &operation_id).await {
@@ -497,14 +533,51 @@ pub async fn seat_inbox(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespo
         Ok(events) => events,
         Err(failure) => return super::err_response(&operation_id, &failure),
     };
-    let mut pending =
-        pending_for_attempt(&events, &seat.run_id, &seat.attempt.packet_id, attempt_id);
+    let mut pending = poll_for_attempt(&events, attempt_id, bodies);
     pending.retain(|message| message.event_id > since);
+    let pending_frontier = pending
+        .iter()
+        .map(|message| message.event_id)
+        .max()
+        .unwrap_or(0);
+    if derived_key {
+        req.idempotency_key = seat_key(
+            "inbox",
+            attempt_id,
+            &json!({
+                "since": since,
+                "bodies": bodies,
+                "limit": limit,
+                "pendingFrontier": pending_frontier,
+                "pendingCount": pending.len(),
+            }),
+        );
+    }
+    pending.sort_by_key(|message| (message.importance != "urgent", message.event_id));
     let total = pending.len();
+    let remaining_floor = pending
+        .iter()
+        .skip(limit as usize)
+        .map(|message| message.event_id)
+        .min();
     pending.truncate(limit as usize);
     let shown = pending.len();
     let truncated = shown < total;
-    let next_cursor = pending.iter().map(|message| message.event_id).max();
+    // Urgent mail may leapfrog older normal mail. The numeric cursor is
+    // therefore the greatest safe event frontier before the oldest unshown
+    // message, rather than the maximum event id in this page. Delivered/read
+    // effects remove shown rows from the next evaluation, so bounded pages
+    // progress without skipping the older row.
+    let next_cursor = if let Some(remaining_floor) = remaining_floor {
+        remaining_floor.saturating_sub(1).max(since)
+    } else {
+        events
+            .iter()
+            .map(|event| event.event_id)
+            .max()
+            .unwrap_or(since)
+            .max(since)
+    };
     let page = pending
         .iter()
         .map(|message| message_json(message, bodies))
@@ -596,8 +669,7 @@ pub async fn seat_ack(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespons
         Err(failure) => return super::err_response(&operation_id, &failure),
     };
     let addressed = messages(&events).into_iter().any(|message| {
-        message.message_id == message_id
-            && targets_attempt(&message, &seat.run_id, &seat.attempt.packet_id, attempt_id)
+        message.message_id == message_id && targets_attempt(&message, &seat.run_id, attempt_id)
     });
     if !addressed {
         return remedy_response(

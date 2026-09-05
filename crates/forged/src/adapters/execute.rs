@@ -1581,12 +1581,8 @@ async fn run_attempt(
     let prepared = async {
         let mut packet = packet;
         let message_events = crate::core::sessions::run_events(ctx, &run_id).await?;
-        let messages = crate::core::seat::pending_for_attempt(
-            &message_events,
-            &run_id,
-            &packet.packet_id,
-            attempt_id,
-        );
+        let messages =
+            crate::core::seat::pending_for_boundary(&message_events, &run_id, attempt_id);
         packet.field_notes.extend(messages.iter().map(|message| {
             let from = message
                 .from
