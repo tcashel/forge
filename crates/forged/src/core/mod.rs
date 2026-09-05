@@ -21,6 +21,7 @@ mod observe;
 mod ops;
 mod ore;
 mod review;
+pub(crate) mod seat;
 mod session_inventory;
 pub(crate) mod sessions;
 pub(crate) mod settlement;
@@ -1541,6 +1542,10 @@ pub async fn dispatch(ctx: &Ctx, name: &str, mut req: OperationRequest) -> Opera
         "session_read" => sessions::session_read(ctx, &req).await,
         "session_message" => sessions::session_message(ctx, &mut req).await,
         "session_stop" => sessions::session_stop(ctx, &mut req).await,
+        "seat_inbox" => seat::seat_inbox(ctx, &mut req).await,
+        "seat_ack" => seat::seat_ack(ctx, &mut req).await,
+        "seat_progress" => seat::seat_progress(ctx, &mut req).await,
+        "seat_note" => seat::seat_note(ctx, &mut req).await,
         "claim_next" => claimnext::claim_next(ctx, &req).await,
         "gate_run" => ops::gate_run(ctx, &mut req).await,
         "reconcile" => ops::reconcile(ctx, &mut req).await,

@@ -9,7 +9,7 @@
 use forged_types::AttentionCondition;
 
 pub const SUBJECT_TOTAL: usize = 120;
-pub const ATTENTION_TOTAL: usize = 62;
+pub const ATTENTION_TOTAL: usize = 64;
 pub const BLOCKED_SYMPTOM_TOTAL: usize = 47;
 pub const DECISION_TOTAL: usize = 10;
 pub const RUNNING_TOTAL: usize = 2;
@@ -152,6 +152,8 @@ pub fn operator_store_fixture() -> OperatorStoreFixture {
             AttentionCondition::ProviderDegraded,
             AttentionCondition::AdmissionDeferred,
             AttentionCondition::WorkSettlementPending,
+            AttentionCondition::AckOverdue,
+            AttentionCondition::SlowStage,
         ])
     {
         attention.push(FixtureAttention {

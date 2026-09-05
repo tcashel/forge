@@ -1805,13 +1805,51 @@ impl ForgedServer {
         self.call_lead_read("session_read", args.0).await
     }
 
-    /// Queue or capability-gated live-deliver an intervention.
+    /// Queue one direct lead instruction for an attempt or run boundary.
     #[tool(
         name = "session_message",
-        description = "Queue an intervention for a run or live session."
+        description = "Queue one direct lead instruction for an attempt or run boundary."
     )]
     pub async fn session_message(&self, args: Parameters<LeadWriteArgs>) -> CallToolResult {
         self.call_lead_write("session_message", args.0).await
+    }
+
+    /// Pull one bounded page of messages for the environment-fenced seat.
+    #[tool(
+        name = "seat_inbox",
+        description = "Pull one stored page for the running provider attempt. Identical \
+                       attempt/since/bodies/limit values replay that page verbatim; pass \
+                       nextSince as since to discover later mail."
+    )]
+    pub async fn seat_inbox(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
+        self.call("seat_inbox", args.0).await
+    }
+
+    /// Acknowledge one message addressed to the environment-fenced seat.
+    #[tool(
+        name = "seat_ack",
+        description = "Acknowledge one message addressed to the running provider attempt."
+    )]
+    pub async fn seat_ack(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
+        self.call("seat_ack", args.0).await
+    }
+
+    /// Record the environment-fenced seat's latest progress snapshot.
+    #[tool(
+        name = "seat_progress",
+        description = "Record a progress snapshot for the running provider attempt."
+    )]
+    pub async fn seat_progress(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
+        self.call("seat_progress", args.0).await
+    }
+
+    /// Send one environment-fenced note directly to the lead.
+    #[tool(
+        name = "seat_note",
+        description = "Send a bounded note from the running provider attempt to the lead."
+    )]
+    pub async fn seat_note(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
+        self.call("seat_note", args.0).await
     }
 
     /// Revoke and confirmed-stop one provider attempt.

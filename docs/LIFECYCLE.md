@@ -61,7 +61,10 @@ fix round, serialized per daemon. An attempt that outlives its stage budget
 is killed as a `deadline:` failure and relaunched at once within
 `deadlineRetryBudget`, with a field note about the work already committed;
 exhaustion is the `deadlineExhausted` terminal, distinct from provider
-unavailability.
+unavailability. At `deadline_warning_s` before the immutable deadline the
+controller queues one urgent, acknowledgement-required instruction telling
+the running seat to commit what is green and return; the deadline and kill
+behavior do not move.
 
 ## Decisions
 

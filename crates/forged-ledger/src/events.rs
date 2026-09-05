@@ -5,11 +5,12 @@ use std::collections::BTreeMap;
 
 use rusqlite::{Connection, TransactionBehavior};
 
-use crate::error::LedgerError;
+use crate::attempts::{get_attempt_tx, run_of_packet};
+use crate::error::{refused, LedgerError};
 use crate::ledger::Ledger;
 use crate::runs::latest_policy_revision_tx;
 use crate::time::now_iso;
-use crate::types::{EventRow, PolicyRevisionRow};
+use crate::types::{AttemptState, EventRow, PolicyRevisionRow};
 
 /// Complete and cursor-eligible counts for one subject in a multi-subject
 /// event page.
@@ -167,6 +168,50 @@ impl Ledger {
             }
             tx.commit()?;
             Ok(!exists)
+        })
+    }
+
+    /// Atomically prove one provider seat still owns a running attempt and
+    /// append each absent coordination event. This is the storage fence for
+    /// every `seat` verb: a revoked or stale seat can never win the race
+    /// between a read-side identity check and its event writes.
+    pub fn append_seat_events_once(
+        &self,
+        attempt_id: i64,
+        claim_token: &str,
+        run_id: &str,
+        events: Vec<(String, serde_json::Value)>,
+    ) -> Result<usize, LedgerError> {
+        let claim_token = claim_token.to_owned();
+        let run_id = run_id.to_owned();
+        self.submit(move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let attempt = get_attempt_tx(&tx, attempt_id)?;
+            let attempt_run = run_of_packet(&tx, &attempt.packet_id)?;
+            if attempt.state != AttemptState::Running
+                || attempt.claim_token != claim_token
+                || attempt_run != run_id
+            {
+                return Err(refused(
+                    forged_types::ErrorCode::SeatFence,
+                    format!("attempt {attempt_id} is not owned by this running seat"),
+                ));
+            }
+            let mut appended = 0;
+            for (kind, payload) in events {
+                let payload_json = serde_json::to_string(&payload)?;
+                let exists: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM events WHERE run_id = ?1 AND kind = ?2 AND payload_json = ?3)",
+                    rusqlite::params![run_id, kind, payload_json],
+                    |row| row.get(0),
+                )?;
+                if !exists {
+                    append_event_tx(&tx, Some(&run_id), &kind, &payload)?;
+                    appended += 1;
+                }
+            }
+            tx.commit()?;
+            Ok(appended)
         })
     }
 

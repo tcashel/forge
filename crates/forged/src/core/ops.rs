@@ -1608,11 +1608,18 @@ pub async fn run_status(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
         let run_id = param_str(&req.params, "run")?;
         let view = super::drive::project(ctx, run_id).await?;
         let run_id_owned = run_id.to_owned();
-        let (definition, revision, protocol_terminal, admission_decisions, deadline_kills) =
+        let (
+            definition,
+            revision,
+            protocol_terminal,
+            admission_decisions,
+            deadline_kills,
+            coordination_events,
+        ) =
             on_ledger(&ctx.ledger, move |ledger| {
-                let protocol_terminal = ledger
-                    .list_events(Some(&run_id_owned), 0, 4096)?
-                    .into_iter()
+                let events = ledger.list_events(Some(&run_id_owned), 0, 16_384)?;
+                let protocol_terminal = events
+                    .iter()
                     .find(|event| event.kind == "run.protocol-terminal")
                     .map(|event| {
                         serde_json::from_str::<Value>(&event.payload_json)
@@ -1642,6 +1649,7 @@ pub async fn run_status(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
                         &run_id_owned,
                         RevokeScope::Deadline,
                     )?,
+                    events,
                 ))
             })
             .await?;
@@ -1802,6 +1810,20 @@ pub async fn run_status(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
                 "candidateSelections": candidates,
             })
         });
+        let current_attempt = view
+            .live_attempts
+            .iter()
+            .max_by_key(|attempt| attempt.attempt_id);
+        let progress = super::seat::latest_progress(
+            &coordination_events,
+            current_attempt.map(|attempt| attempt.attempt_id),
+        );
+        let mail = super::seat::mail_projection(
+            &coordination_events,
+            run_id,
+            current_attempt.map(|attempt| attempt.packet_id.as_str()),
+            current_attempt.map(|attempt| attempt.attempt_id),
+        );
         let mut run = json!({
                 "runId": view.run.run_id,
                 "retryOf": retry_of,
@@ -1853,6 +1875,8 @@ pub async fn run_status(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
                     "idempotencyKey": o.idempotency_key,
                 })).collect::<Vec<_>>(),
                 "deadlineKills": deadline_kills,
+                "progress": progress,
+                "mail": mail,
                 "nextActions": run_projection_actions(&view.run),
                 "nextAction": match protocol_terminal {
                     Some(terminal) if view.accepted_risk.is_none() => json!({"stop": terminal}),
@@ -5648,6 +5672,29 @@ fn next_running_row(
     row["seat"] = attempt
         .map(|attempt| Value::String(attempt.claimant.clone()))
         .unwrap_or(Value::Null);
+    let events = super::seat::coordination_events(snapshot)
+        .into_iter()
+        .filter(|event| event.run_id.as_deref() == Some(id))
+        .collect::<Vec<_>>();
+    let progress = super::seat::latest_progress(&events, attempt.map(|attempt| attempt.attempt_id));
+    let mail = super::seat::mail_projection(
+        &events,
+        id,
+        attempt.map(|attempt| attempt.packet_id.as_str()),
+        attempt.map(|attempt| attempt.attempt_id),
+    );
+    row["commitsAhead"] = progress
+        .as_ref()
+        .and_then(|progress| progress.get("commitsAhead"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    row["progress"] = progress.map_or(
+        Value::Null,
+        |progress| json!({"phase": progress.get("phase").cloned().unwrap_or(Value::Null)}),
+    );
+    row["mail"] = json!({
+        "unacked": mail.get("unacked").cloned().unwrap_or(Value::Null)
+    });
     Ok(row)
 }
 
@@ -5861,8 +5908,12 @@ pub async fn next(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
             }
             None => None,
         };
-        let attention_items =
-            super::attention::project_active(&snapshot, &entries, &work_summaries)?;
+        let attention_items = super::attention::project_active(
+            &snapshot,
+            &entries,
+            &work_summaries,
+            ctx.config.ack_window_s,
+        )?;
         let attention_json = attention_items
             .iter()
             .map(|item| {
@@ -6189,8 +6240,12 @@ pub async fn operations_overview(ctx: &Ctx, req: &OperationRequest) -> Operation
             plan_truncated,
             ..
         } = universe;
-        let attention_items =
-            super::attention::project_active(&snapshot, &entries, &work_summaries)?;
+        let attention_items = super::attention::project_active(
+            &snapshot,
+            &entries,
+            &work_summaries,
+            ctx.config.ack_window_s,
+        )?;
         let attention_decisions = attention_items
             .iter()
             .filter(|item| {
@@ -6552,6 +6607,7 @@ pub async fn attention_list(ctx: &Ctx, req: &OperationRequest) -> OperationRespo
             &universe.snapshot,
             &universe.entries,
             &universe.work_summaries,
+            ctx.config.ack_window_s,
         )?;
         let items: Vec<AttentionItemV1> = items
             .into_iter()
@@ -6706,7 +6762,7 @@ pub(crate) async fn all_attention(ctx: &Ctx) -> Result<Vec<AttentionItemV1>, Fai
         .await
         .unwrap_or_default();
     decorate_titles(&mut entries, &work)?;
-    super::attention::project_all(&snapshot, &entries, &work)
+    super::attention::project_all(&snapshot, &entries, &work, ctx.config.ack_window_s)
 }
 
 #[derive(Clone, Copy)]

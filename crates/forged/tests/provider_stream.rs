@@ -78,6 +78,7 @@ fn make_request(
         &dirs,
         root,
         attempt_id,
+        "claim-private",
         render_mode,
     )
     .expect("request");
@@ -129,7 +130,7 @@ if [ -n "${FORGED_CONTROLLER_PID_PATH+x}" ] || \
   printf 'leaked' > "$FORGED_TEST_MARKER"
   exit 91
 fi
-printf '%s' "$FORGED_PROVIDER_OWNED" > "$FORGED_TEST_MARKER"
+printf '%s|%s|%s' "$FORGED_PROVIDER_OWNED" "$FORGED_SEAT_ATTEMPT" "$FORGED_SEAT_TOKEN" > "$FORGED_TEST_MARKER"
 pwd > "$FORGED_TEST_CWD"
 cat >/dev/null
 printf '%s\n' '{"type":"system","subtype":"init"}' '{"type":"result","is_error":false}'
@@ -157,7 +158,7 @@ printf '%s\n' '{"type":"system","subtype":"init"}' '{"type":"result","is_error":
     assert!(output.stdout.is_empty(), "disabled rendering wrote stdout");
     assert_eq!(
         std::fs::read_to_string(&marker).expect("marker"),
-        "preserved"
+        "preserved|7|claim-private"
     );
     assert_eq!(
         std::fs::canonicalize(PathBuf::from(

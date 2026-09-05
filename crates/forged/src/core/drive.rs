@@ -857,7 +857,20 @@ async fn honor_await(
                     // the ledger every 500 ms. A controller crash is resumed
                     // by that persisted desired-work wake and derives this
                     // same deadline again from started_at + frozen policy.
-                    if wait_for_pid_or_deadline(pid, &deadline).await? {
+                    if wait_for_pid_or_deadline(
+                        ctx,
+                        pid,
+                        &deadline,
+                        DeadlineWarning {
+                            run_id: &view.run.run_id,
+                            packet_id: &packet.packet_id,
+                            attempt_id: attempt.attempt_id,
+                            started_at: &attempt.started_at,
+                            budget_s,
+                        },
+                    )
+                    .await?
+                    {
                         let as_of = now_iso();
                         let config = forged_proto::ReconcileConfig {
                             termination_grace_s: view.policy.termination_grace_s,
@@ -947,13 +960,37 @@ fn pid_alive(pid: i32) -> bool {
     )
 }
 
+struct DeadlineWarning<'a> {
+    run_id: &'a str,
+    packet_id: &'a str,
+    attempt_id: i64,
+    started_at: &'a str,
+    budget_s: u64,
+}
+
 /// Wait for the recovered process to finish or for its one immutable stage
 /// deadline. The durable desired-work wake owns crash recovery; this local
 /// loop only accelerates observation of a process that exits before timeout.
-async fn wait_for_pid_or_deadline(pid: i32, deadline: &str) -> Result<bool, Failure> {
+async fn wait_for_pid_or_deadline(
+    ctx: &Ctx,
+    pid: i32,
+    deadline: &str,
+    warning: DeadlineWarning<'_>,
+) -> Result<bool, Failure> {
     let deadline: jiff::Timestamp = deadline
         .parse()
         .map_err(|error| Failure::internal(format!("invalid stage deadline: {error}")))?;
+    let warning_at = forged_proto::stage_deadline_at(
+        warning.started_at,
+        warning
+            .budget_s
+            .saturating_sub(ctx.config.deadline_warning_s),
+    )
+    .map_err(|error| Failure::internal(error.to_string()))?;
+    let warning_at: jiff::Timestamp = warning_at
+        .parse()
+        .map_err(|error| Failure::internal(format!("invalid warning deadline: {error}")))?;
+    let mut warned = false;
     loop {
         if !pid_alive(pid) {
             return Ok(false);
@@ -961,6 +998,16 @@ async fn wait_for_pid_or_deadline(pid: i32, deadline: &str) -> Result<bool, Fail
         let now = jiff::Timestamp::now();
         if now >= deadline {
             return Ok(true);
+        }
+        if !warned && now >= warning_at {
+            crate::adapters::execute::record_deadline_warning_once(
+                ctx,
+                warning.run_id,
+                warning.packet_id,
+                warning.attempt_id,
+                &mut warned,
+            )
+            .await;
         }
         let remaining_ns = deadline.as_nanosecond() - now.as_nanosecond();
         let remaining_ns = u64::try_from(remaining_ns)

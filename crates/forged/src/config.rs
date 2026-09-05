@@ -61,6 +61,12 @@ pub struct ForgedConfig {
     /// Relaunches allowed after stage-deadline kills, counted apart from
     /// transport failures.
     pub deadline_retry_budget: u32,
+    /// Seconds before a stage deadline when the controller queues its one
+    /// urgent commit-and-return instruction.
+    pub deadline_warning_s: u64,
+    /// Seconds after delivery before an unacknowledged required message
+    /// becomes operator attention.
+    pub ack_window_s: u64,
     /// Environment applied to every provider process the controller spawns.
     pub seat_env: BTreeMap<String, String>,
     /// Operator-defined, case-insensitive transport substrings extending the
@@ -196,6 +202,10 @@ struct ConfigFile {
     seat_commands: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     deadline_retry_budget: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    deadline_warning_s: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ack_window_s: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     seat_env: Option<BTreeMap<String, String>>,
     #[serde(
@@ -413,6 +423,8 @@ fn resolve_stage_budget_s(overrides: Option<HashMap<Stage, u64>>) -> HashMap<Sta
 }
 
 const DEFAULT_TRANSPORT_RETRY_BUDGET: u32 = 3;
+pub(crate) const DEFAULT_DEADLINE_WARNING_S: u64 = 900;
+pub(crate) const DEFAULT_ACK_WINDOW_S: u64 = 600;
 
 fn anvil_home() -> PathBuf {
     if let Some(a) = std::env::var_os("ANVIL_HOME").filter(|v| !v.is_empty()) {
@@ -606,6 +618,10 @@ impl ForgedConfig {
             deadline_retry_budget: file
                 .deadline_retry_budget
                 .unwrap_or(forged_types::DEFAULT_DEADLINE_RETRY_BUDGET),
+            deadline_warning_s: file
+                .deadline_warning_s
+                .unwrap_or(DEFAULT_DEADLINE_WARNING_S),
+            ack_window_s: file.ack_window_s.unwrap_or(DEFAULT_ACK_WINDOW_S),
             seat_env: file.seat_env.unwrap_or_default(),
             transport_patterns,
             provider_transport_patterns,
@@ -917,6 +933,8 @@ impl ForgedConfig {
             transport_retry_budget: Some(DEFAULT_TRANSPORT_RETRY_BUDGET),
             seat_commands: Some(self.seat_commands.clone()),
             deadline_retry_budget: Some(self.deadline_retry_budget),
+            deadline_warning_s: Some(self.deadline_warning_s),
+            ack_window_s: Some(self.ack_window_s),
             seat_env: (!self.seat_env.is_empty()).then(|| self.seat_env.clone()),
             transport_patterns: Some(self.transport_patterns.clone()),
             providers: (!self.provider_transport_patterns.is_empty()).then(|| {
@@ -1440,6 +1458,8 @@ pub(crate) fn scratch_config(anvil_home: &std::path::Path) -> ForgedConfig {
         transport_retry_budget: DEFAULT_TRANSPORT_RETRY_BUDGET,
         seat_commands: Vec::new(),
         deadline_retry_budget: 1,
+        deadline_warning_s: DEFAULT_DEADLINE_WARNING_S,
+        ack_window_s: DEFAULT_ACK_WINDOW_S,
         seat_env: Default::default(),
         transport_patterns: Vec::new(),
         provider_transport_patterns: BTreeMap::new(),
@@ -1476,6 +1496,8 @@ mod tests {
             transport_retry_budget: DEFAULT_TRANSPORT_RETRY_BUDGET,
             seat_commands: Vec::new(),
             deadline_retry_budget: 1,
+            deadline_warning_s: DEFAULT_DEADLINE_WARNING_S,
+            ack_window_s: DEFAULT_ACK_WINDOW_S,
             seat_env: Default::default(),
             transport_patterns: Vec::new(),
             provider_transport_patterns: BTreeMap::new(),
@@ -1496,6 +1518,8 @@ mod tests {
         assert!(text.starts_with("# forged authoring config"));
         let parsed: ConfigFile = serde_yaml::from_str(&text).expect("parse yaml");
         assert_eq!(parsed.default_profile.as_deref(), Some("standard"));
+        assert_eq!(parsed.deadline_warning_s, Some(DEFAULT_DEADLINE_WARNING_S));
+        assert_eq!(parsed.ack_window_s, Some(DEFAULT_ACK_WINDOW_S));
         assert!(
             parsed.bd_path.is_none(),
             "generated config must preserve PATH-based bd resolution"
@@ -2556,7 +2580,7 @@ mod tests {
     #[test]
     fn seat_contract_knobs_parse_and_reach_the_execution_policy() {
         let file: ConfigFile = serde_yaml::from_str(
-            "seat_commands:\n  - cargo fmt --all -- --check\n  - cargo clippy --workspace\ndeadline_retry_budget: 2\nseat_env:\n  RUSTC_WRAPPER: \"\"\nadmission:\n  totalActive: 8\n  providerActive: 4\n  repositoryWriteActive: 1\n  gateActive: 2\n  deferSeconds: 60\n",
+            "seat_commands:\n  - cargo fmt --all -- --check\n  - cargo clippy --workspace\ndeadline_retry_budget: 2\ndeadline_warning_s: 300\nack_window_s: 120\nseat_env:\n  RUSTC_WRAPPER: \"\"\nadmission:\n  totalActive: 8\n  providerActive: 4\n  repositoryWriteActive: 1\n  gateActive: 2\n  deferSeconds: 60\n",
         )
         .expect("seat knobs parse");
         assert_eq!(
@@ -2569,6 +2593,8 @@ mod tests {
             )
         );
         assert_eq!(file.deadline_retry_budget, Some(2));
+        assert_eq!(file.deadline_warning_s, Some(300));
+        assert_eq!(file.ack_window_s, Some(120));
         assert_eq!(
             file.seat_env
                 .as_ref()
@@ -2596,7 +2622,12 @@ mod tests {
         // Absent knobs keep their defaults, and a stored policy without the
         // fields still deserializes.
         let bare: ConfigFile = serde_yaml::from_str("gate_commands: []\n").expect("bare");
-        assert!(bare.seat_commands.is_none() && bare.deadline_retry_budget.is_none());
+        assert!(
+            bare.seat_commands.is_none()
+                && bare.deadline_retry_budget.is_none()
+                && bare.deadline_warning_s.is_none()
+                && bare.ack_window_s.is_none()
+        );
         let legacy: forged_types::ExecutionPolicyV1 = serde_json::from_value(serde_json::json!({
             "gateCommands": [],
             "stageBudgetS": {"implement": 60, "reviewclaude": 60, "reviewcodex": 60, "fix": 60},

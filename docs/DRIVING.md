@@ -147,6 +147,13 @@ on a clean tree and `session message` while the seat's work is still
 uncommitted. The seat's `gateState` result field is the seat-check outcome
 and projects as `seatChecks`; the gate verdict lives in the gate stage.
 
+Direct messaging uses the run event stream as both mailbox and archive.
+`session message` addresses one running attempt or the run's next packet
+boundary; seats pull with `seat inbox`, explicitly `ack` required messages,
+publish replace-keyed `progress`, and send bounded `note` messages to the
+lead. `run status` and `next` project progress and unacknowledged mail, so the
+lead does not need a separate inbox or a remembered polling loop.
+
 ## Wait
 
 ```sh

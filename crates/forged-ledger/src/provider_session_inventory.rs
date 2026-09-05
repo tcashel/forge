@@ -28,10 +28,12 @@ use crate::types::{
 };
 use crate::work_identity::{identity_row, IDENTITY_COLUMNS};
 
-pub const PROVIDER_SESSION_INVENTORY_EVENT_KINDS: [&str; 3] = [
+pub const PROVIDER_SESSION_INVENTORY_EVENT_KINDS: [&str; 5] = [
     "forged.session.started",
     "forged.intervention.queued",
     "forged.intervention.delivered",
+    "forged.message.queued",
+    "forged.message.delivered",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
