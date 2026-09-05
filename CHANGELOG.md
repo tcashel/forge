@@ -4,6 +4,83 @@ This file records user-visible changes to Forge.
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-09-05
+
+Wave 2 of the agent driver surface (epic ore-080, ADR-0036, PRs #266
+through #271, landed on `main` as #272): the lifecycle becomes derived
+truth, `wait` replaces the polling loop, `run dispatch` replaces the
+start-then-submit pair, a retry continues from the committed branch, and
+seat mail opens a direct channel from the lead to a running seat. The
+plugin skills thin down to reading `next`.
+
+### Added
+
+- Typed adjudication, decision, and retro notes (ore-080.7, PR #266):
+  schema-checked note kinds with canonical storage and revision
+  fencing, kind filtering on `work note list`, and per-kind `noteCounts`
+  on `work show`. Migration 028 rebuilds `work_notes` without the kind
+  CHECK and keeps legacy approval rows readable; `approval` is hidden
+  from the MCP surface.
+- `wait` (ore-080.10, PR #267): `forged wait --id <id> --until
+  decision|stage|terminal --timeout <s>` blocks on one subject's event
+  cursor and returns `explain` when the condition is met, or
+  `changed: false` at the bounded timeout; invalid ids and timeouts
+  refuse with `forged.remedy/1`. Decision waits poll the attention fold
+  at a fixed cadence; stage waits read durable stage markers the packet
+  and epic paths now emit.
+- Derived lifecycle, `work adjudicate`, `work park` (ore-080.8, PR #268):
+  every read carries the record's position (`drafted`, `critiqued`,
+  `adjudicated`, `dispatched`, `reviewed`, `landed`, `held`, `blocked`)
+  derived from notes, revisions, revision-bound run evidence, desired
+  rows, and the terminal epic PR. `work adjudicate` writes dispositions,
+  the adjudication note, and the status change as one revision;
+  `work park` is the typed hold and `work reopen --reason` its exit;
+  parked items leave the frontier and count under `hidden.parked`.
+- Seat mail (ore-080.13, PR #269): `session message --attempt --urgent
+  --ack-required` reaches a seat at the next attempt boundary (the
+  v0.7.1 `field_notes` path, kept) or at the seat's own poll; seat verbs
+  `seat inbox` (pages keyed by attempt, `since`, `bodies`, `limit`, with
+  `nextSince` and separate delivered/read markers), `seat ack`, and
+  `seat progress` (a bounded snapshot projected into `run status` and
+  `next`); a deadline warning is queued to the seat once per attempt.
+- `run dispatch` (ore-080.9, PR #270): the lead's one fenced verb to
+  start work. It checks the derived lifecycle (or records an explicit
+  `--override`), and creates the run, the revision-bound approval note,
+  and the desired-work authorization in one ledger transaction. `run
+  start` and `run submit` remain for the machine audience. `run retry`
+  starts the successor from the source run's branch when it is ahead of
+  base and records `startedFrom` and `retryOf`; `--fresh` opts out; a
+  recorded branch that cannot be resolved refuses with the typed
+  `--fresh` remedy; a run that never had a branch retries from base.
+- Thin skills (ore-080.11, PR #271): the seven lead skills read the
+  derived lifecycle and `next` and act through `work adjudicate`,
+  `run dispatch`, and `wait`, each under the plugin validator's line
+  budget with routes derived from the host parity fixtures.
+  `work note add --kind approval` is refused with the `run dispatch`
+  remedy; the plugin README lists the lead tools as the manifest
+  declares them; DRIVING.md marks the wave 3 verbs as not landed.
+
+### Changed
+
+- Profile and roster parameters on the CLI and MCP are parsed strictly;
+  malformed values refuse with a remedy instead of selecting defaults.
+- Restart accounting, parking, and lifecycle projections bind historical
+  run evidence to the work revision it was built from, so a revised item
+  is not reported `landed` on stale evidence.
+
+### Fixed
+
+- A rolling epic reported `reviewed` on a `terminal: false` assurance PR
+  and masked its `dispatched` and `deciding` states; only terminal epic
+  PR events count (PR #268).
+- The parked-work filter in the attention projector hid a run's
+  settlement refusal over `deferred` work; parking now hides only the
+  item's own plan-level attention (PR #268).
+- Strict live-packet decoding made `work list --detail full` fail on
+  packets stored before seat mail existed (PR #269).
+- Retry replay of the same idempotency key with `--because` conflicted
+  instead of reusing the stored response (PR #270).
+
 ## [0.7.2] - 2026-09-04
 
 Wave 1 of the agent driver surface (epic ore-080, ADR-0036, PRs #254
@@ -442,7 +519,8 @@ historical TypeScript `v0.4.0` product has been replaced and is unsupported.
 - Refuses non-normalized or root-equivalent install prefixes before touching a
   live path.
 
-[Unreleased]: https://github.com/tcashel/forge/compare/v0.7.2...HEAD
+[Unreleased]: https://github.com/tcashel/forge/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/tcashel/forge/compare/v0.7.2...v0.8.0
 [0.7.2]: https://github.com/tcashel/forge/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/tcashel/forge/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/tcashel/forge/compare/v0.6.3...v0.7.0
