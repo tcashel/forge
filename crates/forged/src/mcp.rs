@@ -2013,9 +2013,10 @@ impl ForgedServer {
                        recommendation | adjudication | decision | retro), bodyJson (raw JSON \
                        string); typed kinds require their v1 payload and schema, while other \
                        omitted schemas default to <kind>/0. actor defaults to operator. Duplicate \
-                       keys and non-integer numbers are refused. The legacy approval kind remains \
-                       CLI-compatible but is deprecated and intentionally absent from this lead \
-                       surface. Closed work items are accepted."
+                       keys and non-integer numbers are refused. The deprecated approval spelling \
+                       is intentionally absent from this lead surface; the CLI parser retains it \
+                       only to refuse with run dispatch as the structured remedy. Closed work \
+                       items are accepted."
     )]
     pub async fn work_note_add(&self, args: Parameters<WorkNoteAddArgs>) -> CallToolResult {
         self.call("work_note_add", args.0.into_envelope()).await

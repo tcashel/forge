@@ -1446,7 +1446,8 @@ pub struct WorkNoteAddArgs {
     /// The existing work item id.
     #[arg(long)]
     pub id: String,
-    /// comment | critique | recommendation | approval (deprecated) | adjudication | decision | retro.
+    /// comment | critique | recommendation | adjudication | decision | retro.
+    /// The deprecated approval spelling is parsed only to return a run dispatch remedy.
     #[arg(long)]
     pub kind: String,
     /// Payload schema wire name (typed kinds default to their v1 contract; others to <kind>/0).

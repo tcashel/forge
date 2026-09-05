@@ -3,10 +3,10 @@
 You are a lead agent with the forged plugin loaded, in a target
 repository, and the operator has handed you an outcome. This is how to
 drive from operation responses alone. It is written for a reader with
-no memory of the last session. Where the target verb from
+no memory of the last session. Every verb here is on `main` unless a
+line is marked *not landed*; those are the wave 3 verbs from
 [ADR-0036](adr/0036-agent-is-the-operator-one-id-one-lifecycle-one-next.md)
-is not yet on `main`, the **Today** line gives the closest shipped
-substitute.
+and have no substitute yet: the decision stays with the lead.
 
 ## The loop
 
@@ -43,8 +43,8 @@ Sections, in fixed order, capped to one tool result:
    spend so far;
 2. **running** — id, stage, seat, minutes in stage, total age, spend;
 3. **ready** — the frontier with each item's lifecycle stage
-   (`drafted`, `critiqued`, `held`), with the stored evidence for that
-   classification and adjudication reported as unknown until ore-080.8;
+   (`drafted`, `critiqued`, `adjudicated`, `held`), with the stored evidence
+   for that classification;
 4. **landed** — recent deliveries with PR numbers;
 5. **hidden** — counts of symptoms and parked items not shown.
 
@@ -78,10 +78,9 @@ a decision changes product scope, external authority, or accepts risk
 — and ask with the exact tuple the decision needs (id, revision, the
 options, the consequence, the cost).
 
-**Today:** `explain` reads `landed`, `closed`, and `parked` from the
-ledger, and a closed item lists `work reopen` only as `repair`. Treat
-`status: closed` and `outcome: landed` as terminal regardless of
-`next`.
+`explain` reads `landed`, `closed`, and `parked` from the ledger. A closed item
+lists `work reopen` only as `repair`; `status: closed` and `outcome: landed` are
+terminal regardless of `next`.
 
 ## Act — the planning verbs
 
@@ -93,10 +92,9 @@ ledger, and a closed item lists `work reopen` only as `repair`. Treat
 | `adjudicated` → `dispatched` | confirm the tuple (id, revision, repository, base, profile, roster) with the operator, then one verb | `run dispatch --id --approved-by --basis` |
 | epic `adjudicated` → `dispatched` | `epic preflight`, show the identity tuple, then start and submit | `epic start … --rolling`, `epic submit` |
 
-The lifecycle is a total order at every boundary, including stub
-promotions. **Today** you must remember this; after ADR-0036 `run
-dispatch` refuses below `adjudicated` and records an override if you
-insist.
+The lifecycle is a total order at every boundary, including stub promotions.
+`run dispatch` refuses below `adjudicated` and records an explicit override
+reason when the operator insists.
 
 ## Act — the decision verbs
 
@@ -106,8 +104,8 @@ Every decision on `next` names its verbs. The full table is in
 ```sh
 forged run retry --id <run> --because spec-amended|world-changed|rebase
 forged run accept-risk --run <run> --accepted-by <actor> --rationale "…"
-forged run remediate --run <run> --grant 1          # ADR-0036
-forged decide --id <attention> --answer "…"          # ADR-0036, seat questions
+forged run remediate --run <run> --grant 1          # not landed (wave 3)
+forged decide --id <attention> --answer "…"          # not landed (wave 3)
 forged epic resolve --epic <epic> --child <child> --note "…"
 forged run stop --run <run> --outcome landed --pr <n> --sha <full-sha>
 ```
@@ -188,8 +186,8 @@ polling loop.
   protocol did not.
 - Never create files, hooks, or stores in the target repository.
 - Never install software or run package managers.
-- Never store authority only in conversation: every approval, override,
-  and decision is a ledger note before it is acted on.
+- Never store authority only in conversation: dispatch records approval
+  atomically, and every override or decision is durable before it is acted on.
 - Never treat missing cost as zero; never treat a settled gate
   operation as a passed gate (`gateState` is the fact).
 

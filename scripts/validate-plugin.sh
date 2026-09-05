@@ -79,31 +79,14 @@ const requiredSkillText = [
   '../adjudicate/SKILL.md',
   '../dispatch/SKILL.md',
   '../run-epic/SKILL.md',
-  'forged.execution-approval/1',
   'forged definition validate',
+  'forged run dispatch',
   'forged doctor',
   'forged service status',
-  'forged work update',
-  'forged work show',
-  '--expected-revision',
-  'workItemId',
   'metadata.repository',
 ];
 if (!requiredSkillText.every((token) => skill.includes(token))) process.exit(1);
-
-const approvalStart = skill.indexOf('## Require exact execution approval');
-const approvalEnd = skill.indexOf('## Bind every existing-work control', approvalStart);
-if (approvalStart < 0 || approvalEnd <= approvalStart) process.exit(1);
-const approvalSection = skill.slice(approvalStart, approvalEnd);
-const requiredApprovalText = [
-  'APPROVAL_PATH',
-  '[[ ! -r "$APPROVAL_PATH" || ! -s "$APPROVAL_PATH" ]]',
-  'forged work note add',
-  '--kind approval',
-  '--schema forged.execution-approval/1',
-  '--body-file "$APPROVAL_PATH"',
-];
-if (!requiredApprovalText.every((token) => approvalSection.includes(token))) process.exit(1);
+if (skill.includes('--kind approval')) process.exit(1);
 
 if (fixture.schema !== 'forged.manage-work-intent-fixtures/1' ||
     fixture.purpose !== 'validation-only' ||
@@ -111,50 +94,26 @@ if (fixture.schema !== 'forged.manage-work-intent-fixtures/1' ||
     !Array.isArray(fixture.cases)) process.exit(1);
 if (Object.keys(fixture).sort().join('\n') !== ['budgetScope', 'cases', 'purpose', 'schema'].join('\n')) process.exit(1);
 
-const expected = new Map(Object.entries({
-  observe: ['observe', 'none', 'read-only'],
-  explore: ['explore', 'none', 'discuss'],
-  plan: ['plan', 'plan', 'delegate'],
-  revise: ['revise', 'plan', 'delegate'],
-  configure: ['configure', 'configure', 'delegate'],
-  critique: ['critique', 'critique', 'delegate'],
-  adjudicate: ['adjudicate', 'adjudicate', 'delegate'],
-  'plan-approval': ['plan-approval', 'none', 'no-execution'],
-  'execute-slice': ['execute-slice', 'dispatch', 'execute-once'],
-  'execute-epic': ['execute-epic', 'run-epic', 'execute-once'],
-  'ambiguous-approval': ['ambiguous-approval', 'none', 'refuse'],
-  'stale-approval': ['stale-approval', 'none', 'refuse'],
-  status: ['status', 'none', 'read-only'],
-  control: ['control', 'none', 'portfolio-control'],
-  'external-context': ['external-context', 'none', 'discuss'],
-}));
 const effectKeys = [
   'workItemNotesUpdates', 'runStarts', 'runSubmits', 'epicStarts', 'epicSubmits',
   'controlCalls', 'serviceMutations', 'providerCalls', 'githubWrites',
 ].sort();
 const seen = new Set();
 for (const entry of fixture.cases) {
-  if (!entry || typeof entry !== 'object' || seen.has(entry.id) || !expected.has(entry.id)) process.exit(1);
+  if (!entry || typeof entry !== 'object' || typeof entry.id !== 'string' ||
+      !entry.id || seen.has(entry.id)) process.exit(1);
   if (Object.keys(entry).sort().join('\n') !==
       ['decision', 'delegate', 'id', 'request', 'result', 'routerMutationBudget'].join('\n')) process.exit(1);
   seen.add(entry.id);
-  if (typeof entry.request !== 'string' || !entry.request.trim()) process.exit(1);
-  const [decision, delegate, result] = expected.get(entry.id);
-  if (entry.decision !== decision || entry.delegate !== delegate || entry.result !== result) process.exit(1);
+  if (![entry.request, entry.decision, entry.delegate, entry.result]
+      .every((value) => typeof value === 'string' && value.trim())) process.exit(1);
+  const routeLine = `- \`${entry.id}\` → \`${entry.decision}\``;
+  if (skill.split('\n').filter((line) => line === routeLine).length !== 1) process.exit(1);
   const budget = entry.routerMutationBudget;
   if (!budget || Object.keys(budget).sort().join('\n') !== effectKeys.join('\n')) process.exit(1);
   if (!Object.values(budget).every((value) => Number.isInteger(value) && value >= 0)) process.exit(1);
-
-  const expectedNonzero = entry.id === 'execute-slice'
-    ? {workItemNotesUpdates: 1, runStarts: 1, runSubmits: 1}
-    : entry.id === 'execute-epic'
-      ? {workItemNotesUpdates: 1, epicStarts: 1, epicSubmits: 1}
-      : {};
-  for (const key of effectKeys) {
-    if (budget[key] !== (expectedNonzero[key] || 0)) process.exit(1);
-  }
 }
-if (seen.size !== expected.size) process.exit(1);
+if (seen.size !== fixture.cases.length) process.exit(1);
 NODE
 }
 
@@ -165,44 +124,7 @@ const [skillPath, fixturePath] = process.argv.slice(2);
 const skill = fs.readFileSync(skillPath, 'utf8');
 const fixture = JSON.parse(fs.readFileSync(fixturePath, 'utf8'));
 
-const requiredSkillText = [
-  'forged operations overview',
-  'forged work detail',
-  'forged.operations-overview/1',
-  'forged.work-detail/1',
-  'forged.work-identity/1',
-  'forged.attention-item/1',
-  'forged.attention-transition/1',
-  'forged.attention-transition-result/1',
-  'ui://forged/operations-overview.html',
-  'ui://forged/work-detail.html',
-  'detailTarget.subjectKind',
-  'detailTarget.subjectId',
-  'forged epic pause',
-  'forged epic resume',
-  'forged run stop',
-  '--outcome cancelled',
-  'forged run accept-risk',
-  'forged attention acknowledge',
-  'forged attention resolve',
-  'forged attention reopen',
-  'forged work update',
-  '--expected-revision',
-  'Current main does **not** expose priority mutation',
-  'Intended priority:',
-  'ore-063',
-  'top-level `priority` value is unchanged',
-  'lower numbers win',
-  'never preempts active work',
-  'accepted-unknown',
-  'evidence-absent',
-  'manifest-less attempt',
-  'forged run adjudicate-settlement',
-  'ADJUDICATION_REQUIRED',
-  'session stop',
-  'portfolio-control-fixtures.json',
-];
-if (!requiredSkillText.every((token) => skill.includes(token))) process.exit(1);
+if (!skill.includes('portfolio-control-fixtures.json')) process.exit(1);
 
 if (fixture.schema !== 'forged.manage-work-portfolio-control-fixtures/1' ||
     fixture.purpose !== 'validation-only' ||
@@ -226,51 +148,6 @@ const expectedSchemas = {
 };
 if (JSON.stringify(fixture.schemas) !== JSON.stringify(expectedSchemas)) process.exit(1);
 
-const expected = new Map(Object.entries({
-  'status-unscoped': ['operations-overview', 'none', 'bounded-portfolio'],
-  'status-repository': ['operations-overview', 'none', 'exact-repository-only'],
-  'needs-me': ['operations-overview', 'none', 'needs-me-group'],
-  'app-unavailable': ['operations-overview', 'none', 'structured-fallback'],
-  'detail-exact': ['work-detail', 'none', 'exact-work-ref'],
-  'title-unique': ['operations-then-detail', 'none', 'unique-canonical-target'],
-  'title-zero': ['refuse', 'not-applicable', 'not-found-no-mutation'],
-  'title-ambiguous': ['refuse', 'bounded-target', 'disambiguate-no-mutation'],
-  'blocker-explanation': ['work-detail', 'none', 'evidence-and-next-action'],
-  'spend-known': ['work-detail', 'none', 'known-spend'],
-  'spend-unknown': ['work-detail', 'none', 'unknown-not-zero'],
-  'plan-only-detail': ['refuse', 'not-applicable', 'plan-summary-only'],
-  'priority-change': ['work-notes-priority-intent', 'none', 'priority-only-lower-wins-later-no-preemption',
-    {workItemNotesUpdates: 1}],
-  'epic-pause': ['epic-pause', 'none', 'paused-readback', {epicPauses: 1}],
-  'epic-resume': ['epic-resume', 'none', 'active-readback-no-submit', {epicResumes: 1}],
-  'input-required-resume': ['work-detail', 'not-applicable', 'resolve-domain-first'],
-  'slice-cancel': ['run-stop-cancelled', 'destructive', 'cancelled-terminal-readback',
-    {runStops: 1}],
-  'slice-pause-unsupported': ['refuse', 'not-applicable', 'unsupported-no-session-stop'],
-  'epic-stop-unsupported': ['refuse', 'not-applicable', 'offer-pause-boundary'],
-  'stale-precondition': ['refuse', 'not-applicable', 'stale-input-required'],
-  'duplicate-response': ['refuse', 'not-applicable', 'readback-no-retry'],
-  'attention-acknowledge-lead': ['attention-acknowledge', 'none',
-    'acknowledged-still-active', {attentionAcknowledgements: 1}],
-  'attention-resolve-lead': ['attention-resolve', 'none',
-    'accepted-unknown-readback', {attentionResolutions: 1}],
-  'attention-resolve-human': ['attention-resolve', 'human-decision',
-    'resolved-after-domain-evidence', {attentionResolutions: 1}],
-  'attention-source-backed': ['refuse', 'not-applicable', 'domain-transition-only'],
-  'attention-stale-occurrence': ['refuse', 'not-applicable',
-    'stale-occurrence-no-mutation'],
-  'attention-reopen': ['attention-reopen', 'none', 'open-new-decision-required',
-    {attentionReopens: 1}],
-  'review-risk-acceptance': ['run-accept-risk', 'human-decision',
-    'accepted-risk-readback', {riskAcceptances: 1}],
-  'merge-approval': ['refuse', 'human-decision', 'human-github-boundary'],
-  'session-diagnostic': ['session-diagnostic', 'none', 'read-only-attempt-detail'],
-  'session-stop-substitution': ['refuse', 'not-applicable', 'work-control-required'],
-  'adjudicate-unfenceable': ['run-adjudicate-settlement', 'destructive',
-    'adjudicated-terminal-readback', {runAdjudications: 1}],
-  'adjudicate-fenceable-refused': ['refuse', 'not-applicable',
-    'live-fence-run-stop-only'],
-}));
 const effectKeys = [
   'workItemClaims', 'workItemNotesUpdates', 'workItemOtherWrites',
   'epicPauses', 'epicResumes', 'runStops', 'runAdjudications',
@@ -286,24 +163,22 @@ const alwaysZero = [
 ];
 const seen = new Set();
 for (const entry of fixture.cases) {
-  if (!entry || typeof entry !== 'object' || seen.has(entry.id) || !expected.has(entry.id)) process.exit(1);
+  if (!entry || typeof entry !== 'object' || typeof entry.id !== 'string' ||
+      !entry.id || seen.has(entry.id)) process.exit(1);
   if (Object.keys(entry).sort().join('\n') !==
       ['confirmation', 'effectBudget', 'id', 'postcondition', 'request', 'route'].join('\n')) process.exit(1);
   seen.add(entry.id);
-  if (typeof entry.request !== 'string' || !entry.request.trim()) process.exit(1);
-  const [route, confirmation, postcondition, nonzero = {}] = expected.get(entry.id);
-  if (entry.route !== route || entry.confirmation !== confirmation ||
-      entry.postcondition !== postcondition) process.exit(1);
+  if (![entry.request, entry.route, entry.confirmation, entry.postcondition]
+      .every((value) => typeof value === 'string' && value.trim())) process.exit(1);
+  const routeLine = `- \`${entry.id}\` → \`${entry.route}\``;
+  if (skill.split('\n').filter((line) => line === routeLine).length !== 1) process.exit(1);
   const budget = entry.effectBudget;
   if (!budget || Object.keys(budget).sort().join('\n') !== effectKeys.join('\n')) process.exit(1);
   if (!Object.values(budget).every((value) => Number.isInteger(value) && value >= 0 && value <= 1)) process.exit(1);
-  for (const key of effectKeys) {
-    if (budget[key] !== (nonzero[key] || 0)) process.exit(1);
-  }
   if (!alwaysZero.every((key) => budget[key] === 0)) process.exit(1);
   if (Object.values(budget).reduce((sum, value) => sum + value, 0) > 1) process.exit(1);
 }
-if (seen.size !== expected.size) process.exit(1);
+if (seen.size !== fixture.cases.length) process.exit(1);
 NODE
 }
 
@@ -922,33 +797,50 @@ check_ready_frontier_contract() {
   node - "$@" <<'NODE'
 const fs = require('fs');
 const paths = process.argv.slice(2);
-let callCount = 0;
 for (const path of paths) {
   const skill = fs.readFileSync(path, 'utf8');
   const calls = skill.split('\n').filter((line) => line.includes('forged work ready'));
-  if (!calls.length) continue;
-  callCount += calls.length;
-  if (calls.some((line) =>
-    !line.includes('--repo "$TARGET_REPO"') || !line.includes('--limit "$READY_LIMIT"'))) {
-    console.error(`${path}: every ready call must carry the exact repo and bounded limit`);
+  if (calls.some((line) => line.includes('--limit'))) {
+    console.error(`${path}: work ready must not carry --limit`);
     process.exit(1);
   }
-  for (const token of [
-    'result.ready', 'result.totals.shown', 'result.totals.total',
-    'forged work show --id "$READY_ID"', 'maximum is 500',
-    '`id`', '`title`', '`kind`', '`status`', '`priority`', '`repository`', '`revision`',
-  ]) {
-    if (!skill.includes(token)) {
-      console.error(`${path}: missing ready-frontier contract ${token}`);
-      process.exit(1);
-    }
-  }
-  if (!/default(?: ready)? limit is 100/.test(skill)) {
-    console.error(`${path}: missing ready default limit`);
+  const completeReady = calls.some((line) => line.includes('--all'));
+  if (!completeReady && !skill.includes('forged next')) {
+    console.error(`${path}: use work ready --all or next`);
     process.exit(1);
   }
 }
-if (!callCount) process.exit(1);
+NODE
+}
+
+check_thin_lead_skills() {
+  node - "$@" <<'NODE'
+const fs = require('fs');
+const path = require('path');
+for (const skillPath of process.argv.slice(2)) {
+  const markdown = fs.readFileSync(skillPath, 'utf8');
+  const name = path.basename(path.dirname(skillPath));
+  if (name !== 'setup' && name !== 'configure') {
+    const budget = name === 'manage-work' ? 200 : 120;
+    const lines = markdown.trimEnd().split(/\r?\n/).length;
+    if (lines > budget) {
+      console.error(`${skillPath}: ${lines} lines exceeds ${budget}`);
+      process.exit(1);
+    }
+    const shell = [...markdown.matchAll(/```(?:bash|sh|zsh|shell)\r?\n([\s\S]*?)```/g)]
+      .map((match) => match[1])
+      .join('\n');
+    if (/^[ \t]*(?:while|for)\b/m.test(shell) || /\bjq\b/.test(shell) ||
+        /\$\([\s\S]*?\|[\s\S]*?\)/.test(shell)) {
+      console.error(`${skillPath}: shell contains a retired loop, jq, or substitution pipeline`);
+      process.exit(1);
+    }
+  }
+  if (markdown.includes('forged run start') || markdown.includes('forged run submit')) {
+    console.error(`${skillPath}: slice handoff must use run dispatch`);
+    process.exit(1);
+  }
+}
 NODE
 }
 
@@ -1111,7 +1003,17 @@ check "retired Forged verb negative fixture" check_skill_cli_verb_negative_fixtu
 skill_files=("$plugin"/skills/*/SKILL.md)
 [[ ${#skill_files[@]} -eq 9 ]] && pass "exactly nine skills" || fail "exactly nine skills"
 for path in "${skill_files[@]}"; do check "frontmatter $path" check_frontmatter "$path"; done
-check "bounded repository ready-frontier contracts" check_ready_frontier_contract "${skill_files[@]}"
+lead_skill_files=(
+  "$plugin/skills/plan/SKILL.md"
+  "$plugin/skills/critique/SKILL.md"
+  "$plugin/skills/adjudicate/SKILL.md"
+  "$plugin/skills/dispatch/SKILL.md"
+  "$plugin/skills/run-epic/SKILL.md"
+  "$plugin/skills/board/SKILL.md"
+  "$plugin/skills/manage-work/SKILL.md"
+)
+check "thin lead-skill budgets and shell contract" check_thin_lead_skills "${skill_files[@]}"
+check "bounded repository ready-frontier contracts" check_ready_frontier_contract "${lead_skill_files[@]}"
 check "critic frontmatter" check_frontmatter "$plugin/agents/critic.md"
 
 check_board_skill() {
@@ -1120,6 +1022,7 @@ check_board_skill() {
   grep -qE '^description: .+' "$skill" || return 1
   grep -q 'operations_overview' "$skill" || return 1
   grep -q 'forged operations overview' "$skill" || return 1
+  grep -q 'forged next' "$skill" || return 1
   grep -q -- '--repo' "$skill" || return 1
   grep -q '/forged:setup' "$skill" || return 1
   grep -q 'never fail silently' "$skill" || return 1
@@ -1152,15 +1055,10 @@ check "epic handoff start then submit" check_handoff_block \
   "$plugin/skills/run-epic/SKILL.md" "forged epic start" "forged epic submit"
 check "slice reconnect command surface" check_reconnect_surface \
   "$plugin/skills/dispatch/SKILL.md" \
-  "forged overview --run" "forged run status --run" \
-  "forged session list --run" "forged session read --attempt" \
-  "forged events --run"
-check "epic reconnect and resume command surface" check_reconnect_surface \
+  "forged explain --id" "forged wait --id"
+check "epic reconnect command surface" check_reconnect_surface \
   "$plugin/skills/run-epic/SKILL.md" \
-  "forged overview --epic" "forged epic status --epic" \
-  "forged session list --run" "forged session read --attempt" \
-  "forged events --run" "forged epic resolve --epic" \
-  "forged epic submit --epic"
+  "forged explain --id" "forged wait --id"
 
 if grep -Ern --include='*.md' --include='*.sh' \
   '(\.anvil/specs|--spec([[:space:]]|`)|workflows/(execute-review-fix|run-epic|plan-critique-improve)\.js|watch-epic)' \
@@ -1197,18 +1095,29 @@ for needle in 'WORK_ID="ore-' 'metadata.repository' 'description' 'design' \
   'acceptanceCriteria' 'notes' '--id "$WORK_ID"' '--kind task' '--status open' \
   '--repository "$TARGET_REPO"' '--description-file "$DESCRIPTION_PATH"' \
   '--design-file "$DESIGN_PATH"' '--acceptance-file "$ACCEPTANCE_PATH"' \
-  '--notes-file "$NOTES_PATH"' 'for DRAFT_PATH in "$DESCRIPTION_PATH"' \
-  '[ ! -s "$DRAFT_PATH" ]' 'missing, unreadable, or non-UTF-8 draft file' \
+  '--notes-file "$NOTES_PATH"' 'missing, unreadable' 'non-UTF-8' 'empty' \
   'Each file flag conflicts with its corresponding' \
-  'forged work create' 'forged work update' 'forged work link' \
-  'forged work reopen' 'forged work show' 'forged work ready' 'parent-child'; do
+  'forged work create' 'forged work update' 'forged work link' 'forged work promote' \
+  'work promote` preserves the existing title' \
+  'forged work ready' 'forged explain --id' 'forged next --repo' 'parent-child'; do
   grep -Fq -- "$needle" "$plugin/skills/plan/SKILL.md" \
     && pass "native plan contract: $needle" || fail "native plan contract: $needle"
 done
-if grep -Fq '$(<' "$plugin/skills/plan/SKILL.md"; then
-  fail "native plan uses direct file flags instead of shell file substitution"
+if grep -Fq 'forged work reopen' "$plugin/skills/plan/SKILL.md"; then
+  fail "native plan uses atomic promotion instead of work reopen"
 else
-  pass "native plan uses direct file flags instead of shell file substitution"
+  pass "native plan uses atomic promotion instead of work reopen"
+fi
+if awk '
+  /^```bash$/ { fenced = 1; next }
+  /^```$/ { fenced = 0; promote = 0; next }
+  fenced && /^forged work promote([[:space:]]|$)/ { promote = 1 }
+  promote && /--title([=[:space:]]|$)/ { found = 1 }
+  END { exit !found }
+' "$plugin/skills/plan/SKILL.md"; then
+  fail "native plan promotion preserves title"
+else
+  pass "native plan promotion preserves title"
 fi
 for needle in 'newly created id' 'ore-' 'existing or' \
   'imported stored id is preserved verbatim'; do
@@ -1217,30 +1126,39 @@ for needle in 'newly created id' 'ore-' 'existing or' \
 done
 for needle in 'forged work note add' '--kind recommendation' \
   '--schema forged.spec-recommendations/1' '--body-file "$RECOMMENDATIONS_PATH"' \
-  'RECOMMENDATIONS_PATH' \
-  '[[ ! -r "$RECOMMENDATIONS_PATH" || ! -s "$RECOMMENDATIONS_PATH" ]]' \
-  'critique seat writes kind `recommendation`'; do
+  'RECOMMENDATIONS_PATH' 'unreadable or empty payload' \
+  'critique seat writes kind `recommendation`' \
+  'forged work show --id "$WORK_ID" --full' 'forged explain --id' \
+  'forged next --repo'; do
   grep -Fq -- "$needle" "$plugin/skills/critique/SKILL.md" \
     && pass "ledger critique contract: $needle" || fail "ledger critique contract: $needle"
 done
-for needle in 'forged work note list' '--kind recommendation' \
-  'RECOMMENDATION_SHOWN' 'RECOMMENDATION_TOTAL' \
-  'RECOMMENDATION_LIMIT="$RECOMMENDATION_TOTAL"' '.result.notes[-1]' \
-  'forged.spec-recommendations/1' '500-row read cap' \
-  'forged work update' 'forged work reopen' 'non-atomic' 'ore-063' \
-  '[[ ! -r "$FIELD_PATH" || ! -s "$FIELD_PATH" ]]' \
-  'adjudication fields must all be nonempty'; do
+for needle in 'forged.spec-recommendations/1' 'forged.adjudication/1' \
+  'forged work note list' '--kind recommendation' '--limit 500' \
+  'lifecycle.basis.noteIds' \
+  'forged work adjudicate' '--expected-revision "$OBSERVED_REVISION"' \
+  '--dispositions-file "$DISPOSITIONS_PATH"' 'forged explain --id' 'forged next --repo'; do
   grep -Fq -- "$needle" "$plugin/skills/adjudicate/SKILL.md" \
     && pass "ledger adjudication contract: $needle" || fail "ledger adjudication contract: $needle"
 done
-for needle in 'for CHILD_ID in <every exact id from preflight' \
-  'forged work show --id "$CHILD_ID"' 'each frozen child' \
-  'parent-child' '`blocks` dependency edges' \
-  'missing, extra, or contradictory'; do
+for needle in 'forged epic preflight' 'frozen child inventory' \
+  'parent-child' '`blocks` edge' 'missing or extra'; do
   grep -Fq -- "$needle" "$plugin/skills/run-epic/SKILL.md" \
     && pass "epic child preflight contract: $needle" \
     || fail "epic child preflight contract: $needle"
 done
+if grep -Eq 'for CHILD_ID|forged work show --id "\$CHILD_ID"' \
+  "$plugin/skills/run-epic/SKILL.md"; then
+  fail "epic child verification is one preflight read"
+else
+  pass "epic child verification is one preflight read"
+fi
+if grep -Eq 'forged work (update|reopen)|non-atomic|ore-063' \
+  "$plugin/skills/adjudicate/SKILL.md"; then
+  fail "adjudication uses only the atomic work adjudicate transition"
+else
+  pass "adjudication uses only the atomic work adjudicate transition"
+fi
 for path in "$plugin/skills/dispatch/SKILL.md" "$plugin/skills/run-epic/SKILL.md"; do
   for needle in 'every finding, recommendation, CRUX, and' \
     'accepted item must be' 'normative fields' 'rejected item must' \

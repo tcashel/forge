@@ -728,28 +728,35 @@ fn work_notes_round_trip_canonically_without_minting_revisions() {
         .expect("serialize approval"),
     )
     .expect("replace body");
-    let supplied = result(
-        &env,
-        &[
-            "work",
-            "note",
-            "add",
-            "--id",
-            "noted-work",
-            "--kind",
-            "approval",
-            "--actor",
-            "lead-agent",
-            "--body-file",
-            body_path,
-        ],
+    let (code, refused) = env.forged(&[
+        "work",
+        "note",
+        "add",
+        "--id",
+        "noted-work",
+        "--kind",
+        "approval",
+        "--actor",
+        "lead-agent",
+        "--body-file",
+        body_path,
+    ]);
+    assert_ne!(code, 0, "standalone approval note was accepted: {refused}");
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("run dispatch")),
+        "approval refusal names the replacement verb: {refused}"
     );
     assert_eq!(
-        supplied["note"]["schema"],
-        json!("forged.execution-approval/1"),
-        "the approval schema is stored under its typed contract"
+        refused["error"]["detail"],
+        json!({
+            "schema": "forged.remedy/1",
+            "verb": "run dispatch",
+            "args": {"id": "noted-work", "approvedBy": null, "basis": null},
+            "reason": "bind the approving actor and basis, then dispatch this exact work revision",
+        })
     );
-    assert_eq!(supplied["note"]["actor"], json!("lead-agent"));
 
     let mut child = env
         .forged_cmd(&[
@@ -782,7 +789,7 @@ fn work_notes_round_trip_canonically_without_minting_revisions() {
 
     let listed = result(&env, &["work", "note", "list", "--id", "noted-work"]);
     assert_eq!(listed["filters"], json!({"id": "noted-work", "limit": 100}));
-    assert_eq!(listed["totals"], json!({"shown": 3, "total": 3}));
+    assert_eq!(listed["totals"], json!({"shown": 2, "total": 2}));
     assert_eq!(listed["notes"][0]["bodyJson"], added["note"]["bodyJson"]);
     let filtered = result(
         &env,
@@ -806,11 +813,8 @@ fn work_notes_round_trip_canonically_without_minting_revisions() {
     assert_eq!(filtered["notes"][0]["noteId"], json!(note_id));
 
     let shown = result(&env, &["work", "show", "--id", "noted-work"]);
-    assert_eq!(shown["notesCount"], json!(3));
-    assert_eq!(
-        shown["noteCounts"],
-        json!({"approval": 1, "comment": 1, "critique": 1})
-    );
+    assert_eq!(shown["notesCount"], json!(2));
+    assert_eq!(shown["noteCounts"], json!({"comment": 1, "critique": 1}));
     assert_eq!(
         shown["work"]["revision"],
         json!(1),
@@ -1633,38 +1637,18 @@ fn typed_work_note_refusals_name_schema_and_first_field() {
     let body = env.root.join("typed-note.json");
     let body_path = body.to_str().expect("UTF-8 body path");
 
-    let cases = [
-        (
-            "recommendation",
-            json!({
-                "schema": "forged.spec-recommendations/1",
-                "repository": "/tmp/typed-note-work",
-                "reviewedAt": "2026-08-29T12:00:00Z",
-                "recommendations": [],
-                "cruxes": []
-            }),
-            "forged.spec-recommendations/1",
-            "workItem",
-        ),
-        (
-            "approval",
-            json!({
-                "schema": "forged.execution-approval/1",
-                "subjectKind": "slice",
-                "workItemId": "typed-note-work",
-                "observedRevision": "1",
-                "repository": "/tmp/typed-note-work",
-                "baseRef": "main",
-                "profile": "default",
-                "roster": "default",
-                "action": "run-start-submit",
-                "approvedAt": "2026-08-29T12:00:00Z",
-                "actor": "operator"
-            }),
-            "forged.execution-approval/1",
-            "basis",
-        ),
-    ];
+    let cases = [(
+        "recommendation",
+        json!({
+            "schema": "forged.spec-recommendations/1",
+            "repository": "/tmp/typed-note-work",
+            "reviewedAt": "2026-08-29T12:00:00Z",
+            "recommendations": [],
+            "cruxes": []
+        }),
+        "forged.spec-recommendations/1",
+        "workItem",
+    )];
     for (kind, payload, schema, field) in cases {
         std::fs::write(
             &body,
@@ -1722,42 +1706,6 @@ fn typed_work_note_refusals_name_schema_and_first_field() {
         message.contains("forged.spec-recommendations/1"),
         "{message}"
     );
-
-    let legacy_approval = json!({
-        "schema": "forged-execution-approval/1",
-        "subjectKind": "slice",
-        "workItemId": "typed-note-work",
-        "observedRevision": "1",
-        "repository": "/tmp/typed-note-work",
-        "baseRef": "main",
-        "profile": "default",
-        "roster": "default",
-        "action": "run-start-submit",
-        "approvedAt": "2026-08-29T12:00:00Z",
-        "actor": "operator",
-        "basis": "approved tuple"
-    });
-    std::fs::write(
-        &body,
-        serde_json::to_vec(&legacy_approval).expect("serialize legacy approval"),
-    )
-    .expect("write legacy approval");
-    let (code, legacy) = env.forged(&[
-        "work",
-        "note",
-        "add",
-        "--id",
-        "typed-note-work",
-        "--kind",
-        "approval",
-        "--body-file",
-        body_path,
-    ]);
-    assert_ne!(code, 0, "legacy approval schema was accepted: {legacy}");
-    let message = legacy["error"]["message"].as_str().unwrap_or_default();
-    assert!(message.contains("forged-execution-approval/1"), "{message}");
-    assert!(message.contains("forged.execution-approval/1"), "{message}");
-    assert!(message.contains("schema"), "{message}");
 }
 
 #[test]

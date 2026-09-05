@@ -287,13 +287,9 @@ struct DeprecatedInput {
     remove_at: &'static str,
 }
 
-const DEPRECATED_INPUTS: &[DeprecatedInput] = &[DeprecatedInput {
-    operation: "work_note_add",
-    parameter: "kind",
-    value: "approval",
-    replacement: "run_dispatch",
-    remove_at: "ore-080.11",
-}];
+/// Empty since ore-080.11: `work_note_add --kind approval` is refused with the
+/// `run dispatch` remedy rather than accepted as deprecated input.
+const DEPRECATED_INPUTS: &[DeprecatedInput] = &[];
 
 const DEPRECATED_KEYS: &[DeprecatedKey] = &[
     DeprecatedKey {

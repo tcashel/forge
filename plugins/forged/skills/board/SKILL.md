@@ -5,48 +5,43 @@ description: "Deliberately open the Forged control plane: call operations_overvi
 
 # /forged:board
 
-Position: any ledger/run lifecycle state -> one read-only portfolio snapshot.
-Next: inspect or control an exact subject through `../manage-work/SKILL.md`.
+Position: `forged next --repo "$TARGET_REPO"` reports the repository lifecycle queues.
+Next: `forged explain --id "$SUBJECT_ID"` resolves any exact subject selected later.
 
-Boundary: the lead session requests and interprets one projection. Forged owns
-the ledger, run/controller evidence, and execution state; this skill never
-mutates a work item, dispatches work, or turns App state into authority.
+Boundary: the lead requests and interprets one read-only projection. Views are
+optional renderings, never state, authority, or mutation selectors.
 
-## With native Forge tools in the session
+## Open once
 
-Call `operations_overview` in an MCP host or Pi's direct `forged_overview` tool
-once, unscoped unless the operator named a repository or group. The
-authoritative response schema is `forged.operations-overview/1` and its App
-resource is `ui://forged/operations-overview.html`. In an App-capable host,
-render that view. In Pi, `/forge` opens the native terminal cockpit over the
-same Operations, history, and provider-session projections. Views are optional
-projections; the structured response is what the answer reads.
+With native Forge tools, call `operations_overview` once, unscoped unless the
+operator named a repository or group. Its authoritative schema is
+`forged.operations-overview/1`; an App-capable host renders
+`ui://forged/operations-overview.html`. Pi may use its direct
+`forged_overview` tool or `/forge` terminal cockpit.
 
-Answer with one line summarizing Needs me, Ready to merge, Running, Stalled or
-recoverable, and Planned group counts plus attention items. Keep every
-degradation fact: degraded or missing sources, stale capture time, incomplete
-coverage or truncation, and unknown spend. Missing cost is unknown, never zero.
+Answer in one line with Needs me, Ready to merge, Running, Stalled or
+recoverable, and Planned counts plus attention. Preserve every degraded or
+missing source, capture time, incomplete coverage or truncation, and unknown
+spend. Missing cost is unknown, never zero.
 
-Do not refresh by mutation, poll, drill into every row, or open several views.
-One read answers the question; a follow-up gets its own read.
+Do not refresh by mutation, poll, or drill into every row. A follow-up gets a
+fresh exact read.
 
-## Without forged server tools
+## CLI fallback
 
-The host silently skips server registration when the operator-installed binary
-is missing, so absent tools are evidence to report. Degrade to the CLI:
+If server tools are absent, state that fact and use one matching read:
 
 ```bash
-forged operations overview
+forged operations overview --repo "$TARGET_REPO"
+forged next --repo "$TARGET_REPO"
 ```
 
-Preserve operator scope: a repository carries through as `--repo <canonical
-path>` and a group as `--group <code>`. Report the same one-line summary from
-the JSON output and say the session has no server tools. If the CLI is also
-missing, state that and point the operator at `/forged:setup`; never fail silently
-and never install anything from here.
+Omit `--repo` only when the operator requested the whole portfolio; a named
+group uses `--group <code>`. If the CLI is absent, say so and point to
+`/forged:setup`; never fail silently or install anything here.
 
 ## Never
 
-- Do not mutate, dispatch, poll, or broaden the requested scope.
-- Do not use a rendered card as a mutation selector.
-- Do not conceal source degradation or treat missing spend as zero.
+- Do not mutate, dispatch, poll, or broaden scope.
+- Do not use a rendered card or human title as a mutation selector.
+- Do not conceal degradation or treat missing spend as zero.
