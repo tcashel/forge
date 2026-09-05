@@ -719,6 +719,31 @@ fn dispatch_result(started: &Value, revision: Value, submission: Value) -> Value
     })
 }
 
+async fn record_dispatch_authorized(ctx: &Ctx, run_id: &str, event: Value) -> Result<(), Failure> {
+    let run_id = run_id.to_owned();
+    let operation_id = event
+        .get("operationId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Failure::internal("dispatch authorization event omitted operationId"))?
+        .to_owned();
+    on_ledger(&ctx.ledger, move |ledger| {
+        let already_recorded = ledger
+            .latest_event_of_kind(&run_id, "forged.run.dispatch.authorized")?
+            .map(|stored| {
+                serde_json::from_str::<Value>(&stored.payload_json)
+                    .map(|payload| payload.get("operationId") == Some(&json!(operation_id)))
+                    .map_err(forged_ledger::LedgerError::from)
+            })
+            .transpose()?
+            .unwrap_or(false);
+        if !already_recorded {
+            ledger.append_event(Some(&run_id), "forged.run.dispatch.authorized", event)?;
+        }
+        Ok(())
+    })
+    .await
+}
+
 /// `run dispatch` — validate the durable work lifecycle, freeze one execution
 /// package, and seal the run, generation-zero authorization, and approval
 /// decision behind one lead-facing fence.
@@ -981,6 +1006,26 @@ pub async fn run_dispatch(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
             "retry the latest terminal run instead of dispatching a second first run",
         );
     }
+    let collision = {
+        let id = run_id.as_str().to_owned();
+        on_ledger(&ctx.ledger, move |ledger| ledger.get_run(&id)).await
+    };
+    match collision {
+        Ok(existing) => {
+            return dispatch_remedy(
+                &req.idempotency_key,
+                Failure::invalid(format!(
+                    "run id {} already belongs to work {}; pass --run-id",
+                    existing.run_id, existing.work_id
+                )),
+                "run dispatch",
+                json!({"id": work_id, "basis": basis, "runId": Value::Null}),
+                "pass --run-id with a non-colliding explicit run id",
+            )
+        }
+        Err(error) if error.code == ErrorCode::RunNotFound => {}
+        Err(error) => return err_response(&req.idempotency_key, &error),
+    }
 
     let submit_guard = match super::handoff::acquire_run_submit(ctx, run_id.as_str()).await {
         Ok(guard) => guard,
@@ -1006,7 +1051,7 @@ pub async fn run_dispatch(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
                 work_for_effect,
                 run_for_effect.clone(),
                 compiled,
-                operation_id,
+                operation_id.clone(),
                 RunProvenance::default(),
             )
             .await?;
@@ -1016,6 +1061,20 @@ pub async fn run_dispatch(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
             let (submission, mut authorization) =
                 super::handoff::authorize_dispatch(ctx, run_for_effect.as_str(), &submit_guard)
                     .await?;
+            record_dispatch_authorized(
+                ctx,
+                run_for_effect.as_str(),
+                json!({
+                    "schemaVersion": 1,
+                    "runId": run_for_effect.as_str(),
+                    "workId": started.get("bead_id"),
+                    "revision": revision,
+                    "packageSha256": started.get("package_sha256"),
+                    "operationId": operation_id,
+                    "submission": submission,
+                }),
+            )
+            .await?;
             authorization.sealed_notes = notes;
             Ok((
                 dispatch_result(&started, revision, submission),
@@ -2088,6 +2147,20 @@ async fn recover_applied_run_dispatch(
         super::handoff::authorize_dispatch(ctx, run_id.as_str(), &submit_guard).await?;
     let (revision, notes) = dispatch_decisions(ctx, request, run_id.as_str(), &started).await?;
     let result = dispatch_result(&started, revision, submission);
+    record_dispatch_authorized(
+        ctx,
+        run_id.as_str(),
+        json!({
+            "schemaVersion": 1,
+            "runId": run_id.as_str(),
+            "workId": started.get("bead_id"),
+            "revision": result.get("revision"),
+            "packageSha256": started.get("package_sha256"),
+            "operationId": row.operation_id,
+            "submission": result.get("submission"),
+        }),
+    )
+    .await?;
     let response = ok_response(&row.operation_id, false, result);
     let operation_id = row.operation_id;
     let stored = response.clone();
