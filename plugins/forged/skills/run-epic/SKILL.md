@@ -21,14 +21,17 @@ forged epic preflight --epic "$EPIC_ID" --repo "$TARGET_REPO" \
 
 This single read returns the frozen child inventory and rehearses repository,
 base, epic and child shape, complete specs versus honest stubs, definitions,
-provider binaries, and authentication. Fail closed on any false check, missing
-or extra child, repository mismatch, or unresolved question.
+provider binaries, and authentication. Fail closed on any false check, a
+missing or extra child, a repository mismatch, or an unresolved question.
 
-Preflight does not prove adjudication or dependency geometry. The epic's
-derived lifecycle does: `adjudicated` means every open child derives
-`adjudicated` (dispositions recorded through `work adjudicate`) and every stub
-is an honest hold. A child at `critiqued` or `held` returns to
-`/forged:adjudicate`; a contradictory `parent-child`/`blocks` edge is a
+Preflight does not prove adjudication or dependency geometry; the derived
+lifecycle does. The epic reads `adjudicated` only when
+every finding, recommendation, CRUX, and open question has a disposition
+recorded through `work adjudicate`. Each accepted item must be folded into
+normative fields and each rejected item must retain its reason.
+Checkbox-free critique prose is not evidence of adjudication; keep the
+unchecked-checkbox gate and return a child at `critiqued` or `held` to
+`/forged:adjudicate`. A contradictory `parent-child`/`blocks` edge is a
 planning defect to fix before handoff.
 
 Show the returned normalized base, integration branch, assurance stage, and
