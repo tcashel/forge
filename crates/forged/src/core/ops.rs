@@ -5088,9 +5088,10 @@ pub(super) fn operator_queue(
             .is_some_and(|holder| holder != expected && holder != crate::core::FRONTIER_HOLDER);
         let outcome = entry["outcome"].as_str();
         let awaiting_delivery = matches!(outcome, Some("clean" | "accepted-risk"));
+        // A slice publishes its candidate PR before review. Terminal epic
+        // delivery is already folded into the epoch-aware submitted state.
         let visibly_terminal = !entry["outcome"].is_null()
-            || !entry["delivery"].is_null()
-            || entry["state"] == json!("stopped");
+            || matches!(entry["state"].as_str(), Some("stopped" | "submitted"));
         let dead_controller = !controller.is_null()
             && matches!(controller_state, Some("dead" | "vanished" | "exited"));
         let unverified_controller_is_blocker = false;

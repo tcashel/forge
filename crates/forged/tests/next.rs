@@ -181,6 +181,19 @@ fn seed_operator_store(env: &TestEnv) {
             }
         }
     }
+    ledger
+        .append_event(
+            Some(&fixture.subjects[0].id),
+            "proto.pr",
+            json!({
+                "schemaVersion": 1,
+                "number": 43,
+                "isDraft": true,
+                "baseRefName": env.repos.base,
+                "url": "https://example.invalid/pr/43",
+            }),
+        )
+        .expect("record running candidate PR");
     ledger.close().expect("close ledger");
     for (ordinal, subject) in fixture.subjects.iter().take(RUNNING_TOTAL).enumerate() {
         seed_live_attempt(env, &subject.id, ordinal);
@@ -506,10 +519,12 @@ fn shared_operator_fixture_stays_under_the_default_four_kib_budget() {
     assert_eq!(running.len(), RUNNING_TOTAL);
     assert_eq!(landed.len(), RECENT_LANDED_TOTAL);
     assert_eq!(running[0]["stage"], json!("implement"));
+    assert_eq!(running[0]["health"], json!("running"));
     assert_eq!(running[0]["seat"], json!("fixture-seat-0"));
     assert!(running[0]["ageMin"].is_u64());
     assert_eq!(running[0]["spendUsd"], json!(1.25));
     assert_eq!(landed[0]["pr"], json!(262));
+    assert_eq!(landed[0]["health"], json!("terminal"));
     assert_eq!(landed[0]["spendUsd"], json!(0.75));
 }
 
