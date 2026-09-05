@@ -133,13 +133,12 @@ pub fn project_run_with_policy(
     let packets = ledger.list_packets(run_id)?;
     let live_attempts = ledger.list_live_attempts(Some(run_id))?;
     let inflight_operations = ledger.list_inflight_operations(Some(run_id))?;
-    let events = fetch_all_events(ledger, run_id)?;
+    let (settled_operations, events) = machine_evidence(ledger, run_id, &packets, || {})?;
     let terminal_attempts = reconstruct_terminal_attempts(ledger, &events)?;
     let proto_events = parse_proto_events(&events)?;
     let retry_grants = timed_retry_grants(&events)?;
     let profile_escalations = parse_profile_escalations(&events)?;
     let accepted_risk = parse_accepted_risk(&run, &events)?;
-    let settled_operations = settled_machine_operations(ledger, run_id, &packets)?;
     let mut active_roster_revision = None;
     let mut active_policy_revision = None;
     let execution_package = match ledger.get_run_definition(run_id)? {
@@ -370,6 +369,22 @@ fn settled_machine_operations(
     Ok(out)
 }
 
+fn machine_evidence(
+    ledger: &Ledger,
+    run_id: &str,
+    packets: &[PacketRow],
+    between_reads: impl FnOnce(),
+) -> Result<(Vec<OperationRow>, Vec<EventRow>), ProtoError> {
+    // Machine effects append their evidence before settling the operation.
+    // Read settlement first so every observed terminal operation has its
+    // supporting events. A completion between these reads conservatively
+    // remains unsettled until the next projection, never a missing gate fact.
+    let operations = settled_machine_operations(ledger, run_id, packets)?;
+    between_reads();
+    let events = fetch_all_events(ledger, run_id)?;
+    Ok((operations, events))
+}
+
 /// Rebuild each packet's terminal attempt history, oldest first, from the
 /// `attempt.state` events.
 fn reconstruct_terminal_attempts(
@@ -444,4 +459,87 @@ fn reconstruct_terminal_attempts(
         });
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{record, GatePhase, ProtoEvent};
+    use forged_ledger::{EffectClass, NewRun, OperationOutcome};
+    use forged_types::{OperationRequest, OperationResponse, RunId};
+
+    #[test]
+    fn concurrent_regate_completion_cannot_outpace_its_projected_evidence() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ledger = Ledger::open(&dir.path().join("state.db")).expect("ledger");
+        let run_id = "concurrent-regate";
+        ledger
+            .create_run(NewRun {
+                run_id: RunId::new(run_id).expect("run id"),
+                work_id: "child".to_owned(),
+                repo: "octo/demo".to_owned(),
+                base_ref: "main".to_owned(),
+                branch: "feat/child".to_owned(),
+            })
+            .expect("run");
+        let initial = ProtoEvent::Gate {
+            phase: GatePhase::Gate,
+            seq: 0,
+            passed: true,
+            rows: Vec::new(),
+        };
+        record(&ledger, run_id, initial.clone()).expect("initial gate");
+        let request = OperationRequest {
+            schema_version: 1,
+            idempotency_key: machine_idempotency_key(run_id, MachineStage::ReGate, 1),
+            run_id: Some(run_id.to_owned()),
+            params: Default::default(),
+        };
+        let OperationOutcome::Fresh(ticket) = ledger
+            .begin_operation("regate", &request, EffectClass::SafeRetry, None)
+            .expect("begin regate")
+        else {
+            panic!("fresh operation");
+        };
+        let repaired = ProtoEvent::Gate {
+            phase: GatePhase::Regate,
+            seq: 1,
+            passed: true,
+            rows: Vec::new(),
+        };
+        let (operations, events) = machine_evidence(&ledger, run_id, &[], || {
+            // This exact interleaving used to read old Gate0 events, then
+            // the newly terminal Regate1 operation: a false missing gate.
+            record(&ledger, run_id, repaired.clone()).expect("regate evidence");
+            ledger
+                .complete_operation(
+                    &ticket.operation_id,
+                    &OperationResponse {
+                        ok: true,
+                        operation_id: ticket.operation_id.clone(),
+                        reused: false,
+                        result: Some(serde_json::json!({"passed": true})),
+                        error: None,
+                    },
+                )
+                .expect("complete regate");
+        })
+        .expect("project concurrent completion");
+        assert!(
+            operations.is_empty(),
+            "concurrent completion is conservative"
+        );
+        assert_eq!(
+            parse_proto_events(&events).expect("events"),
+            [initial, repaired.clone()]
+        );
+
+        let (operations, events) =
+            machine_evidence(&ledger, run_id, &[], || {}).expect("project completed regate");
+        assert_eq!(operations.len(), 1);
+        assert_eq!(operations[0].idempotency_key, request.idempotency_key);
+        assert!(parse_proto_events(&events)
+            .expect("events")
+            .contains(&repaired));
+    }
 }

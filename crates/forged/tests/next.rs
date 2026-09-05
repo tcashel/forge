@@ -166,16 +166,34 @@ fn seed_operator_store(env: &TestEnv) {
                     .expect("settle decision fixture");
             }
             _ => {
+                // Quiet historical work has a deliberate terminal outcome.
+                // A stop without settlement is an unresolved machine failure.
                 ledger
-                    .set_run_state(
+                    .settle_run(
                         &subject.id,
-                        forged_ledger::RunState::Stopped,
-                        Some("old fixture".to_owned()),
+                        RunOutcome::Cancelled,
+                        "old fixture intentionally cancelled".to_owned(),
+                        None,
+                        None,
+                        None,
                     )
-                    .expect("stop old fixture");
+                    .expect("settle old fixture");
             }
         }
     }
+    ledger
+        .append_event(
+            Some(&fixture.subjects[0].id),
+            "proto.pr",
+            json!({
+                "schemaVersion": 1,
+                "number": 43,
+                "isDraft": true,
+                "baseRefName": env.repos.base,
+                "url": "https://example.invalid/pr/43",
+            }),
+        )
+        .expect("record running candidate PR");
     ledger.close().expect("close ledger");
     for (ordinal, subject) in fixture.subjects.iter().take(RUNNING_TOTAL).enumerate() {
         seed_live_attempt(env, &subject.id, ordinal);
@@ -306,6 +324,49 @@ fn ready_rows_derive_drafted_critiqued_and_held_from_stored_evidence() {
         assert_eq!(row["subject"]["revision"], json!(1));
         assert_eq!(row["lifecycle"]["basis"]["revision"], json!(1));
     }
+}
+
+#[test]
+fn ready_rows_preserve_existing_execution_health_and_spend() {
+    let env = TestEnv::new("forged-next-ready-execution");
+    assert_eq!(env.forged(&["init"]).0, 0);
+    create_work(&env, "bead-ready-history", "Previously executed item", None);
+    create_work(&env, "ready-fresh", "Unsubmitted item", None);
+    fabricate_run(&env, "ready-history");
+    let ledger = env.ledger();
+    ledger
+        .settle_run(
+            "ready-history",
+            RunOutcome::InputRequired,
+            "operator decision remains open".to_owned(),
+            None,
+            None,
+            None,
+        )
+        .expect("settle historical execution");
+    ledger.close().expect("close ledger");
+    record_spend(&env, "ready-history", 2.5);
+
+    let repository = env.repos.repo.to_string_lossy().into_owned();
+    let (code, response) = env.forged(&["next", "--repo", &repository]);
+    assert_eq!(code, 0, "next: {response}");
+    let rows = response["result"]["sections"]["ready"]
+        .as_array()
+        .expect("ready rows");
+    let by_id = rows
+        .iter()
+        .map(|row| (row["id"].as_str().unwrap(), row))
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(rows.len(), 2, "frontier membership is unchanged");
+    assert_eq!(by_id["bead-ready-history"]["health"], json!("terminal"));
+    assert_eq!(by_id["bead-ready-history"]["spendUsd"], json!(2.5));
+    assert_eq!(
+        by_id["bead-ready-history"]["lifecycle"]["stage"],
+        json!("deciding")
+    );
+    assert!(by_id["bead-ready-history"]["should"].is_null());
+    assert_eq!(by_id["ready-fresh"]["health"], json!("unsubmitted"));
+    assert_eq!(by_id["ready-fresh"]["spendUsd"], json!(0.0));
 }
 
 #[test]
@@ -458,10 +519,12 @@ fn shared_operator_fixture_stays_under_the_default_four_kib_budget() {
     assert_eq!(running.len(), RUNNING_TOTAL);
     assert_eq!(landed.len(), RECENT_LANDED_TOTAL);
     assert_eq!(running[0]["stage"], json!("implement"));
+    assert_eq!(running[0]["health"], json!("running"));
     assert_eq!(running[0]["seat"], json!("fixture-seat-0"));
     assert!(running[0]["ageMin"].is_u64());
     assert_eq!(running[0]["spendUsd"], json!(1.25));
     assert_eq!(landed[0]["pr"], json!(262));
+    assert_eq!(landed[0]["health"], json!("terminal"));
     assert_eq!(landed[0]["spendUsd"], json!(0.75));
 }
 

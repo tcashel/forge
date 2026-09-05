@@ -440,7 +440,9 @@ async fn relaunch_note(
             };
             Ok(Some(format!(
                 "{attempt} already ran here; the worktree carries {commits}. Continue \
-                 from the committed state: do not redo, re-baseline, or re-verify it."
+                 from this work. Existing commits do not prove that checks passed. \
+                 Inspect the current changes and reported failures, complete or repair \
+                 the work within this stage's authority, and run the required checks."
             )))
         }
     }
@@ -534,7 +536,7 @@ pub fn build_packet(
             Stage::ReviewClaude | Stage::ReviewCodex => {
                 "review the diff against the spec and report a verdict"
             }
-            Stage::Fix => "address the merged review findings and push the fixes",
+            Stage::Fix => "address the gate or review findings and commit the fixes",
         }
     };
     let mut packet = WorkPacket {
@@ -3889,6 +3891,34 @@ mod settle_tests {
 
     async fn claimed_fixture(root: &Path, socket: &Path) -> ClaimedFixture {
         claimed_fixture_with_budget(root, socket, 600).await
+    }
+
+    #[tokio::test]
+    async fn relaunch_note_does_not_treat_prior_work_as_passed_checks() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let socket = root.path().join("herdr.sock");
+        let fixture = claimed_fixture(root.path(), &socket).await;
+        assert!(relaunch_note(&fixture.ctx, RUN_ID, &fixture.packet)
+            .await
+            .expect("first attempt context")
+            .is_none());
+        fixture
+            .ledger
+            .fail_packet(
+                &fixture.packet_id,
+                &fixture.claim_token,
+                "seat check failed",
+            )
+            .expect("settle prior attempt");
+        let note = relaunch_note(&fixture.ctx, RUN_ID, &fixture.packet)
+            .await
+            .expect("relaunch context")
+            .expect("failed attempt is carried forward");
+        assert!(note.contains(&format!("Attempt {}", fixture.attempt_id)));
+        assert!(note.contains("Existing commits do not prove that checks passed"));
+        assert!(note.contains("within this stage's authority"));
+        assert!(note.contains("run the required checks"));
+        assert!(!note.contains("do not redo, re-baseline, or re-verify"));
     }
 
     #[tokio::test]

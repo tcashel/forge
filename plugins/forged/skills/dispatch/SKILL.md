@@ -34,11 +34,14 @@ implementation, deterministic gates, one independent review, and bounded
 remediation. Escalate only risks involving security, destructive data,
 concurrency, or public compatibility. The profile budget is the stopping rule.
 
-## Confirm and dispatch once
+## Verify authority and dispatch once
 
-Present work id, title, revision, repository, base, profile, roster, actor, and
-the durable effect. A short approval is valid only as the immediate unambiguous
-answer to that tuple. Any normative drift requires a fresh tuple.
+Verify work id, title, revision, repository, base, profile, roster, actor, and
+the durable effect against the operator's explicit execution authority.
+Authority already granted for this outcome does not require another approval
+prompt. Ask only when authority is missing or the proposed action exceeds its
+scope, cost, or risk limits. When approval names an exact revision or tuple,
+drift invalidates it; present the changed tuple before seeking fresh approval.
 
 ```bash
 forged run dispatch --id "$WORK_ID" --basis "$BASIS" \

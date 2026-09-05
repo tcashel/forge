@@ -390,6 +390,7 @@ fn coverage_and_exempt_registry_cases_reach_real_recommendation_actions() {
         assert_eq!(should.len(), 1, "{case:?} for {subject}: {item}");
         let expected_verb = match (case.condition, case.context) {
             (AttentionCondition::InputRequired, _) => "work update",
+            (AttentionCondition::MergeApproval, _) => "run stop",
             (AttentionCondition::RestartBudgetExhausted, _) => "run retry",
             (
                 AttentionCondition::ReviewerDisagreement,
@@ -463,6 +464,10 @@ fn shared_operator_store_fixture_pins_shape_coverage_and_exempt_sets() {
                 condition: AttentionCondition::RetryExhausted,
                 context: FixtureDecisionContext::Ordinary,
             },
+            FixtureDecision {
+                condition: AttentionCondition::MergeApproval,
+                context: FixtureDecisionContext::Ordinary,
+            },
         ]
     );
     assert_eq!(
@@ -470,10 +475,6 @@ fn shared_operator_store_fixture_pins_shape_coverage_and_exempt_sets() {
         [
             FixtureDecision {
                 condition: AttentionCondition::AmbiguousEffect,
-                context: FixtureDecisionContext::Ordinary,
-            },
-            FixtureDecision {
-                condition: AttentionCondition::MergeApproval,
                 context: FixtureDecisionContext::Ordinary,
             },
             FixtureDecision {

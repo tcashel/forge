@@ -2,9 +2,9 @@
 //! [`NextAction`] out — no I/O, no clock reads, no randomness. Any caller
 //! may push any run at any time.
 //!
-//! Stage graph: `Resolve → Implement → Gate → Push → DraftPr → Review →
-//! [Fix → ReGate → Push → Review]* → Stop`. The bracketed loop is bounded
-//! solely by the frozen profile's fix-round budget. Provider stages become
+//! Stage graph: `Resolve → Implement → Gate → [Fix → ReGate]* → Push →
+//! DraftPr → Review → [Fix → ReGate → Push → Review]* → Stop`. Both repair
+//! paths share the frozen profile's fix-round budget; review requires a green gate. Provider stages become
 //! packets and attempts; machine steps become operations keyed
 //! `<run_id>/<step>/<round>`, so every loop iteration remains replay-safe.
 
@@ -200,7 +200,8 @@ pub enum Terminal {
         /// Review seats that failed without producing a result.
         failed_review_seats: u32,
     },
-    /// The configured review/fix loop ran to its immutable limit.
+    /// The configured gate/review repair loop ran to its immutable limit.
+    /// `review_rounds` is zero when no candidate passed its gate.
     ReviewBudgetExhausted {
         /// Review invocations completed, including the initial review.
         review_rounds: u8,
@@ -629,95 +630,31 @@ fn advance_adaptive(view: &RunView, package: &ExecutionPackageV1) -> NextAction 
     }
 
     let implement = seats_for(profile, SeatPurpose::Implement);
-    match adaptive_group(view, package, &implement, 0) {
-        AdaptiveGroup::Action(action) => return action,
-        AdaptiveGroup::Done(done) if done.amendment.is_some() => {
-            return amendment_stop(done.amendment.expect("checked"))
-        }
-        AdaptiveGroup::Done(done) if done.semantic_failure => {
-            if let Some(packet) = implement
-                .first()
-                .and_then(|seat| adaptive_packet(view, seat, 0))
-            {
-                return NextAction::AwaitPacket {
-                    packet_id: packet.packet_id.clone(),
-                    not_before: None,
-                };
+    if !implementation_reused(view) {
+        match adaptive_group(view, package, &implement, 0) {
+            AdaptiveGroup::Action(action) => return action,
+            AdaptiveGroup::Done(done) if done.amendment.is_some() => {
+                return amendment_stop(done.amendment.expect("checked"))
             }
-            return NextAction::Stop(Terminal::ExternallyStopped {
-                reason: "semantic implement failure has no reopenable packet".to_owned(),
-            });
+            AdaptiveGroup::Done(done) if done.semantic_failure => {
+                if let Some(packet) = implement
+                    .first()
+                    .and_then(|seat| adaptive_packet(view, seat, 0))
+                {
+                    return NextAction::AwaitPacket {
+                        packet_id: packet.packet_id.clone(),
+                        not_before: None,
+                    };
+                }
+                return NextAction::Stop(Terminal::ExternallyStopped {
+                    reason: "semantic implement failure has no reopenable packet".to_owned(),
+                });
+            }
+            AdaptiveGroup::Done { .. } => {}
         }
-        AdaptiveGroup::Done { .. } => {}
     }
 
-    if !op_settled(view, MachineStage::Gate, 0) {
-        return NextAction::RunMachine(MachineStage::Gate);
-    }
-    if gate_failed(view) {
-        if let Some(action) = escalation_action(view, profile, EscalationTrigger::GateFailure) {
-            return action;
-        }
-    }
-    if !op_settled(view, MachineStage::Push, 0) {
-        return NextAction::RunMachine(MachineStage::Push);
-    }
-    if !op_settled(view, MachineStage::DraftPr, 0) {
-        return NextAction::RunMachine(MachineStage::DraftPr);
-    }
-
-    let fixes = seats_for(profile, SeatPurpose::Fix);
-    for review_round in 0..=profile.fix_round_budget {
-        let reviewed = match adaptive_review_round(view, package, profile, review_round) {
-            AdaptiveGroup::Action(action) => return action,
-            AdaptiveGroup::Done(done) => done,
-        };
-        if let Some(amendment) = reviewed.amendment {
-            return amendment_stop(amendment);
-        }
-        if reviewed.control == Verdict::Approve {
-            return NextAction::Stop(Terminal::Done {
-                review_rounds: review_round.saturating_add(1),
-                final_verdict: reviewed.produced,
-                final_verdict_is_durable: reviewed.produced_is_durable,
-                failed_review_seats: reviewed.failed_without_result,
-            });
-        }
-        if review_round == profile.fix_round_budget {
-            return NextAction::Stop(Terminal::ReviewBudgetExhausted {
-                review_rounds: review_round.saturating_add(1),
-                final_verdict: reviewed.produced,
-                final_verdict_is_durable: reviewed.produced_is_durable,
-                failed_review_seats: reviewed.failed_without_result,
-            });
-        }
-
-        let fixed = match adaptive_group(view, package, &fixes, review_round) {
-            AdaptiveGroup::Action(action) => return action,
-            AdaptiveGroup::Done(done) => done,
-        };
-        if let Some(amendment) = fixed.amendment {
-            return amendment_stop(amendment);
-        }
-        if fixed.semantic_failure {
-            return NextAction::Stop(Terminal::RemediationFailed {
-                round: review_round.saturating_add(1),
-                final_verdict: reviewed.produced,
-                final_verdict_is_durable: reviewed.produced_is_durable,
-                failed_review_seats: reviewed.failed_without_result,
-            });
-        }
-        let machine_round = u32::from(review_round) + 1;
-        if !op_settled(view, MachineStage::ReGate, machine_round) {
-            return NextAction::RunMachine(MachineStage::ReGate);
-        }
-        if !op_settled(view, MachineStage::Push, machine_round) {
-            return NextAction::RunMachine(MachineStage::Push);
-        }
-    }
-    NextAction::Stop(Terminal::ExternallyStopped {
-        reason: "review loop exceeded its validated round bound".to_owned(),
-    })
+    advance_assurance_rounds(view, package, profile, true)
 }
 
 /// Internal `epic-assurance/v1`: validate the already-integrated branch,
@@ -739,49 +676,94 @@ fn advance_epic_assurance(view: &RunView, package: &ExecutionPackageV1) -> NextA
     if !op_settled(view, MachineStage::Resolve, 0) {
         return NextAction::RunMachine(MachineStage::Resolve);
     }
-    if !op_settled(view, MachineStage::Gate, 0) {
-        return NextAction::RunMachine(MachineStage::Gate);
-    }
-    if !gate_passed_for_round(view, 0) {
-        if let Some(action) = escalation_action(view, profile, EscalationTrigger::GateFailure) {
-            return action;
-        }
-    }
+    advance_assurance_rounds(view, package, profile, false)
+}
 
+/// Each candidate spends the same frozen repair budget, whether the finding
+/// came from a machine gate or a reviewer. A failed gate never opens a new
+/// review or expands the review panel. Already-open reviews are drained for
+/// compatibility with runs started under the former review-before-repair graph.
+fn advance_assurance_rounds(
+    view: &RunView,
+    package: &ExecutionPackageV1,
+    profile: &ProfileDefinitionV1,
+    publish_pr: bool,
+) -> NextAction {
     let fixes = seats_for(profile, SeatPurpose::Fix);
-    for review_round in 0..=profile.fix_round_budget {
-        let reviewed = match adaptive_review_round(view, package, profile, review_round) {
-            AdaptiveGroup::Action(action) => return action,
-            AdaptiveGroup::Done(done) => done,
+    let mut review_rounds = 0u8;
+    let mut reviewed = AdaptiveDone {
+        control: Verdict::RequestChanges,
+        produced: None,
+        produced_is_durable: false,
+        failed_without_result: 0,
+        semantic_failure: false,
+        amendment: None,
+        block: None,
+    };
+    for round in 0..=profile.fix_round_budget {
+        let gate = if round == 0 {
+            MachineStage::Gate
+        } else {
+            MachineStage::ReGate
         };
-        if let Some(amendment) = reviewed.amendment {
-            return amendment_stop(amendment);
+        if !op_settled(view, gate, u32::from(round)) {
+            return NextAction::RunMachine(gate);
         }
-        let gate_passed = gate_passed_for_round(view, review_round);
-        let severe = review_round_has_severe_findings(view, profile, review_round);
-        if gate_passed
-            && reviewed.control == Verdict::Approve
-            && reviewed.produced == Some(Verdict::Approve)
-            && reviewed.produced_is_durable
-            && !severe
-        {
-            return NextAction::Stop(Terminal::Done {
-                review_rounds: review_round.saturating_add(1),
-                final_verdict: reviewed.produced,
-                final_verdict_is_durable: true,
-                failed_review_seats: reviewed.failed_without_result,
-            });
+        let gate_passed = gate_passed_for_round(view, round);
+        if gate_passed {
+            if (publish_pr || round > 0) && !op_settled(view, MachineStage::Push, u32::from(round))
+            {
+                return NextAction::RunMachine(MachineStage::Push);
+            }
+            if publish_pr && !op_settled(view, MachineStage::DraftPr, 0) {
+                return NextAction::RunMachine(MachineStage::DraftPr);
+            }
         }
-        if review_round == profile.fix_round_budget {
+        let existing_reviews = profile
+            .seats
+            .iter()
+            .filter(|seat| {
+                matches!(seat.purpose, SeatPurpose::Review | SeatPurpose::Synthesis)
+                    && adaptive_packet(view, seat, round).is_some()
+            })
+            .collect::<Vec<_>>();
+        if gate_passed || !existing_reviews.is_empty() {
+            let review = if gate_passed {
+                adaptive_review_round(view, package, profile, round)
+            } else {
+                adaptive_group(view, package, &existing_reviews, round)
+            };
+            reviewed = match review {
+                AdaptiveGroup::Action(action) => return action,
+                AdaptiveGroup::Done(done) => done,
+            };
+            review_rounds = review_rounds.saturating_add(1);
+            if let Some(amendment) = reviewed.amendment {
+                return amendment_stop(amendment);
+            }
+            if gate_passed
+                && reviewed.control == Verdict::Approve
+                && reviewed.produced == Some(Verdict::Approve)
+                && reviewed.produced_is_durable
+                && (publish_pr || !review_round_has_severe_findings(view, profile, round))
+            {
+                return NextAction::Stop(Terminal::Done {
+                    review_rounds,
+                    final_verdict: reviewed.produced,
+                    final_verdict_is_durable: true,
+                    failed_review_seats: reviewed.failed_without_result,
+                });
+            }
+        }
+        if round == profile.fix_round_budget {
             return NextAction::Stop(Terminal::ReviewBudgetExhausted {
-                review_rounds: review_round.saturating_add(1),
+                review_rounds,
                 final_verdict: reviewed.produced,
                 final_verdict_is_durable: reviewed.produced_is_durable,
                 failed_review_seats: reviewed.failed_without_result,
             });
         }
-
-        let fixed = match adaptive_group(view, package, &fixes, review_round) {
+        let fixed = match adaptive_group(view, package, &fixes, round) {
             AdaptiveGroup::Action(action) => return action,
             AdaptiveGroup::Done(done) => done,
         };
@@ -790,22 +772,15 @@ fn advance_epic_assurance(view: &RunView, package: &ExecutionPackageV1) -> NextA
         }
         if fixed.semantic_failure {
             return NextAction::Stop(Terminal::RemediationFailed {
-                round: review_round.saturating_add(1),
+                round: round.saturating_add(1),
                 final_verdict: reviewed.produced,
                 final_verdict_is_durable: reviewed.produced_is_durable,
                 failed_review_seats: reviewed.failed_without_result,
             });
         }
-        let machine_round = u32::from(review_round) + 1;
-        if !op_settled(view, MachineStage::ReGate, machine_round) {
-            return NextAction::RunMachine(MachineStage::ReGate);
-        }
-        if !op_settled(view, MachineStage::Push, machine_round) {
-            return NextAction::RunMachine(MachineStage::Push);
-        }
     }
     NextAction::Stop(Terminal::ExternallyStopped {
-        reason: "epic-assurance review loop exceeded its validated round bound".to_owned(),
+        reason: "assurance loop exceeded its validated round bound".to_owned(),
     })
 }
 
@@ -978,21 +953,6 @@ fn seats_for(profile: &ProfileDefinitionV1, purpose: SeatPurpose) -> Vec<&SeatDe
         .collect()
 }
 
-fn gate_failed(view: &RunView) -> bool {
-    view.proto_events
-        .iter()
-        .rev()
-        .find_map(|event| match event {
-            ProtoEvent::Gate {
-                phase: crate::events::GatePhase::Gate,
-                passed,
-                ..
-            } => Some(!passed),
-            _ => None,
-        })
-        == Some(true)
-}
-
 fn gate_passed_for_round(view: &RunView, round: u8) -> bool {
     let (phase, seq) = if round == 0 {
         (crate::events::GatePhase::Gate, 0)
@@ -1012,27 +972,6 @@ fn gate_passed_for_round(view: &RunView, round: u8) -> bool {
             _ => None,
         })
         == Some(true)
-}
-
-fn escalation_action(
-    view: &RunView,
-    profile: &ProfileDefinitionV1,
-    trigger: EscalationTrigger,
-) -> Option<NextAction> {
-    if !profile.escalate_on.contains(&trigger)
-        || view
-            .profile_escalations
-            .iter()
-            .any(|event| event.trigger == trigger)
-    {
-        return None;
-    }
-    let target = profile.escalate_to.as_ref()?;
-    Some(NextAction::EscalateProfile(ProfileEscalation {
-        from: profile.name.clone(),
-        to: target.name.clone(),
-        trigger,
-    }))
 }
 
 #[derive(Debug)]
@@ -1648,6 +1587,57 @@ fn op_settled(view: &RunView, step: MachineStage, round: u32) -> bool {
     view.settled_operations.iter().any(|o| {
         o.idempotency_key == key && o.name == step.as_str() && o.state == OperationState::Terminal
     })
+}
+
+/// Resolve may reference a completed predecessor implementation only after
+/// checking the successor's claimed spec, contract, clean HEAD, and base.
+/// This skips one seat, never its fresh gate or independent review.
+fn implementation_reused(view: &RunView) -> bool {
+    if view
+        .packets
+        .iter()
+        .any(|packet| packet.stage == Stage::Implement)
+    {
+        return false;
+    }
+    let key = machine_idempotency_key(&view.run.run_id, MachineStage::Resolve, 0);
+    let Some(row) = view.settled_operations.iter().find(|row| {
+        row.name == "resolve" && row.idempotency_key == key && row.state == OperationState::Terminal
+    }) else {
+        return false;
+    };
+    let Some(response) = row
+        .response_json
+        .as_deref()
+        .and_then(|body| serde_json::from_str::<serde_json::Value>(body).ok())
+    else {
+        return false;
+    };
+    let Some(proof) = response.pointer("/result/implementationReuse") else {
+        return false;
+    };
+    response.get("ok").and_then(serde_json::Value::as_bool) == Some(true)
+        && [
+            "sourceRunId",
+            "sourcePacketId",
+            "headSha",
+            "baseSha",
+            "workRevision",
+            "specSha256",
+        ]
+        .iter()
+        .all(|key| {
+            proof
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|value| !value.is_empty())
+        })
+        && proof.get("sourceRunId").and_then(serde_json::Value::as_str)
+            != Some(view.run.run_id.as_str())
+        && proof
+            .get("sourceAttemptId")
+            .and_then(serde_json::Value::as_i64)
+            .is_some_and(|id| id > 0)
 }
 
 /// The next unused seq for a stage (1 for its first packet).

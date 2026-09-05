@@ -129,15 +129,6 @@ fn admission_preflight_refusal(
         )
     };
     let remedy = match refusal.reason {
-        AdmissionReason::WorkMalformed if candidate.priority.is_none() => action_remedy(
-            "work update",
-            json!({
-                "id": work_id,
-                "expectedRevision": Value::Null,
-                "priority": Value::Null,
-            }),
-            "set a priority with the current work revision before submitting again",
-        ),
         AdmissionReason::WorkMalformed
             if candidate.provider.as_deref().is_none_or(str::is_empty)
                 || candidate.model.as_deref().is_none_or(str::is_empty) =>

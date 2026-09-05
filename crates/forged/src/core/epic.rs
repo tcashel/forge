@@ -3101,6 +3101,13 @@ fn clean_slice(view: &forged_proto::RunView) -> (bool, Value) {
     )
 }
 
+fn settled_slice(view: &forged_proto::RunView) -> Option<(bool, Value)> {
+    // The child controller owns settlement. Its live projection can span
+    // concurrent writes, so a provisional protocol Stop is not a handoff.
+    // The run row is read first; Stopped precedes reading all final evidence.
+    (view.run.state == RunState::Stopped).then(|| clean_slice(view))
+}
+
 pub(super) enum ReconcileAction {
     Progress(Value),
     Wait(Value),
@@ -3875,8 +3882,7 @@ pub(super) async fn reconcile_once(ctx: &Ctx, epic: &str) -> Result<ReconcileAct
             continue;
         }
         let run = super::drive::project(ctx, &state.run_id).await?;
-        if matches!(forged_proto::advance(&run), NextAction::Stop(_)) {
-            let (is_clean, evidence) = clean_slice(&run);
+        if let Some((is_clean, evidence)) = settled_slice(&run) {
             if is_clean {
                 clean_children.push((child.id.clone(), run, evidence));
             } else {
@@ -4560,6 +4566,224 @@ pub async fn epic_resolve(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parent_waits_for_settlement_when_live_child_projection_looks_terminal() {
+        use forged_ledger::{EffectClass, NewRun, OperationOutcome};
+        use forged_proto::{advance, machine_idempotency_key, GatePhase, MachineStage, RunView};
+        use forged_types::{Deliverable, Outcome, RunId, SeatPurpose, StageContract, WorkPacket};
+
+        fn settle(
+            ledger: &forged_ledger::Ledger,
+            view: &mut RunView,
+            stage: MachineStage,
+            round: u32,
+        ) {
+            let request = OperationRequest {
+                schema_version: 1,
+                idempotency_key: machine_idempotency_key(&view.run.run_id, stage, round),
+                run_id: Some(view.run.run_id.clone()),
+                params: Default::default(),
+            };
+            let OperationOutcome::Fresh(ticket) = ledger
+                .begin_operation(stage.as_str(), &request, EffectClass::SafeRetry, None)
+                .expect("begin machine step")
+            else {
+                panic!("fresh machine step");
+            };
+            ledger
+                .complete_operation(
+                    &ticket.operation_id,
+                    &OperationResponse {
+                        ok: true,
+                        operation_id: ticket.operation_id.clone(),
+                        reused: false,
+                        result: Some(json!({"passed": true})),
+                        error: None,
+                    },
+                )
+                .expect("settle machine step");
+            view.settled_operations.push(
+                ledger
+                    .find_operation(stage.as_str(), &request.idempotency_key)
+                    .expect("find step")
+                    .expect("step"),
+            );
+        }
+
+        fn complete(view: &mut RunView, outcome: Outcome) {
+            let NextAction::OpenPackets(mut intents) = advance(view) else {
+                panic!("expected next provider packet: {:?}", advance(view));
+            };
+            assert_eq!(intents.len(), 1);
+            let intent = intents.remove(0);
+            let execution = intent.execution.clone().expect("semantic packet");
+            let packet = WorkPacket {
+                schema: "forged.packet/1".to_owned(),
+                packet_id: intent.packet_id.expect("packet id"),
+                run_id: view.run.run_id.clone(),
+                work_id: view.run.work_id.clone(),
+                stage: intent.stage,
+                lane_seq: Some(intent.seq),
+                spec: forged_types::SpecRef {
+                    path: "spec.md".to_owned(),
+                    sha256: "spec".to_owned(),
+                    revision: None,
+                },
+                worktree: "/tmp/child".into(),
+                branch: view.run.branch.clone(),
+                base_ref: view.run.base_ref.clone(),
+                contract: StageContract {
+                    instructions: "child regression".to_owned(),
+                    gate_commands: vec!["true".to_owned()],
+                    deliverable: match execution.purpose {
+                        SeatPurpose::Implement => Deliverable::CommitsInWorktree,
+                        SeatPurpose::Fix => Deliverable::FixCommitsPushed,
+                        _ => Deliverable::ReviewBlock,
+                    },
+                    budget_s: 60,
+                    seat_commands: Vec::new(),
+                },
+                execution: Some(execution),
+                result_schema: "forged.result/1".to_owned(),
+                provider_hints: intent.hints,
+                field_notes: Vec::new(),
+            };
+            view.packets.push(forged_ledger::PacketRow {
+                packet_id: packet.packet_id.clone(),
+                run_id: packet.run_id.clone(),
+                stage: packet.stage,
+                seq: intent.seq,
+                spec_path: packet.spec.path.clone(),
+                spec_sha256: packet.spec.sha256.clone(),
+                spec_revision: None,
+                policy_revision: None,
+                body_json: packet.stored_body().expect("packet body"),
+                created_at: view.now.clone(),
+            });
+            view.terminal_attempts.insert(
+                packet.packet_id,
+                vec![forged_proto::TerminalAttempt {
+                    attempt_id: i64::try_from(view.packets.len()).expect("attempt id"),
+                    state: forged_ledger::AttemptState::Completed,
+                    outcome: Some(outcome),
+                    fail_note: None,
+                    started_at: view.now.clone(),
+                }],
+            );
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ledger = forged_ledger::Ledger::open(&dir.path().join("state.db")).expect("ledger");
+        let run_id = "child-settlement-boundary";
+        ledger
+            .create_run(NewRun {
+                run_id: RunId::new(run_id).expect("run id"),
+                work_id: "child".to_owned(),
+                repo: "octo/demo".to_owned(),
+                base_ref: "main".to_owned(),
+                branch: "feat/child".to_owned(),
+            })
+            .expect("run");
+        let config = crate::config::scratch_config(dir.path());
+        let compiled = config
+            .compile_definition(Some("standard"), None)
+            .expect("standard profile");
+        let mut view = forged_proto::project_run_with_policy(
+            &ledger,
+            run_id,
+            compiled.compatibility_roster,
+            compiled.package.policy.clone(),
+            "2026-09-05T21:30:40.000000000Z",
+        )
+        .expect("view");
+        view.execution_package = Some(compiled.package);
+        settle(&ledger, &mut view, MachineStage::Resolve, 0);
+        complete(
+            &mut view,
+            Outcome::Implement {
+                implemented: true,
+                commits_ahead: 1,
+                summary: "implemented".to_owned(),
+                gate_state: None,
+                note: None,
+            },
+        );
+        settle(&ledger, &mut view, MachineStage::Gate, 0);
+        view.proto_events.push(ProtoEvent::Gate {
+            phase: GatePhase::Gate,
+            seq: 0,
+            passed: true,
+            rows: Vec::new(),
+        });
+        settle(&ledger, &mut view, MachineStage::Push, 0);
+        settle(&ledger, &mut view, MachineStage::DraftPr, 0);
+        complete(
+            &mut view,
+            Outcome::Review {
+                verdict: Verdict::RequestChanges,
+                summary: "needs a fix".to_owned(),
+                available: true,
+                findings: vec![forged_types::Finding {
+                    severity: Severity::High,
+                    message: "needs a fix".to_owned(),
+                    file: Some("impl-1.txt".to_owned()),
+                    line: Some(1),
+                }],
+            },
+        );
+        complete(
+            &mut view,
+            Outcome::Fix {
+                applied: true,
+                summary: "fixed".to_owned(),
+            },
+        );
+        settle(&ledger, &mut view, MachineStage::ReGate, 1);
+
+        // Reproduce the failed convergence observation: Regate1 is terminal,
+        // but the event snapshot still ends at the Gate0/review0 candidate.
+        assert!(matches!(
+            advance(&view),
+            NextAction::Stop(Terminal::ReviewBudgetExhausted { .. })
+        ));
+        assert!(
+            settled_slice(&view).is_none(),
+            "parent must wait for its live child"
+        );
+        let mut blocked = view.clone();
+        blocked.run.state = RunState::Stopped;
+        blocked.run.terminal_outcome = Some(RunOutcome::Blocked);
+        assert!(!settled_slice(&blocked).expect("settled blocker").0);
+
+        view.proto_events.push(ProtoEvent::Gate {
+            phase: GatePhase::Regate,
+            seq: 1,
+            passed: true,
+            rows: Vec::new(),
+        });
+        settle(&ledger, &mut view, MachineStage::Push, 1);
+        complete(
+            &mut view,
+            Outcome::Review {
+                verdict: Verdict::Approve,
+                summary: "fixed".to_owned(),
+                findings: Vec::new(),
+                available: true,
+            },
+        );
+        assert!(matches!(
+            advance(&view),
+            NextAction::Stop(Terminal::Done { .. })
+        ));
+        assert!(
+            settled_slice(&view).is_none(),
+            "even approval awaits controller settlement"
+        );
+        view.run.state = RunState::Stopped;
+        view.run.terminal_outcome = Some(RunOutcome::Clean);
+        assert!(settled_slice(&view).expect("settled clean child").0);
+    }
 
     #[test]
     fn base_ref_normalization_strips_exactly_one_remote_prefix() {

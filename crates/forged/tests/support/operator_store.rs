@@ -28,7 +28,7 @@ pub struct FixtureDecision {
     pub context: FixtureDecisionContext,
 }
 
-pub const COVERAGE_CONDITIONS: [FixtureDecision; 7] = [
+pub const COVERAGE_CONDITIONS: [FixtureDecision; 8] = [
     FixtureDecision {
         condition: AttentionCondition::InputRequired,
         context: FixtureDecisionContext::Ordinary,
@@ -57,15 +57,15 @@ pub const COVERAGE_CONDITIONS: [FixtureDecision; 7] = [
         condition: AttentionCondition::RetryExhausted,
         context: FixtureDecisionContext::Ordinary,
     },
-];
-
-pub const EXEMPT_CONDITIONS: [FixtureDecision; 3] = [
-    FixtureDecision {
-        condition: AttentionCondition::AmbiguousEffect,
-        context: FixtureDecisionContext::Ordinary,
-    },
     FixtureDecision {
         condition: AttentionCondition::MergeApproval,
+        context: FixtureDecisionContext::Ordinary,
+    },
+];
+
+pub const EXEMPT_CONDITIONS: [FixtureDecision; 2] = [
+    FixtureDecision {
+        condition: AttentionCondition::AmbiguousEffect,
         context: FixtureDecisionContext::Ordinary,
     },
     FixtureDecision {

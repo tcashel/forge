@@ -145,12 +145,20 @@ fn render_succeeds_for_all_three_stages() {
     assert!(!implement.contains("cargo test --workspace"));
     let flattened = implement.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(
-        flattened.contains("forged runs the gate commands after you return"),
+        flattened.contains("Forged runs the authoritative gate after you return"),
         "names the controller-owned gate: {implement}"
     );
     assert!(
         !flattened.contains("BEFORE your first commit"),
         "no baseline instruction: {implement}"
+    );
+    assert!(
+        flattened.contains("any checks required by the repository"),
+        "operator seat commands do not waive repository checks: {implement}"
+    );
+    assert!(
+        !flattened.contains("nothing wider") && !flattened.contains("Do NOT run"),
+        "seat-check economy must not prohibit necessary verification: {implement}"
     );
     for command in ["seat inbox", "seat ack", "seat progress", "seat note"] {
         assert!(
@@ -197,6 +205,33 @@ fn render_succeeds_for_all_three_stages() {
     );
     let listed = fix.matches("  - [").count();
     assert_eq!(listed, 2, "fix lists exactly the findings it was given");
+    assert!(
+        flattened_fix.contains("any checks required by the repository"),
+        "remediation retains repository checks: {fix}"
+    );
+    assert!(
+        flattened_fix.contains("Do not push: forged publishes the committed fixes"),
+        "publication remains a controller operation: {fix}"
+    );
+}
+
+#[test]
+fn gate_remediation_prompt_works_before_a_pull_request_exists() {
+    let templates = PromptTemplates::load().expect("loads");
+    let mut context = fix_context(&[RenderedFinding {
+        severity: "HIGH".to_owned(),
+        location: "gate:cargo fmt --all -- --check".to_owned(),
+        message: "exit 1; formatting differs in src/lib.rs".to_owned(),
+    }]);
+    context["pr_number"] = json!(0);
+    let rendered = templates
+        .render(PromptStage::Fix, &context)
+        .expect("renders");
+    assert!(!rendered.contains("PR #0"), "no fictitious PR: {rendered}");
+    assert!(rendered.contains("gate:cargo fmt --all -- --check"));
+    assert!(rendered.contains("formatting differs in src/lib.rs"));
+    assert!(!rendered.contains("Both reviewers"));
+    assert!(!rendered.contains("https://example.invalid/repo.git"));
 }
 
 #[test]
@@ -295,7 +330,8 @@ fn empty_seat_commands_fall_back_to_the_changed_files_sentence() {
     assert!(flattened.contains("the tests that cover the files you changed"));
     assert!(!implement.contains("cargo fmt --all -- --check"));
     assert!(!implement.contains("cargo test --workspace"));
-    assert!(flattened.contains("forged runs the gate commands after you return"));
+    assert!(flattened.contains("Forged runs the authoritative gate after you return"));
+    assert!(flattened.contains("any checks required by the repository"));
     let mut fix = fix_context(&[]);
     fix["seat_commands"] = json!([]);
     let fix = templates

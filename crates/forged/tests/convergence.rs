@@ -201,103 +201,80 @@ fn non_runnable_status_defers_only_that_row_in_a_mixed_admission_batch() {
 }
 
 #[test]
-fn priority_update_repairs_a_priorityless_item_before_admission() {
-    let env = TestEnv::new("adm-priority-update");
-    let run = "adm-priority-update";
-    start_run(&env, run);
-    env.set_scenario("implement", "hang", 1);
-    env.set_work_field(run, "priority", "");
+fn native_optional_priority_admits_without_rewriting_work() {
+    for (suffix, priority) in [("default", None), ("high", Some(0_i64)), ("low", Some(4))] {
+        let run = format!("adm-native-priority-{suffix}");
+        let env = TestEnv::new(&run);
+        assert_eq!(env.forged(&["init"]).0, 0);
+        let repository = env.repos.repo.to_string_lossy().into_owned();
+        let mut args = vec![
+            "work",
+            "create",
+            "--id",
+            &run,
+            "--title",
+            &run,
+            "--repository",
+            &repository,
+        ];
+        let priority_arg = priority.map(|value| value.to_string());
+        if let Some(priority_arg) = priority_arg.as_deref() {
+            args.extend(["--priority", priority_arg]);
+        }
+        let (code, created) = env.forged(&args);
+        assert_eq!(code, 0, "create native work: {created}");
+        assert_eq!(created["result"]["work"]["priority"], json!(priority));
+        start_run(&env, &run);
+        env.set_scenario("implement", "hang", 1);
+        let (code, before) = env.forged(&["work", "show", "--id", &run]);
+        assert_eq!(code, 0, "show native work: {before}");
+        assert_eq!(before["result"]["work"]["priority"], json!(priority));
+        assert!(before["result"]["work"]["revision"].is_i64());
+        assert!(before["result"]["work"]["spec"].is_object());
 
-    let (code, before) = env.forged(&["work", "show", "--id", run]);
-    assert_eq!(code, 0, "show priority-less work: {before}");
-    assert_eq!(before["result"]["work"]["priority"], Value::Null);
-    let (code, refused) = env.forged(&[
-        "run",
-        "submit",
-        "--run",
-        run,
-        "--idempotency-key",
-        "adm-priority-missing-submit",
-    ]);
-    assert_ne!(code, 0, "priority-less submit must refuse: {refused}");
-    assert!(
-        refused["error"]["message"]
-            .as_str()
-            .is_some_and(
-                |message| message.contains("bead-malformed") && message.contains("priority")
-            ),
-        "field-naming admission refusal: {refused}"
-    );
-    assert_eq!(
-        refused["error"]["detail"],
-        json!({
-            "schema": "forged.remedy/1",
-            "verb": "work update",
-            "args": {
-                "id": run,
-                "expectedRevision": null,
-                "priority": null,
-            },
-            "reason": "set a priority with the current work revision before submitting again",
-        })
-    );
-    let ledger = env.ledger();
-    assert!(ledger
-        .get_desired_work(DesiredSubjectKind::Run, run)
-        .expect("desired query")
-        .is_none());
-    ledger.close().expect("close ledger");
-    let revision = before["result"]["work"]["revision"]
-        .as_i64()
-        .expect("ledger revision");
-    let revision_arg = revision.to_string();
-    let (code, repaired) = env.forged(&[
-        "work",
-        "update",
-        "--id",
-        run,
-        "--expected-revision",
-        &revision_arg,
-        "--priority",
-        "2",
-    ]);
-    assert_eq!(code, 0, "repair priority: {repaired}");
-    assert_eq!(repaired["result"]["work"]["priority"], json!(2));
-    assert_eq!(
-        repaired["result"]["work"]["revision"],
-        json!(revision),
-        "priority repair must not mint a spec revision"
-    );
-
-    let (code, submitted) = env.forged(&[
-        "run",
-        "submit",
-        "--run",
-        run,
-        "--idempotency-key",
-        "adm-priority-update-submit",
-    ]);
-    assert_eq!(code, 0, "submit after priority repair: {submitted}");
-    assert!(
-        submitted["result"]["controller"].is_object(),
-        "the repaired work item must admit immediately: {submitted}"
-    );
-    let ledger = env.ledger();
-    let admitted = ledger
-        .latest_admission_decisions(Some(AdmissionSubjectKind::Run), Some(run))
-        .expect("run admission decision")
-        .into_iter()
-        .any(|decision| {
-            decision.subject_id == run && decision.outcome == AdmissionOutcome::Admitted
+        let (code, submitted) = env.forged(&["run", "submit", "--run", &run]);
+        assert_eq!(code, 0, "submit native priority {priority:?}: {submitted}");
+        assert!(submitted["result"]["controller"].is_object(), "{submitted}");
+        wait_until("native priority packet admission", || {
+            !provider_starts(&env, "implementation").is_empty()
         });
-    ledger.close().expect("close ledger");
-    assert!(
-        admitted,
-        "priority repair must clear WorkMalformed admission"
-    );
+        let ledger = env.ledger();
+        for (kind, subject) in [
+            (AdmissionSubjectKind::Run, run.clone()),
+            (
+                AdmissionSubjectKind::Packet,
+                format!("{run}/implementation/0"),
+            ),
+        ] {
+            let decision = ledger
+                .latest_admission_decisions(Some(kind), Some(&subject))
+                .expect("native priority admission decisions")
+                .into_iter()
+                .find(|decision| decision.subject_id == subject)
+                .expect("controller and packet decisions exist");
+            assert_eq!(decision.outcome, AdmissionOutcome::Admitted, "{decision:?}");
+            assert_eq!(
+                decision.priority,
+                Some(priority.unwrap_or(2)),
+                "{decision:?}"
+            );
+        }
+        ledger.close().expect("close ledger");
+        let (code, after) = env.forged(&["work", "show", "--id", &run]);
+        assert_eq!(code, 0, "show admitted work: {after}");
+        assert_eq!(after["result"]["work"]["priority"], json!(priority));
+        assert_eq!(
+            after["result"]["work"]["revision"],
+            before["result"]["work"]["revision"]
+        );
+        assert_eq!(
+            after["result"]["work"]["spec"],
+            before["result"]["work"]["spec"]
+        );
 
-    stop_run(&env, run);
-    no_live_reservations(&env);
+        stop_run(&env, &run);
+        no_live_reservations(&env);
+    }
 }
 
 #[test]
@@ -442,8 +419,8 @@ fn malformed_packet_facts_defer_without_reservation_or_provider_effect() {
     start_run(&env, run);
 
     // Controller admission consumes the healthy row; the packet's own exact
-    // admission read then finds it malformed (a NULL priority is the
-    // WorkMalformed arm). The controller is frozen across the injection so
+    // admission read then finds the required repository metadata missing.
+    // The controller is frozen across the injection so
     // the two admissions cannot race.
     let (code, submitted) = env.forged(&[
         "run",
@@ -467,7 +444,7 @@ fn malformed_packet_facts_defer_without_reservation_or_provider_effect() {
         nix::sys::signal::Signal::SIGSTOP,
     )
     .expect("freeze the controller before injecting malformed facts");
-    env.set_work_field(run, "priority", "");
+    env.set_work_field(run, "metadata", "{}");
     nix::sys::signal::killpg(
         nix::unistd::Pid::from_raw(frozen),
         nix::sys::signal::Signal::SIGCONT,
@@ -489,7 +466,7 @@ fn malformed_packet_facts_defer_without_reservation_or_provider_effect() {
     });
     assert!(
         env.provider_log().is_empty(),
-        "revision-less packet admission must have zero provider effect"
+        "repository-less packet admission must have zero provider effect"
     );
 
     // Only the capacity reason family parks. A WorkMalformed deferral never

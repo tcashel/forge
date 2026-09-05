@@ -19,8 +19,8 @@ pub struct IssueSummary {
     pub description: String,
     /// Current work status.
     pub status: String,
-    /// Native numeric scheduling priority. Missing or non-integral values
-    /// remain `None` so admission can defer fail-closed.
+    /// Native numeric scheduling priority. Omission remains `None` in the
+    /// work projection; admission schedules it at the normal priority.
     pub priority: Option<i64>,
     /// Current work assignee/lease holder, when any.
     pub assignee: Option<String>,

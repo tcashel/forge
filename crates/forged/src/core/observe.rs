@@ -1319,7 +1319,22 @@ pub(crate) async fn explain_work_item(
         .await?
         .remove(&work.work_id)
         .ok_or_else(|| Failure::internal("work lifecycle projection omitted its item"))?;
-    let next = super::work_ops::projection_actions(&work, lifecycle.stage);
+    let mut next = super::work_ops::projection_actions(&work, lifecycle.stage);
+    if !matches!(
+        work.status,
+        forged_ledger::WorkStatus::Closed | forged_ledger::WorkStatus::Deferred
+    ) {
+        if let Some(run) = latest.as_ref() {
+            let delivery_pr = super::ops::run_delivery_pr(ctx, run).await?;
+            next = super::ops::run_projection_actions(run, delivery_pr);
+            next.extend(subject_attention_actions(
+                attention,
+                AttentionSubjectKind::Run,
+                &run.run_id,
+            ));
+        }
+    }
+    let (next, _) = rank_subject_actions(next);
     Ok(json!({
         "schema": "forged.explain/1",
         "subject": {
@@ -1340,6 +1355,7 @@ pub(crate) async fn explain_work_item(
             "revision": work.revision,
             "repository": work.metadata.get("repository"),
             "healthRunId": latest.as_ref().map(|run| run.run_id.as_str()),
+            "stopReason": latest.as_ref().and_then(|run| run.stop_reason.as_deref()),
             "runs": {
                 "items": run_items,
                 "total": total,
@@ -1464,7 +1480,8 @@ pub(crate) async fn explain_run(
     };
     // Lifecycle first: the run's own outcome names the one `should`; open
     // decisions on the same subject merge into it or demote to `can`.
-    let mut next = super::ops::run_projection_actions(run);
+    let delivery_pr = super::ops::run_delivery_pr(ctx, run).await?;
+    let mut next = super::ops::run_projection_actions(run, delivery_pr);
     next.extend(subject_attention_actions(
         attention,
         AttentionSubjectKind::Run,
@@ -1491,6 +1508,7 @@ pub(crate) async fn explain_run(
             "state": run.state.as_str(),
             "outcome": run.terminal_outcome.map(RunOutcome::as_str),
             "stopReason": run.stop_reason,
+            "delivery": run_delivery(run, delivery_pr),
             "currentStage": current_stage,
             "liveAttempts": live_attempts,
             "repository": run.repo,
@@ -1593,7 +1611,8 @@ async fn explain_attempt(
     let inputs = run_observation_inputs(&observation, run);
     let mut how = explain_how(inputs);
     how["attempt"] = json!({"state": attempt.state.as_str(), "stage": stage});
-    let next = super::ops::run_projection_actions(run);
+    let delivery_pr = super::ops::run_delivery_pr(ctx, run).await?;
+    let next = super::ops::run_projection_actions(run, delivery_pr);
     let lifecycle = projected_lifecycle(ctx, &observation.identity, attention).await?;
     Ok(json!({
         "schema": "forged.explain/1",
@@ -1822,11 +1841,11 @@ fn run_status(row: &forged_ledger::RunRow) -> Value {
     })
 }
 
-fn run_delivery(row: &forged_ledger::RunRow) -> Value {
+fn run_delivery(row: &forged_ledger::RunRow, pr: Option<u64>) -> Value {
     json!({
         "source": "ledger",
-        "known": row.delivery_pr.is_some() || row.delivery_sha.is_some(),
-        "pr": row.delivery_pr,
+        "known": pr.is_some() || row.delivery_sha.is_some(),
+        "pr": pr,
         "sha": row.delivery_sha,
     })
 }
@@ -2379,7 +2398,7 @@ fn child_rows(snapshot: &WorkObservationSnapshot) -> Vec<Value> {
                 "phase": child.phase.as_str(),
                 "identity": identity,
                 "status": run_status(run),
-                "delivery": run_delivery(run),
+                "delivery": run_delivery(run, run.delivery_pr),
             })
         })
         .collect()
@@ -2556,7 +2575,10 @@ async fn project_work_detail(
                 .ok_or_else(|| {
                     Failure::internal("run observation snapshot omitted its requested run")
                 })?;
-            (run_status(run), run_delivery(run))
+            (
+                run_status(run),
+                run_delivery(run, super::ops::run_delivery_pr(ctx, run).await?),
+            )
         }
         forged_types::WorkIdentitySubjectKind::Epic => {
             let (status, delivery, _) = epic_status_delivery(&snapshot)?;

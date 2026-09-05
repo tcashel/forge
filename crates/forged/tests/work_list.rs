@@ -260,6 +260,8 @@ fn the_operator_queue_is_human_named_grouped_and_honest_about_unknowns() {
     fabricate_run(&env, "q-ready");
     fabricate_live_seats(&env, "q-running", 1);
     env.set_work_field("bead-q-planned", "title", "Prepare the operator queue");
+    env.set_work_field("bead-q-running", "status", "in_progress");
+    env.set_assignee("bead-q-running", "forged:bead-q-running:0");
     env.set_work_field("bead-q-stalled", "status", "in_progress");
     env.set_assignee("bead-q-stalled", "someone-else");
     env.set_work_field("bead-q-ready", "status", "in_progress");
@@ -357,12 +359,41 @@ fn the_operator_queue_is_human_named_grouped_and_honest_about_unknowns() {
         json!(false)
     );
     assert_eq!(
-        in_group("Running", "q-running")["currentStage"],
-        json!("implement")
+        in_group("Ready to merge", "q-ready")["executionHealth"],
+        json!("terminal")
     );
-    let stalled = in_group("Stalled or recoverable", "q-stalled");
+    let running = in_group("Running", "q-running");
+    assert_eq!(running["currentStage"], json!("implement"));
+    assert_eq!(running["pr"]["number"], json!(43));
+    assert_eq!(running["executionHealth"], json!("running"));
+    assert_eq!(running["claimHealth"]["known"], json!(true));
+    assert_eq!(running["claimHealth"]["staleInProgress"], json!(false));
+    assert_eq!(running["blocker"], Value::Null);
+    // An unsettled stop needs an operator decision, while its stale claim
+    // remains visible as evidence for recovery.
+    let stalled = in_group("Needs me", "q-stalled");
     assert_eq!(stalled["claimHealth"]["staleInProgress"], json!(true));
     assert!(stalled["blocker"].as_str().is_some());
+    let stopped_attention = response["result"]["attention"]
+        .as_array()
+        .expect("attention items")
+        .iter()
+        .find(|item| item["subjectId"] == json!("q-stalled"))
+        .expect("unsettled stop attention");
+    assert_eq!(stopped_attention["condition"], json!("input-required"));
+    assert_eq!(
+        stopped_attention["detail"],
+        json!("driver exited before settlement")
+    );
+    assert_eq!(
+        stopped_attention["nextActions"],
+        json!([{
+            "verb": "run retry",
+            "class": "should",
+            "args": {"id": "q-stalled", "runId": null, "because": "world-changed"},
+            "reason": "correct the recorded stop condition, then retry: driver exited before settlement",
+        }])
+    );
     let planned = in_group("Planned", "q-planned");
     assert_eq!(planned["title"], planned["identity"]["displayTitle"]);
     assert_ne!(
@@ -798,6 +829,7 @@ fn an_epic_reports_the_state_its_events_describe() {
     );
     let epic = epic_entry(&env, "epic-state");
     assert_eq!(epic["state"], json!("submitted"), "final PR: {epic}");
+    assert_eq!(epic["executionHealth"], json!("terminal"));
     assert_eq!(epic["stopReason"], Value::Null);
     assert_ne!(epic["updatedAt"], created_at);
 }

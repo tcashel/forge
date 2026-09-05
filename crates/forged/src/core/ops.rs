@@ -1771,6 +1771,9 @@ pub async fn run_retry(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespon
     match replay {
         Ok(Some(response)) => return response,
         Ok(None) => {}
+        // The source singleton below distinguishes an active caller from a
+        // crashed one and permits recovery of its already-applied bundle.
+        Err(error) if error.code == ErrorCode::OperationInProgress => {}
         Err(error) => return err_response(&req.idempotency_key, &error),
     }
 
@@ -1826,6 +1829,26 @@ pub async fn run_retry(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespon
         );
     }
 
+    // Serialize applied-bundle recovery as well as fresh successor creation.
+    let _source_guard = match super::handoff::acquire_run_submit(ctx, &source_id).await {
+        Ok(guard) => guard,
+        Err(error) => return err_response(&req.idempotency_key, &error),
+    };
+    match recover_applied_run_retry(ctx, req).await {
+        Ok(Some(response)) => return response,
+        Ok(None) => {}
+        Err(error) => {
+            return retry_refusal(
+                &req.idempotency_key,
+                error,
+                action(
+                    "run status",
+                    json!({"run": source_id}),
+                    "inspect the interrupted retry before changing its request",
+                ),
+            )
+        }
+    }
     let work = match super::workstore::show_issue(&ctx.ledger, &source.work_id).await {
         Ok(work) => work,
         Err(error) => return err_response(&req.idempotency_key, &error),
@@ -1881,13 +1904,37 @@ pub async fn run_retry(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespon
             ),
         );
     }
-    if work.status != "open" {
-        return err_response(
+    if !matches!(work.status.as_str(), "open" | "in_progress") {
+        return retry_refusal(
             &req.idempotency_key,
-            &Failure::invalid(format!(
+            Failure::invalid(format!(
                 "work {} must be open before retrying; current status is {}",
                 source.work_id, work.status
             )),
+            classified_action(
+                "work reopen",
+                json!({"id": source.work_id}),
+                "resolve the blocking condition, then reopen the work before retrying",
+                forged_types::ActionClass::Repair,
+            ),
+        );
+    }
+    if work
+        .assignee
+        .as_deref()
+        .is_some_and(|holder| holder != crate::core::run_holder(&source.work_id))
+    {
+        return retry_refusal(
+            &req.idempotency_key,
+            Failure::refused(
+                ErrorCode::WorkLeaseHeld,
+                format!("work {} is held by {:?}", source.work_id, work.assignee),
+            ),
+            action(
+                "work show",
+                json!({"id": source.work_id}),
+                "inspect the current owner; retry cannot release another holder's custody",
+            ),
         );
     }
 
@@ -1977,10 +2024,13 @@ pub async fn run_retry(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespon
             )
         }
     };
-    let submit_guard = match super::handoff::acquire_run_submit(ctx, successor.as_str()).await {
-        Ok(guard) => guard,
-        Err(error) => return err_response(&req.idempotency_key, &error),
-    };
+    if successor.as_str() == source_id {
+        return retry_refusal(
+            &req.idempotency_key,
+            Failure::invalid("retry successor must differ from its source run"),
+            retry_action(&source_id, "pass a different --run-id or omit it"),
+        );
+    }
     let collision = {
         let id = successor.as_str().to_owned();
         on_ledger(&ctx.ledger, move |ledger| ledger.get_run(&id)).await
@@ -2011,11 +2061,15 @@ pub async fn run_retry(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespon
         Err(error) if error.code == ErrorCode::RunNotFound => {}
         Err(error) => return err_response(&req.idempotency_key, &error),
     }
+    let submit_guard = match super::handoff::acquire_run_submit(ctx, successor.as_str()).await {
+        Ok(guard) => guard,
+        Err(error) => return err_response(&req.idempotency_key, &error),
+    };
     let because = param_str(&req.params, "because")
         .expect("run retry normalized because before fencing")
         .to_owned();
     let source_worktree = ctx.config.runs_root.join(&source_id).join("worktree");
-    let (started_from, started_from_value) = if fresh {
+    let (started_from, _started_from_value) = if fresh {
         (None, json!("base"))
     } else if source.branch.trim().is_empty() {
         if source_worktree.exists() {
@@ -2077,18 +2131,15 @@ pub async fn run_retry(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespon
     let source_id_for_effect = source_id.clone();
     let successor_for_effect = successor.clone();
     let work_id = source.work_id.clone();
-    let actor_for_effect = param_str(&req.params, "actor")
-        .expect("run retry normalized actor before fencing")
-        .to_owned();
-    let because_for_effect = because.clone();
     let started_from_for_effect = started_from.clone();
-    let started_from_value_for_effect = started_from_value.clone();
+    let retry_request = req.clone();
     let response = fenced_dynamic_authorizing_desired(
         ctx,
         "run_retry",
         EffectClass::SafeRetry,
         req,
         move |operation_id| async move {
+            super::settlement::prepare_retry(ctx, &source).await?;
             let started = create_run_from_definition(
                 ctx,
                 &start_params,
@@ -2104,91 +2155,234 @@ pub async fn run_retry(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespon
                 },
             )
             .await?;
-            let spec_event_run = successor_for_effect.as_str().to_owned();
-            let spec_event = on_ledger(&ctx.ledger, move |ledger| {
-                ledger.latest_event_of_kind(&spec_event_run, "forged.run.spec")
-            })
-            .await?
-            .ok_or_else(|| Failure::internal("retry successor has no frozen spec event"))?;
-            let spec_payload: Value = serde_json::from_str(&spec_event.payload_json)
-                .map_err(|error| Failure::internal(format!("stored retry spec event: {error}")))?;
-            let revision = spec_payload
-                .get("workRevision")
-                .or_else(|| spec_payload.get("beadRevision"))
-                .cloned()
-                .ok_or_else(|| Failure::internal("retry successor spec has no revision"))?;
-            let (submitted, mut authorization) = super::handoff::authorize_dispatch(
+            authorize_retry(
                 ctx,
+                &retry_request,
                 successor_for_effect.as_str(),
+                started,
                 &submit_guard,
+                &operation_id,
             )
-            .await?;
-            let revision_number = revision_number(&revision)?;
-            authorization.sealed_notes = vec![decision_note(
-                &work_id,
-                DecisionV1 {
-                    schema: DECISION_SCHEMA_V1.to_owned(),
-                    revision: Some(revision_number),
-                    kind: DecisionKind::Retry,
-                    subject: DecisionSubjectV1 {
-                        kind: "run".to_owned(),
-                        id: source_id_for_effect.clone(),
-                    },
-                    choice: because_for_effect.clone(),
-                    rationale: format!(
-                        "retry {source_id_for_effect} as {} because {because_for_effect}",
-                        successor_for_effect.as_str()
-                    ),
-                    actor: actor_for_effect.clone(),
-                    at: spec_event.ts.clone(),
-                    cost_microusd_at_decision: None,
-                    approval: None,
-                    because_defaulted: Some(because_defaulted),
-                },
-            )?];
-            let event = json!({
-                "schemaVersion": 1,
-                "runId": successor_for_effect.as_str(),
-                "retryOf": source_id_for_effect,
-                "workId": work_id,
-                "revision": revision,
-                "because": because_for_effect,
-                "becauseDefaulted": because_defaulted,
-                "startedFrom": started_from_value_for_effect,
-                "packageSha256": started.get("package_sha256"),
-                "operationId": operation_id,
-                "submission": submitted,
-            });
-            let event_run = successor_for_effect.as_str().to_owned();
-            on_ledger(&ctx.ledger, move |ledger| {
-                ledger.append_event(Some(&event_run), "forged.run.retry.authorized", event)
-            })
-            .await?;
-            Ok((
-                json!({
-                    "runId": successor_for_effect.as_str(),
-                    "retryOf": source_id_for_effect,
-                    "workId": work_id,
-                    "revision": revision,
-                    "because": because_for_effect,
-                    "becauseDefaulted": because_defaulted,
-                    "startedFrom": started_from_value_for_effect,
-                    "packageSha256": started.get("package_sha256"),
-                    "profileSha256": started.get("profile_sha256"),
-                    "rosterSha256": started.get("roster_sha256"),
-                    "protocolRef": started.get("protocol_ref"),
-                    "profileRef": started.get("profile_ref"),
-                    "rosterRef": started.get("roster_ref"),
-                    "branch": started.get("branch"),
-                    "baseRef": started.get("base_ref"),
-                    "submission": submitted,
-                }),
-                authorization,
-            ))
+            .await
         },
     )
     .await;
+    if let Some(error) = response.error.as_ref() {
+        let next = match error.code {
+            ErrorCode::OperationInProgress
+                if error.message.contains("uncontained machine operations")
+                    || error.message.contains("still has live attempts") =>
+            {
+                classified_action(
+                    "reconcile",
+                    json!({"run": source_id}),
+                    "reconcile outstanding source attempts and effects, then retry",
+                    forged_types::ActionClass::Repair,
+                )
+            }
+            ErrorCode::WorkLeaseHeld => action(
+                "work show",
+                json!({"id": work.id}),
+                "inspect competing execution or custody before retrying",
+            ),
+            ErrorCode::AdjudicationRequired => action(
+                "run status",
+                json!({"run": source_id}),
+                "controller identity is missing; inspect the evidence gap before retrying",
+            ),
+            _ => action(
+                "run status",
+                json!({"run": source_id}),
+                "inspect the source failure before retrying",
+            ),
+        };
+        let mut response = response;
+        response.error.as_mut().expect("error checked").detail = Some(
+            serde_json::to_value(forged_types::RemedyV1::from(next))
+                .expect("remedy is serializable"),
+        );
+        return response;
+    }
     response
+}
+
+async fn authorize_retry(
+    ctx: &Ctx,
+    request: &OperationRequest,
+    successor: &str,
+    started: Value,
+    submit_guard: &super::handoff::SubmitGuard,
+    operation_id: &str,
+) -> Result<(Value, super::DesiredAuthorization), Failure> {
+    let source_id = param_str(&request.params, "id")?.to_owned();
+    let work_id = started
+        .get("bead_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Failure::internal("retry launch has no work id"))?
+        .to_owned();
+    let actor = param_str(&request.params, "actor")?.to_owned();
+    let because = param_str(&request.params, "because")?.to_owned();
+    let because_defaulted = request
+        .params
+        .get("becauseDefaulted")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let started_from_value = started
+        .get("started_from")
+        .filter(|value| !value.is_null())
+        .cloned()
+        .unwrap_or_else(|| json!("base"));
+    let spec_event_run = successor.to_owned();
+    let spec_event = on_ledger(&ctx.ledger, move |ledger| {
+        ledger.latest_event_of_kind(&spec_event_run, "forged.run.spec")
+    })
+    .await?
+    .ok_or_else(|| Failure::internal("retry successor has no frozen spec event"))?;
+    let spec_payload: Value = serde_json::from_str(&spec_event.payload_json)
+        .map_err(|error| Failure::internal(format!("stored retry spec event: {error}")))?;
+    let revision = spec_payload
+        .get("workRevision")
+        .or_else(|| spec_payload.get("beadRevision"))
+        .cloned()
+        .ok_or_else(|| Failure::internal("retry successor spec has no revision"))?;
+    let (submitted, mut authorization) =
+        super::handoff::authorize_dispatch(ctx, successor, submit_guard).await?;
+    let revision_number = revision_number(&revision)?;
+    authorization.sealed_notes = vec![decision_note(
+        &work_id,
+        DecisionV1 {
+            schema: DECISION_SCHEMA_V1.to_owned(),
+            revision: Some(revision_number),
+            kind: DecisionKind::Retry,
+            subject: DecisionSubjectV1 {
+                kind: "run".to_owned(),
+                id: source_id.clone(),
+            },
+            choice: because.clone(),
+            rationale: format!("retry {source_id} as {} because {because}", successor),
+            actor: actor.clone(),
+            at: spec_event.ts.clone(),
+            cost_microusd_at_decision: None,
+            approval: None,
+            because_defaulted: Some(because_defaulted),
+        },
+    )?];
+    let event = json!({
+        "schemaVersion": 1,
+        "runId": successor,
+        "retryOf": source_id,
+        "workId": work_id,
+        "revision": revision,
+        "because": because,
+        "becauseDefaulted": because_defaulted,
+        "startedFrom": started_from_value,
+        "packageSha256": started.get("package_sha256"),
+        "operationId": operation_id,
+        "submission": submitted,
+    });
+    let event_run = successor.to_owned();
+    on_ledger(&ctx.ledger, move |ledger| {
+        ledger.append_event_once(&event_run, "forged.run.retry.authorized", event)
+    })
+    .await?;
+    Ok((
+        json!({
+            "runId": successor,
+            "retryOf": source_id,
+            "workId": work_id,
+            "revision": revision,
+            "because": because,
+            "becauseDefaulted": because_defaulted,
+            "startedFrom": started_from_value,
+            "packageSha256": started.get("package_sha256"),
+            "profileSha256": started.get("profile_sha256"),
+            "rosterSha256": started.get("roster_sha256"),
+            "protocolRef": started.get("protocol_ref"),
+            "profileRef": started.get("profile_ref"),
+            "rosterRef": started.get("roster_ref"),
+            "branch": started.get("branch"),
+            "baseRef": started.get("base_ref"),
+            "submission": submitted,
+        }),
+        authorization,
+    ))
+}
+
+/// A crash after the launch bundle committed must finish that exact retry,
+/// not mint another successor or reclaim custody again. The source singleton
+/// excludes a live concurrent writer; the stored operation request and frozen
+/// spec event bind the successor without consulting mutable execution config.
+async fn recover_applied_run_retry(
+    ctx: &Ctx,
+    request: &OperationRequest,
+) -> Result<Option<OperationResponse>, Failure> {
+    let key = request.idempotency_key.clone();
+    let operation = on_ledger(&ctx.ledger, move |ledger| {
+        ledger.find_operation("run_retry", &key)
+    })
+    .await?;
+    let Some(operation) = operation else {
+        return Ok(None);
+    };
+    if operation.state == OperationState::Terminal {
+        let request = request.clone();
+        return on_ledger(&ctx.ledger, move |ledger| {
+            ledger.replay_event_operation("run_retry", &request)
+        })
+        .await;
+    }
+    let hash = request_sha256(request)
+        .map_err(|error| Failure::invalid(format!("params cannot be canonicalized: {error}")))?;
+    if hash != operation.request_sha256 {
+        return Err(Failure::refused(
+            ErrorCode::IdempotencyConflict,
+            "run retry key was stored with a different request",
+        ));
+    }
+    let operation_id = operation.operation_id.clone();
+    let successor = on_ledger(&ctx.ledger, move |ledger| {
+        ledger.run_started_by_operation(&operation_id)
+    })
+    .await?;
+    let Some(successor) = successor else {
+        return Ok(None);
+    };
+    if successor.run_id == param_str(&request.params, "id")? {
+        return Err(Failure::internal(
+            "retry operation unexpectedly created its source run",
+        ));
+    }
+    let successor_id = RunId::new(successor.run_id.clone())
+        .map_err(|error| Failure::internal(error.to_string()))?;
+    let guard = super::handoff::acquire_run_submit(ctx, &successor.run_id).await?;
+    let started = replay_atomic_run_start(ctx, &successor_id, &operation.operation_id)
+        .await?
+        .ok_or_else(|| Failure::internal("retry bundle has no matching launch evidence"))?;
+    let (result, authorization) = authorize_retry(
+        ctx,
+        request,
+        &successor.run_id,
+        started,
+        &guard,
+        &operation.operation_id,
+    )
+    .await?;
+    let response = ok_response(&operation.operation_id, false, result);
+    let stored = response.clone();
+    on_ledger(&ctx.ledger, move |ledger| {
+        ledger.resolve_interrupted_operation_authorizing_desired_with_notes(
+            &operation.operation_id,
+            &stored,
+            authorization.kind,
+            &authorization.id,
+            authorization.generation,
+            authorization.sealed_notes,
+        )
+    })
+    .await?;
+    let mut response = response;
+    response.reused = true;
+    Ok(Some(response))
 }
 
 async fn recover_applied_run_start(
@@ -2406,6 +2600,7 @@ async fn replay_atomic_run_start(
         "package_sha256": definition.package_sha256,
         "profile_sha256": definition.profile_sha256,
         "roster_sha256": definition.roster_sha256,
+        "started_from": definition.started_from,
     })))
 }
 
@@ -2511,6 +2706,7 @@ fn run_status_gate_state(view: &forged_proto::RunView) -> Option<&'static str> {
 
 pub(crate) fn run_projection_actions(
     run: &forged_ledger::RunRow,
+    delivery_pr: Option<u64>,
 ) -> Vec<forged_types::OperationActionV1> {
     if run.state == RunState::Active {
         return vec![action(
@@ -2542,7 +2738,7 @@ pub(crate) fn run_projection_actions(
                         "run": run.run_id,
                         "outcome": "landed",
                         "reason": null,
-                        "pr": null,
+                        "pr": delivery_pr,
                         "sha": null,
                     }),
                     "merge the reviewed PR on GitHub first",
@@ -2569,7 +2765,8 @@ pub(crate) fn run_projection_actions(
         Some(forged_ledger::RunOutcome::Superseded) => {
             unreachable!("superseded implies a recorded successor")
         }
-        Some(forged_ledger::RunOutcome::Cancelled) | None => {}
+        None => return vec![stopped_run_retry_action(run)],
+        Some(forged_ledger::RunOutcome::Cancelled) => {}
         Some(forged_ledger::RunOutcome::Landed) => unreachable!("handled above"),
     }
     let mut supersede = work_supersede_action(&run.work_id);
@@ -2577,6 +2774,44 @@ pub(crate) fn run_projection_actions(
         "use work supersede when the spec must change; create the successor first with work create"
             .to_owned();
     vec![retry_action(&run.run_id, retry_reason(run)), supersede]
+}
+
+pub(crate) fn stopped_run_retry_action(
+    run: &forged_ledger::RunRow,
+) -> forged_types::OperationActionV1 {
+    classified_action(
+        "run retry",
+        json!({"id": run.run_id, "because": "world-changed", "runId": Value::Null}),
+        format!(
+            "correct the recorded stop condition, then retry: {}",
+            run.stop_reason.as_deref().unwrap_or("no reason recorded")
+        ),
+        forged_types::ActionClass::Should,
+    )
+}
+
+/// A reviewed candidate's PR is recorded before landing. A null settlement
+/// field does not erase that fact; a candidate never supplies a merge SHA.
+pub(crate) async fn run_delivery_pr(
+    ctx: &Ctx,
+    run: &forged_ledger::RunRow,
+) -> Result<Option<u64>, Failure> {
+    if run.delivery_pr.is_some() {
+        return Ok(run.delivery_pr);
+    }
+    let run_id = run.run_id.clone();
+    let event = on_ledger(&ctx.ledger, move |ledger| {
+        ledger.latest_event_of_kind(&run_id, PROTO_PR)
+    })
+    .await?;
+    event
+        .map(|event| {
+            let payload: Value = serde_json::from_str(&event.payload_json)
+                .map_err(|error| Failure::internal(format!("stored PR evidence: {error}")))?;
+            Ok(payload.get("number").and_then(Value::as_u64))
+        })
+        .transpose()
+        .map(Option::flatten)
 }
 
 pub(crate) async fn run_provenance(ctx: &Ctx, run_id: &str) -> Result<RunProvenance, Failure> {
@@ -2667,6 +2902,12 @@ pub async fn run_status(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
         let action = forged_proto::advance(&view);
         let (current_stage, started_at) = run_status_position(&view, &action);
         let gate_state = run_status_gate_state(&view);
+        let delivery_pr = view.run.delivery_pr.or_else(|| {
+            view.proto_events.iter().rev().find_map(|event| match event {
+                forged_proto::ProtoEvent::Pr { number, .. } => Some(*number),
+                _ => None,
+            })
+        });
         let controller = super::handoff::controller_status(ctx, run_id).await?;
         let identity =
             super::work_identity::load(ctx, WorkIdentitySubjectKind::Run, run_id).await?;
@@ -2852,7 +3093,7 @@ pub async fn run_status(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
                 "stopReason": view.run.stop_reason,
                 "outcome": view.run.terminal_outcome.map(|value| value.as_str()),
                 "delivery": {
-                    "pr": view.run.delivery_pr,
+                    "pr": delivery_pr,
                     "sha": view.run.delivery_sha,
                 },
                 "supersededBy": view.run.superseded_by,
@@ -2889,7 +3130,7 @@ pub async fn run_status(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
                 "deadlineKills": deadline_kills,
                 "progress": progress,
                 "mail": mail,
-                "nextActions": run_projection_actions(&view.run),
+                "nextActions": run_projection_actions(&view.run, delivery_pr),
                 "nextAction": match protocol_terminal {
                     Some(terminal) if view.accepted_risk.is_none() => json!({"stop": terminal}),
                     _ => match &action {
@@ -4847,9 +5088,10 @@ pub(super) fn operator_queue(
             .is_some_and(|holder| holder != expected && holder != crate::core::FRONTIER_HOLDER);
         let outcome = entry["outcome"].as_str();
         let awaiting_delivery = matches!(outcome, Some("clean" | "accepted-risk"));
+        // A slice publishes its candidate PR before review. Terminal epic
+        // delivery is already folded into the epoch-aware submitted state.
         let visibly_terminal = !entry["outcome"].is_null()
-            || !entry["delivery"].is_null()
-            || entry["state"] == json!("stopped");
+            || matches!(entry["state"].as_str(), Some("stopped" | "submitted"));
         let dead_controller = !controller.is_null()
             && matches!(controller_state, Some("dead" | "vanished" | "exited"));
         let unverified_controller_is_blocker = false;
@@ -6952,12 +7194,32 @@ pub async fn next(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
             .iter()
             .filter_map(|entry| entry.get("id").and_then(Value::as_str))
             .collect::<BTreeSet<_>>();
-        let parked_ids = entries
+        let parked_count = entries
             .iter()
             .filter(|entry| {
                 entry.pointer("/plan/status").and_then(Value::as_str) == Some("deferred")
                     || entry.pointer("/claimHealth/status").and_then(Value::as_str)
                         == Some("deferred")
+            })
+            .count();
+        let inactive_ids = entries
+            .iter()
+            .filter(|entry| {
+                let inactive = matches!(
+                    entry.pointer("/plan/status").and_then(Value::as_str),
+                    Some("deferred" | "closed")
+                ) || matches!(
+                    entry.pointer("/claimHealth/status").and_then(Value::as_str),
+                    Some("deferred" | "closed")
+                );
+                let live = entry.get("liveSeats").and_then(Value::as_u64).unwrap_or(0) > 0
+                    || (entry.pointer("/controller/state").and_then(Value::as_str)
+                        == Some("running")
+                        && entry
+                            .pointer("/controller/verified")
+                            .and_then(Value::as_bool)
+                            == Some(true));
+                inactive && !live
             })
             .filter_map(|entry| entry.get("id").and_then(Value::as_str))
             .collect::<BTreeSet<_>>();
@@ -7025,7 +7287,7 @@ pub async fn next(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
         for item in attention_items.iter().filter(|item| {
             item.state == AttentionState::Open
                 && scoped_ids.contains(item.subject_id.as_str())
-                && !parked_ids.contains(item.subject_id.as_str())
+                && !inactive_ids.contains(item.subject_id.as_str())
         }) {
             let row = next_attention_row(
                 item,
@@ -7059,16 +7321,30 @@ pub async fn next(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
                 let lifecycle = lifecycles
                     .get(&item.work_id)
                     .ok_or_else(|| Failure::internal("ready next row omitted work lifecycle"))?;
+                // Frontier membership can coexist with historical execution.
+                // Inventory is chronological; preserve the latest execution's facts.
+                let execution = entries.iter().rev().find(|entry| {
+                    next_entry_kind(entry) != "plan"
+                        && next_entry_work_id(entry) == Some(item.work_id.as_str())
+                });
+                let spend_usd = execution
+                    .and_then(|entry| {
+                        entry
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .map(|id| next_spend(&entries, id, next_entry_kind(entry)))
+                    })
+                    .unwrap_or_else(|| json!(0.0));
                 Ok(next_row(NextRow {
                     id: &item.work_id,
                     kind: item.kind.as_str(),
                     title: next_title(&item.spec.title),
                     state: json!(item.status.as_str()),
                     age_min: next_age_min(&captured_at, Some(&item.updated_at)),
-                    spend_usd: json!(0.0),
+                    spend_usd,
                     actions: &[],
                     lifecycle: json!(lifecycle),
-                    health: json!("unsubmitted"),
+                    health: next_entry_health(execution, "unsubmitted"),
                     revision: json!(item.revision),
                 }))
             })
@@ -7145,7 +7421,7 @@ pub async fn next(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
             "sections": sections,
             "hidden": {
                 "symptoms": symptoms.len().saturating_sub(symptom_rows.len()),
-                "parked": parked_ids.len(),
+                "parked": parked_count,
             },
             "coverage": {
                 "limit": NEXT_DEFAULT_LIMIT,

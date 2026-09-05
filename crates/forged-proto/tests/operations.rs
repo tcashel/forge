@@ -382,6 +382,127 @@ async fn a_redone_gate_report_replays_last_wins() {
 }
 
 #[tokio::test]
+async fn retry_machine_recovery_preserves_control_operations_and_observes_exact_sha() {
+    for remote_sha in [None, Some("different"), Some("expected")] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ledger = Ledger::open(&dir.path().join("state.db")).expect("open");
+        seed_run(&ledger);
+        let retry = begin_inflight(
+            &ledger,
+            "run_retry",
+            "retry-key",
+            EffectClass::SafeRetry,
+            None,
+        );
+        let control = begin_inflight(
+            &ledger,
+            "run_stop",
+            "stop-key",
+            EffectClass::SafeRetry,
+            None,
+        );
+        let ambiguous = begin_inflight(
+            &ledger,
+            "custom-effect",
+            "ambiguous-key",
+            EffectClass::HumanAmbiguous,
+            None,
+        );
+        let gate = begin_inflight(&ledger, "gate", "gate-key", EffectClass::SafeRetry, None);
+        let push = begin_inflight_with(
+            &ledger,
+            "push",
+            "push-key",
+            EffectClass::ObserveOnly,
+            None,
+            serde_json::Map::from_iter([("expectedSha".to_owned(), serde_json::json!("expected"))]),
+        );
+        ledger
+            .set_run_state(
+                RUN,
+                forged_ledger::RunState::Stopped,
+                Some("retry".to_owned()),
+            )
+            .unwrap();
+        let ports = FakePorts::new();
+        ports
+            .sha_script
+            .lock()
+            .unwrap()
+            .push_back(remote_sha.map(str::to_owned));
+        let report = forged_proto::reconcile::reconcile_machine_operations(&ledger, RUN, &ports)
+            .await
+            .unwrap();
+        assert!(report.released.contains(&gate));
+        if remote_sha == Some("expected") {
+            assert_eq!(report.observed, vec![push]);
+            assert_eq!(
+                ledger
+                    .find_operation("push", "push-key")
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                OperationState::Terminal
+            );
+        } else {
+            assert!(report.released.contains(&push));
+            assert!(report.observed.is_empty());
+            assert!(ledger.find_operation("push", "push-key").unwrap().is_none());
+        }
+        for (name, key, id) in [
+            ("run_retry", "retry-key", retry),
+            ("run_stop", "stop-key", control),
+            ("custom-effect", "ambiguous-key", ambiguous),
+        ] {
+            let row = ledger.find_operation(name, key).unwrap().unwrap();
+            assert_eq!(row.operation_id, id);
+            assert_eq!(row.state, OperationState::InProgress);
+        }
+        ledger.close().unwrap();
+    }
+}
+
+#[tokio::test]
+async fn retry_machine_recovery_does_not_guess_when_observation_fails() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ledger = Ledger::open(&dir.path().join("state.db")).expect("open");
+    seed_run(&ledger);
+    let retry = begin_inflight(
+        &ledger,
+        "run_retry",
+        "retry-key",
+        EffectClass::SafeRetry,
+        None,
+    );
+    let push = begin_inflight(&ledger, "push", "push-key", EffectClass::ObserveOnly, None);
+    ledger
+        .set_run_state(
+            RUN,
+            forged_ledger::RunState::Stopped,
+            Some("retry".to_owned()),
+        )
+        .unwrap();
+    let ports = FakePorts::new();
+    *ports.sha_failure.lock().unwrap() = Some(forged_proto::PortError::Unavailable(
+        "remote unavailable".to_owned(),
+    ));
+    assert!(
+        forged_proto::reconcile::reconcile_machine_operations(&ledger, RUN, &ports)
+            .await
+            .is_err()
+    );
+    for (name, key, id) in [
+        ("run_retry", "retry-key", retry),
+        ("push", "push-key", push),
+    ] {
+        let row = ledger.find_operation(name, key).unwrap().unwrap();
+        assert_eq!(row.operation_id, id);
+        assert_eq!(row.state, OperationState::InProgress);
+    }
+    ledger.close().unwrap();
+}
+
+#[tokio::test]
 async fn safe_retry_is_released_and_redoable() {
     let dir = tempfile::tempdir().expect("tempdir");
     let ledger = Ledger::open(&dir.path().join("state.db")).expect("open");

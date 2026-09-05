@@ -436,3 +436,130 @@ fn an_unknown_id_is_the_existing_successful_unresolved_shape() {
         })
     );
 }
+
+#[test]
+fn a_recorded_candidate_pr_survives_clean_settlement_on_every_driving_surface() {
+    let env = TestEnv::new("forged-explain-candidate-pr");
+    assert_eq!(env.forged(&["init"]).0, 0);
+    let run = "candidate-pr";
+    env.ensure_work_item("bead-candidate-pr");
+    fabricate_run(&env, run);
+    fabricate_run(&env, "unrelated-candidate");
+    let ledger = env.ledger();
+    // Evidence is independent of the requested event page.
+    for index in 0..1_001 {
+        ledger
+            .append_event(Some(run), "fixture.progress", json!({"index": index}))
+            .unwrap();
+    }
+    for (id, number) in [(run, 28), ("unrelated-candidate", 99)] {
+        ledger.append_event(Some(id), "proto.pr", json!({
+            "schemaVersion": 1, "number": number, "isDraft": true,
+            "baseRefName": env.repos.base, "url": format!("https://example.test/pull/{number}"),
+        })).unwrap();
+    }
+    ledger
+        .settle_run(
+            run,
+            forged_ledger::RunOutcome::Clean,
+            "review passed".to_owned(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+    ledger.close().unwrap();
+
+    let (code, status) = env.forged(&["run", "status", "--run", run]);
+    assert_eq!(code, 0, "{status}");
+    assert_eq!(
+        status["result"]["run"]["delivery"],
+        json!({"pr": 28, "sha": null})
+    );
+    assert_eq!(
+        status["result"]["run"]["nextActions"][0]["args"]["pr"],
+        json!(28)
+    );
+
+    let (code, explained) = env.forged(&["explain", "--id", run]);
+    assert_eq!(code, 0, "{explained}");
+    assert_eq!(result(&explained)["what"]["delivery"]["pr"], json!(28));
+    assert_eq!(result(&explained)["what"]["delivery"]["sha"], Value::Null);
+    assert_eq!(result(&explained)["next"][0]["args"]["pr"], json!(28));
+
+    let (code, detail) = env.forged(&["work", "detail", "--id", run]);
+    assert_eq!(code, 0, "{detail}");
+    assert_eq!(result(&detail)["delivery"]["pr"], json!(28));
+    assert_eq!(result(&detail)["delivery"]["sha"], Value::Null);
+
+    let (code, next) = env.forged(&["next", "--repo", env.repos.repo.to_str().unwrap()]);
+    assert_eq!(code, 0, "{next}");
+    let candidate = result(&next)["sections"]["decisions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == json!(run))
+        .expect("candidate decision");
+    assert_eq!(candidate["should"]["args"]["pr"], json!(28), "{candidate}");
+    assert_eq!(candidate["should"]["args"]["sha"], Value::Null);
+}
+
+#[test]
+fn machine_stop_is_actionable_by_work_id_and_disappears_after_close_or_successor() {
+    let env = TestEnv::new("forged-explain-machine-stop");
+    assert_eq!(env.forged(&["init"]).0, 0);
+    let run = "machine-stop";
+    let work = "bead-machine-stop";
+    env.ensure_work_item(work);
+    fabricate_run(&env, run);
+    let reason = "input-required: git push authentication failed after 4 attempts: Permission denied (publickey)";
+    let ledger = env.ledger();
+    ledger
+        .set_run_state(
+            run,
+            forged_ledger::RunState::Stopped,
+            Some(reason.to_owned()),
+        )
+        .unwrap();
+    ledger.close().unwrap();
+
+    for id in [run, work] {
+        let (code, explained) = env.forged(&["explain", "--id", id]);
+        assert_eq!(code, 0, "{explained}");
+        assert_eq!(result(&explained)["what"]["stopReason"], json!(reason));
+        let next = &result(&explained)["next"][0];
+        assert_eq!(next["verb"], json!("run retry"), "{explained}");
+        assert_eq!(next["class"], json!("should"));
+        assert_eq!(next["args"]["because"], json!("world-changed"));
+        assert!(next["reason"].as_str().unwrap().contains(reason));
+    }
+    let decisions = || {
+        let (code, next) = env.forged(&["next", "--repo", env.repos.repo.to_str().unwrap()]);
+        assert_eq!(code, 0, "{next}");
+        result(&next)["sections"]["decisions"]
+            .as_array()
+            .unwrap()
+            .clone()
+    };
+    assert!(decisions()
+        .iter()
+        .any(|row| row["id"] == json!(run) && row["should"]["verb"] == json!("run retry")));
+    env.set_work_field(work, "status", "closed");
+    assert!(decisions().iter().all(|row| row["id"] != json!(run)));
+    env.set_work_field(work, "status", "open");
+    let ledger = env.ledger();
+    ledger
+        .create_run(forged_ledger::NewRun {
+            run_id: forged_types::RunId::new("machine-stop-r1").unwrap(),
+            work_id: work.to_owned(),
+            repo: env.repos.repo.to_string_lossy().into_owned(),
+            base_ref: env.repos.base.clone(),
+            branch: "forged/machine-stop-r1".to_owned(),
+        })
+        .unwrap();
+    ledger.close().unwrap();
+    assert!(
+        decisions().iter().all(|row| row["id"] != json!(run)),
+        "retry successor clears the old machine-stop decision"
+    );
+}

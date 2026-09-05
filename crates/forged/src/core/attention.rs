@@ -330,6 +330,9 @@ pub(crate) fn recommendation_actions(
                 forged_types::ActionClass::Should,
             )],
             AttentionSubjectKind::Run => retryable.map_or_else(Vec::new, |run| {
+                if run.terminal_outcome.is_none() {
+                    return vec![super::ops::stopped_run_retry_action(run)];
+                }
                 let work_id = work_id.unwrap_or(&run.work_id);
                 vec![
                     classified_action(
@@ -524,10 +527,18 @@ pub(crate) fn recommendation_actions(
             "bind a nonblank note explaining why this attempt-only evidence was never captured",
             forged_types::ActionClass::Repair,
         )],
+        Action::MergePullRequest => run
+            .filter(|run| matches!(run.terminal_outcome, Some(RunOutcome::Clean | RunOutcome::AcceptedRisk)))
+            .map_or_else(Vec::new, |run| {
+                super::ops::run_projection_actions(
+                    run,
+                    evidence.and_then(|value| value.get("pr")).and_then(Value::as_u64),
+                )
+            }),
         // These decision codes have no honesty-tested in-surface domain verb.
         // RepairEvidence is likewise empty for the repairable, non-attempt
         // half because no delivery-evidence recording verb exists.
-        Action::MergePullRequest | Action::AdjudicateEffect | Action::RepairEvidence => Vec::new(),
+        Action::AdjudicateEffect | Action::RepairEvidence => Vec::new(),
         Action::ReconcileWork
         | Action::ReclaimAttempt
         | Action::RecoverController
@@ -807,6 +818,36 @@ fn collect_domain_sources(input: &ProjectionInput<'_>) -> Result<Vec<RawAttentio
             payload,
             AttentionEvidenceKind::Event,
             event.event_id.to_string(),
+        );
+    }
+
+    // A machine-stage stop predates protocol settlement. Its durable reason
+    // is still an input requirement, not an invisible completed run.
+    for run in input.runs.iter().filter(|run| {
+        run.state == RunState::Stopped
+            && run.terminal_outcome.is_none()
+            && run.superseded_by.is_none()
+            && !exhausted_run_has_successor(input, &run.run_id)
+            && !work_by_id
+                .get(run.work_id.as_str())
+                .is_some_and(|work| matches!(work.status.as_str(), "closed" | "deferred"))
+    }) {
+        let reason = run
+            .stop_reason
+            .as_deref()
+            .unwrap_or("run stopped before settlement");
+        add_raw(
+            &mut raw,
+            &run.run_id,
+            AttentionCondition::InputRequired,
+            &run.updated_at,
+            &run.updated_at,
+            0,
+            format!("run:{}:stopped:{}", run.run_id, run.updated_at),
+            reason,
+            json!({"runId": run.run_id, "reason": reason}),
+            AttentionEvidenceKind::Event,
+            format!("run:{}", run.run_id),
         );
     }
 

@@ -1569,6 +1569,33 @@ impl Ledger {
         self.submit(move |conn| get_run_tx(conn, &run_id))
     }
 
+    /// Recover the run bundle atomically attributed to one launch operation.
+    /// The operation id in its frozen spec event is the provenance fence;
+    /// names and current Work state are not sufficient replay evidence.
+    pub fn run_started_by_operation(
+        &self,
+        operation_id: &str,
+    ) -> Result<Option<RunRow>, LedgerError> {
+        let operation_id = operation_id.to_owned();
+        self.submit(move |conn| {
+            let mut statement = conn.prepare(
+                "SELECT run_id FROM events WHERE kind = 'forged.run.spec' \
+                 AND json_extract(payload_json, '$.operationId') = ?1 LIMIT 2",
+            )?;
+            let rows = statement
+                .query_map([operation_id], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            match rows.as_slice() {
+                [] => Ok(None),
+                [run_id] => get_run_tx(conn, run_id).map(Some),
+                _ => Err(refused(
+                    ErrorCode::InvalidRequest,
+                    "launch operation names multiple run bundles",
+                )),
+            }
+        })
+    }
+
     /// All runs, ordered by `created_at` then rowid ascending.
     pub fn list_runs(&self) -> Result<Vec<RunRow>, LedgerError> {
         self.submit(move |conn| list_runs_tx(conn))

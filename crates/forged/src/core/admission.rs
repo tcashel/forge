@@ -30,6 +30,8 @@ const SNAPSHOT_RETRY_LIMIT: usize = 16;
 const SNAPSHOT_CHANGED_MESSAGE: &str = "admission ledger facts changed before allocation";
 const SNAPSHOT_RETRY_BASE_MS: u64 = 2;
 const SNAPSHOT_RETRY_MAX_MS: u64 = 64;
+// Omitted native priority schedules at the normal level without rewriting work.
+const DEFAULT_WORK_PRIORITY: i64 = 2;
 static SNAPSHOT_RETRY_JITTER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
@@ -236,9 +238,10 @@ fn invalid_reason(
         Some(AdmissionReason::Exhausted)
     } else if work.input_error.is_some() || work.item.is_none() {
         Some(AdmissionReason::WorkUnavailable)
-    } else if work.item.is_some_and(|item| {
-        item.priority.is_none() || item.revision.is_none() || work_repository.is_none()
-    }) {
+    } else if work
+        .item
+        .is_some_and(|item| item.revision.is_none() || work_repository.is_none())
+    {
         Some(AdmissionReason::WorkMalformed)
     } else if work.item.is_some_and(|item| !runnable(&item.status)) {
         Some(AdmissionReason::WorkNotRunnable)
@@ -305,7 +308,7 @@ fn project_candidates(
                 .unwrap_or_else(|| durable.subject_id.clone()),
             work_revision: issue.and_then(|issue| issue.revision.clone()),
             work_status: issue.map(|issue| issue.status.clone()),
-            priority: issue.and_then(|issue| issue.priority),
+            priority: issue.map(|issue| issue.priority.unwrap_or(DEFAULT_WORK_PRIORITY)),
             repository: repository.clone(),
             work_repository: work_repository.clone(),
             input_error: input_error.map(str::to_owned),
@@ -405,9 +408,6 @@ fn reason_detail(candidate: &AdmissionCandidateV1, reason: AdmissionReason) -> O
     match reason {
         AdmissionReason::WorkMalformed => {
             let mut missing = Vec::new();
-            if candidate.priority.is_none() {
-                missing.push("priority");
-            }
             if candidate.work_revision.is_none() {
                 missing.push("revision");
             }
@@ -1026,7 +1026,7 @@ async fn admit_packet_facts_once(
         work_id: packet.work_id.clone(),
         work_revision: issue.and_then(|issue| issue.revision.clone()),
         work_status: issue.map(|issue| issue.status.clone()),
-        priority: issue.and_then(|issue| issue.priority),
+        priority: issue.map(|issue| issue.priority.unwrap_or(DEFAULT_WORK_PRIORITY)),
         repository: repository.clone(),
         work_repository: work_repository.clone(),
         input_error: input_error.clone(),
@@ -1186,9 +1186,23 @@ mod tests {
                 facts,
                 "/repo",
             ),
+            None,
+            "native scheduling priority is optional"
+        );
+        item.revision = None;
+        assert_eq!(
+            invalid_reason(
+                desired,
+                WorkAdmissionShape {
+                    item: Some(&item),
+                    input_error: None,
+                },
+                facts,
+                "/repo",
+            ),
             Some(AdmissionReason::WorkMalformed)
         );
-        item.priority = Some(2);
+        item.revision = Some("1".to_owned());
         assert_eq!(
             invalid_reason(
                 DesiredAdmissionShape {
@@ -1700,8 +1714,8 @@ mod tests {
     #[test]
     fn malformed_and_unrunnable_decisions_name_the_failing_fields() {
         let policy = AdmissionPolicy::default();
-        let mut malformed = candidate("missing-priority", 0, "codex");
-        malformed.priority = None;
+        let mut malformed = candidate("missing-revision", 0, "codex");
+        malformed.work_revision = None;
         let inputs = AdmissionInputsV1 {
             schema: ADMISSION_INPUTS_SCHEMA_V1.to_owned(),
             as_of: "2030-01-01T00:00:00.000000000Z".to_owned(),
@@ -1713,7 +1727,7 @@ mod tests {
             latest_rate_limits: vec![],
         };
         let invalid = BTreeMap::from([(
-            (AdmissionSubjectKind::Run, "missing-priority".to_owned()),
+            (AdmissionSubjectKind::Run, "missing-revision".to_owned()),
             AdmissionReason::WorkMalformed,
         )]);
         let (_, decisions) = evaluate(inputs, &policy, &invalid).expect("evaluate malformed");
@@ -1721,11 +1735,11 @@ mod tests {
         assert_eq!(decisions[0].reason, AdmissionReason::WorkMalformed);
         assert_eq!(
             decisions[0].reason_detail.as_deref(),
-            Some("missing required field(s): priority")
+            Some("missing required field(s): revision")
         );
         assert_eq!(
             decision_reason(&decisions[0]),
-            "bead-malformed: missing required field(s): priority"
+            "bead-malformed: missing required field(s): revision"
         );
 
         let mut unrunnable = candidate("blocked-work", 0, "codex");
