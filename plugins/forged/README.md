@@ -264,6 +264,14 @@ inspection commands. They do not shell-detach jobs or keep the lead session
 alive. Slice work stops at a reviewed draft pull request. An epic may integrate
 mechanically clean children, but default-branch merge remains human-owned.
 
+The lead skills are thin lifecycle clients: `next` or `explain` establishes
+position, one typed verb changes state, and `wait --id` reconnects without a
+polling loop. `work adjudicate` commits dispositions with any field and status
+change atomically; `run dispatch` records execution approval with the immutable
+handoff. The ledger now owns pagination, readiness, lifecycle evidence, and the
+single recommended next action, so a lead no longer carries those procedures in
+prompt prose.
+
 ## Operator scope
 
 Runtime and planning state stays under `$ANVIL_HOME` and `$BEADS_DIR`

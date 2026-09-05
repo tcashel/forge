@@ -883,6 +883,20 @@ pub async fn work_note_add(ctx: &Ctx, req: &mut OperationRequest) -> OperationRe
             return err_response(&derive_key("work_note_add", Some(&id), None, None), &error)
         }
     };
+    if kind == WorkNoteKind::Approval {
+        let key = derive_key("work_note_add", Some(&id), Some(kind.as_str()), None);
+        return remedy_response(
+            &key,
+            &Failure::invalid(
+                "work note kind \"approval\" is retired; use run dispatch so approval and handoff are atomic",
+            ),
+            work_remedy(
+                "run dispatch",
+                json!({"id": id, "approvedBy": Value::Null, "basis": Value::Null}),
+                "bind the approving actor and basis, then dispatch this exact work revision",
+            ),
+        );
+    }
     let schema = match work_note_wire_string(&req.params, "schema")
         .and_then(|schema| work_note_schema(kind, schema))
     {
