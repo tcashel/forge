@@ -1315,6 +1315,17 @@ fn resolving_post_apply_implementation_failure_uses_ordinary_child_reset() {
     assert_eq!(code, 0, "implementation failure becomes input: {held}");
     assert_eq!(held["result"]["stopped"]["childId"], json!("child-stub"));
 
+    let (code, parked) = env.forged(&[
+        "work",
+        "park",
+        "--id",
+        "child-stub",
+        "--reason",
+        "defer while the implementation decision is pending",
+    ]);
+    assert_eq!(code, 0, "park held child: {parked}");
+    assert_eq!(parked["result"]["work"]["status"], json!("deferred"));
+
     let (code, resolved) = env.forged(&[
         "epic",
         "resolve",
@@ -1325,7 +1336,17 @@ fn resolving_post_apply_implementation_failure_uses_ordinary_child_reset() {
         "--note",
         "retry the implementation under the already-applied plan",
     ]);
-    assert_eq!(code, 0, "ordinary implementation resolution: {resolved}");
+    assert_eq!(code, 0, "parked implementation resolution: {resolved}");
+    assert_eq!(env.work_status("child-stub"), "open");
+    let decisions = env
+        .ledger()
+        .list_work_notes(
+            "child-stub",
+            Some(forged_ledger::WorkNoteKind::Decision),
+            10,
+        )
+        .expect("child decisions");
+    assert_eq!(decisions.notes.len(), 2, "park and resume decisions land");
     let events = env
         .ledger()
         .list_events(Some("epic-rolling"), 0, 65_536)

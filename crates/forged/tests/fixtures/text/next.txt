@@ -8,12 +8,12 @@ DECISIONS  1 of 1 shown
 RUNNING  1 of 2 shown
   run-1  implementation  Build the bounded surface
     stage implementation  seat codex:worker-1
-    age 7m  lifecycle running  spend $0.50
+    age 7m  lifecycle dispatched  spend $0.50
 
 READY  1 of 1 shown
   ore-081  open  Follow-up slice
     age 3m  lifecycle critiqued
-    basis recommendation note exists; adjudicated: unknown-until-.8
+    basis revision 1
 
 LANDED  1 of 3 shown
   run-2  landed  Finished slice

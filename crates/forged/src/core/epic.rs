@@ -4526,6 +4526,7 @@ pub async fn epic_resolve(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
                     &ctx.ledger,
                     &child,
                     &format!("forged:{epic}"),
+                    Some(&note),
                 )
                 .await?;
             }

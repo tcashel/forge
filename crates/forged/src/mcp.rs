@@ -1913,10 +1913,11 @@ impl ForgedServer {
         self.call_lead_write("work_update", args.0).await
     }
 
-    /// Typed work authoring: atomic stub promotion.
+    /// Stub-only compatibility alias for atomic promotion.
     #[tool(
         name = "work_promote",
-        description = "Atomically promote one blocked or deferred stub. Arguments: id, \
+        description = "Compatibility alias for one release: atomically promote one blocked or \
+                       deferred stub. Arguments: id, \
                        expectedRevision (the revision you read), optional description, \
                        acceptanceCriteria, design, notes, and actor. One fenced operation \
                        mints revision N+1 with cause planning-apply, sets status open, and \
@@ -1926,6 +1927,32 @@ impl ForgedServer {
     )]
     pub async fn work_promote(&self, args: Parameters<LeadWriteArgs>) -> CallToolResult {
         self.call_lead_write("work_promote", args.0).await
+    }
+
+    /// Atomically bind adjudication dispositions to the resulting revision.
+    #[tool(
+        name = "work_adjudicate",
+        description = "Atomically adjudicate one work specification. Arguments: id, \
+                       expectedRevision, bodyJson (a forged.adjudication/1 payload), and \
+                       optional title, description, acceptanceCriteria, design, or notes. \
+                       A changed spec mints one revision; an unchanged spec does not. The \
+                       revision, adjudication note, and accepted status transition commit \
+                       together."
+    )]
+    pub async fn work_adjudicate(&self, args: Parameters<LeadWriteArgs>) -> CallToolResult {
+        self.call_lead_write("work_adjudicate", args.0).await
+    }
+
+    /// Park one idle item outside the active planning rails.
+    #[tool(
+        name = "work_park",
+        description = "Park one idle work item. Arguments: id, reason, optional actor. Records \
+                       a typed park decision, sets status deferred, and clears any lease \
+                       without minting a revision. A nonterminal run or custody refuses with \
+                       run stop as the remedy."
+    )]
+    pub async fn work_park(&self, args: Parameters<LeadWriteArgs>) -> CallToolResult {
+        self.call_lead_write("work_park", args.0).await
     }
 
     /// Append one immutable work annotation.
@@ -1979,8 +2006,9 @@ impl ForgedServer {
     /// Typed repair verb: reopen.
     #[tool(
         name = "work_reopen",
-        description = "Set a work item's status to open from any state, custody untouched. \
-                       Arguments: id, actor."
+        description = "Set a work item's status to open. Arguments: id, actor, and reason. \
+                       reason is required for a deferred item and records a typed park/resume \
+                       decision without minting a revision."
     )]
     pub async fn work_reopen(&self, args: Parameters<LeadWriteArgs>) -> CallToolResult {
         self.call_lead_write("work_reopen", args.0).await

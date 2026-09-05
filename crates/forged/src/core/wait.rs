@@ -54,16 +54,17 @@ enum WaitSubject {
 
 impl WaitSubject {
     async fn explain(&self, ctx: &Ctx) -> Result<Value, Failure> {
+        let attention = super::ops::all_attention(ctx).await?;
         match self {
             Self::Work { id, .. } => {
                 let id = id.clone();
                 let work = on_ledger(&ctx.ledger, move |ledger| ledger.work_item(&id))
                     .await?
                     .ok_or_else(|| Failure::internal("resolved work item disappeared"))?;
-                super::observe::explain_work_item(ctx, work).await
+                super::observe::explain_work_item(ctx, work, &attention).await
             }
-            Self::Run(id) => super::observe::explain_run(ctx, id.clone()).await,
-            Self::Epic(id) => super::observe::explain_epic(ctx, id.clone()).await,
+            Self::Run(id) => super::observe::explain_run(ctx, id.clone(), &attention).await,
+            Self::Epic(id) => super::observe::explain_epic(ctx, id.clone(), &attention).await,
         }
     }
 

@@ -53,6 +53,9 @@
 //! creation record, compatibility event, and WorkIdentityV1 commit in one
 //! transaction but before the operation response is settled; replay must use
 //! the durable bundle without consulting current work again.
+//! `work.adjudicate.revision.after` sits after an optional replacement
+//! revision is inserted but before its revision-bound adjudication note; a
+//! crash must roll both writes back with their enclosing transaction.
 //! `review.publish.probe.before` and `review.publish.probe.after` bracket the
 //! exact-marker observation. `review.publish.post.before` is after uncertain
 //! intent is durable but before GitHub is called; `review.publish.post.after`

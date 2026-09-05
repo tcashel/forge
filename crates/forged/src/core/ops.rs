@@ -8,8 +8,8 @@ use std::path::{Component, Path, PathBuf};
 use forged_gate::GateRequest;
 use forged_ledger::{
     EffectClass, InventorySnapshot, InventoryUsage, InventoryUsageSelection, NewRun,
-    NewRunDefinition, OperationState, RevokeScope, RunState, WorkItemFilters, WorkNoteKind,
-    WorkStatus,
+    NewRunDefinition, OperationState, RevokeScope, RunState, WorkItemFilters, WorkItemSnapshot,
+    WorkKind, WorkSpecFields, WorkStatus,
 };
 use forged_provider::{CodexDriver, PiDriver, ProviderDriver};
 use forged_types::{
@@ -330,6 +330,9 @@ async fn ready_slice_work(
     work: &str,
 ) -> Result<crate::core::work_types::IssueSummary, Failure> {
     let issue = super::spec::read_work(ctx, work).await?;
+    if issue.status == "deferred" {
+        return Err(parked_run_start_failure(work));
+    }
     let frontier_claimed = issue.status == "in_progress"
         && issue.assignee.as_deref() == Some(crate::core::FRONTIER_HOLDER);
     if issue.status != "open" && !frontier_claimed {
@@ -376,6 +379,37 @@ async fn ready_slice_work(
         }
     }
     Ok(issue)
+}
+
+fn parked_run_start_failure(work: &str) -> Failure {
+    Failure::invalid(format!(
+        "work {work} is parked and cannot admit a run start"
+    ))
+}
+
+/// Add the structured recovery contract to effect-time run-start refusals.
+/// The exact failure comparison keeps unrelated invalid requests on their
+/// ordinary error path while preserving the operation fence's race check.
+pub(super) fn run_start_failure_response(
+    operation: &str,
+    request: &OperationRequest,
+    operation_id: &str,
+    failure: &Failure,
+) -> Option<OperationResponse> {
+    let work = request.params.get("bead")?.as_str()?;
+    if operation != "run_start" || failure.message != parked_run_start_failure(work).message {
+        return None;
+    }
+    Some(remedy_response(
+        operation_id,
+        failure,
+        forged_types::RemedyV1::from(classified_action(
+            "work reopen",
+            json!({"id": work, "reason": Value::Null}),
+            "record why the parked work is resuming before starting a run",
+            forged_types::ActionClass::Repair,
+        )),
+    ))
 }
 
 /// `run start` — mint the RunId from the work id (or the epic pass's
@@ -982,6 +1016,21 @@ pub async fn run_retry(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespon
                 "work reopen",
                 json!({"id": source.work_id}),
                 "reopen the work item before retrying",
+                forged_types::ActionClass::Repair,
+            ),
+        );
+    }
+    if work.status == "deferred" {
+        return retry_refusal(
+            &req.idempotency_key,
+            Failure::invalid(format!(
+                "work {} is parked and cannot admit a retry",
+                source.work_id
+            )),
+            classified_action(
+                "work reopen",
+                json!({"id": source.work_id, "reason": Value::Null}),
+                "record why the parked work is resuming before retrying",
                 forged_types::ActionClass::Repair,
             ),
         );
@@ -5211,14 +5260,112 @@ fn next_subject(revision: Value) -> Value {
     json!({"revision": revision})
 }
 
-fn next_entry_lifecycle(entry: &Value) -> String {
+fn next_entry_work_id(entry: &Value) -> Option<&str> {
     entry
-        .get("outcome")
+        .get("workId")
+        .or_else(|| entry.get("beadId"))
         .and_then(Value::as_str)
-        .or_else(|| entry.pointer("/plan/status").and_then(Value::as_str))
-        .or_else(|| entry.get("state").and_then(Value::as_str))
-        .unwrap_or("unknown")
-        .to_owned()
+        .or_else(|| {
+            (entry.get("source").and_then(Value::as_str) == Some("live-plan"))
+                .then(|| entry.get("id").and_then(Value::as_str))
+                .flatten()
+        })
+}
+
+/// Compatibility identity for durable runs whose pre-ledger work item is no
+/// longer readable. It enters the same lifecycle derivation as native work;
+/// run and attention evidence still determine every post-draft stage.
+fn next_lifecycle_fallback(
+    work_id: &str,
+    work: &[crate::core::work_types::IssueSummary],
+    entries: &[Value],
+    captured_at: &str,
+) -> Option<WorkItemSnapshot> {
+    if let Some(issue) = work.iter().find(|issue| issue.id == work_id) {
+        return Some(WorkItemSnapshot {
+            work_id: issue.id.clone(),
+            kind: if issue.issue_type == "epic" {
+                WorkKind::Epic
+            } else {
+                WorkKind::Task
+            },
+            status: WorkStatus::parse(&issue.status).unwrap_or(WorkStatus::Open),
+            priority: issue.priority,
+            assignee: issue.assignee.clone(),
+            metadata: issue.metadata.clone(),
+            revision: issue
+                .revision
+                .as_deref()
+                .and_then(|revision| revision.parse().ok())
+                .unwrap_or(0),
+            spec: WorkSpecFields {
+                title: issue.title.clone(),
+                description: issue.description.clone(),
+                acceptance_criteria: issue.acceptance_criteria.clone(),
+                design: issue.design.clone(),
+                notes: issue.notes.clone(),
+            },
+            created_at: issue
+                .updated_at
+                .clone()
+                .unwrap_or_else(|| captured_at.to_owned()),
+            updated_at: issue
+                .updated_at
+                .clone()
+                .unwrap_or_else(|| captured_at.to_owned()),
+        });
+    }
+    let entry = entries
+        .iter()
+        .find(|entry| next_entry_work_id(entry) == Some(work_id))?;
+    let revision = next_entry_revision(entry);
+    let revision = revision
+        .as_i64()
+        .or_else(|| revision.as_str().and_then(|revision| revision.parse().ok()))
+        .unwrap_or(0);
+    let status = entry
+        .pointer("/plan/status")
+        .or_else(|| entry.pointer("/claimHealth/status"))
+        .and_then(Value::as_str)
+        .and_then(WorkStatus::parse)
+        .unwrap_or(WorkStatus::Open);
+    let title = entry
+        .pointer("/titleSource/value")
+        .or_else(|| entry.get("title"))
+        .and_then(Value::as_str)
+        .unwrap_or(work_id)
+        .to_owned();
+    let mut metadata = BTreeMap::new();
+    if let Some(repository) = entry.get("repository").and_then(Value::as_str) {
+        metadata.insert("repository".to_owned(), repository.to_owned());
+    }
+    let updated_at = entry
+        .get("updatedAt")
+        .and_then(Value::as_str)
+        .unwrap_or(captured_at)
+        .to_owned();
+    Some(WorkItemSnapshot {
+        work_id: work_id.to_owned(),
+        kind: if entry.get("kind").and_then(Value::as_str) == Some("epic") {
+            WorkKind::Epic
+        } else {
+            WorkKind::Task
+        },
+        status,
+        priority: entry.get("priority").and_then(Value::as_i64),
+        assignee: None,
+        metadata,
+        revision,
+        spec: WorkSpecFields {
+            title,
+            description: String::new(),
+            acceptance_criteria: String::new(),
+            design: String::new(),
+            notes: String::new(),
+        },
+        created_at: updated_at.clone(),
+        updated_at,
+    })
 }
 
 fn next_entry_health(entry: Option<&Value>, fallback: &str) -> Value {
@@ -5379,7 +5526,7 @@ struct NextRow<'a> {
     age_min: u64,
     spend_usd: Value,
     actions: &'a [Value],
-    lifecycle: String,
+    lifecycle: Value,
     health: Value,
     revision: Value,
 }
@@ -5409,6 +5556,7 @@ fn next_attention_row(
     entries: &[Value],
     captured_at: &str,
     expand_next: bool,
+    lifecycles: &BTreeMap<String, super::lifecycle::Lifecycle>,
 ) -> Result<Value, Failure> {
     let kind = match item.subject_kind {
         AttentionSubjectKind::Run => "run",
@@ -5426,6 +5574,10 @@ fn next_attention_row(
     let actions = serde_json::to_value(&item.next_actions)
         .map_err(|error| Failure::internal(format!("serializing next actions: {error}")))?;
     let actions = next_actions(&actions);
+    let lifecycle = entry
+        .and_then(next_entry_work_id)
+        .and_then(|work_id| lifecycles.get(work_id))
+        .ok_or_else(|| Failure::internal("attention next row omitted work lifecycle"))?;
     let mut row = next_row(NextRow {
         id: &item.subject_id,
         kind,
@@ -5435,7 +5587,7 @@ fn next_attention_row(
         age_min: next_age_min(captured_at, Some(&item.updated_at)),
         spend_usd: next_spend(entries, &item.subject_id, kind),
         actions: &actions,
-        lifecycle: entry.map_or_else(|| "unknown".to_owned(), next_entry_lifecycle),
+        lifecycle: json!(lifecycle),
         health: next_entry_health(entry, "unknown"),
         revision: entry.map_or(Value::Null, next_entry_revision),
     });
@@ -5450,6 +5602,7 @@ fn next_running_row(
     snapshot: &InventorySnapshot,
     entries: &[Value],
     captured_at: &str,
+    lifecycles: &BTreeMap<String, super::lifecycle::Lifecycle>,
 ) -> Result<Value, Failure> {
     let id = entry
         .get("id")
@@ -5473,6 +5626,9 @@ fn next_running_row(
         });
     let actions = next_actions(&operations_next_actions(entry));
     let kind = next_entry_kind(entry);
+    let lifecycle = next_entry_work_id(entry)
+        .and_then(|work_id| lifecycles.get(work_id))
+        .ok_or_else(|| Failure::internal("running next row omitted work lifecycle"))?;
     let mut row = next_row(NextRow {
         id,
         kind,
@@ -5484,7 +5640,7 @@ fn next_running_row(
         ),
         spend_usd: next_spend(entries, id, kind),
         actions: &actions,
-        lifecycle: "running".to_owned(),
+        lifecycle: json!(lifecycle),
         health: next_entry_health(Some(entry), "running"),
         revision: next_entry_revision(entry),
     });
@@ -5495,12 +5651,20 @@ fn next_running_row(
     Ok(row)
 }
 
-fn next_landed_row(entry: &Value, entries: &[Value], captured_at: &str) -> Result<Value, Failure> {
+fn next_landed_row(
+    entry: &Value,
+    entries: &[Value],
+    captured_at: &str,
+    lifecycles: &BTreeMap<String, super::lifecycle::Lifecycle>,
+) -> Result<Value, Failure> {
     let id = entry
         .get("id")
         .and_then(Value::as_str)
         .ok_or_else(|| Failure::internal("landed next row has no id"))?;
     let kind = next_entry_kind(entry);
+    let lifecycle = next_entry_work_id(entry)
+        .and_then(|work_id| lifecycles.get(work_id))
+        .ok_or_else(|| Failure::internal("landed next row omitted work lifecycle"))?;
     let mut row = next_row(NextRow {
         id,
         kind,
@@ -5509,7 +5673,7 @@ fn next_landed_row(entry: &Value, entries: &[Value], captured_at: &str) -> Resul
         age_min: next_age_min(captured_at, entry.get("updatedAt").and_then(Value::as_str)),
         spend_usd: next_spend(entries, id, kind),
         actions: &[],
-        lifecycle: "landed".to_owned(),
+        lifecycle: json!(lifecycle),
         health: next_entry_health(Some(entry), "terminal"),
         revision: next_entry_revision(entry),
     });
@@ -5710,7 +5874,7 @@ pub async fn next(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
         enrich_operations_facts(&snapshot, &attention_json, &mut entries)?;
         let work_read = match claim_error {
             Some(error) => Err(error),
-            None => Ok(work_summaries),
+            None => Ok(work_summaries.clone()),
         };
         let _queue = operator_queue(&snapshot, &mut entries, &attention_json, work_read);
 
@@ -5741,35 +5905,6 @@ pub async fn next(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
             .iter()
             .filter_map(|entry| Some((entry.get("id")?.as_str()?, entry)))
             .collect::<BTreeMap<_, _>>();
-
-        let expand_decisions = section == Some(NextSection::Decisions);
-        let mut decisions = Vec::new();
-        let mut symptoms = Vec::new();
-        for item in attention_items.iter().filter(|item| {
-            item.state == AttentionState::Open
-                && scoped_ids.contains(item.subject_id.as_str())
-                && !parked_ids.contains(item.subject_id.as_str())
-        }) {
-            let row = next_attention_row(
-                item,
-                entry_by_id.get(item.subject_id.as_str()).copied(),
-                &entries,
-                &captured_at,
-                expand_decisions,
-            )?;
-            match super::attention::classification(item.condition) {
-                super::attention::AttentionClass::Decision => decisions.push(row),
-                super::attention::AttentionClass::Symptom => symptoms.push(row),
-            }
-        }
-
-        let mut running = entries
-            .iter()
-            .filter(|entry| entry.get("liveSeats").and_then(Value::as_u64).unwrap_or(0) > 0)
-            .map(|entry| next_running_row(entry, &snapshot, &entries, &captured_at))
-            .collect::<Result<Vec<_>, _>>()?;
-        running.sort_by(|left, right| left["id"].as_str().cmp(&right["id"].as_str()));
-
         let (ready_items, ready_total, ready_has_more) =
             if let Some(scope_ids) = epic_scope_work_ids.as_ref() {
                 let items = on_ledger(&ctx.ledger, |ledger| ledger.ready_work_items()).await?;
@@ -5797,32 +5932,74 @@ pub async fn next(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
                 let total = usize::try_from(page.total).unwrap_or(usize::MAX);
                 (page.items, total, page.has_more)
             };
+        let lifecycle_work_ids = entries
+            .iter()
+            .filter_map(next_entry_work_id)
+            .chain(ready_items.iter().map(|item| item.work_id.as_str()))
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let mut lifecycle_items = on_ledger(&ctx.ledger, {
+            let lifecycle_work_ids = lifecycle_work_ids.clone();
+            move |ledger| ledger.work_items(&lifecycle_work_ids)
+        })
+        .await?;
+        let native_ids = lifecycle_items
+            .iter()
+            .map(|item| item.work_id.clone())
+            .collect::<BTreeSet<_>>();
+        lifecycle_items.extend(
+            lifecycle_work_ids
+                .iter()
+                .filter(|work_id| !native_ids.contains(work_id.as_str()))
+                .filter_map(|work_id| {
+                    next_lifecycle_fallback(work_id, &work_summaries, &entries, &captured_at)
+                }),
+        );
+        let lifecycles = super::lifecycle::project(ctx, &lifecycle_items, &attention_items).await?;
+
+        let expand_decisions = section == Some(NextSection::Decisions);
+        let mut decisions = Vec::new();
+        let mut symptoms = Vec::new();
+        for item in attention_items.iter().filter(|item| {
+            item.state == AttentionState::Open
+                && scoped_ids.contains(item.subject_id.as_str())
+                && !parked_ids.contains(item.subject_id.as_str())
+        }) {
+            let row = next_attention_row(
+                item,
+                entry_by_id.get(item.subject_id.as_str()).copied(),
+                &entries,
+                &captured_at,
+                expand_decisions,
+                &lifecycles,
+            )?;
+            match super::attention::classification(item.condition) {
+                super::attention::AttentionClass::Decision => decisions.push(row),
+                super::attention::AttentionClass::Symptom => symptoms.push(row),
+            }
+        }
+
+        let mut running = entries
+            .iter()
+            .filter(|entry| entry.get("liveSeats").and_then(Value::as_u64).unwrap_or(0) > 0)
+            .map(|entry| next_running_row(entry, &snapshot, &entries, &captured_at, &lifecycles))
+            .collect::<Result<Vec<_>, _>>()?;
+        running.sort_by(|left, right| left["id"].as_str().cmp(&right["id"].as_str()));
+
         let scope_plan_truncated = if epic_id.is_some() {
             false
         } else {
             plan_truncated
         };
-        let ready_ids = ready_items
-            .iter()
-            .map(|item| item.work_id.clone())
-            .collect::<Vec<_>>();
-        let critiqued = on_ledger(&ctx.ledger, move |ledger| {
-            ledger.work_items_with_note_kind(&ready_ids, WorkNoteKind::Recommendation)
-        })
-        .await?;
         let ready = ready_items
             .into_iter()
             .map(|item| {
-                let (lifecycle, evidence) = if item.status == WorkStatus::Blocked {
-                    ("held", "status: blocked")
-                } else if item.spec.notes.contains("[ ]") {
-                    ("held", "notes: unchecked checkbox")
-                } else if critiqued.contains(&item.work_id) {
-                    ("critiqued", "recommendation note exists")
-                } else {
-                    ("drafted", "no recommendation note")
-                };
-                let mut row = next_row(NextRow {
+                let lifecycle = lifecycles
+                    .get(&item.work_id)
+                    .ok_or_else(|| Failure::internal("ready next row omitted work lifecycle"))?;
+                Ok(next_row(NextRow {
                     id: &item.work_id,
                     kind: item.kind.as_str(),
                     title: next_title(&item.spec.title),
@@ -5830,14 +6007,12 @@ pub async fn next(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
                     age_min: next_age_min(&captured_at, Some(&item.updated_at)),
                     spend_usd: json!(0.0),
                     actions: &[],
-                    lifecycle: lifecycle.to_owned(),
+                    lifecycle: json!(lifecycle),
                     health: json!("unsubmitted"),
                     revision: json!(item.revision),
-                });
-                row["basis"] = json!(format!("{evidence}; adjudicated: unknown-until-.8"));
-                row
+                }))
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, Failure>>()?;
 
         let mut landed = entries
             .iter()
@@ -5845,7 +6020,7 @@ pub async fn next(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
             .filter(|entry| {
                 next_within_last_day(&captured_at, entry.get("updatedAt").and_then(Value::as_str))
             })
-            .map(|entry| next_landed_row(entry, &entries, &captured_at))
+            .map(|entry| next_landed_row(entry, &entries, &captured_at, &lifecycles))
             .collect::<Result<Vec<_>, _>>()?;
         landed.sort_by(|left, right| left["ageMin"].as_u64().cmp(&right["ageMin"].as_u64()));
 
@@ -7238,16 +7413,31 @@ mod tests {
 
         let legacy = json!({
             "id": "legacy-landed",
+            "beadId": "landed-work",
             "delivery": {"pr": Value::Null},
             "pr": {"number": 260},
             "updatedAt": "2026-09-03T11:00:00Z",
             "costUsdKnown": 0.0,
             "rowsMissingCost": 0,
         });
+        let lifecycles = BTreeMap::from([(
+            "landed-work".to_owned(),
+            crate::core::lifecycle::Lifecycle {
+                stage: crate::core::lifecycle::LifecycleStage::Landed,
+                since: "2026-09-03T11:00:00Z".to_owned(),
+                basis: crate::core::lifecycle::LifecycleBasis {
+                    revision: 1,
+                    note_ids: Vec::new(),
+                    run_id: Some("legacy-landed".to_owned()),
+                    attention_id: None,
+                },
+            },
+        )]);
         let row = next_landed_row(
             &legacy,
             std::slice::from_ref(&legacy),
             "2026-09-03T12:00:00Z",
+            &lifecycles,
         )
         .expect("legacy landed row");
         assert_eq!(row["pr"], json!(260));

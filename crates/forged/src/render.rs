@@ -227,7 +227,7 @@ fn render_next_row(lines: &mut Vec<String>, section: &str, row: &Value) {
 
     let age = row.get("ageMin").and_then(Value::as_u64).unwrap_or(0);
     let lifecycle = row
-        .get("lifecycle")
+        .pointer("/lifecycle/stage")
         .and_then(Value::as_str)
         .unwrap_or("unknown");
     let spend = || {
@@ -248,15 +248,11 @@ fn render_next_row(lines: &mut Vec<String>, section: &str, row: &Value) {
         }
         "ready" => {
             push_line(lines, format!("    age {age}m  lifecycle {lifecycle}"));
-            push_line(
-                lines,
-                format!(
-                    "    basis {}",
-                    row.get("basis")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown")
-                ),
-            );
+            let revision = row
+                .pointer("/lifecycle/basis/revision")
+                .map(scalar)
+                .unwrap_or_else(|| "unknown".to_owned());
+            push_line(lines, format!("    basis revision {revision}"));
         }
         "landed" => {
             let pr = row.get("pr").map(scalar).unwrap_or_else(|| "—".to_owned());
@@ -617,6 +613,7 @@ fn render_work_show(result: &Value, now: &str, full: bool) -> String {
         }
     }
     push_field(&mut lines, "notes count", result.get("notesCount"));
+    push_field(&mut lines, "lifecycle", result.pointer("/lifecycle/stage"));
     let dependencies = result
         .get("dependencies")
         .and_then(Value::as_array)
@@ -729,7 +726,7 @@ mod tests {
                     "decisions": [{
                         "id": "ore-080", "title": "Choose the release",
                         "state": "awaiting_operator", "ageMin": 12,
-                        "spendUsd": 1.25, "lifecycle": "reviewed",
+                        "spendUsd": 1.25, "lifecycle": {"stage": "reviewed", "since": "2026-09-03T10:00:00Z", "basis": {"revision": 1}},
                         "should": {"verb": "epic resolve", "args": {"id": "ore-080"}},
                         "canCount": 1
                     }],
@@ -737,18 +734,17 @@ mod tests {
                         "id": "run-1", "title": "Build the bounded surface",
                         "state": "implementation", "stage": "implementation",
                         "seat": "codex:worker-1", "ageMin": 7,
-                        "spendUsd": 0.5, "lifecycle": "running",
+                        "spendUsd": 0.5, "lifecycle": {"stage": "dispatched", "since": "2026-09-03T10:00:00Z", "basis": {"revision": 1, "runId": "run-1"}},
                         "should": null, "canCount": 0
                     }],
                     "ready": [{
                         "id": "ore-081", "title": "Follow-up slice", "state": "open",
-                        "ageMin": 3, "lifecycle": "critiqued",
-                        "basis": "recommendation note exists; adjudicated: unknown-until-.8",
+                        "ageMin": 3, "lifecycle": {"stage": "critiqued", "since": "2026-09-03T10:00:00Z", "basis": {"revision": 1, "noteIds": ["note-1"]}},
                         "should": null, "canCount": 0
                     }],
                     "landed": [{
                         "id": "run-2", "title": "Finished slice", "state": "landed",
-                        "ageMin": 60, "lifecycle": "landed", "pr": 258,
+                        "ageMin": 60, "lifecycle": {"stage": "landed", "since": "2026-09-03T10:00:00Z", "basis": {"revision": 1, "runId": "run-2"}}, "pr": 258,
                         "should": null, "canCount": 0
                     }]
                 },
