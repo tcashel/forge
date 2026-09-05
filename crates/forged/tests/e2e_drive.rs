@@ -1324,7 +1324,7 @@ fn resolving_post_apply_implementation_failure_uses_ordinary_child_reset() {
         "defer while the implementation decision is pending",
     ]);
     assert_eq!(code, 0, "park held child: {parked}");
-    assert_eq!(parked["work"]["status"], json!("deferred"));
+    assert_eq!(parked["result"]["work"]["status"], json!("deferred"));
 
     let (code, resolved) = env.forged(&[
         "epic",

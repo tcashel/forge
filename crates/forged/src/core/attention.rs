@@ -2118,10 +2118,10 @@ fn project(input: ProjectionInput<'_>) -> Result<Vec<AttentionItemV1>, Failure> 
     }
     let mut projected = Vec::new();
     for ((subject_id, condition), mut sources) in buckets {
-        if work_by_subject
-            .get(subject_id.as_str())
-            .is_some_and(|work_id| parked_work.contains(work_id))
-        {
+        // Parking hides the work item's own plan-level attention. A run or
+        // epic condition on a parked item stays visible: the operator still
+        // has to settle it, and a settlement refusal must not vanish.
+        if parked_work.contains(subject_id.as_str()) {
             continue;
         }
         let Some(subject) = subject_metadata(&input, &subject_id) else {
