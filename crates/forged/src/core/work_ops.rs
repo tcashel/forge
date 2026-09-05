@@ -15,15 +15,16 @@ use forged_ledger::{
     WORK_NOTE_DEFAULT_LIMIT, WORK_NOTE_MAX_LIMIT,
 };
 use forged_types::{
-    canonical_json_bytes, parse_canonical, request_sha256, ErrorCode, ExecutionApprovalV1,
-    OperationRequest, OperationResponse, SpecRecommendationsV1, EXECUTION_APPROVAL_SCHEMA_V1,
+    canonical_json_bytes, parse_canonical, request_sha256, AdjudicationV1, DecisionV1, ErrorCode,
+    ExecutionApprovalV1, OperationRequest, OperationResponse, RetroV1, SpecRecommendationsV1,
+    ADJUDICATION_SCHEMA_V1, DECISION_SCHEMA_V1, EXECUTION_APPROVAL_SCHEMA_V1, RETRO_SCHEMA_V1,
     SPEC_RECOMMENDATIONS_SCHEMA_V1,
 };
 use serde_json::{json, Value};
 
 use crate::core::{
     default_key, derive_key, err_response, fenced, on_ledger, param_opt_i64_strict, param_opt_str,
-    param_opt_str_strict, param_str, Ctx, Failure,
+    param_opt_str_strict, param_str, remedy_response, Ctx, Failure,
 };
 
 const WORK_READY_DEFAULT_LIMIT: u64 = 100;
@@ -101,36 +102,39 @@ fn snapshot_json(snapshot: &WorkItemSnapshot, next_steps: &[&str]) -> Value {
 
 pub(crate) fn projection_actions(
     snapshot: &WorkItemSnapshot,
+    lifecycle: super::lifecycle::LifecycleStage,
 ) -> Vec<forged_types::OperationActionV1> {
     let actions = match snapshot.status {
         WorkStatus::Open => {
-            let repository = snapshot.metadata.get("repository");
-            vec![
-                (
-                    "run start",
-                    json!({
-                        "work": snapshot.work_id,
-                        "repo": repository,
-                    }),
-                    if repository.is_some() {
-                        "start a run once the work specification is complete"
-                    } else {
-                        "choose the repository before starting the run"
-                    },
-                    forged_types::ActionClass::Can,
-                ),
-                (
-                    "work update",
+            let mut actions = Vec::new();
+            if matches!(
+                lifecycle,
+                super::lifecycle::LifecycleStage::Adjudicated
+                    | super::lifecycle::LifecycleStage::Ready
+            ) {
+                actions.push((
+                    "run dispatch",
                     json!({
                         "id": snapshot.work_id,
-                        "expectedRevision": snapshot.revision,
-                        "description": Value::Null,
+                        "approvedBy": Value::Null,
+                        "basis": Value::Null,
                     }),
-                    "supply at least one spec field or priority under the \
-                     current revision guard",
-                    forged_types::ActionClass::Can,
-                ),
-            ]
+                    "bind the approving actor and basis for this adjudicated revision",
+                    forged_types::ActionClass::Should,
+                ));
+            }
+            actions.push((
+                "work update",
+                json!({
+                    "id": snapshot.work_id,
+                    "expectedRevision": snapshot.revision,
+                    "description": Value::Null,
+                }),
+                "supply at least one spec field or priority under the \
+                 current revision guard",
+                forged_types::ActionClass::Can,
+            ));
+            actions
         }
         WorkStatus::Blocked | WorkStatus::Closed => vec![(
             "work reopen",
@@ -138,7 +142,13 @@ pub(crate) fn projection_actions(
             "reopen the work item before scheduling it",
             forged_types::ActionClass::Repair,
         )],
-        WorkStatus::InProgress | WorkStatus::Deferred => Vec::new(),
+        WorkStatus::Deferred => vec![(
+            "work reopen",
+            json!({"id": snapshot.work_id, "reason": Value::Null}),
+            "record why the parked work is resuming",
+            forged_types::ActionClass::Repair,
+        )],
+        WorkStatus::InProgress => Vec::new(),
     };
     actions
         .into_iter()
@@ -259,7 +269,8 @@ fn actor_of(params: &serde_json::Map<String, Value>) -> Result<String, Failure> 
 fn work_note_kind(value: &str) -> Result<WorkNoteKind, Failure> {
     WorkNoteKind::parse(value).ok_or_else(|| {
         Failure::invalid(format!(
-            "work note kind {value:?} is not one of comment, critique, recommendation, approval"
+            "work note kind {value:?} is not one of comment, critique, recommendation, approval, \
+             adjudication, decision, retro"
         ))
     })
 }
@@ -277,32 +288,35 @@ fn work_note_wire_string(
     }
 }
 
-fn canonical_work_note_body(
-    params: &serde_json::Map<String, Value>,
-) -> Result<(Value, String), Failure> {
+fn parse_work_note_body(params: &serde_json::Map<String, Value>) -> Result<Value, Failure> {
     let raw = work_note_wire_string(params, "bodyJson")?
         .ok_or_else(|| Failure::invalid("bodyJson is required: pass JSON from --body-file"))?;
-    let value = parse_canonical(&raw).map_err(|error| {
+    parse_canonical(&raw).map_err(|error| {
+        Failure::invalid(format!(
+            "work note bodyJson must be JSON without duplicate keys or non-integer numbers: \
+             {error}"
+        ))
+    })
+}
+
+fn canonical_work_note_body(value: &Value) -> Result<String, Failure> {
+    let bytes = canonical_json_bytes(value).map_err(|error| {
         Failure::invalid(format!(
             "work note bodyJson must be JSON without duplicate keys or non-integer numbers: \
              {error}"
         ))
     })?;
-    let bytes = canonical_json_bytes(&value).map_err(|error| {
-        Failure::invalid(format!(
-            "work note bodyJson must be JSON without duplicate keys or non-integer numbers: \
-             {error}"
-        ))
-    })?;
-    let body = String::from_utf8(bytes)
-        .map_err(|error| Failure::internal(format!("canonical bodyJson is not UTF-8: {error}")))?;
-    Ok((value, body))
+    String::from_utf8(bytes)
+        .map_err(|error| Failure::internal(format!("canonical bodyJson is not UTF-8: {error}")))
 }
 
 fn work_note_schema(kind: WorkNoteKind, supplied: Option<String>) -> Result<String, Failure> {
     let expected = match kind {
         WorkNoteKind::Recommendation => Some(SPEC_RECOMMENDATIONS_SCHEMA_V1),
         WorkNoteKind::Approval => Some(EXECUTION_APPROVAL_SCHEMA_V1),
+        WorkNoteKind::Adjudication => Some(ADJUDICATION_SCHEMA_V1),
+        WorkNoteKind::Decision => Some(DECISION_SCHEMA_V1),
+        WorkNoteKind::Retro => Some(RETRO_SCHEMA_V1),
         WorkNoteKind::Comment | WorkNoteKind::Critique => None,
     };
     match (expected, supplied) {
@@ -327,6 +341,9 @@ fn validate_work_note_contract(
             SpecRecommendationsV1::parse_value(body.clone()).map(|_| ())
         }
         WorkNoteKind::Approval => ExecutionApprovalV1::parse_value(body.clone()).map(|_| ()),
+        WorkNoteKind::Adjudication => AdjudicationV1::parse_value(body.clone()).map(|_| ()),
+        WorkNoteKind::Decision => DecisionV1::parse_value(body.clone()).map(|_| ()),
+        WorkNoteKind::Retro => RetroV1::parse_value(body.clone()).map(|_| ()),
         WorkNoteKind::Comment | WorkNoteKind::Critique => return Ok(()),
     };
     result.map_err(|error| {
@@ -608,6 +625,243 @@ pub async fn work_promote(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
     }
 }
 
+fn work_remedy(verb: &str, args: Value, reason: &str) -> forged_types::RemedyV1 {
+    let Value::Object(args) = args else {
+        unreachable!("work remedy args are objects")
+    };
+    forged_types::RemedyV1::from(forged_types::OperationActionV1 {
+        verb: verb.to_owned(),
+        args,
+        reason: reason.to_owned(),
+        class: forged_types::ActionClass::Repair,
+    })
+}
+
+/// `work_adjudicate` — one operation-atomic revision/note/status write.
+pub async fn work_adjudicate(ctx: &Ctx, req: &mut OperationRequest) -> OperationResponse {
+    let id = match param_str(&req.params, "id") {
+        Ok(value) if !value.trim().is_empty() => value.to_owned(),
+        _ => {
+            return err_response(
+                &derive_key("work_adjudicate", None, None, None),
+                &Failure::invalid("id is required"),
+            )
+        }
+    };
+    let expected = match expected_revision_of(&req.params) {
+        Ok(expected) => expected,
+        Err(error) => {
+            return err_response(
+                &derive_key("work_adjudicate", Some(&id), None, None),
+                &error,
+            )
+        }
+    };
+    let patch = match WorkSpecPatch::parse(&req.params, true) {
+        Ok(patch) => patch,
+        Err(error) => {
+            return err_response(
+                &derive_key("work_adjudicate", Some(&id), None, Some(expected)),
+                &error,
+            )
+        }
+    };
+    let body = match parse_work_note_body(&req.params) {
+        Ok(body) => body,
+        Err(error) => {
+            return err_response(
+                &derive_key("work_adjudicate", Some(&id), None, Some(expected)),
+                &Failure::invalid(format!(
+                    "work adjudication payload violates field bodyJson: {}",
+                    error.message
+                )),
+            )
+        }
+    };
+    let adjudication = match AdjudicationV1::parse_value(body.clone()) {
+        Ok(adjudication) => adjudication,
+        Err(error) => {
+            return err_response(
+                &derive_key("work_adjudicate", Some(&id), None, Some(expected)),
+                &Failure::invalid(format!("work adjudication payload violates {error}")),
+            )
+        }
+    };
+    if adjudication.work_item != id {
+        return err_response(
+            &derive_key("work_adjudicate", Some(&id), None, Some(expected)),
+            &Failure::invalid(format!(
+                "adjudication workItem {:?} does not match {id:?}",
+                adjudication.work_item
+            )),
+        );
+    }
+    let body_json = match canonical_work_note_body(&body) {
+        Ok(body) => body,
+        Err(error) => {
+            return err_response(
+                &derive_key("work_adjudicate", Some(&id), None, Some(expected)),
+                &error,
+            )
+        }
+    };
+    let current = {
+        let id = id.clone();
+        on_ledger(&ctx.ledger, move |ledger| ledger.work_item(&id)).await
+    };
+    let current = match current {
+        Ok(Some(current)) => current,
+        Ok(None) => {
+            return err_response(
+                &derive_key("work_adjudicate", Some(&id), None, Some(expected)),
+                &Failure::invalid(format!("work item {id:?} does not exist")),
+            )
+        }
+        Err(error) => {
+            return err_response(
+                &derive_key("work_adjudicate", Some(&id), None, Some(expected)),
+                &error,
+            )
+        }
+    };
+    let spec = patch.apply(current.spec);
+    req.params.insert("id".to_owned(), json!(id));
+    req.params
+        .insert("expectedRevision".to_owned(), json!(expected));
+    req.params
+        .insert("actor".to_owned(), json!(adjudication.actor));
+    req.params.insert("bodyJson".to_owned(), json!(body_json));
+    if crate::core::key_absent(req) {
+        let hash = match request_sha256(req) {
+            Ok(hash) => hash,
+            Err(error) => {
+                return err_response(
+                    &derive_key("work_adjudicate", Some(&id), None, Some(expected)),
+                    &Failure::invalid(format!("params cannot be canonicalized: {error}")),
+                )
+            }
+        };
+        default_key(req, format!("op:work_adjudicate:{id}:{expected}:{hash}"));
+    }
+    let note = NewWorkNote {
+        work_id: id.clone(),
+        kind: WorkNoteKind::Adjudication,
+        schema: ADJUDICATION_SCHEMA_V1.to_owned(),
+        actor: adjudication.actor,
+        body_json,
+    };
+    let key = req.idempotency_key.clone();
+    match on_ledger(&ctx.ledger, {
+        let request = req.clone();
+        let id = id.clone();
+        move |ledger| {
+            ledger.apply_work_adjudicate_operation(&request, &id, expected, spec, note, || {
+                crate::failpoint::hit("work.adjudicate.revision.after")
+            })
+        }
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(error) if error.code == ErrorCode::WorkLeaseHeld => remedy_response(
+            &key,
+            &error,
+            work_remedy(
+                "run status",
+                json!({"run": Value::Null}),
+                "inspect the nonterminal run or custody before adjudicating",
+            ),
+        ),
+        Err(error) if error.message.contains("is closed") => remedy_response(
+            &key,
+            &error,
+            work_remedy(
+                "work reopen",
+                json!({"id": id}),
+                "reopen the closed work item before adjudicating",
+            ),
+        ),
+        Err(error) => err_response(&key, &error),
+    }
+}
+
+/// `work_park` — defer one idle work item with a typed park decision.
+pub async fn work_park(ctx: &Ctx, req: &mut OperationRequest) -> OperationResponse {
+    let id = match param_str(&req.params, "id") {
+        Ok(value) if !value.trim().is_empty() => value.to_owned(),
+        _ => {
+            return err_response(
+                &derive_key("work_park", None, None, None),
+                &Failure::invalid("id is required"),
+            )
+        }
+    };
+    let reason = match param_opt_str_strict(&req.params, "reason") {
+        Ok(Some(reason)) if !reason.trim().is_empty() => reason.to_owned(),
+        _ => {
+            return err_response(
+                &derive_key("work_park", Some(&id), None, None),
+                &Failure::invalid("reason is required and must be non-empty"),
+            )
+        }
+    };
+    let actor = match actor_of(&req.params) {
+        Ok(actor) => actor,
+        Err(error) => return err_response(&derive_key("work_park", Some(&id), None, None), &error),
+    };
+    req.params.insert("actor".to_owned(), json!(actor));
+    if crate::core::key_absent(req) {
+        let hash = match request_sha256(req) {
+            Ok(hash) => hash,
+            Err(error) => {
+                return err_response(
+                    &derive_key("work_park", Some(&id), None, None),
+                    &Failure::invalid(format!("params cannot be canonicalized: {error}")),
+                )
+            }
+        };
+        default_key(req, format!("op:work_park:{id}:{hash}"));
+    }
+    let key = req.idempotency_key.clone();
+    match on_ledger(&ctx.ledger, {
+        let request = req.clone();
+        let id = id.clone();
+        move |ledger| ledger.apply_work_park_operation(&request, &id, &actor, &reason)
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(error) if error.message.contains("has a running epic controller") => remedy_response(
+            &key,
+            &error,
+            work_remedy(
+                "epic pause",
+                json!({"epic": id, "reason": Value::Null}),
+                "pause the epic controller at its durable boundary before parking",
+            ),
+        ),
+        Err(error) if error.code == ErrorCode::WorkLeaseHeld => remedy_response(
+            &key,
+            &error,
+            work_remedy(
+                "run stop",
+                json!({"run": Value::Null, "outcome": Value::Null, "reason": Value::Null}),
+                "stop the nonterminal run and release custody before parking",
+            ),
+        ),
+        Err(error) if error.message.contains("is closed") => remedy_response(
+            &key,
+            &error,
+            work_remedy(
+                "work reopen",
+                json!({"id": id}),
+                "reopen the closed work item before parking it",
+            ),
+        ),
+        Err(error) => err_response(&key, &error),
+    }
+}
+
 /// `work_note_add` — append evidence about a spec without minting a spec
 /// revision. The note row and terminal idempotency receipt land atomically.
 pub async fn work_note_add(ctx: &Ctx, req: &mut OperationRequest) -> OperationResponse {
@@ -629,6 +883,20 @@ pub async fn work_note_add(ctx: &Ctx, req: &mut OperationRequest) -> OperationRe
             return err_response(&derive_key("work_note_add", Some(&id), None, None), &error)
         }
     };
+    if kind == WorkNoteKind::Approval {
+        let key = derive_key("work_note_add", Some(&id), Some(kind.as_str()), None);
+        return remedy_response(
+            &key,
+            &Failure::invalid(
+                "work note kind \"approval\" is retired; use run dispatch so approval and handoff are atomic",
+            ),
+            work_remedy(
+                "run dispatch",
+                json!({"id": id, "approvedBy": Value::Null, "basis": Value::Null}),
+                "bind the approving actor and basis, then dispatch this exact work revision",
+            ),
+        );
+    }
     let schema = match work_note_wire_string(&req.params, "schema")
         .and_then(|schema| work_note_schema(kind, schema))
     {
@@ -640,10 +908,17 @@ pub async fn work_note_add(ctx: &Ctx, req: &mut OperationRequest) -> OperationRe
             )
         }
     };
-    let (body, body_json) = match canonical_work_note_body(&req.params) {
+    let body = match parse_work_note_body(&req.params) {
         Ok(body) => body,
         Err(error) => {
-            let error = if matches!(kind, WorkNoteKind::Recommendation | WorkNoteKind::Approval) {
+            let error = if matches!(
+                kind,
+                WorkNoteKind::Recommendation
+                    | WorkNoteKind::Approval
+                    | WorkNoteKind::Adjudication
+                    | WorkNoteKind::Decision
+                    | WorkNoteKind::Retro
+            ) {
                 Failure::invalid(format!(
                     "work note {:?} payload for schema {schema:?} violates field bodyJson: {}",
                     kind.as_str(),
@@ -664,6 +939,15 @@ pub async fn work_note_add(ctx: &Ctx, req: &mut OperationRequest) -> OperationRe
             &error,
         );
     }
+    let body_json = match canonical_work_note_body(&body) {
+        Ok(body) => body,
+        Err(error) => {
+            return err_response(
+                &derive_key("work_note_add", Some(&id), Some(kind.as_str()), None),
+                &error,
+            )
+        }
+    };
     let actor = match work_note_wire_string(&req.params, "actor") {
         Ok(actor) => actor.unwrap_or_else(|| "operator".to_owned()),
         Err(error) => {
@@ -853,6 +1137,7 @@ enum WorkVerb {
     Reopen {
         id: String,
         actor: String,
+        reason: Option<String>,
     },
     Release {
         id: String,
@@ -881,9 +1166,11 @@ impl WorkVerb {
                 .await?;
                 Ok((snapshot, "work_reopen is the deliberate exit from closed"))
             }
-            WorkVerb::Reopen { id, actor } => {
-                let snapshot =
-                    on_ledger(&ctx.ledger, move |l| l.reopen_work_item(&id, &actor)).await?;
+            WorkVerb::Reopen { id, actor, reason } => {
+                let snapshot = on_ledger(&ctx.ledger, move |l| {
+                    l.reopen_work_item(&id, &actor, reason.as_deref())
+                })
+                .await?;
                 Ok((
                     snapshot,
                     "the item is schedulable once unblocked and unheld",
@@ -943,10 +1230,27 @@ pub async fn work_close(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespo
 /// `work_reopen` — status open from any state, custody untouched.
 pub async fn work_reopen(ctx: &Ctx, req: &mut OperationRequest) -> OperationResponse {
     let mut moved = req.clone();
-    one_id_verb(ctx, &mut moved, "work_reopen", |id, actor, _params| {
-        Ok(WorkVerb::Reopen { id, actor })
+    let mut response = one_id_verb(ctx, &mut moved, "work_reopen", |id, actor, params| {
+        let reason = param_opt_str_strict(&params, "reason")?.map(str::to_owned);
+        Ok(WorkVerb::Reopen { id, actor, reason })
     })
-    .await
+    .await;
+    if let Some(error) = response.error.as_mut() {
+        if error
+            .message
+            .contains("is parked; use work reopen --reason")
+        {
+            error.detail = Some(
+                serde_json::to_value(work_remedy(
+                    "work reopen",
+                    json!({"id": param_opt_str(&req.params, "id"), "reason": Value::Null}),
+                    "supply the reason for resuming this parked work item",
+                ))
+                .expect("forged.remedy/1 always serializes"),
+            );
+        }
+    }
+    response
 }
 
 /// `work_release` — clear custody under the actor CAS.
@@ -1023,10 +1327,17 @@ pub async fn work_show(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
             let id = id.clone();
             on_ledger(&ctx.ledger, move |l| l.work_dependencies(&id)).await?
         };
-        let notes_count = {
+        let note_counts = {
             let id = id.clone();
-            on_ledger(&ctx.ledger, move |l| l.work_note_count(&id)).await?
+            on_ledger(&ctx.ledger, move |l| l.work_note_counts(&id)).await?
         };
+        let notes_count = note_counts.values().sum::<u64>();
+        let attention = super::ops::all_attention(ctx).await?;
+        let lifecycle = super::lifecycle::project(ctx, std::slice::from_ref(&snapshot), &attention)
+            .await?
+            .remove(&snapshot.work_id)
+            .ok_or_else(|| Failure::internal("work lifecycle projection omitted its item"))?;
+        let next_actions = projection_actions(&snapshot, lifecycle.stage);
         Ok(forged_types::with_work_twins(json!({
             "subject": {
                 "id": snapshot.work_id,
@@ -1038,7 +1349,9 @@ pub async fn work_show(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
             "work": snapshot,
             "dependencies": deps,
             "notesCount": notes_count,
-            "nextActions": projection_actions(&snapshot),
+            "noteCounts": note_counts,
+            "lifecycle": lifecycle,
+            "nextActions": next_actions,
         })))
     })
     .await
@@ -1172,13 +1485,18 @@ pub async fn work_ready(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
         } else {
             None
         };
+        let attention = super::ops::all_attention(ctx).await?;
+        let lifecycles = super::lifecycle::project(ctx, &page.items, &attention).await?;
         let total = page.total;
         let ready = match detail {
             WorkReadyDetail::Summary => page
                 .items
                 .into_iter()
                 .map(|item| {
-                    json!({
+                    let lifecycle = lifecycles.get(&item.work_id).ok_or_else(|| {
+                        Failure::internal("work ready lifecycle projection omitted an item")
+                    })?;
+                    Ok(json!({
                         "subject": {
                             "id": item.work_id,
                             "kind": "work",
@@ -1193,13 +1511,17 @@ pub async fn work_ready(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
                         "priority": item.priority,
                         "repository": item.metadata.get("repository"),
                         "revision": item.revision,
-                    })
+                        "lifecycle": lifecycle,
+                    }))
                 })
-                .collect::<Vec<_>>(),
+                .collect::<Result<Vec<_>, Failure>>()?,
             WorkReadyDetail::Full => page
                 .items
                 .into_iter()
                 .map(|item| {
+                    let lifecycle = lifecycles.get(&item.work_id).ok_or_else(|| {
+                        Failure::internal("work ready lifecycle projection omitted an item")
+                    })?;
                     let subject = json!({
                         "id": item.work_id,
                         "kind": "work",
@@ -1209,9 +1531,10 @@ pub async fn work_ready(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
                     });
                     let mut value = json!(item);
                     value["subject"] = subject;
-                    value
+                    value["lifecycle"] = json!(lifecycle);
+                    Ok(value)
                 })
-                .collect::<Vec<_>>(),
+                .collect::<Result<Vec<_>, Failure>>()?,
         };
         let mut applied_filters = json!({
             "detail": detail.as_str(),

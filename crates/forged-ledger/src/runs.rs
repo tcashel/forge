@@ -21,9 +21,16 @@ use crate::types::{
     PolicyRevisionRow, RosterRevisionBatch, RosterRevisionRow, RunDefinitionRow, RunOutcome,
     RunRow, RunSettlement, RunState,
 };
+use crate::work::{canonical_work_note_body, insert_work_note_tx, NewWorkNote};
 use crate::work_identity::{
     get_work_identity_tx, identity_replay_matches, insert_work_identity_tx, legacy_run_identity,
 };
+
+struct FirstRunDispatchSeal {
+    generation: u32,
+    notes: Vec<NewWorkNote>,
+    event: Value,
+}
 
 pub(crate) fn run_row(row: &rusqlite::Row<'_>) -> Result<RunRow, rusqlite::Error> {
     let state = row.get::<_, String>(6)?;
@@ -74,7 +81,7 @@ pub(crate) const RUN_COLUMNS: &str = "run_id, bead_id, repo, base_ref, branch, p
 const EFFECTIVE_DEFINITION_COLUMNS: &str = "d.run_id, d.protocol_ref_json, d.profile_ref_json, \
     d.roster_ref_json, COALESCE(m.package_sha256, d.package_sha256), d.profile_sha256, \
     d.roster_sha256, COALESCE(m.package_json, d.package_json), d.compatibility_roster_json, \
-    d.created_at";
+    d.started_from_json, d.created_at";
 const EXECUTION_POLICY_MIGRATION: &str = "forged.run.execution-policy/1";
 const CONTROLLER_REVOKED: &str = "forged.controller.revoked";
 
@@ -204,6 +211,17 @@ fn append_controller_revocation_tx(
 }
 
 fn definition_row(row: &rusqlite::Row<'_>) -> Result<RunDefinitionRow, rusqlite::Error> {
+    let started_from_json = row.get::<_, Option<String>>(9)?;
+    let started_from = started_from_json
+        .map(|value| serde_json::from_str(&value))
+        .transpose()
+        .map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                9,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?;
     Ok(RunDefinitionRow {
         run_id: row.get(0)?,
         protocol_ref_json: row.get(1)?,
@@ -214,7 +232,8 @@ fn definition_row(row: &rusqlite::Row<'_>) -> Result<RunDefinitionRow, rusqlite:
         roster_sha256: row.get(6)?,
         package_json: row.get(7)?,
         compatibility_roster_json: row.get(8)?,
-        created_at: row.get(9)?,
+        started_from,
+        created_at: row.get(10)?,
     })
 }
 
@@ -542,6 +561,11 @@ impl Ledger {
             let (profile_ref_json, _) = canonical(&package.profile_ref)?;
             let (roster_ref_json, _) = canonical(&package.roster_ref)?;
             let (compatibility_roster_json, _) = canonical(&definition.compatibility_roster)?;
+            let started_from_json = definition
+                .started_from
+                .as_ref()
+                .map(|value| canonical(value).map(|(json, _)| json))
+                .transpose()?;
 
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let now = now_iso();
@@ -549,8 +573,8 @@ impl Ledger {
             tx.execute(
                 "INSERT INTO run_definitions (run_id, protocol_ref_json, profile_ref_json, \
                  roster_ref_json, package_sha256, profile_sha256, roster_sha256, package_json, \
-                 compatibility_roster_json, created_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                 compatibility_roster_json, started_from_json, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 rusqlite::params![
                     row.run_id,
                     protocol_ref_json,
@@ -561,6 +585,7 @@ impl Ledger {
                     roster_sha256,
                     package_json,
                     compatibility_roster_json,
+                    started_from_json,
                     now,
                 ],
             )?;
@@ -594,6 +619,72 @@ impl Ledger {
         spec_event: serde_json::Value,
         identity: WorkIdentityV1,
     ) -> Result<RunRow, LedgerError> {
+        self.create_run_with_identity_guarded(new_run, definition, spec_event, identity, None, None)
+    }
+
+    /// Atomically create the first run for one work item only when its current
+    /// revision is the revision whose lifecycle the caller authorized.
+    pub fn create_first_run_with_identity_at_revision(
+        &self,
+        new_run: NewRun,
+        definition: NewRunDefinition,
+        spec_event: serde_json::Value,
+        identity: WorkIdentityV1,
+        expected_work_revision: i64,
+    ) -> Result<RunRow, LedgerError> {
+        self.create_run_with_identity_guarded(
+            new_run,
+            definition,
+            spec_event,
+            identity,
+            Some(expected_work_revision),
+            None,
+        )
+    }
+
+    /// Atomically create a first run, bind its approval decisions to the
+    /// checked Work revision, and authorize generation zero. A failure in any
+    /// part rolls the complete dispatch seal back.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_first_run_with_identity_at_revision_authorizing(
+        &self,
+        new_run: NewRun,
+        definition: NewRunDefinition,
+        spec_event: serde_json::Value,
+        identity: WorkIdentityV1,
+        expected_work_revision: i64,
+        generation: u32,
+        notes: Vec<NewWorkNote>,
+        authorization_event: serde_json::Value,
+    ) -> Result<RunRow, LedgerError> {
+        self.create_run_with_identity_guarded(
+            new_run,
+            definition,
+            spec_event,
+            identity,
+            Some(expected_work_revision),
+            Some(FirstRunDispatchSeal {
+                generation,
+                notes,
+                event: authorization_event,
+            }),
+        )
+    }
+
+    fn create_run_with_identity_guarded(
+        &self,
+        new_run: NewRun,
+        definition: NewRunDefinition,
+        spec_event: serde_json::Value,
+        identity: WorkIdentityV1,
+        first_run_revision: Option<i64>,
+        mut dispatch_seal: Option<FirstRunDispatchSeal>,
+    ) -> Result<RunRow, LedgerError> {
+        if let Some(seal) = dispatch_seal.as_mut() {
+            for note in &mut seal.notes {
+                note.body_json = canonical_work_note_body(&note.body_json)?;
+            }
+        }
         self.submit(move |conn| {
             identity.validate_for_storage().map_err(|error| {
                 refused(
@@ -694,8 +785,53 @@ impl Ledger {
             let (profile_ref_json, _) = canonical(&package.profile_ref)?;
             let (roster_ref_json, _) = canonical(&package.roster_ref)?;
             let (compatibility_roster_json, _) = canonical(&definition.compatibility_roster)?;
+            let started_from_json = definition
+                .started_from
+                .as_ref()
+                .map(|value| canonical(value).map(|(json, _)| json))
+                .transpose()?;
 
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if let Some(expected_revision) = first_run_revision {
+                let current_revision = tx
+                    .query_row(
+                        "SELECT current_revision FROM work_items WHERE work_id = ?1",
+                        [&new_run.work_id],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .optional()?;
+                let Some(current_revision) = current_revision else {
+                    return Err(refused(
+                        ErrorCode::InvalidRequest,
+                        format!("work item {:?} does not exist", new_run.work_id),
+                    ));
+                };
+                if current_revision != expected_revision {
+                    return Err(refused(
+                        ErrorCode::WorkContention,
+                        format!(
+                            "work item {:?} revision moved: expected {expected_revision}, current {current_revision}",
+                            new_run.work_id
+                        ),
+                    ));
+                }
+                let existing_run = tx
+                    .query_row(
+                        "SELECT run_id FROM runs WHERE bead_id = ?1 ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                        [&new_run.work_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?;
+                if let Some(existing_run) = existing_run {
+                    return Err(refused(
+                        ErrorCode::WorkContention,
+                        format!(
+                            "work item {:?} already has run {existing_run:?}",
+                            new_run.work_id
+                        ),
+                    ));
+                }
+            }
             let run_id = new_run.run_id.as_str();
             let existing = {
                 let sql = format!("SELECT {RUN_COLUMNS} FROM runs WHERE run_id = ?1");
@@ -710,7 +846,7 @@ impl Ledger {
                     .query_row(
                         "SELECT run_id, protocol_ref_json, profile_ref_json, roster_ref_json, \
                          package_sha256, profile_sha256, roster_sha256, package_json, \
-                         compatibility_roster_json, created_at FROM run_definitions \
+                         compatibility_roster_json, started_from_json, created_at FROM run_definitions \
                          WHERE run_id = ?1",
                         [run_id],
                         definition_row,
@@ -725,6 +861,7 @@ impl Ledger {
                         && stored.roster_sha256 == roster_sha256
                         && stored.package_json == package_json
                         && stored.compatibility_roster_json == compatibility_roster_json
+                        && stored.started_from == definition.started_from
                 });
                 let revision_matches: bool = tx.query_row(
                     "SELECT EXISTS(SELECT 1 FROM roster_revisions WHERE run_id = ?1 \
@@ -778,8 +915,8 @@ impl Ledger {
             tx.execute(
                 "INSERT INTO run_definitions (run_id, protocol_ref_json, profile_ref_json, \
                  roster_ref_json, package_sha256, profile_sha256, roster_sha256, package_json, \
-                 compatibility_roster_json, created_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                 compatibility_roster_json, started_from_json, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 rusqlite::params![
                     row.run_id,
                     protocol_ref_json,
@@ -790,6 +927,7 @@ impl Ledger {
                     roster_sha256,
                     package_json,
                     compatibility_roster_json,
+                    started_from_json,
                     now,
                 ],
             )?;
@@ -805,6 +943,29 @@ impl Ledger {
             )?;
             append_event_tx(&tx, Some(&row.run_id), "forged.run.spec", &spec_event)?;
             insert_work_identity_tx(&tx, &identity)?;
+            if let Some(seal) = dispatch_seal {
+                crate::desired::authorize_tx(
+                    &tx,
+                    DesiredSubjectKind::Run,
+                    &row.run_id,
+                    seal.generation,
+                )?;
+                let written_at = now_iso();
+                for note in &seal.notes {
+                    insert_work_note_tx(
+                        &tx,
+                        note,
+                        uuid::Uuid::now_v7().to_string(),
+                        written_at.clone(),
+                    )?;
+                }
+                append_event_tx(
+                    &tx,
+                    Some(&row.run_id),
+                    "forged.run.dispatch.authorized",
+                    &seal.event,
+                )?;
+            }
             drop(profile_json);
             tx.commit()?;
             Ok(row)

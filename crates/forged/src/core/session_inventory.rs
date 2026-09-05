@@ -35,6 +35,8 @@ const CURSOR_SCHEMA: &str = "forged.provider-session-inventory-cursor/1";
 const SESSION_STARTED: &str = "forged.session.started";
 const INTERVENTION_QUEUED: &str = "forged.intervention.queued";
 const INTERVENTION_DELIVERED: &str = "forged.intervention.delivered";
+const MESSAGE_QUEUED: &str = "forged.message.queued";
+const MESSAGE_DELIVERED: &str = "forged.message.delivered";
 const ERROR_MAX_BYTES: usize = 2_048;
 
 #[derive(Debug)]
@@ -520,7 +522,10 @@ fn legacy_sessions(
     Ok(sessions)
 }
 
-fn event_id(event: &forged_ledger::EventRow, kind: &str) -> Result<(String, String), Failure> {
+fn event_id(
+    event: &forged_ledger::EventRow,
+    kind: &str,
+) -> Result<Option<(String, String)>, Failure> {
     let payload: Value = serde_json::from_str(&event.payload_json).map_err(|error| {
         Failure::internal(format!(
             "malformed stored {kind} event {}: {error}",
@@ -535,6 +540,7 @@ fn event_id(event: &forged_ledger::EventRow, kind: &str) -> Result<(String, Stri
     }
     let id = payload
         .get("interventionId")
+        .or_else(|| payload.get("messageId"))
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| {
@@ -543,13 +549,21 @@ fn event_id(event: &forged_ledger::EventRow, kind: &str) -> Result<(String, Stri
                 event.event_id
             ))
         })?;
+    if event.kind == MESSAGE_QUEUED
+        && !matches!(
+            payload.pointer("/to/kind").and_then(Value::as_str),
+            Some("attempt" | "run")
+        )
+    {
+        return Ok(None);
+    }
     let run_id = event.run_id.clone().ok_or_else(|| {
         Failure::internal(format!(
             "stored {kind} event {} has no run identity",
             event.event_id
         ))
     })?;
-    Ok((run_id, id.to_owned()))
+    Ok(Some((run_id, id.to_owned())))
 }
 
 fn pending_interventions(
@@ -558,13 +572,21 @@ fn pending_interventions(
     let delivered = snapshot
         .events(INTERVENTION_DELIVERED)
         .iter()
+        .chain(snapshot.events(MESSAGE_DELIVERED))
         .map(|event| event_id(event, "intervention-delivered"))
-        .collect::<Result<BTreeSet<_>, _>>()?;
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .flatten()
+        .collect::<BTreeSet<_>>();
     let queued = snapshot
         .events(INTERVENTION_QUEUED)
         .iter()
+        .chain(snapshot.events(MESSAGE_QUEUED))
         .map(|event| event_id(event, "intervention-queued"))
-        .collect::<Result<BTreeSet<_>, _>>()?;
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .flatten()
+        .collect::<BTreeSet<_>>();
     let mut counts = BTreeMap::new();
     for (run_id, id) in queued {
         if !delivered.contains(&(run_id.clone(), id)) {

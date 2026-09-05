@@ -140,6 +140,7 @@ impl ProviderStreamRequestV1 {
         dirs: &PacketDirs,
         run_root: &Path,
         attempt_id: i64,
+        claim_token: &str,
         render_mode: ProviderStreamRenderModeV1,
     ) -> Result<Self, ProviderError> {
         if invocation.prompt_path != dirs.prompt()
@@ -167,6 +168,9 @@ impl ProviderStreamRequestV1 {
             })?
             .to_string_lossy()
             .into_owned();
+        let mut seat_env = packet.provider_hints.env.clone();
+        seat_env.insert("FORGED_SEAT_ATTEMPT".to_owned(), attempt_id.to_string());
+        seat_env.insert("FORGED_SEAT_TOKEN".to_owned(), claim_token.to_owned());
         let request = Self {
             schema: REQUEST_SCHEMA.to_owned(),
             provider,
@@ -184,7 +188,7 @@ impl ProviderStreamRequestV1 {
             artifact_dir,
             session_id: invocation.session_hint.clone(),
             render_mode,
-            seat_env: packet.provider_hints.env.clone(),
+            seat_env,
         };
         request.validate_shape(&dirs.provider_stream_request(), false)?;
         Ok(request)
@@ -1430,6 +1434,7 @@ mod tests {
             &dirs,
             root.path(),
             7,
+            "claim-token",
             ProviderStreamRenderModeV1::Disabled,
         )
         .expect("request");

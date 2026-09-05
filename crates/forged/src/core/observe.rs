@@ -3,11 +3,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use forged_ledger::{
-    AttemptState, EventRow, RevokeScope, RunOutcome, WorkItemSnapshot, WorkObservationSnapshot,
+    AttemptState, EventRow, RevokeScope, RunOutcome, WorkItemSnapshot, WorkKind,
+    WorkObservationSnapshot, WorkSpecFields, WorkStatus,
 };
 use forged_types::{
     AttentionItemV1, AttentionState, AttentionSubjectKind, Finding, OperationRequest,
-    OperationResponse, Outcome, PacketResult, WorkRefKind, WorkRefV1,
+    OperationResponse, Outcome, PacketResult, WorkIdentitySubjectKind, WorkIdentityV1, WorkRefKind,
+    WorkRefV1,
 };
 use serde_json::{json, Map, Value};
 
@@ -800,6 +802,15 @@ pub(crate) async fn resolve_id(
     id: &str,
     subject_kind: Option<&str>,
 ) -> Result<ResolvedId, Failure> {
+    resolve_id_with_attention(ctx, id, subject_kind, None).await
+}
+
+async fn resolve_id_with_attention(
+    ctx: &Ctx,
+    id: &str,
+    subject_kind: Option<&str>,
+    attention: Option<&[AttentionItemV1]>,
+) -> Result<ResolvedId, Failure> {
     let subject_kind = subject_kind
         .map(|kind| match kind {
             "work" | "work-item" => Ok("work"),
@@ -906,11 +917,18 @@ pub(crate) async fn resolve_id(
     }
 
     if subject_kind.is_none() || subject_kind == Some("attention") {
-        if let Some(item) = super::ops::all_attention(ctx)
-            .await?
-            .into_iter()
-            .find(|item| item.attention_id == id)
-        {
+        let item = if let Some(attention) = attention {
+            attention
+                .iter()
+                .find(|item| item.attention_id == id)
+                .cloned()
+        } else {
+            super::ops::all_attention(ctx)
+                .await?
+                .into_iter()
+                .find(|item| item.attention_id == id)
+        };
+        if let Some(item) = item {
             return Ok(ResolvedId::Attention(Box::new(item)));
         }
         if subject_kind.is_some() {
@@ -1020,6 +1038,78 @@ async fn explain_observation(
     .await
 }
 
+async fn complete_attention_observation(
+    ctx: &Ctx,
+    kind: forged_types::WorkIdentitySubjectKind,
+    id: &str,
+) -> Result<WorkObservationSnapshot, Failure> {
+    let mut observation = explain_observation(ctx, kind, id).await?;
+    while observation.events.has_more {
+        let after = observation.events.next_after_event_id.ok_or_else(|| {
+            Failure::internal("truncated work observation has no next event cursor")
+        })?;
+        let id = id.to_owned();
+        let page = on_ledger(&ctx.ledger, move |ledger| {
+            ledger.work_observation_snapshot(
+                kind,
+                &id,
+                after,
+                forged_ledger::WORK_OBSERVATION_MAX_EVENT_LIMIT,
+            )
+        })
+        .await?;
+        if page.events.rows.is_empty() {
+            return Err(Failure::internal(
+                "truncated work observation returned an empty next event page",
+            ));
+        }
+        observation.events.rows.extend(page.events.rows);
+        observation.events.next_after_event_id = page.events.next_after_event_id;
+        observation.events.has_more = page.events.has_more;
+    }
+    Ok(observation)
+}
+
+/// Fold attention from one exact observation instead of scanning the whole
+/// operator inventory. Blocking reads use this so their five-second decision
+/// cadence costs one subject, regardless of portfolio size.
+pub(crate) async fn subject_attention(
+    ctx: &Ctx,
+    kind: AttentionSubjectKind,
+    id: &str,
+) -> Result<Vec<AttentionItemV1>, Failure> {
+    let observation_kind = match kind {
+        AttentionSubjectKind::Run => forged_types::WorkIdentitySubjectKind::Run,
+        AttentionSubjectKind::Epic => forged_types::WorkIdentitySubjectKind::Epic,
+    };
+    let observation = complete_attention_observation(ctx, observation_kind, id).await?;
+    let live_work = crate::core::workstore::list_issues(
+        &ctx.ledger,
+        std::slice::from_ref(&observation.identity.work.id),
+    )
+    .await
+    .ok()
+    .and_then(|issues| {
+        issues
+            .into_iter()
+            .find(|issue| issue.id == observation.identity.work.id)
+    });
+    let title = forged_types::resolve_work_title(
+        &observation.identity,
+        live_work.as_ref().map(|issue| issue.title.as_str()),
+    );
+    let decoded = decode_packets_and_results(&observation)?;
+    let review = review_projection(&observation, &decoded.packets, &decoded.results);
+    super::attention::project_observation(
+        &observation,
+        &review.disagreements,
+        &decoded.results,
+        &title,
+        live_work.as_ref(),
+        ctx.config.ack_window_s,
+    )
+}
+
 fn run_observation_inputs<'a>(
     snapshot: &'a WorkObservationSnapshot,
     run: &forged_ledger::RunRow,
@@ -1125,7 +1215,61 @@ fn explain_how(inputs: super::health::HealthInputs<'_>) -> Value {
     explain_how_with_verdict(inputs, super::health::execution_health(inputs))
 }
 
-async fn explain_work_item(ctx: &Ctx, work: WorkItemSnapshot) -> Result<Value, Failure> {
+async fn projected_lifecycle(
+    ctx: &Ctx,
+    identity: &WorkIdentityV1,
+    attention: &[AttentionItemV1],
+) -> Result<super::lifecycle::Lifecycle, Failure> {
+    let work_id = identity.work.id.clone();
+    let work = on_ledger(&ctx.ledger, move |ledger| ledger.work_item(&work_id)).await?;
+    let work = work.unwrap_or_else(|| {
+        let mut metadata = BTreeMap::new();
+        if let Some(repository) = &identity.repository {
+            metadata.insert("repository".to_owned(), repository.path.clone());
+        }
+        WorkItemSnapshot {
+            work_id: identity.work.id.clone(),
+            kind: if identity.subject.kind == WorkIdentitySubjectKind::Epic {
+                WorkKind::Epic
+            } else {
+                WorkKind::Task
+            },
+            status: WorkStatus::Open,
+            priority: None,
+            assignee: None,
+            metadata,
+            revision: identity
+                .work
+                .revision
+                .as_deref()
+                .and_then(|revision| revision.parse().ok())
+                .unwrap_or(0),
+            spec: WorkSpecFields {
+                title: identity
+                    .work
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| identity.display_title.clone()),
+                description: String::new(),
+                acceptance_criteria: String::new(),
+                design: String::new(),
+                notes: String::new(),
+            },
+            created_at: identity.captured_at.clone(),
+            updated_at: identity.captured_at.clone(),
+        }
+    });
+    super::lifecycle::project(ctx, std::slice::from_ref(&work), attention)
+        .await?
+        .remove(&work.work_id)
+        .ok_or_else(|| Failure::internal("lifecycle projection omitted its work item"))
+}
+
+pub(crate) async fn explain_work_item(
+    ctx: &Ctx,
+    work: WorkItemSnapshot,
+    attention: &[AttentionItemV1],
+) -> Result<Value, Failure> {
     let work_id = work.work_id.clone();
     let mut runs = on_ledger(&ctx.ledger, move |ledger| ledger.list_runs()).await?;
     runs.retain(|run| run.work_id == work_id);
@@ -1171,7 +1315,11 @@ async fn explain_work_item(ctx: &Ctx, work: WorkItemSnapshot) -> Result<Value, F
             })
         })
         .collect::<Vec<_>>();
-    let next = super::work_ops::projection_actions(&work);
+    let lifecycle = super::lifecycle::project(ctx, std::slice::from_ref(&work), attention)
+        .await?
+        .remove(&work.work_id)
+        .ok_or_else(|| Failure::internal("work lifecycle projection omitted its item"))?;
+    let next = super::work_ops::projection_actions(&work, lifecycle.stage);
     Ok(json!({
         "schema": "forged.explain/1",
         "subject": {
@@ -1204,32 +1352,27 @@ async fn explain_work_item(ctx: &Ctx, work: WorkItemSnapshot) -> Result<Value, F
             },
         },
         "how": how,
+        "lifecycle": lifecycle,
         "next": next,
     }))
 }
 
-async fn subject_attention_actions(
-    ctx: &Ctx,
+fn subject_attention_actions(
+    attention: &[AttentionItemV1],
     kind: AttentionSubjectKind,
     id: &str,
-) -> Result<Vec<forged_types::OperationActionV1>, Failure> {
+) -> Vec<forged_types::OperationActionV1> {
     let mut actions = Vec::new();
-    for item in super::ops::all_attention(ctx)
-        .await?
-        .into_iter()
-        .filter(|item| {
-            item.subject_kind == kind
-                && item.subject_id == id
-                && item.state != AttentionState::Resolved
-        })
-    {
-        for action in item.next_actions {
-            if !actions.contains(&action) {
-                actions.push(action);
+    for item in attention.iter().filter(|item| {
+        item.subject_kind == kind && item.subject_id == id && item.state != AttentionState::Resolved
+    }) {
+        for action in &item.next_actions {
+            if !actions.contains(action) {
+                actions.push(action.clone());
             }
         }
     }
-    Ok(actions)
+    actions
 }
 
 /// Rank one subject's advertised actions into its `next`. Duplicates (same
@@ -1285,7 +1428,11 @@ fn next_coverage(shown: usize, total: usize) -> Value {
     })
 }
 
-async fn explain_run(ctx: &Ctx, id: String) -> Result<Value, Failure> {
+pub(crate) async fn explain_run(
+    ctx: &Ctx,
+    id: String,
+    attention: &[AttentionItemV1],
+) -> Result<Value, Failure> {
     let observation =
         explain_observation(ctx, forged_types::WorkIdentitySubjectKind::Run, &id).await?;
     let run = observation
@@ -1306,7 +1453,7 @@ async fn explain_run(ctx: &Ctx, id: String) -> Result<Value, Failure> {
         .iter()
         .filter(|attempt| attempt.state == AttemptState::Running)
         .count();
-    let retry_of = super::ops::run_retry_of(ctx, &run.run_id).await?;
+    let provenance = super::ops::run_provenance(ctx, &run.run_id).await?;
     let policy_revision = {
         let run_id = run.run_id.clone();
         on_ledger(&ctx.ledger, move |ledger| {
@@ -1318,9 +1465,14 @@ async fn explain_run(ctx: &Ctx, id: String) -> Result<Value, Failure> {
     // Lifecycle first: the run's own outcome names the one `should`; open
     // decisions on the same subject merge into it or demote to `can`.
     let mut next = super::ops::run_projection_actions(run);
-    next.extend(subject_attention_actions(ctx, AttentionSubjectKind::Run, &id).await?);
+    next.extend(subject_attention_actions(
+        attention,
+        AttentionSubjectKind::Run,
+        &id,
+    ));
     let (next, next_total) = rank_subject_actions(next);
     let next_coverage = next_coverage(next.len(), next_total);
+    let lifecycle = projected_lifecycle(ctx, &observation.identity, attention).await?;
     Ok(json!({
         "schema": "forged.explain/1",
         "subject": super::work_identity::projection_subject(
@@ -1333,7 +1485,8 @@ async fn explain_run(ctx: &Ctx, id: String) -> Result<Value, Failure> {
         "what": {
             "identity": observation.identity,
             "workId": run.work_id,
-            "retryOf": retry_of,
+            "retryOf": provenance.retry_of,
+            "startedFrom": provenance.started_from,
             "policyRevision": policy_revision,
             "state": run.state.as_str(),
             "outcome": run.terminal_outcome.map(RunOutcome::as_str),
@@ -1347,12 +1500,17 @@ async fn explain_run(ctx: &Ctx, id: String) -> Result<Value, Failure> {
             "updatedAt": run.updated_at,
         },
         "how": explain_how(inputs),
+        "lifecycle": lifecycle,
         "next": next,
         "nextCoverage": next_coverage,
     }))
 }
 
-async fn explain_epic(ctx: &Ctx, id: String) -> Result<Value, Failure> {
+pub(crate) async fn explain_epic(
+    ctx: &Ctx,
+    id: String,
+    attention: &[AttentionItemV1],
+) -> Result<Value, Failure> {
     let observation =
         explain_observation(ctx, forged_types::WorkIdentitySubjectKind::Epic, &id).await?;
     let (status, delivery, inputs) = epic_status_delivery(&observation)?;
@@ -1373,10 +1531,13 @@ async fn explain_epic(ctx: &Ctx, id: String) -> Result<Value, Failure> {
             })
         })
         .collect::<Vec<_>>();
-    let (next, next_total) = rank_subject_actions(
-        subject_attention_actions(ctx, AttentionSubjectKind::Epic, &id).await?,
-    );
+    let (next, next_total) = rank_subject_actions(subject_attention_actions(
+        attention,
+        AttentionSubjectKind::Epic,
+        &id,
+    ));
     let next_coverage = next_coverage(next.len(), next_total);
+    let lifecycle = projected_lifecycle(ctx, &observation.identity, attention).await?;
     Ok(json!({
         "schema": "forged.explain/1",
         "subject": super::work_identity::projection_subject(
@@ -1399,12 +1560,17 @@ async fn explain_epic(ctx: &Ctx, id: String) -> Result<Value, Failure> {
             },
         },
         "how": explain_how_with_verdict(inputs, verdict),
+        "lifecycle": lifecycle,
         "next": next,
         "nextCoverage": next_coverage,
     }))
 }
 
-async fn explain_attempt(ctx: &Ctx, resolved: forged_ledger::AttemptRow) -> Result<Value, Failure> {
+async fn explain_attempt(
+    ctx: &Ctx,
+    resolved: forged_ledger::AttemptRow,
+    attention: &[AttentionItemV1],
+) -> Result<Value, Failure> {
     let (run_id, stage, _) = super::split_packet_key(&resolved.packet_id)?;
     let observation =
         explain_observation(ctx, forged_types::WorkIdentitySubjectKind::Run, &run_id).await?;
@@ -1428,6 +1594,7 @@ async fn explain_attempt(ctx: &Ctx, resolved: forged_ledger::AttemptRow) -> Resu
     let mut how = explain_how(inputs);
     how["attempt"] = json!({"state": attempt.state.as_str(), "stage": stage});
     let next = super::ops::run_projection_actions(run);
+    let lifecycle = projected_lifecycle(ctx, &observation.identity, attention).await?;
     Ok(json!({
         "schema": "forged.explain/1",
         "subject": super::work_identity::projection_subject(
@@ -1448,11 +1615,16 @@ async fn explain_attempt(ctx: &Ctx, resolved: forged_ledger::AttemptRow) -> Resu
             "endedAt": attempt.ended_at,
         },
         "how": how,
+        "lifecycle": lifecycle,
         "next": next,
     }))
 }
 
-async fn explain_attention(ctx: &Ctx, item: AttentionItemV1) -> Result<Value, Failure> {
+async fn explain_attention(
+    ctx: &Ctx,
+    item: AttentionItemV1,
+    attention: &[AttentionItemV1],
+) -> Result<Value, Failure> {
     let observation_kind = match item.subject_kind {
         AttentionSubjectKind::Run => forged_types::WorkIdentitySubjectKind::Run,
         AttentionSubjectKind::Epic => forged_types::WorkIdentitySubjectKind::Epic,
@@ -1464,6 +1636,7 @@ async fn explain_attention(ctx: &Ctx, item: AttentionItemV1) -> Result<Value, Fa
         "state": item.state,
         "condition": item.condition,
     });
+    let lifecycle = projected_lifecycle(ctx, &observation.identity, attention).await?;
     Ok(json!({
         "schema": "forged.explain/1",
         "subject": super::work_identity::projection_subject(
@@ -1487,6 +1660,7 @@ async fn explain_attention(ctx: &Ctx, item: AttentionItemV1) -> Result<Value, Fa
             "updatedAt": item.updated_at,
         },
         "how": how,
+        "lifecycle": lifecycle,
         "next": item.next_actions,
     }))
 }
@@ -1500,12 +1674,14 @@ pub async fn explain(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
             .ok_or_else(|| Failure::invalid("explain param \"id\" must name a subject"))?
             .to_owned();
         let subject_kind = param_opt_str(&req.params, "subjectKind");
-        let projected = match resolve_id(ctx, &id, subject_kind).await? {
-            ResolvedId::WorkItem(work) => explain_work_item(ctx, *work).await,
-            ResolvedId::Run(run) => explain_run(ctx, run).await,
-            ResolvedId::Epic(epic) => explain_epic(ctx, epic).await,
-            ResolvedId::Attempt(attempt) => explain_attempt(ctx, *attempt).await,
-            ResolvedId::Attention(item) => explain_attention(ctx, *item).await,
+        let attention = super::ops::all_attention(ctx).await?;
+        let resolved = resolve_id_with_attention(ctx, &id, subject_kind, Some(&attention)).await?;
+        let projected = match resolved {
+            ResolvedId::WorkItem(work) => explain_work_item(ctx, *work, &attention).await,
+            ResolvedId::Run(run) => explain_run(ctx, run, &attention).await,
+            ResolvedId::Epic(epic) => explain_epic(ctx, epic, &attention).await,
+            ResolvedId::Attempt(attempt) => explain_attempt(ctx, *attempt, &attention).await,
+            ResolvedId::Attention(item) => explain_attention(ctx, *item, &attention).await,
             ResolvedId::Unresolved(resolution) => Ok(json!({
                 "schema": "forged.explain/1",
                 "resolution": resolution,
@@ -2362,6 +2538,7 @@ async fn project_work_detail(
         &decoded.results,
         &title_source,
         live_work.as_ref(),
+        ctx.config.ack_window_s,
     )?
     .into_iter()
     .map(|item| {

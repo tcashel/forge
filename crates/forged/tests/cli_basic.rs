@@ -35,6 +35,7 @@ fn help_lists_every_command_and_subcommand_flags() {
         "usage",
         "events",
         "overview",
+        "wait",
         "work",
         "worktree",
         "mcp",
@@ -102,12 +103,30 @@ fn help_lists_every_command_and_subcommand_flags() {
         assert!(session.contains(sub), "session --help must list {sub}");
     }
     let message = help_text(&env, &["session", "message", "--help"]);
-    for flag in ["--run", "--attempt", "--message", "--requested-by"] {
+    for flag in [
+        "--run",
+        "--attempt",
+        "--message",
+        "--requested-by",
+        "--urgent",
+        "--ack-required",
+        "--reply-to",
+        "--kind",
+    ] {
         assert!(
             message.contains(flag),
             "session message --help must document {flag}"
         );
     }
+    let seat = help_text(&env, &["seat", "--help"]);
+    for sub in ["inbox", "ack", "progress", "note"] {
+        assert!(seat.contains(sub), "seat --help must list {sub}");
+    }
+    let inbox = help_text(&env, &["seat", "inbox", "--help"]);
+    assert!(
+        inbox.contains("nextSince"),
+        "seat inbox help names its cursor"
+    );
     let retire = help_text(&env, &["worktree", "retire", "--help"]);
     for flag in [
         "--run",
@@ -134,6 +153,10 @@ fn help_lists_every_command_and_subcommand_flags() {
             overview.contains(flag),
             "overview --help must document {flag}"
         );
+    }
+    let wait = help_text(&env, &["wait", "--help"]);
+    for flag in ["--id", "--until", "--timeout"] {
+        assert!(wait.contains(flag), "wait --help must document {flag}");
     }
 }
 

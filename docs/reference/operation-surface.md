@@ -43,14 +43,19 @@ Generated from the dispatch table, clap tree, MCP router, and fenced-call audit.
 | `run_accept_risk` | `forged run accept-risk` | yes | yes | lead | fenced | no | yes |
 | `run_adjudicate_settlement` | `forged run adjudicate-settlement` | yes | yes | lead | fenced | no | yes |
 | `run_advance` | `forged run advance` | yes | yes | machine | machine-fenced | no | yes |
+| `run_dispatch` | `forged run dispatch` | yes | yes | lead | fenced | no | yes |
 | `run_drive` | `forged run drive` | yes | no | — | machine-fenced | no | yes |
 | `run_retry` | `forged run retry` | yes | yes | lead | fenced | no | yes |
 | `run_revise_policy` | `forged run revise-policy` | yes | yes | lead | fenced | no | yes |
 | `run_revise_roster` | `forged run revise-roster` | yes | yes | lead | fenced | no | yes |
-| `run_start` | `forged run start` | yes | yes | lead | fenced | no | yes |
+| `run_start` | `forged run start` | yes | yes | machine | fenced | no | yes |
 | `run_status` | `forged run status` | yes | yes | lead | read_only | no | yes |
 | `run_stop` | `forged run stop` | yes | yes | lead | fenced | no | yes |
-| `run_submit` | `forged run submit` | yes | yes | lead | fenced | no | yes |
+| `run_submit` | `forged run submit` | yes | yes | machine | fenced | no | yes |
+| `seat_ack` | `forged seat ack` | yes | yes | machine | fenced | no | yes |
+| `seat_inbox` | `forged seat inbox` | yes | yes | machine | fenced | no | yes |
+| `seat_note` | `forged seat note` | yes | yes | machine | fenced | no | yes |
+| `seat_progress` | `forged seat progress` | yes | yes | machine | fenced | no | yes |
 | `service_install` | `forged service install` | yes | no | — | — | no | no |
 | `service_restart` | `forged service restart` | yes | no | — | — | no | no |
 | `service_start` | `forged service start` | yes | no | — | — | no | no |
@@ -65,6 +70,8 @@ Generated from the dispatch table, clap tree, MCP router, and fenced-call audit.
 | `supervise` | `forged supervise` | yes | no | — | machine-fenced | no | yes |
 | `usage_ingest` | `forged usage ingest` | yes | yes | operator | unfenced_write | no | yes |
 | `usage_report` | `forged usage` | yes | yes | lead | read_only | no | yes |
+| `wait` | `forged wait` | yes | yes | lead | read_only | no | yes |
+| `work_adjudicate` | `forged work adjudicate` | yes | yes | lead | fenced | no | yes |
 | `work_close` | `forged work close` | yes | yes | lead | fenced | no | yes |
 | `work_create` | `forged work create` | yes | yes | lead | fenced | no | yes |
 | `work_detail` | `forged work detail` | yes | yes | operator | read_only | no | yes |
@@ -75,6 +82,7 @@ Generated from the dispatch table, clap tree, MCP router, and fenced-call audit.
 | `work_map` | `forged work map` | yes | yes | operator | read_only | no | yes |
 | `work_note_add` | `forged work note add` | yes | yes | lead | fenced | no | yes |
 | `work_note_list` | `forged work note list` | yes | yes | lead | read_only | no | yes |
+| `work_park` | `forged work park` | yes | yes | lead | fenced | no | yes |
 | `work_promote` | `forged work promote` | yes | yes | lead | fenced | no | yes |
 | `work_ready` | `forged work ready` | yes | yes | lead | read_only | no | yes |
 | `work_release` | `forged work release` | yes | yes | lead | fenced | no | yes |
@@ -106,3 +114,10 @@ Legacy keys remain present with same-value provider-neutral twins until 1.0.
 | `forged.projection/*` | `beads` | `work` | `1.0` |
 | `forged.projection/*` | `beadsStatus` | `workStatus` | `1.0` |
 | `forged.projection/*` | `beadsInventory` | `workInventory` | `1.0` |
+
+## Deprecated inputs
+
+Legacy inputs remain accepted by the CLI until their named replacement lands.
+
+| Operation | Parameter | Value | Replacement | Remove at |
+| --- | --- | --- | --- | --- |

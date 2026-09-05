@@ -135,6 +135,85 @@ fn recovered_live_attempt_persists_a_wake_no_later_than_its_deadline() {
 }
 
 #[test]
+fn deadline_warning_is_urgent_ack_required_and_singleton_while_controller_ticks() {
+    if !require_serialized_runner() {
+        return;
+    }
+    let env = TestEnv::new("supervise-deadline-warning");
+    let config_path = env.anvil.join("config.json");
+    let mut config: Value = serde_json::from_str(
+        &std::fs::read_to_string(&config_path).expect("read deadline-warning config"),
+    )
+    .expect("config JSON");
+    config["stage_budget_s"]["implement"] = json!(10);
+    config["deadline_warning_s"] = json!(9);
+    std::fs::write(
+        &config_path,
+        serde_json::to_vec_pretty(&config).expect("serialize deadline-warning config"),
+    )
+    .expect("write deadline-warning config");
+
+    start_run(&env, "run-deadline-warning");
+    env.set_scenario("implement", "hang", 1);
+    let (code, submitted) = env.forged(&["run", "submit", "--run", "run-deadline-warning"]);
+    assert_eq!(code, 0, "submit: {submitted}");
+    let controller = controller_pid(&submitted);
+    wait_until("deadline warning is queued", || {
+        let ledger = env.ledger();
+        let queued = ledger
+            .list_events(Some("run-deadline-warning"), 0, 65_536)
+            .expect("warning events")
+            .into_iter()
+            .any(|event| {
+                event.kind == "forged.message.queued"
+                    && serde_json::from_str::<Value>(&event.payload_json).is_ok_and(|payload| {
+                        payload["messageId"]
+                            .as_str()
+                            .is_some_and(|id| id.starts_with("deadline-warning:"))
+                    })
+            });
+        ledger.close().expect("close ledger");
+        queued
+    });
+
+    // The live controller observes the still-running provider repeatedly;
+    // append_event_once keeps those concurrent/repeated warning ticks to one.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let ledger = env.ledger();
+    let warnings = ledger
+        .list_events(Some("run-deadline-warning"), 0, 65_536)
+        .expect("warning events")
+        .into_iter()
+        .filter(|event| event.kind == "forged.message.queued")
+        .filter_map(|event| serde_json::from_str::<Value>(&event.payload_json).ok())
+        .filter(|payload| {
+            payload["messageId"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("deadline-warning:"))
+        })
+        .collect::<Vec<_>>();
+    ledger.close().expect("close ledger");
+    assert_eq!(warnings.len(), 1, "one warning per attempt: {warnings:?}");
+    assert_eq!(warnings[0]["importance"], json!("urgent"));
+    assert_eq!(warnings[0]["ackRequired"], json!(true));
+    assert_eq!(warnings[0]["kind"], json!("instruction"));
+    assert_eq!(
+        warnings[0]["body"],
+        json!("commit what is green and return; forged runs the gate after you return")
+    );
+
+    stop_until_lands(
+        &env,
+        "run-deadline-warning",
+        "deadline warning fixture cleanup",
+        "deadline warning fixture stop",
+    );
+    wait_until("deadline warning controller death", || {
+        !process_group_alive(controller)
+    });
+}
+
+#[test]
 fn never_submitted_and_failed_submissions_never_become_desired() {
     if !require_serialized_runner() {
         return;

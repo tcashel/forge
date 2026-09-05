@@ -27,6 +27,7 @@ pub fn supports(operation: &str) -> bool {
         operation,
         "next"
             | "explain"
+            | "wait"
             | "run_status"
             | "epic_status"
             | "usage_report"
@@ -78,6 +79,7 @@ impl Render for ResponseRender<'_> {
             "usage_report" => render_usage(result, now),
             "work_history" => render_work_history(result, now),
             "explain" => render_explain(result, now),
+            "wait" => render_explain(result.get("explain").unwrap_or(&Value::Null), now),
             _ => unreachable!("unsupported successful response reached the renderer"),
         }
     }
@@ -90,11 +92,15 @@ fn refusal(error: &forged_types::OpError) -> String {
         .unwrap_or_else(|| "ERROR".to_owned());
     let mut lines = Vec::new();
     push_line(&mut lines, format!("✗ {code} {}", error.message));
-    if let Some(remedy) = error
-        .detail
-        .as_ref()
-        .and_then(|value| serde_json::from_value::<RemedyV1>(value.clone()).ok())
-    {
+    if let Some(remedy) = error.detail.as_ref().and_then(|value| {
+        serde_json::from_value::<RemedyV1>(
+            value
+                .get("remedy")
+                .cloned()
+                .unwrap_or_else(|| value.clone()),
+        )
+        .ok()
+    }) {
         push_line(
             &mut lines,
             format!(
@@ -221,7 +227,7 @@ fn render_next_row(lines: &mut Vec<String>, section: &str, row: &Value) {
 
     let age = row.get("ageMin").and_then(Value::as_u64).unwrap_or(0);
     let lifecycle = row
-        .get("lifecycle")
+        .pointer("/lifecycle/stage")
         .and_then(Value::as_str)
         .unwrap_or("unknown");
     let spend = || {
@@ -242,15 +248,11 @@ fn render_next_row(lines: &mut Vec<String>, section: &str, row: &Value) {
         }
         "ready" => {
             push_line(lines, format!("    age {age}m  lifecycle {lifecycle}"));
-            push_line(
-                lines,
-                format!(
-                    "    basis {}",
-                    row.get("basis")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown")
-                ),
-            );
+            let revision = row
+                .pointer("/lifecycle/basis/revision")
+                .map(scalar)
+                .unwrap_or_else(|| "unknown".to_owned());
+            push_line(lines, format!("    basis revision {revision}"));
         }
         "landed" => {
             let pr = row.get("pr").map(scalar).unwrap_or_else(|| "—".to_owned());
@@ -400,6 +402,18 @@ fn render_run_status(result: &Value, now: &str) -> String {
         &mut lines,
         format!("packets: {packets}  live attempts: {attempts}"),
     );
+    if let Some(progress) = run.get("progress").filter(|value| !value.is_null()) {
+        let phase = progress
+            .get("phase")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let commits = scalar(progress.get("commitsAhead").unwrap_or(&Value::Null));
+        let checks = scalar(progress.get("seatChecks").unwrap_or(&Value::Null));
+        push_line(
+            &mut lines,
+            format!("progress: {phase}  commits {commits}  seat checks {checks}"),
+        );
+    }
     if let Some(next) = run.get("nextAction") {
         let next = serde_json::to_string(next).unwrap_or_else(|_| "null".to_owned());
         push_line(&mut lines, format!("driver next: {next}"));
@@ -611,6 +625,7 @@ fn render_work_show(result: &Value, now: &str, full: bool) -> String {
         }
     }
     push_field(&mut lines, "notes count", result.get("notesCount"));
+    push_field(&mut lines, "lifecycle", result.pointer("/lifecycle/stage"));
     let dependencies = result
         .get("dependencies")
         .and_then(Value::as_array)
@@ -723,7 +738,7 @@ mod tests {
                     "decisions": [{
                         "id": "ore-080", "title": "Choose the release",
                         "state": "awaiting_operator", "ageMin": 12,
-                        "spendUsd": 1.25, "lifecycle": "reviewed",
+                        "spendUsd": 1.25, "lifecycle": {"stage": "reviewed", "since": "2026-09-03T10:00:00Z", "basis": {"revision": 1}},
                         "should": {"verb": "epic resolve", "args": {"id": "ore-080"}},
                         "canCount": 1
                     }],
@@ -731,18 +746,17 @@ mod tests {
                         "id": "run-1", "title": "Build the bounded surface",
                         "state": "implementation", "stage": "implementation",
                         "seat": "codex:worker-1", "ageMin": 7,
-                        "spendUsd": 0.5, "lifecycle": "running",
+                        "spendUsd": 0.5, "lifecycle": {"stage": "dispatched", "since": "2026-09-03T10:00:00Z", "basis": {"revision": 1, "runId": "run-1"}},
                         "should": null, "canCount": 0
                     }],
                     "ready": [{
                         "id": "ore-081", "title": "Follow-up slice", "state": "open",
-                        "ageMin": 3, "lifecycle": "critiqued",
-                        "basis": "recommendation note exists; adjudicated: unknown-until-.8",
+                        "ageMin": 3, "lifecycle": {"stage": "critiqued", "since": "2026-09-03T10:00:00Z", "basis": {"revision": 1, "noteIds": ["note-1"]}},
                         "should": null, "canCount": 0
                     }],
                     "landed": [{
                         "id": "run-2", "title": "Finished slice", "state": "landed",
-                        "ageMin": 60, "lifecycle": "landed", "pr": 258,
+                        "ageMin": 60, "lifecycle": {"stage": "landed", "since": "2026-09-03T10:00:00Z", "basis": {"revision": 1, "runId": "run-2"}}, "pr": 258,
                         "should": null, "canCount": 0
                     }]
                 },
@@ -829,6 +843,11 @@ mod tests {
                 "delivery": {"pr": null, "sha": null},
                 "packets": [{"packetId": "run-1/implementation/0"}],
                 "liveAttempts": [{"attemptId": 7, "claimant": "codex:worker"}],
+                "progress": {
+                    "attemptId": 7, "phase": "seat-checks", "commitsAhead": 2,
+                    "seatChecks": "pass", "blockers": [], "etaMin": 0
+                },
+                "mail": {"undelivered": 0, "unacked": 1, "lastDeliveredAt": null},
                 "nextAction": {"awaitPacket": {"packetId": "run-1/implementation/0"}},
                 "nextActions": [{
                     "verb": "run status", "args": {"run": "run-1"},
@@ -892,7 +911,9 @@ mod tests {
             "dependencies": [{"id": "ore-0", "kind": "blocks", "status": "closed"}],
             "notesCount": 2,
             "nextActions": [{
-                "verb": "run start", "args": {"work": "ore-1"},
+                "verb": "run dispatch", "args": {
+                    "id": "ore-1", "approvedBy": null, "basis": null
+                },
                 "reason": "execute", "class": "should"
             }]
         }));

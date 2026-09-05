@@ -1394,6 +1394,7 @@ mod tests {
             package_sha256: digest(&package).expect("package digest"),
             package,
             compatibility_roster: HashMap::new(),
+            started_from: None,
         }
     }
 

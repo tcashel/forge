@@ -29,6 +29,9 @@ pub struct WorktreeSpec {
     pub base: String,
     /// When set, the resolved base sha must match exactly.
     pub expected_base_sha: Option<String>,
+    /// Optional commit from which the work branch starts while `base` remains
+    /// the PR base and merge target.
+    pub start_sha: Option<String>,
 }
 
 /// A successfully prepared worktree.
@@ -74,7 +77,7 @@ pub async fn prepare_worktree(spec: &WorktreeSpec) -> Result<PreparedWorktree, G
 
     if worktree.exists() || registered_worktree(&spec.repo, &worktree).await? {
         if worktree.exists() {
-            if let Some(expected) = &spec.expected_base_sha {
+            if let Some(expected) = spec.start_sha.as_ref().or(spec.expected_base_sha.as_ref()) {
                 let head = git_output(
                     &worktree,
                     ["rev-parse", "--verify", "--end-of-options", "HEAD"],
@@ -146,7 +149,18 @@ pub async fn prepare_worktree(spec: &WorktreeSpec) -> Result<PreparedWorktree, G
         }
     }
 
+    if let Some(start_sha) = &spec.start_sha {
+        let commit = format!("{start_sha}^{{commit}}");
+        let resolved = git_output(
+            &spec.repo,
+            ["rev-parse", "--verify", "--end-of-options", commit.as_str()],
+        )
+        .await?;
+        require_success(&resolved, "git rev-parse retry start sha")?;
+    }
+
     std::fs::create_dir_all(&run_dir)?;
+    let start = spec.start_sha.as_deref().unwrap_or(tracking.as_str());
     let args: Vec<OsString> = vec![
         "worktree".into(),
         "add".into(),
@@ -154,7 +168,7 @@ pub async fn prepare_worktree(spec: &WorktreeSpec) -> Result<PreparedWorktree, G
         spec.branch.clone().into(),
         "--end-of-options".into(),
         worktree.clone().into_os_string(),
-        tracking.into(),
+        start.into(),
     ];
     let add = git_output(&spec.repo, &args).await?;
     require_success(&add, "git worktree add")?;

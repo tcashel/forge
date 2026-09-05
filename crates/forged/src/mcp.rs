@@ -174,7 +174,7 @@ pub struct LeadWriteArgs {
 fn flat_run_id(name: &str, params: &serde_json::Map<String, Value>) -> Option<String> {
     let key = match name {
         "run_start" => return None,
-        "run_retry" => "id",
+        "run_dispatch" | "run_retry" => "id",
         "run_status"
         | "run_stop"
         | "run_submit"
@@ -243,6 +243,9 @@ fn flat_envelope(
         }
     }
     for key in ["profile", "roster", "runId", "baseRef"] {
+        if matches!(name, "run_dispatch" | "run_retry") && matches!(key, "profile" | "roster") {
+            continue;
+        }
         match params.get(key) {
             None | Some(Value::Null | Value::String(_)) => {}
             Some(other) => {
@@ -429,6 +432,55 @@ impl ExplainArgs {
     }
 }
 
+fn default_wait_until() -> WaitUntilParam {
+    WaitUntilParam::Stage
+}
+
+fn default_wait_timeout() -> i64 {
+    240
+}
+
+/// Condition that releases `wait`.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(rename_all = "lowercase")]
+pub enum WaitUntilParam {
+    Decision,
+    Stage,
+    Terminal,
+}
+
+/// One blocking wait over an exact operator-visible subject.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars", inline)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WaitArgs {
+    #[serde(deserialize_with = "named_string")]
+    pub id: String,
+    /// Condition that releases the call; defaults to stage.
+    #[serde(default = "default_wait_until")]
+    pub until: WaitUntilParam,
+    /// Seconds before returning changed false; defaults to 240, maximum 3600.
+    #[serde(default = "default_wait_timeout")]
+    pub timeout: i64,
+}
+
+impl WaitArgs {
+    fn into_envelope(self) -> EnvelopeArgs {
+        let run_id = Some(self.id.clone());
+        let params = match serde_json::to_value(&self) {
+            Ok(Value::Object(map)) => map,
+            _ => serde_json::Map::new(),
+        };
+        EnvelopeArgs {
+            schema_version: 1,
+            idempotency_key: None,
+            run_id,
+            params,
+        }
+    }
+}
+
 /// Composable exact scopes for `work_list`.
 #[derive(Debug, Default, Deserialize, Serialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars", inline)]
@@ -537,7 +589,9 @@ pub enum WorkNoteKindParam {
     Comment,
     Critique,
     Recommendation,
-    Approval,
+    Adjudication,
+    Decision,
+    Retro,
 }
 
 /// Flat parameters for one immutable annotation.
@@ -1455,6 +1509,15 @@ impl ForgedServer {
         self.call_lead_read("definition_validate", args.0).await
     }
 
+    /// Approve, create, and submit one ready work item behind one fence.
+    #[tool(
+        name = "run_dispatch",
+        description = "Approve, create, and submit one ready work item atomically. Requires id and basis; defaults repository from work metadata."
+    )]
+    pub async fn run_dispatch(&self, args: Parameters<LeadWriteArgs>) -> CallToolResult {
+        self.call_lead_write("run_dispatch", args.0).await
+    }
+
     /// Start a run for a work item.
     #[tool(name = "run_start", description = "Create a run for a work item.")]
     pub async fn run_start(&self, args: Parameters<LeadWriteArgs>) -> CallToolResult {
@@ -1635,6 +1698,17 @@ impl ForgedServer {
             .await
     }
 
+    /// Block until one subject reaches the requested condition.
+    #[tool(
+        name = "wait",
+        description = "Block on one work item, run, or epic until a decision opens, its packet stage changes, or it becomes terminal. until defaults to stage. timeout defaults to 240 seconds and must be between 1 and the maximum 3600 seconds. Returns the current explain projection with changed true when released, or changed false at timeout.",
+        annotations(read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false),
+        meta = lead_tool_meta()
+    )]
+    pub async fn wait(&self, args: Parameters<WaitArgs>) -> CallToolResult {
+        self.call_structured("wait", args.0.into_envelope()).await
+    }
+
     /// Bounded decision-first lead driver surface.
     #[tool(
         name = "next",
@@ -1743,13 +1817,51 @@ impl ForgedServer {
         self.call_lead_read("session_read", args.0).await
     }
 
-    /// Queue or capability-gated live-deliver an intervention.
+    /// Queue one direct lead instruction for an attempt or run boundary.
     #[tool(
         name = "session_message",
-        description = "Queue an intervention for a run or live session."
+        description = "Queue one direct lead instruction for an attempt or run boundary."
     )]
     pub async fn session_message(&self, args: Parameters<LeadWriteArgs>) -> CallToolResult {
         self.call_lead_write("session_message", args.0).await
+    }
+
+    /// Pull one bounded page of messages for the environment-fenced seat.
+    #[tool(
+        name = "seat_inbox",
+        description = "Pull one stored page for the running provider attempt. Identical \
+                       attempt/since/bodies/limit values replay that page verbatim; pass \
+                       nextSince as since to discover later mail."
+    )]
+    pub async fn seat_inbox(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
+        self.call("seat_inbox", args.0).await
+    }
+
+    /// Acknowledge one message addressed to the environment-fenced seat.
+    #[tool(
+        name = "seat_ack",
+        description = "Acknowledge one message addressed to the running provider attempt."
+    )]
+    pub async fn seat_ack(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
+        self.call("seat_ack", args.0).await
+    }
+
+    /// Record the environment-fenced seat's latest progress snapshot.
+    #[tool(
+        name = "seat_progress",
+        description = "Record a progress snapshot for the running provider attempt."
+    )]
+    pub async fn seat_progress(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
+        self.call("seat_progress", args.0).await
+    }
+
+    /// Send one environment-fenced note directly to the lead.
+    #[tool(
+        name = "seat_note",
+        description = "Send a bounded note from the running provider attempt to the lead."
+    )]
+    pub async fn seat_note(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
+        self.call("seat_note", args.0).await
     }
 
     /// Revoke and confirmed-stop one provider attempt.
@@ -1851,10 +1963,11 @@ impl ForgedServer {
         self.call_lead_write("work_update", args.0).await
     }
 
-    /// Typed work authoring: atomic stub promotion.
+    /// Stub-only compatibility alias for atomic promotion.
     #[tool(
         name = "work_promote",
-        description = "Atomically promote one blocked or deferred stub. Arguments: id, \
+        description = "Compatibility alias for one release: atomically promote one blocked or \
+                       deferred stub. Arguments: id, \
                        expectedRevision (the revision you read), optional description, \
                        acceptanceCriteria, design, notes, and actor. One fenced operation \
                        mints revision N+1 with cause planning-apply, sets status open, and \
@@ -1866,15 +1979,44 @@ impl ForgedServer {
         self.call_lead_write("work_promote", args.0).await
     }
 
+    /// Atomically bind adjudication dispositions to the resulting revision.
+    #[tool(
+        name = "work_adjudicate",
+        description = "Atomically adjudicate one work specification. Arguments: id, \
+                       expectedRevision, bodyJson (a forged.adjudication/1 payload), and \
+                       optional title, description, acceptanceCriteria, design, or notes. \
+                       A changed spec mints one revision; an unchanged spec does not. The \
+                       revision, adjudication note, and accepted status transition commit \
+                       together."
+    )]
+    pub async fn work_adjudicate(&self, args: Parameters<LeadWriteArgs>) -> CallToolResult {
+        self.call_lead_write("work_adjudicate", args.0).await
+    }
+
+    /// Park one idle item outside the active planning rails.
+    #[tool(
+        name = "work_park",
+        description = "Park one idle work item. Arguments: id, reason, optional actor. Records \
+                       a typed park decision, sets status deferred, and clears any lease \
+                       without minting a revision. A nonterminal run or custody refuses with \
+                       run stop as the remedy."
+    )]
+    pub async fn work_park(&self, args: Parameters<LeadWriteArgs>) -> CallToolResult {
+        self.call_lead_write("work_park", args.0).await
+    }
+
     /// Append one immutable work annotation.
     #[tool(
         name = "work_note_add",
         description = "Append evidence about a work specification without changing its \
                        revision or coordination state. Arguments: id, kind (comment | critique | \
-                       recommendation | approval), bodyJson (raw JSON string); recommendation and \
-                       approval require their typed v1 payload and schema, while other omitted \
-                       schemas default to <kind>/0. actor defaults to operator. Duplicate keys and \
-                       non-integer numbers are refused. Closed work items are accepted."
+                       recommendation | adjudication | decision | retro), bodyJson (raw JSON \
+                       string); typed kinds require their v1 payload and schema, while other \
+                       omitted schemas default to <kind>/0. actor defaults to operator. Duplicate \
+                       keys and non-integer numbers are refused. The deprecated approval spelling \
+                       is intentionally absent from this lead surface; the CLI parser retains it \
+                       only to refuse with run dispatch as the structured remedy. Closed work \
+                       items are accepted."
     )]
     pub async fn work_note_add(&self, args: Parameters<WorkNoteAddArgs>) -> CallToolResult {
         self.call("work_note_add", args.0.into_envelope()).await
@@ -1915,8 +2057,9 @@ impl ForgedServer {
     /// Typed repair verb: reopen.
     #[tool(
         name = "work_reopen",
-        description = "Set a work item's status to open from any state, custody untouched. \
-                       Arguments: id, actor."
+        description = "Set a work item's status to open. Arguments: id, actor, and reason. \
+                       reason is required for a deferred item and records a typed park/resume \
+                       decision without minting a revision."
     )]
     pub async fn work_reopen(&self, args: Parameters<LeadWriteArgs>) -> CallToolResult {
         self.call_lead_write("work_reopen", args.0).await
@@ -1960,7 +2103,7 @@ impl ForgedServer {
         name = "work_show",
         description = "One work item's current snapshot plus hydrated dependencies — the \
                        read-only bd show replacement — and honesty-tested nextActions. Argument: \
-                       id. Returns notesCount but never note bodies; retrieve those with \
+                       id. Returns notesCount and noteCounts by kind but never note bodies; retrieve those with \
                        work_note_list."
     )]
     pub async fn work_show(&self, args: Parameters<LeadReadArgs>) -> CallToolResult {

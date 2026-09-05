@@ -72,6 +72,12 @@ pub enum Command {
         #[command(subcommand)]
         command: SessionCmd,
     },
+    /// Attempt-fenced provider-seat messaging and progress.
+    Seat {
+        /// The seat subcommand.
+        #[command(subcommand)]
+        command: SeatCmd,
+    },
     /// Resume a ledger run or claim the next ready work (explicit
     /// idempotency key required).
     ClaimNext(ClaimNextArgs),
@@ -91,6 +97,8 @@ pub enum Command {
     Overview(OverviewArgs),
     /// Explain any durable id without guessing its kind (read-only).
     Explain(ExplainArgs),
+    /// Block until one durable subject reaches a requested condition (read-only).
+    Wait(WaitArgs),
     /// Bounded operator-facing operations projection.
     Operations {
         /// Operations subcommand.
@@ -271,6 +279,8 @@ pub struct ServiceStopArgs {
 /// `run` subcommands.
 #[derive(Debug, Subcommand)]
 pub enum RunCmd {
+    /// Approve, create, and submit one ready work item atomically.
+    Dispatch(RunDispatchArgs),
     /// Create a run for a work item.
     Start(RunStartArgs),
     /// Re-execute a terminal run on its current Work revision.
@@ -691,6 +701,60 @@ pub struct RunStartArgs {
     pub idempotency_key: Option<String>,
 }
 
+/// `run dispatch` flags. The work item's own fields are the immutable spec;
+/// this lead-facing command deliberately has no spec-file escape hatch.
+#[derive(Debug, Args)]
+pub struct RunDispatchArgs {
+    /// Ready work item to approve and dispatch.
+    #[arg(long)]
+    pub id: String,
+    /// Why this exact revision and execution tuple are approved.
+    #[arg(long)]
+    pub basis: String,
+    /// Approval actor; defaults to the current operation actor.
+    #[arg(long)]
+    pub approved_by: Option<String>,
+    /// Explicit reason to bypass a pre-adjudication lifecycle gate.
+    #[arg(long = "override")]
+    pub override_reason: Option<String>,
+    /// Named assurance profile; defaults from config.
+    #[arg(long)]
+    pub profile: Option<String>,
+    /// Named model roster; defaults from config.
+    #[arg(long)]
+    pub roster: Option<String>,
+    /// Absolute target checkout; defaults from work metadata.repository.
+    #[arg(long)]
+    pub repo: Option<String>,
+    /// Base ref; defaults to the repository's default branch.
+    #[arg(long)]
+    pub base_ref: Option<String>,
+    /// Override the run id minted from the work id.
+    #[arg(long)]
+    pub run_id: Option<String>,
+    /// Override the derived idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+/// Why a terminal run needs a successor.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum RunRetryBecause {
+    SpecAmended,
+    WorldChanged,
+    Rebase,
+}
+
+impl RunRetryBecause {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::SpecAmended => "spec-amended",
+            Self::WorldChanged => "world-changed",
+            Self::Rebase => "rebase",
+        }
+    }
+}
+
 /// `run retry` flags. A fresh successor desired row also receives a fresh
 /// default restart budget; retry never resets budgets on the terminal run.
 #[derive(Debug, Args)]
@@ -701,6 +765,12 @@ pub struct RunRetryArgs {
     /// Override the flat `<root>-r<N>` successor id.
     #[arg(long)]
     pub run_id: Option<String>,
+    /// Why the successor is required; defaults to world-changed for one release.
+    #[arg(long, value_enum)]
+    pub because: Option<RunRetryBecause>,
+    /// Start from the base ref instead of preserving committed source work.
+    #[arg(long)]
+    pub fresh: bool,
     /// Named assurance profile; defaults from current config.
     #[arg(long)]
     pub profile: Option<String>,
@@ -958,15 +1028,115 @@ pub struct SessionMessageArgs {
     /// Run receiving the intervention.
     #[arg(long)]
     pub run: String,
-    /// Live attempt to target when interactive delivery is supported.
+    /// Exact attempt to receive this direct message.
     #[arg(long)]
     pub attempt: Option<i64>,
-    /// Message delivered live or at the next durable provider boundary.
+    /// Mark the instruction urgent without interrupting the provider turn.
+    #[arg(long)]
+    pub urgent: bool,
+    /// Require the receiving seat to acknowledge this message.
+    #[arg(long)]
+    pub ack_required: bool,
+    /// Message identity this instruction replies to.
+    #[arg(long)]
+    pub reply_to: Option<String>,
+    /// Closed lead message kind (instruction in this release).
+    #[arg(long, value_enum, default_value_t = LeadMessageKindArg::Instruction)]
+    pub kind: LeadMessageKindArg,
+    /// Direct instruction body (maximum 16 KiB).
     #[arg(long)]
     pub message: String,
     /// Human or agent identity requesting the intervention.
     #[arg(long, default_value = "operator")]
     pub requested_by: String,
+    /// Override the derived idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+/// Lead-originated message kinds available in this slice.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum LeadMessageKindArg {
+    Instruction,
+}
+
+impl LeadMessageKindArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Instruction => "instruction",
+        }
+    }
+}
+
+/// Attempt-fenced provider-seat commands.
+#[derive(Debug, Subcommand)]
+pub enum SeatCmd {
+    /// Pull a bounded page; pass its nextSince to --since for later mail.
+    Inbox(SeatInboxArgs),
+    /// Acknowledge one message addressed to this attempt.
+    Ack(SeatAckArgs),
+    /// Record the latest keyed-replace progress snapshot.
+    Progress(SeatProgressArgs),
+    /// Send one bounded note directly to the lead.
+    Note(SeatNoteArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct SeatInboxArgs {
+    /// Positive attempt identity injected into the provider environment.
+    #[arg(long)]
+    pub attempt: i64,
+    /// Seat cursor: pass the preceding response's nextSince to discover later mail.
+    #[arg(long)]
+    pub since: Option<i64>,
+    /// Include bodies and mark shown messages read; metadata-only delivery stays unread.
+    #[arg(long)]
+    pub bodies: bool,
+    /// Maximum messages (default 100, maximum 500).
+    #[arg(long)]
+    pub limit: Option<u64>,
+    /// Override the derived idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct SeatAckArgs {
+    /// Positive attempt identity injected into the provider environment.
+    #[arg(long)]
+    pub attempt: i64,
+    /// Message identity to acknowledge.
+    #[arg(long)]
+    pub message: String,
+    /// Optional acknowledgement note.
+    #[arg(long)]
+    pub note: Option<String>,
+    /// Override the derived idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct SeatProgressArgs {
+    /// Positive attempt identity injected into the provider environment.
+    #[arg(long)]
+    pub attempt: i64,
+    /// JSON snapshot file, or - for stdin.
+    #[arg(long)]
+    pub snapshot_file: PathBuf,
+    /// Override the derived idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct SeatNoteArgs {
+    /// Positive attempt identity injected into the provider environment.
+    #[arg(long)]
+    pub attempt: i64,
+    /// UTF-8 note file, or - for stdin.
+    #[arg(long)]
+    pub body_file: PathBuf,
     /// Override the derived idempotency key.
     #[arg(long)]
     pub idempotency_key: Option<String>,
@@ -1149,6 +1319,38 @@ pub struct ExplainArgs {
     pub idempotency_key: Option<String>,
 }
 
+/// Condition that releases `wait`.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum WaitUntilArg {
+    Decision,
+    Stage,
+    Terminal,
+}
+
+impl WaitUntilArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Decision => "decision",
+            Self::Stage => "stage",
+            Self::Terminal => "terminal",
+        }
+    }
+}
+
+/// `wait` flags.
+#[derive(Debug, Args)]
+pub struct WaitArgs {
+    /// Exact work-item, run, or epic id; run and epic ids retain unique-prefix behavior.
+    #[arg(long)]
+    pub id: String,
+    /// Condition that releases the wait (default stage).
+    #[arg(long, value_enum, default_value_t = WaitUntilArg::Stage)]
+    pub until: WaitUntilArg,
+    /// Maximum seconds to wait, 1..=3600 (default 240).
+    #[arg(long, default_value_t = 240, allow_hyphen_values = true)]
+    pub timeout: i64,
+}
+
 /// `operations` subcommands.
 #[derive(Debug, Subcommand)]
 pub enum OperationsCmd {
@@ -1209,14 +1411,18 @@ pub enum WorkCmd {
     /// CAS-fenced spec/priority update; priority alone keeps the revision.
     /// Use promote for blocked/deferred stubs and reopen for closed items.
     Update(WorkUpdateArgs),
-    /// Atomically write a stub spec revision and promote it to open.
+    /// Stub-only compatibility alias for atomic promotion (one release).
     Promote(WorkPromoteArgs),
+    /// Atomically apply spec dispositions and bind adjudication evidence.
+    Adjudicate(WorkAdjudicateArgs),
+    /// Park an idle work item outside scheduling and attention rails.
+    Park(WorkParkArgs),
     /// Add one typed dependency edge.
     Link(WorkLinkArgs),
     /// Close a work item with a recorded reason.
     Close(WorkCloseArgs),
-    /// Reopen: status open from any state, custody untouched.
-    Reopen(WorkActorArgs),
+    /// Reopen an item; parked work requires a recorded resume reason.
+    Reopen(WorkReopenArgs),
     /// Release custody under the actor CAS.
     Release(WorkActorArgs),
     /// Supersede: link a successor and close the superseded item.
@@ -1240,7 +1446,8 @@ pub struct WorkNoteAddArgs {
     /// The existing work item id.
     #[arg(long)]
     pub id: String,
-    /// comment | critique | recommendation | approval.
+    /// comment | critique | recommendation | adjudication | decision | retro.
+    /// The deprecated approval spelling is parsed only to return a run dispatch remedy.
     #[arg(long)]
     pub kind: String,
     /// Payload schema wire name (typed kinds default to their v1 contract; others to <kind>/0).
@@ -1411,7 +1618,7 @@ pub struct WorkUpdateArgs {
     pub idempotency_key: Option<String>,
 }
 
-/// `work promote` arguments.
+/// `work promote` stub-only compatibility alias arguments.
 #[derive(Debug, Args)]
 pub struct WorkPromoteArgs {
     /// The blocked or deferred stub id.
@@ -1444,6 +1651,67 @@ pub struct WorkPromoteArgs {
     /// Read new agent instructions verbatim from one UTF-8 file.
     #[arg(long)]
     pub notes_file: Option<PathBuf>,
+    /// Acting identity (default operator).
+    #[arg(long)]
+    pub actor: Option<String>,
+    /// Override the derived idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+/// `work adjudicate` arguments.
+#[derive(Debug, Args)]
+pub struct WorkAdjudicateArgs {
+    /// The work item id.
+    #[arg(long)]
+    pub id: String,
+    /// The revision you read — the CAS guard.
+    #[arg(long)]
+    pub expected_revision: i64,
+    /// New title; omitted preserves the current bytes.
+    #[arg(long)]
+    pub title: Option<String>,
+    /// New description; omitted preserves the current bytes.
+    #[arg(long, allow_hyphen_values = true, conflicts_with = "description_file")]
+    pub description: Option<String>,
+    /// Read the new description verbatim from one UTF-8 file.
+    #[arg(long)]
+    pub description_file: Option<PathBuf>,
+    /// New acceptance criteria; omitted preserves the current bytes.
+    #[arg(long, allow_hyphen_values = true, conflicts_with = "acceptance_file")]
+    pub acceptance: Option<String>,
+    /// Read the new acceptance criteria verbatim from one UTF-8 file.
+    #[arg(long)]
+    pub acceptance_file: Option<PathBuf>,
+    /// New design notes; omitted preserves the current bytes.
+    #[arg(long, allow_hyphen_values = true, conflicts_with = "design_file")]
+    pub design: Option<String>,
+    /// Read the new design notes verbatim from one UTF-8 file.
+    #[arg(long)]
+    pub design_file: Option<PathBuf>,
+    /// New agent instructions; omitted preserves the current bytes.
+    #[arg(long, allow_hyphen_values = true, conflicts_with = "notes_file")]
+    pub notes: Option<String>,
+    /// Read the new agent instructions verbatim from one UTF-8 file.
+    #[arg(long)]
+    pub notes_file: Option<PathBuf>,
+    /// Read the forged.adjudication/1 payload from a UTF-8 file; `-` reads stdin.
+    #[arg(long)]
+    pub dispositions_file: PathBuf,
+    /// Override the derived idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+/// `work park` arguments.
+#[derive(Debug, Args)]
+pub struct WorkParkArgs {
+    /// The idle work item id.
+    #[arg(long)]
+    pub id: String,
+    /// Why this work is being removed from active planning rails.
+    #[arg(long)]
+    pub reason: String,
     /// Acting identity (default operator).
     #[arg(long)]
     pub actor: Option<String>,
@@ -1492,6 +1760,23 @@ pub struct WorkActorArgs {
     /// The work item id.
     #[arg(long)]
     pub id: String,
+    /// Acting identity (default operator).
+    #[arg(long)]
+    pub actor: Option<String>,
+    /// Override the derived idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+/// `work reopen` arguments.
+#[derive(Debug, Args)]
+pub struct WorkReopenArgs {
+    /// The work item id.
+    #[arg(long)]
+    pub id: String,
+    /// Required when resuming a parked item; recorded as a decision.
+    #[arg(long)]
+    pub reason: Option<String>,
     /// Acting identity (default operator).
     #[arg(long)]
     pub actor: Option<String>,
@@ -2031,6 +2316,7 @@ pub fn command_name(command: &Command) -> &'static str {
             DefinitionCmd::Validate(_) => "definition_validate",
         },
         Command::Run { command } => match command {
+            RunCmd::Dispatch(_) => "run_dispatch",
             RunCmd::Start(_) => "run_start",
             RunCmd::Retry(_) => "run_retry",
             RunCmd::Advance(_) => "run_advance",
@@ -2076,6 +2362,12 @@ pub fn command_name(command: &Command) -> &'static str {
             SessionCmd::Message(_) => "session_message",
             SessionCmd::Stop(_) => "session_stop",
         },
+        Command::Seat { command } => match command {
+            SeatCmd::Inbox(_) => "seat_inbox",
+            SeatCmd::Ack(_) => "seat_ack",
+            SeatCmd::Progress(_) => "seat_progress",
+            SeatCmd::Note(_) => "seat_note",
+        },
         Command::ClaimNext(_) => "claim_next",
         Command::Gate { command } => match command {
             GateCmd::Run(_) => "gate_run",
@@ -2088,6 +2380,7 @@ pub fn command_name(command: &Command) -> &'static str {
         Command::Events(_) => "events_tail",
         Command::Overview(_) => "overview",
         Command::Explain(_) => "explain",
+        Command::Wait(_) => "wait",
         Command::Operations { command } => match command {
             OperationsCmd::Overview(_) => "operations_overview",
         },
@@ -2108,6 +2401,8 @@ pub fn command_name(command: &Command) -> &'static str {
             WorkCmd::Create(_) => "work_create",
             WorkCmd::Update(_) => "work_update",
             WorkCmd::Promote(_) => "work_promote",
+            WorkCmd::Adjudicate(_) => "work_adjudicate",
+            WorkCmd::Park(_) => "work_park",
             WorkCmd::Link(_) => "work_link",
             WorkCmd::Close(_) => "work_close",
             WorkCmd::Reopen(_) => "work_reopen",
@@ -2169,6 +2464,24 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
             ),
         },
         Command::Run { command } => match command {
+            RunCmd::Dispatch(a) => (
+                "run_dispatch",
+                request(
+                    a.idempotency_key,
+                    Some(a.id.clone()),
+                    json!({
+                        "id": a.id,
+                        "basis": a.basis,
+                        "approvedBy": a.approved_by,
+                        "override": a.override_reason,
+                        "profile": a.profile,
+                        "roster": a.roster,
+                        "repo": a.repo,
+                        "baseRef": a.base_ref,
+                        "runId": a.run_id,
+                    }),
+                ),
+            ),
             RunCmd::Start(a) => (
                 "run_start",
                 request(
@@ -2194,6 +2507,8 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
                     json!({
                         "id": a.id,
                         "runId": a.run_id,
+                        "because": a.because.map(RunRetryBecause::as_str),
+                        "fresh": a.fresh,
                         "profile": a.profile,
                         "roster": a.roster,
                     }),
@@ -2542,6 +2857,10 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
                         "attempt": a.attempt,
                         "message": a.message,
                         "requestedBy": a.requested_by,
+                        "urgent": a.urgent,
+                        "ackRequired": a.ack_required,
+                        "replyTo": a.reply_to,
+                        "kind": a.kind.as_str(),
                     }),
                 ),
             ),
@@ -2551,6 +2870,57 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
                     a.idempotency_key,
                     None,
                     json!({"attempt": a.attempt, "reason": a.reason}),
+                ),
+            ),
+        },
+        Command::Seat { command } => match command {
+            SeatCmd::Inbox(a) => (
+                "seat_inbox",
+                request(
+                    a.idempotency_key,
+                    None,
+                    json!({
+                        "attempt": a.attempt,
+                        "since": a.since,
+                        "bodies": a.bodies,
+                        "limit": a.limit,
+                    }),
+                ),
+            ),
+            SeatCmd::Ack(a) => (
+                "seat_ack",
+                request(
+                    a.idempotency_key,
+                    None,
+                    json!({"attempt": a.attempt, "message": a.message, "note": a.note}),
+                ),
+            ),
+            SeatCmd::Progress(a) => {
+                let text = read_utf8_file_or_stdin(&a.snapshot_file, "--snapshot-file")?;
+                let snapshot = serde_json::from_str::<Value>(&text).map_err(|error| {
+                    format!(
+                        "parsing --snapshot-file {} as JSON: {error}",
+                        a.snapshot_file.display()
+                    )
+                })?;
+                (
+                    "seat_progress",
+                    request(
+                        a.idempotency_key,
+                        None,
+                        json!({"attempt": a.attempt, "snapshot": snapshot}),
+                    ),
+                )
+            }
+            SeatCmd::Note(a) => (
+                "seat_note",
+                request(
+                    a.idempotency_key,
+                    None,
+                    json!({
+                        "attempt": a.attempt,
+                        "body": read_utf8_file_or_stdin(&a.body_file, "--body-file")?,
+                    }),
                 ),
             ),
         },
@@ -2676,6 +3046,18 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
                 request(a.idempotency_key, Some(a.id.clone()), Value::Object(params)),
             )
         }
+        Command::Wait(a) => (
+            "wait",
+            request(
+                None,
+                Some(a.id.clone()),
+                json!({
+                    "id": a.id,
+                    "until": a.until.as_str(),
+                    "timeout": a.timeout,
+                }),
+            ),
+        ),
         Command::Operations { command } => match command {
             OperationsCmd::Overview(a) => {
                 let mut params = Map::new();
@@ -3032,6 +3414,65 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
                     request(a.idempotency_key, None, Value::Object(params)),
                 )
             }
+            WorkCmd::Adjudicate(a) => {
+                let description = spec_field_input(
+                    a.description,
+                    a.description_file.as_deref(),
+                    "--description",
+                    "--description-file",
+                )?;
+                let acceptance = spec_field_input(
+                    a.acceptance,
+                    a.acceptance_file.as_deref(),
+                    "--acceptance",
+                    "--acceptance-file",
+                )?;
+                let design = spec_field_input(
+                    a.design,
+                    a.design_file.as_deref(),
+                    "--design",
+                    "--design-file",
+                )?;
+                let notes =
+                    spec_field_input(a.notes, a.notes_file.as_deref(), "--notes", "--notes-file")?;
+                let mut params = Map::new();
+                params.insert("id".to_owned(), json!(a.id));
+                params.insert("expectedRevision".to_owned(), json!(a.expected_revision));
+                params.insert(
+                    "bodyJson".to_owned(),
+                    json!(read_utf8_file_or_stdin(
+                        &a.dispositions_file,
+                        "--dispositions-file",
+                    )?),
+                );
+                for (name, value) in [
+                    ("title", a.title),
+                    ("description", description),
+                    ("acceptanceCriteria", acceptance),
+                    ("design", design),
+                    ("notes", notes),
+                ] {
+                    if let Some(value) = value {
+                        params.insert(name.to_owned(), json!(value));
+                    }
+                }
+                (
+                    "work_adjudicate",
+                    request(a.idempotency_key, None, Value::Object(params)),
+                )
+            }
+            WorkCmd::Park(a) => {
+                let mut params = Map::new();
+                params.insert("id".to_owned(), json!(a.id));
+                params.insert("reason".to_owned(), json!(a.reason));
+                if let Some(actor) = a.actor {
+                    params.insert("actor".to_owned(), json!(actor));
+                }
+                (
+                    "work_park",
+                    request(a.idempotency_key, None, Value::Object(params)),
+                )
+            }
             WorkCmd::Link(a) => {
                 let mut params = Map::new();
                 params.insert("fromId".to_owned(), json!(a.from));
@@ -3059,6 +3500,9 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
             WorkCmd::Reopen(a) => {
                 let mut params = Map::new();
                 params.insert("id".to_owned(), json!(a.id));
+                if let Some(reason) = a.reason {
+                    params.insert("reason".to_owned(), json!(reason));
+                }
                 if let Some(actor) = a.actor {
                     params.insert("actor".to_owned(), json!(actor));
                 }

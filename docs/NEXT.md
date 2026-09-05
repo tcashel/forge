@@ -184,9 +184,9 @@ an observable pane.
 ## Submit a slice
 
 ```sh
-forged run start --work <id> --repo /absolute/repo \
+forged run dispatch --id <id> --basis <approval-basis> \
+  --approved-by <actor> --repo /absolute/repo \
   --profile standard --roster default
-forged run submit --run <id>
 ```
 
 The spec is the work item: its `description`, `acceptance_criteria`,
@@ -196,8 +196,9 @@ hash. The item's `revision` is recorded as provenance alongside the fence —
 spec writes mint revision N+1 under CAS while coordination churn (claims,
 heartbeats, releases) never touches it. Revise a spec with `forged work
 update`; the next packet opened pins the new body, and a packet already
-open is re-pinned before its next claim. `--spec <path>` still names a spec file for one
-release and is recorded as deprecated.
+open is re-pinned before its next claim. The machine-facing `run start`
+compatibility command still accepts `--spec <path>` for one release and
+records it as deprecated; lead dispatch never accepts a spec file.
 
 Submit returns a durable controller identity immediately. Retrying while it is
 live adopts the same verified driver; a confirmed-dead driver is reconciled
@@ -550,8 +551,8 @@ forged session message --run <run-id> --attempt <attempt-id> \
   --message '<guidance>' --requested-by '<human-or-agent>'
 ```
 
-Messages without live-delivery capability are ledgered for the next provider
-boundary.
+Messages are ledgered for the addressed seat to pull with `forged seat inbox`,
+or for delivery at the next provider boundary.
 
 ## Forge plugin convergence — 2026-08-14
 

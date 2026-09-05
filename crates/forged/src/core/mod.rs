@@ -16,16 +16,19 @@ pub(crate) mod herdr_layout;
 pub(crate) mod herdr_ownership;
 pub(crate) mod herdr_projection;
 mod history;
+pub(crate) mod lifecycle;
 mod observe;
 mod ops;
 mod ore;
 mod review;
+pub(crate) mod seat;
 mod session_inventory;
 pub(crate) mod sessions;
 pub(crate) mod settlement;
 pub(crate) mod spec;
 mod supervise;
 pub(crate) mod usage;
+mod wait;
 pub(crate) mod work_identity;
 mod work_import;
 mod work_map;
@@ -43,6 +46,9 @@ use serde_json::{Map, Value};
 
 use crate::config::ForgedConfig;
 use crate::failpoint;
+
+/// Durable cursor marker emitted when a run or epic enters a new packet stage.
+pub(crate) const PACKET_STAGE_CHANGED_EVENT: &str = "forged.packet.stage.changed";
 
 /// Everything a core function needs: the once-read config and the open
 /// ledger.
@@ -1121,6 +1127,7 @@ pub(crate) struct DesiredAuthorization {
     pub(crate) generation: u32,
     pub(crate) queued_until: Option<String>,
     pub(crate) admission_reason: Option<String>,
+    pub(crate) sealed_notes: Vec<forged_ledger::NewWorkNote>,
 }
 
 impl OnEffectError {
@@ -1379,6 +1386,7 @@ where
                         authorization.generation,
                         authorization.queued_until,
                         authorization.admission_reason,
+                        authorization.sealed_notes,
                     ),
                     None => l.complete_operation(&operation_id, &resp),
                 })
@@ -1394,7 +1402,8 @@ where
         }
         Err(f) => {
             release_if(ctx, OnEffectError::for_class(class), &operation_id).await;
-            err_response(&operation_id, &f)
+            ops::run_start_failure_response(name, &request, &operation_id, &f)
+                .unwrap_or_else(|| err_response(&operation_id, &f))
         }
     }
 }
@@ -1478,6 +1487,7 @@ pub async fn dispatch(ctx: &Ctx, name: &str, mut req: OperationRequest) -> Opera
         "doctor" => ops::doctor(ctx, &req).await,
         "init" => ops::init(ctx, &mut req).await,
         "definition_validate" => ops::definition_validate(ctx, &req).await,
+        "run_dispatch" => ops::run_dispatch(ctx, &mut req).await,
         "run_start" => ops::run_start(ctx, &mut req).await,
         "run_retry" => ops::run_retry(ctx, &mut req).await,
         "run_advance" => drive::run_advance(ctx, &req).await,
@@ -1501,6 +1511,7 @@ pub async fn dispatch(ctx: &Ctx, name: &str, mut req: OperationRequest) -> Opera
         "epic_revise_policy" => epic::epic_revise_policy(ctx, &mut req).await,
         "overview" => observe::overview(ctx, &req).await,
         "explain" => observe::explain(ctx, &req).await,
+        "wait" => wait::wait(ctx, &req).await,
         "next" => ops::next(ctx, &req).await,
         "operations_overview" => ops::operations_overview(ctx, &req).await,
         "work_detail" => observe::work_detail(ctx, &req).await,
@@ -1509,6 +1520,8 @@ pub async fn dispatch(ctx: &Ctx, name: &str, mut req: OperationRequest) -> Opera
         "work_create" => work_ops::work_create(ctx, &mut req).await,
         "work_update" => work_ops::work_update(ctx, &mut req).await,
         "work_promote" => work_ops::work_promote(ctx, &mut req).await,
+        "work_adjudicate" => work_ops::work_adjudicate(ctx, &mut req).await,
+        "work_park" => work_ops::work_park(ctx, &mut req).await,
         "work_note_add" => work_ops::work_note_add(ctx, &mut req).await,
         "work_note_list" => work_ops::work_note_list(ctx, &req).await,
         "work_link" => work_ops::work_link(ctx, &mut req).await,
@@ -1532,6 +1545,10 @@ pub async fn dispatch(ctx: &Ctx, name: &str, mut req: OperationRequest) -> Opera
         "session_read" => sessions::session_read(ctx, &req).await,
         "session_message" => sessions::session_message(ctx, &mut req).await,
         "session_stop" => sessions::session_stop(ctx, &mut req).await,
+        "seat_inbox" => seat::seat_inbox(ctx, &mut req).await,
+        "seat_ack" => seat::seat_ack(ctx, &mut req).await,
+        "seat_progress" => seat::seat_progress(ctx, &mut req).await,
+        "seat_note" => seat::seat_note(ctx, &mut req).await,
         "claim_next" => claimnext::claim_next(ctx, &req).await,
         "gate_run" => ops::gate_run(ctx, &mut req).await,
         "reconcile" => ops::reconcile(ctx, &mut req).await,

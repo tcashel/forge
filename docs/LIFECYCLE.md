@@ -5,9 +5,8 @@ change. This document is the normative statement of that lifecycle: the
 stages, the evidence that proves each stage, the verb that records the
 move, and what the driver surface says at each point. It is decided in
 [ADR-0036](adr/0036-agent-is-the-operator-one-id-one-lifecycle-one-next.md).
-The **Today** column says where the shipped v0.7.0 system holds the
-same fact; where it says *prose*, the fact exists only in a skill's
-text and the kernel cannot see it.
+The lifecycle is projected by the kernel from the ledger facts below;
+skills no longer need to reconstruct it from prose.
 
 ## Why the lifecycle lives in the ledger
 
@@ -27,24 +26,24 @@ Stages are **derived**, never set directly. Each is proven by typed
 evidence bound to the spec revision it applies to. A newer spec revision
 without matching evidence drops the item back to `drafted`.
 
-| Stage | Meaning | Evidence (bound to current revision) | Moved by | Today |
-| --- | --- | --- | --- | --- |
-| `drafted` | A complete spec exists; nobody independent has read it. | revision N exists; no `recommendation` note at N | `work create`, `work update` | status `open`/`blocked` |
-| `critiqued` | An independent critic has produced findings. | a `recommendation` note (`forged.spec-recommendations/1`) at N | `/forged:critique` → `work note add --kind recommendation` | note exists, unread by kernel |
-| `adjudicated` | Every recommendation, crux, and question has a disposition; the spec reflects the accepted ones. | an `adjudication` note (`forged.adjudication/1`) at N whose dispositions cover every item in the newest recommendation at N, and `notes` has no unchecked `- [ ]` | `/forged:adjudicate` → `work adjudicate` (spec revision + dispositions in one fenced write) | prose in `notes`; `update` then `reopen` |
-| `ready` | Adjudicated, `open`, unassigned, unleased, every `blocks` target closed. | the frontier query | dependency closure | `work ready` (without the adjudication conjunct) |
-| `dispatched` | A nonterminal run exists for this item. | run row in a nonterminal state | `run dispatch` (**ADR-0036**) / `run start` + `run submit` | `run status.state` |
-| `deciding` | A run is parked on a decision only the lead or human can make. | an open decision-class attention item on the current run | the protocol (spec amendment, seat question, lead adjudication, merge conflict, gate failure, restart budget, input required) | `input-required` / `reviewBudgetExhausted` stops |
-| `reviewed` | The protocol reached a draft PR and a terminal verdict; awaiting landing. | `run.protocol-terminal` with `delivery.pr` | the protocol | outcome `clean` |
-| `landed` | The change is merged where the run's base says it should be. | `delivery {pr, sha}` recorded; work closed | `run stop --outcome landed`, the ore pass (epic children), `run adjudicate-settlement` | outcome `landed` |
-| `closed` | Done, superseded, or abandoned with a recorded reason. | status `closed` + close reason | `work close`, `work supersede`, landing | status `closed` |
+| Stage | Meaning | Evidence (bound to current revision) | Moved by |
+| --- | --- | --- | --- |
+| `drafted` | A complete spec exists; nobody independent has read it. | revision N exists; no `recommendation` note at N | `work create`, `work update` |
+| `critiqued` | An independent critic has produced findings. | a `recommendation` note (`forged.spec-recommendations/1`) captured at N | `/forged:critique` → `work note add --kind recommendation` |
+| `adjudicated` | Every recommendation, crux, and question has a disposition; the spec reflects the accepted ones. | the newest `adjudication` note has `resultingRevision: N`, names its recommendation note, covers every recommendation and crux in that note, and `notes` has no unchecked `- [ ]` | `/forged:adjudicate` → `work adjudicate` |
+| `ready` | Adjudicated, `open`, unassigned, unleased, every `blocks` target closed. | the frontier query | dependency closure |
+| `dispatched` | A nonterminal run exists for this item. | run row in a nonterminal state | `run dispatch` (**ADR-0036**) |
+| `deciding` | A run is parked on a decision only the lead or human can make. | an open decision-class attention item on the current run | the protocol (spec amendment, seat question, lead adjudication, merge conflict, gate failure, restart budget, input required) |
+| `reviewed` | The protocol reached a draft PR and a terminal verdict; awaiting landing. | `run.protocol-terminal` with `delivery.pr` | the protocol |
+| `landed` | The change is merged where the run's base says it should be. | `delivery {pr, sha}` recorded | `run stop --outcome landed`, the ore pass (epic children), `run adjudicate-settlement` |
+| `closed` | Done, superseded, or abandoned with a recorded reason. | status `closed` + close reason | `work close`, `work supersede`, landing |
 
 Held states, orthogonal to the sequence:
 
 | State | Meaning | Evidence | In / out |
 | --- | --- | --- | --- |
 | `blocked` | A planning stub with assumptions, or an unresolved `- [ ]` question. Never on the frontier. | status `blocked`, or an unchecked checkbox in `notes` | `work create --status blocked` / `work promote`, `work adjudicate` |
-| `parked` | Deliberately shelved; hidden from frontier, rails, and `next`; keeps its spec and history. | status `deferred` + a `decision` note with reason (**ADR-0036** `work park`) | `work park` / `work promote` |
+| `parked` | Deliberately shelved; hidden from frontier, rails, and `next`; keeps its spec and history. | status `deferred` + a `decision` note with reason | `work park` / `work reopen --reason` |
 
 An epic's stage derives from its children and its own run: `drafted`
 until its wave-one children are `adjudicated`; `dispatched` while the
@@ -62,7 +61,10 @@ fix round, serialized per daemon. An attempt that outlives its stage budget
 is killed as a `deadline:` failure and relaunched at once within
 `deadlineRetryBudget`, with a field note about the work already committed;
 exhaustion is the `deadlineExhausted` terminal, distinct from provider
-unavailability.
+unavailability. At `deadline_warning_s` before the immutable deadline the
+controller queues one urgent, acknowledgement-required instruction telling
+the running seat to commit what is green and return; the deadline and kill
+behavior do not move.
 
 ## Decisions
 
@@ -93,9 +95,17 @@ not only what.
   with `remedy.verb` naming the missing stage (`work note add --kind
   recommendation` or `work adjudicate`). `--override "<reason>"` is
   accepted and recorded as a `decision` of kind `lifecycle-override`.
-  Today `run start` checks readiness only.
-- A spec revision after adjudication resets the stage; the previous
-  adjudication stays on the record at its revision. There is no
+  Machine-facing `run start` retains its narrower readiness-only compatibility
+  contract.
+- `work adjudicate` compares `expectedRevision` with the current revision in
+  the same transaction. If any spec field changes it mints N+1 and requires
+  the adjudication body's `resultingRevision` to be N+1; if no field changes,
+  it keeps N and requires `resultingRevision: N`. The revision pointer,
+  adjudication note, and status transition commit together. A later `work
+  update`, `work revert`, or spec-changing `work promote` therefore resets
+  the derived stage to `drafted`; the older adjudication remains immutable.
+- `work promote` remains the stub-only promotion alias for one release.
+  There is no
   "approval" note kind after ADR-0036: `run dispatch --approved-by
   <actor> --basis "<text>"` records approval as part of the fenced
   dispatch, so approval cannot drift from the revision it approved.

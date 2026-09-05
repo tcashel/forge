@@ -7,6 +7,7 @@ health: in_progress
 controller: running
 pr: —
 packets: 1  live attempts: 1
+progress: seat-checks  commits 2  seat checks pass
 driver next: {"awaitPacket":{"packetId":"run-1/implementation/0"}}
 next actions: 1
   can run status --run run-1

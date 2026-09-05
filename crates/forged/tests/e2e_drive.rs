@@ -1315,6 +1315,17 @@ fn resolving_post_apply_implementation_failure_uses_ordinary_child_reset() {
     assert_eq!(code, 0, "implementation failure becomes input: {held}");
     assert_eq!(held["result"]["stopped"]["childId"], json!("child-stub"));
 
+    let (code, parked) = env.forged(&[
+        "work",
+        "park",
+        "--id",
+        "child-stub",
+        "--reason",
+        "defer while the implementation decision is pending",
+    ]);
+    assert_eq!(code, 0, "park held child: {parked}");
+    assert_eq!(parked["result"]["work"]["status"], json!("deferred"));
+
     let (code, resolved) = env.forged(&[
         "epic",
         "resolve",
@@ -1325,7 +1336,17 @@ fn resolving_post_apply_implementation_failure_uses_ordinary_child_reset() {
         "--note",
         "retry the implementation under the already-applied plan",
     ]);
-    assert_eq!(code, 0, "ordinary implementation resolution: {resolved}");
+    assert_eq!(code, 0, "parked implementation resolution: {resolved}");
+    assert_eq!(env.work_status("child-stub"), "open");
+    let decisions = env
+        .ledger()
+        .list_work_notes(
+            "child-stub",
+            Some(forged_ledger::WorkNoteKind::Decision),
+            10,
+        )
+        .expect("child decisions");
+    assert_eq!(decisions.notes.len(), 2, "park and resume decisions land");
     let events = env
         .ledger()
         .list_events(Some("epic-rolling"), 0, 65_536)
@@ -1736,8 +1757,8 @@ fn interventions_cross_a_durable_boundary_and_sessions_stay_observable() {
         .filter_map(|event| event["kind"].as_str())
         .collect();
     for kind in [
-        "forged.intervention.queued",
-        "forged.intervention.delivered",
+        "forged.message.queued",
+        "forged.message.delivered",
         "forged.host.fallback",
         "forged.session.started",
     ] {
@@ -1800,7 +1821,7 @@ fn a_rejected_cross_run_intervention_never_enters_the_target_queue() {
         .as_array()
         .expect("events")
         .iter()
-        .all(|event| event["kind"] != json!("forged.intervention.queued")));
+        .all(|event| event["kind"] != json!("forged.message.queued")));
 }
 
 #[test]

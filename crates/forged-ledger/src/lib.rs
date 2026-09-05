@@ -77,14 +77,15 @@ pub use types::{
     ReviewFindingDeliveryClaim, ReviewFindingDeliveryKey, ReviewFindingDeliveryOutcome,
     ReviewFindingDeliveryRow, ReviewFindingDeliveryState, ReviewPublicationSource, RevokeScope,
     RosterRevisionBatch, RosterRevisionRow, RunDefinitionRow, RunOutcome, RunRow, RunSettlement,
-    RunState, SlotOutcome, SpecFence, UsageRecord, UsageTotals, WorkSettlementRetryRow,
+    RunStartPoint, RunState, SlotOutcome, SpecFence, UsageRecord, UsageTotals,
+    WorkSettlementRetryRow,
 };
 pub use work::{
     ImportedWorkItem, NewWorkItem, NewWorkNote, WorkDepKind, WorkDepRow, WorkDependencyStatus,
-    WorkImportReport, WorkItemFilters, WorkItemSnapshot, WorkKind, WorkNoteKind, WorkNotePage,
-    WorkNoteRow, WorkPlanRow, WorkPlanSnapshot, WorkReadyAfter, WorkReadyPage, WorkRevisionCause,
-    WorkSpecFields, WorkStatus, WORK_BLOCKED_CLAIM_REFUSAL, WORK_CLAIM_REFUSAL_PREFIX,
-    WORK_NOTE_DEFAULT_LIMIT, WORK_NOTE_MAX_LIMIT,
+    WorkImportReport, WorkItemFilters, WorkItemSnapshot, WorkKind, WorkLifecycleSnapshot,
+    WorkNoteKind, WorkNotePage, WorkNoteRow, WorkPlanRow, WorkPlanSnapshot, WorkReadyAfter,
+    WorkReadyPage, WorkRevisionCause, WorkSpecFields, WorkStatus, WORK_BLOCKED_CLAIM_REFUSAL,
+    WORK_CLAIM_REFUSAL_PREFIX, WORK_NOTE_DEFAULT_LIMIT, WORK_NOTE_MAX_LIMIT,
 };
 pub use work_lease::{work_reclaim_older_than, WorkLeaseRow, WorkReclaimOutcome, WORK_LEASE_TTL_S};
 pub use work_settlement::{RetryErrorUpdate, WORK_SETTLEMENT_RETRY_BUDGET};

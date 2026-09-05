@@ -35,23 +35,25 @@ The Claude plugin registers the server with `--audience all` so the host can off
 - `next`
 - `run_accept_risk`
 - `run_adjudicate_settlement`
+- `run_dispatch`
 - `run_retry`
 - `run_revise_policy`
 - `run_revise_roster`
-- `run_start`
 - `run_status`
 - `run_stop`
-- `run_submit`
 - `session_list`
 - `session_message`
 - `session_read`
 - `usage_report`
+- `wait`
+- `work_adjudicate`
 - `work_close`
 - `work_create`
 - `work_link`
 - `work_list`
 - `work_note_add`
 - `work_note_list`
+- `work_park`
 - `work_promote`
 - `work_ready`
 - `work_release`
@@ -256,11 +258,19 @@ Named skills remain available as explicit power-user and debugging surfaces:
 - `/forged:dispatch`
 - `/forged:run-epic`
 
-The dispatch skills call `forged run start` followed by `forged run submit`, or
-the corresponding epic commands, and return immediately with durable
+The slice dispatch skill calls the single fenced `forged run dispatch` verb;
+epic dispatch uses the corresponding epic commands. Both return immediately with durable
 inspection commands. They do not shell-detach jobs or keep the lead session
 alive. Slice work stops at a reviewed draft pull request. An epic may integrate
 mechanically clean children, but default-branch merge remains human-owned.
+
+The lead skills are thin lifecycle clients: `next` or `explain` establishes
+position, one typed verb changes state, and `wait --id` reconnects without a
+polling loop. `work adjudicate` commits dispositions with any field and status
+change atomically; `run dispatch` records execution approval with the immutable
+handoff. The ledger now owns pagination, readiness, lifecycle evidence, and the
+single recommended next action, so a lead no longer carries those procedures in
+prompt prose.
 
 ## Operator scope
 

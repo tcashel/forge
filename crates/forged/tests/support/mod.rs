@@ -2538,9 +2538,7 @@ impl McpClient {
     /// handshake.
     pub fn new(env: &TestEnv, audience: Option<&str>) -> Self {
         let mut command = env.forged_cmd(&["mcp"]);
-        if let Some(audience) = audience {
-            command.arg("--audience").arg(audience);
-        }
+        command.arg("--audience").arg(audience.unwrap_or("all"));
         Self::from_command(command)
     }
 

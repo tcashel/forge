@@ -262,7 +262,7 @@ fn ready_rows_derive_drafted_critiqued_and_held_from_stored_evidence() {
         &env,
         "ready-held",
         "Held item",
-        Some("[ ] unresolved operator question"),
+        Some("- [ ] unresolved operator question"),
     );
     let ledger = env.ledger();
     ledger
@@ -290,18 +290,21 @@ fn ready_rows_derive_drafted_critiqued_and_held_from_stored_evidence() {
         .iter()
         .map(|row| (row["id"].as_str().unwrap(), row))
         .collect::<BTreeMap<_, _>>();
-    assert_eq!(by_id["ready-drafted"]["lifecycle"], json!("drafted"));
-    assert_eq!(by_id["ready-critiqued"]["lifecycle"], json!("critiqued"));
-    assert_eq!(by_id["ready-held"]["lifecycle"], json!("held"));
+    assert_eq!(
+        by_id["ready-drafted"]["lifecycle"]["stage"],
+        json!("drafted")
+    );
+    assert_eq!(
+        by_id["ready-critiqued"]["lifecycle"]["stage"],
+        json!("critiqued")
+    );
+    assert_eq!(by_id["ready-held"]["lifecycle"]["stage"], json!("blocked"));
     for row in rows {
         assert!(row["title"].as_str().unwrap().chars().count() <= 60);
         assert_eq!(row["health"], json!("unsubmitted"));
         assert_eq!(row["spendUsd"], json!(0.0));
         assert_eq!(row["subject"]["revision"], json!(1));
-        assert!(row["basis"]
-            .as_str()
-            .unwrap()
-            .contains("adjudicated: unknown-until-.8"));
+        assert_eq!(row["lifecycle"]["basis"]["revision"], json!(1));
     }
 }
 

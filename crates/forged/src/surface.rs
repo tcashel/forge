@@ -59,6 +59,7 @@ const LEAD_MCP_OPERATIONS: &[&str] = &[
     "definition_validate",
     "explain",
     "next",
+    "run_dispatch",
     "run_retry",
     "run_status",
     "run_stop",
@@ -66,8 +67,6 @@ const LEAD_MCP_OPERATIONS: &[&str] = &[
     "run_adjudicate_settlement",
     "run_revise_roster",
     "run_revise_policy",
-    "run_start",
-    "run_submit",
     "epic_preflight",
     "epic_start",
     "epic_submit",
@@ -82,9 +81,12 @@ const LEAD_MCP_OPERATIONS: &[&str] = &[
     "session_read",
     "session_message",
     "usage_report",
+    "wait",
     "work_create",
     "work_update",
     "work_promote",
+    "work_adjudicate",
+    "work_park",
     "work_link",
     "work_close",
     "work_reopen",
@@ -116,6 +118,12 @@ const OPERATOR_MCP_OPERATIONS: &[&str] = &[
 ];
 
 const MACHINE_MCP_OPERATIONS: &[&str] = &[
+    "run_start",
+    "run_submit",
+    "seat_inbox",
+    "seat_ack",
+    "seat_progress",
+    "seat_note",
     "run_advance",
     "packet_show",
     "packet_claim",
@@ -202,6 +210,7 @@ const OPERATION_CLASSES: &[(&str, OperationClass)] = &[
     ("run_adjudicate_settlement", OperationClass::Fenced),
     ("run_advance", OperationClass::MachineFenced),
     ("run_drive", OperationClass::MachineFenced),
+    ("run_dispatch", OperationClass::Fenced),
     ("run_retry", OperationClass::Fenced),
     ("run_revise_roster", OperationClass::Fenced),
     ("run_revise_policy", OperationClass::Fenced),
@@ -209,6 +218,10 @@ const OPERATION_CLASSES: &[(&str, OperationClass)] = &[
     ("run_status", OperationClass::ReadOnly),
     ("run_stop", OperationClass::Fenced),
     ("run_submit", OperationClass::Fenced),
+    ("seat_ack", OperationClass::Fenced),
+    ("seat_inbox", OperationClass::Fenced),
+    ("seat_note", OperationClass::Fenced),
+    ("seat_progress", OperationClass::Fenced),
     ("session_inventory", OperationClass::ReadOnly),
     ("session_list", OperationClass::ReadOnly),
     ("session_message", OperationClass::Fenced),
@@ -217,6 +230,8 @@ const OPERATION_CLASSES: &[(&str, OperationClass)] = &[
     ("supervise", OperationClass::MachineFenced),
     ("usage_ingest", OperationClass::UnfencedWrite),
     ("usage_report", OperationClass::ReadOnly),
+    ("wait", OperationClass::ReadOnly),
+    ("work_adjudicate", OperationClass::Fenced),
     ("work_close", OperationClass::Fenced),
     ("work_create", OperationClass::Fenced),
     ("work_detail", OperationClass::ReadOnly),
@@ -227,6 +242,7 @@ const OPERATION_CLASSES: &[(&str, OperationClass)] = &[
     ("work_map", OperationClass::ReadOnly),
     ("work_note_add", OperationClass::Fenced),
     ("work_note_list", OperationClass::ReadOnly),
+    ("work_park", OperationClass::Fenced),
     ("work_promote", OperationClass::Fenced),
     ("work_ready", OperationClass::ReadOnly),
     ("work_release", OperationClass::Fenced),
@@ -260,6 +276,20 @@ struct DeprecatedKey {
     twin: &'static str,
     remove_at: &'static str,
 }
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeprecatedInput {
+    operation: &'static str,
+    parameter: &'static str,
+    value: &'static str,
+    replacement: &'static str,
+    remove_at: &'static str,
+}
+
+/// Empty since ore-080.11: `work_note_add --kind approval` is refused with the
+/// `run dispatch` remedy rather than accepted as deprecated input.
+const DEPRECATED_INPUTS: &[DeprecatedInput] = &[];
 
 const DEPRECATED_KEYS: &[DeprecatedKey] = &[
     DeprecatedKey {
@@ -358,6 +388,8 @@ const DEPRECATED_KEYS: &[DeprecatedKey] = &[
 struct SurfaceManifest {
     #[serde(rename = "deprecatedKeys")]
     deprecated_keys: Vec<DeprecatedKey>,
+    #[serde(rename = "deprecatedInputs")]
+    deprecated_inputs: Vec<DeprecatedInput>,
     operations: Vec<SurfaceRow>,
     schema: &'static str,
 }
@@ -723,6 +755,7 @@ fn manifest_rows() -> Result<Vec<SurfaceRow>, String> {
 fn render_json(rows: &[SurfaceRow]) -> Result<String, String> {
     let manifest = SurfaceManifest {
         deprecated_keys: DEPRECATED_KEYS.to_vec(),
+        deprecated_inputs: DEPRECATED_INPUTS.to_vec(),
         operations: rows.to_vec(),
         schema: "forged.operation-surface/1",
     };
@@ -773,6 +806,18 @@ fn render_markdown(rows: &[SurfaceRow]) -> String {
         output.push_str(&format!(
             "| `{}` | `{}` | `{}` | `{}` |\n",
             key.schema, key.key, key.twin, key.remove_at,
+        ));
+    }
+    output.push_str("\n## Deprecated inputs\n\n");
+    output.push_str(
+        "Legacy inputs remain accepted by the CLI until their named replacement lands.\n\n",
+    );
+    output.push_str("| Operation | Parameter | Value | Replacement | Remove at |\n");
+    output.push_str("| --- | --- | --- | --- | --- |\n");
+    for input in DEPRECATED_INPUTS {
+        output.push_str(&format!(
+            "| `{}` | `{}` | `{}` | `{}` | `{}` |\n",
+            input.operation, input.parameter, input.value, input.replacement, input.remove_at,
         ));
     }
     output

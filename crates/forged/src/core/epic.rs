@@ -936,10 +936,20 @@ async fn complete_assurance_cleanup(
 }
 
 async fn append(ctx: &Ctx, epic: &str, kind: &str, value: Value) -> Result<(), Failure> {
+    let source_sha256 = bytes_digest(
+        &serde_json::to_vec(&value)
+            .map_err(|error| Failure::internal(format!("serializing epic event: {error}")))?,
+    );
+    let stage = json!({
+        "schema": "forged.packet-stage-change/1",
+        "sourceKind": kind,
+        "sourceSha256": source_sha256,
+    });
     let epic = epic.to_owned();
     let kind = kind.to_owned();
     on_ledger(&ctx.ledger, move |ledger| {
         ledger.append_event_once(&epic, &kind, value)?;
+        ledger.append_event_once(&epic, super::PACKET_STAGE_CHANGED_EVENT, stage)?;
         Ok(())
     })
     .await
@@ -4516,6 +4526,7 @@ pub async fn epic_resolve(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
                     &ctx.ledger,
                     &child,
                     &format!("forged:{epic}"),
+                    Some(&note),
                 )
                 .await?;
             }

@@ -10,6 +10,7 @@ use std::process::Stdio;
 use forged_ledger::{
     NewWorkItem, NewWorkNote, WorkKind, WorkNoteKind, WorkRevisionCause, WorkSpecFields, WorkStatus,
 };
+use forged_types::canonical_json_bytes;
 use serde_json::{json, Value};
 use support::TestEnv;
 
@@ -20,6 +21,73 @@ fn result(env: &TestEnv, args: &[&str]) -> Value {
     let (code, envelope) = env.forged(args);
     assert_eq!(code, 0, "{args:?}: {envelope}");
     envelope["result"].clone()
+}
+
+fn add_recommendation(env: &TestEnv, work_id: &str, file_name: &str) -> String {
+    let body = json!({
+        "schema": "forged.spec-recommendations/1",
+        "revision": 1,
+        "workItem": work_id,
+        "repository": "/tmp/lifecycle",
+        "reviewedAt": "2026-09-03T12:00:00Z",
+        "recommendations": [{
+            "target": "description",
+            "correction": "bind the accepted wording"
+        }],
+        "cruxes": []
+    });
+    let path = env.root.join(file_name);
+    std::fs::write(
+        &path,
+        serde_json::to_vec(&body).expect("recommendation JSON"),
+    )
+    .expect("write recommendation");
+    result(
+        env,
+        &[
+            "work",
+            "note",
+            "add",
+            "--id",
+            work_id,
+            "--kind",
+            "recommendation",
+            "--body-file",
+            path.to_str().expect("UTF-8 recommendation path"),
+        ],
+    )["note"]["noteId"]
+        .as_str()
+        .expect("recommendation note id")
+        .to_owned()
+}
+
+fn write_adjudication(
+    env: &TestEnv,
+    work_id: &str,
+    recommendation_note_id: &str,
+    resulting_revision: u64,
+    file_name: &str,
+) -> std::path::PathBuf {
+    let body = json!({
+        "schema": "forged.adjudication/1",
+        "revision": resulting_revision,
+        "workItem": work_id,
+        "critiquedRevision": 1,
+        "recommendationNoteId": recommendation_note_id,
+        "resultingRevision": resulting_revision,
+        "dispositions": [{
+            "ref": {"noteId": recommendation_note_id, "index": 0},
+            "disposition": "accept",
+            "reason": "accepted for this exact revision"
+        }],
+        "cruxes": [],
+        "adjudicatedAt": "2026-09-03T12:01:00Z",
+        "actor": "operator"
+    });
+    let path = env.root.join(file_name);
+    std::fs::write(&path, serde_json::to_vec(&body).expect("adjudication JSON"))
+        .expect("write adjudication");
+    path
 }
 
 fn pause_epic(env: &TestEnv, epic: &str) -> Value {
@@ -112,6 +180,7 @@ fn work_ready_summarizes_by_default_and_full_round_trips_complete_rows() {
             "status",
             "subject",
             "title",
+            "lifecycle",
         ])
     );
     assert_eq!(
@@ -124,6 +193,11 @@ fn work_ready_summarizes_by_default_and_full_round_trips_complete_rows() {
             "priority": 2,
             "repository": "/tmp/fat-ready-repo",
             "revision": 1,
+            "lifecycle": {
+                "stage": "drafted",
+                "since": created["work"]["updatedAt"],
+                "basis": {"revision": 1},
+            },
             "subject": {
                 "id": "fat-ready",
                 "kind": "work",
@@ -141,6 +215,7 @@ fn work_ready_summarizes_by_default_and_full_round_trips_complete_rows() {
     );
     let mut expected_full = created["work"].clone();
     expected_full["subject"] = row["subject"].clone();
+    expected_full["lifecycle"] = row["lifecycle"].clone();
     assert_eq!(full["ready"][0], expected_full);
 }
 
@@ -176,23 +251,15 @@ fn work_show_next_actions_execute_for_open_blocked_and_closed_states() {
     let shown = result(&env, &["work", "show", "--id", "action-open"]);
     assert_eq!(
         shown["nextActions"],
-        json!([
-            {
-                "verb": "run start",
-                "args": {"work": "action-open", "repo": repository},
-                "reason": "start a run once the work specification is complete",
-                "class": "can",
-            },
-            {
-                "verb": "work update",
-                "args": {"id": "action-open", "expectedRevision": 1, "description": null},
-                "reason": "supply at least one spec field or priority under the current revision guard",
-                "class": "can",
-            },
-        ])
+        json!([{
+            "verb": "work update",
+            "args": {"id": "action-open", "expectedRevision": 1, "description": null},
+            "reason": "supply at least one spec field or priority under the current revision guard",
+            "class": "can",
+        }])
     );
 
-    let update = &shown["nextActions"][1];
+    let update = &shown["nextActions"][0];
     let expected = update["args"]["expectedRevision"]
         .as_i64()
         .expect("expected revision")
@@ -211,58 +278,6 @@ fn work_show_next_actions_execute_for_open_blocked_and_closed_states() {
         ],
     );
     assert_eq!(updated["work"]["revision"], json!(2));
-
-    let start = &shown["nextActions"][0];
-    let (code, started) = env.forged(&[
-        "run",
-        "start",
-        "--work",
-        start["args"]["work"].as_str().expect("start work"),
-        "--repo",
-        start["args"]["repo"].as_str().expect("start repo"),
-    ]);
-    assert_eq!(code, 0, "advertised run start succeeds: {started}");
-
-    result(
-        &env,
-        &[
-            "work",
-            "create",
-            "--id",
-            "action-repo-placeholder",
-            "--title",
-            "Repository placeholder fixture",
-            "--description",
-            "complete description",
-            "--acceptance",
-            "complete acceptance",
-            "--design",
-            "complete design",
-            "--notes",
-            "complete notes",
-            "--priority",
-            "3",
-        ],
-    );
-    let shown = result(&env, &["work", "show", "--id", "action-repo-placeholder"]);
-    let start = &shown["nextActions"][0];
-    assert_eq!(start["args"]["repo"], Value::Null);
-    assert_eq!(
-        start["reason"],
-        json!("choose the repository before starting the run")
-    );
-    let (code, started) = env.forged(&[
-        "run",
-        "start",
-        "--work",
-        start["args"]["work"].as_str().expect("start work"),
-        "--repo",
-        &repository,
-    ]);
-    assert_eq!(
-        code, 0,
-        "advertised run start succeeds after binding repo: {started}"
-    );
 
     result(
         &env,
@@ -713,28 +728,35 @@ fn work_notes_round_trip_canonically_without_minting_revisions() {
         .expect("serialize approval"),
     )
     .expect("replace body");
-    let supplied = result(
-        &env,
-        &[
-            "work",
-            "note",
-            "add",
-            "--id",
-            "noted-work",
-            "--kind",
-            "approval",
-            "--actor",
-            "lead-agent",
-            "--body-file",
-            body_path,
-        ],
+    let (code, refused) = env.forged(&[
+        "work",
+        "note",
+        "add",
+        "--id",
+        "noted-work",
+        "--kind",
+        "approval",
+        "--actor",
+        "lead-agent",
+        "--body-file",
+        body_path,
+    ]);
+    assert_ne!(code, 0, "standalone approval note was accepted: {refused}");
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("run dispatch")),
+        "approval refusal names the replacement verb: {refused}"
     );
     assert_eq!(
-        supplied["note"]["schema"],
-        json!("forged.execution-approval/1"),
-        "the approval schema is stored under its typed contract"
+        refused["error"]["detail"],
+        json!({
+            "schema": "forged.remedy/1",
+            "verb": "run dispatch",
+            "args": {"id": "noted-work", "approvedBy": null, "basis": null},
+            "reason": "bind the approving actor and basis, then dispatch this exact work revision",
+        })
     );
-    assert_eq!(supplied["note"]["actor"], json!("lead-agent"));
 
     let mut child = env
         .forged_cmd(&[
@@ -767,7 +789,7 @@ fn work_notes_round_trip_canonically_without_minting_revisions() {
 
     let listed = result(&env, &["work", "note", "list", "--id", "noted-work"]);
     assert_eq!(listed["filters"], json!({"id": "noted-work", "limit": 100}));
-    assert_eq!(listed["totals"], json!({"shown": 3, "total": 3}));
+    assert_eq!(listed["totals"], json!({"shown": 2, "total": 2}));
     assert_eq!(listed["notes"][0]["bodyJson"], added["note"]["bodyJson"]);
     let filtered = result(
         &env,
@@ -791,7 +813,8 @@ fn work_notes_round_trip_canonically_without_minting_revisions() {
     assert_eq!(filtered["notes"][0]["noteId"], json!(note_id));
 
     let shown = result(&env, &["work", "show", "--id", "noted-work"]);
-    assert_eq!(shown["notesCount"], json!(3));
+    assert_eq!(shown["notesCount"], json!(2));
+    assert_eq!(shown["noteCounts"], json!({"comment": 1, "critique": 1}));
     assert_eq!(
         shown["work"]["revision"],
         json!(1),
@@ -890,6 +913,713 @@ fn recommendation_notes_round_trip_the_closed_v1_contract() {
 }
 
 #[test]
+fn work_adjudicate_atomically_binds_revision_evidence_and_status() {
+    let env = TestEnv::new("forged-work-adjudicate");
+    assert_eq!(env.forged(&["init"]).0, 0);
+
+    for (id, status, notes, expected_status) in [
+        ("adj-open", "open", None, "open"),
+        ("adj-blocked", "blocked", None, "open"),
+        (
+            "adj-unresolved",
+            "blocked",
+            Some("- [ ] operator choice remains"),
+            "blocked",
+        ),
+    ] {
+        let mut args = vec![
+            "work", "create", "--id", id, "--title", id, "--status", status,
+        ];
+        if let Some(notes) = notes {
+            args.extend(["--notes", notes]);
+        }
+        result(&env, &args);
+        let recommendation = add_recommendation(&env, id, &format!("{id}-recommendation.json"));
+        let body = write_adjudication(
+            &env,
+            id,
+            &recommendation,
+            1,
+            &format!("{id}-adjudication.json"),
+        );
+        let adjudicated = result(
+            &env,
+            &[
+                "work",
+                "adjudicate",
+                "--id",
+                id,
+                "--expected-revision",
+                "1",
+                "--dispositions-file",
+                body.to_str().expect("UTF-8 adjudication path"),
+            ],
+        );
+        assert_eq!(adjudicated["work"]["revision"], json!(1));
+        assert_eq!(adjudicated["work"]["status"], json!(expected_status));
+        assert_eq!(adjudicated["note"]["revision"], json!(1));
+        let shown = result(&env, &["work", "show", "--id", id]);
+        let expected_stage = if expected_status == "blocked" {
+            "blocked"
+        } else {
+            "ready"
+        };
+        assert_eq!(shown["lifecycle"]["stage"], json!(expected_stage));
+    }
+
+    result(
+        &env,
+        &[
+            "work",
+            "create",
+            "--id",
+            "adj-deferred",
+            "--title",
+            "Deferred adjudication",
+        ],
+    );
+    let recommendation =
+        add_recommendation(&env, "adj-deferred", "adj-deferred-recommendation.json");
+    result(
+        &env,
+        &[
+            "work",
+            "park",
+            "--id",
+            "adj-deferred",
+            "--reason",
+            "wait for adjudication",
+        ],
+    );
+    let body = write_adjudication(
+        &env,
+        "adj-deferred",
+        &recommendation,
+        1,
+        "adj-deferred-adjudication.json",
+    );
+    let adjudicated = result(
+        &env,
+        &[
+            "work",
+            "adjudicate",
+            "--id",
+            "adj-deferred",
+            "--expected-revision",
+            "1",
+            "--dispositions-file",
+            body.to_str().expect("UTF-8 adjudication path"),
+        ],
+    );
+    assert_eq!(adjudicated["work"]["status"], json!("open"));
+    assert_eq!(adjudicated["work"]["revision"], json!(1));
+
+    result(
+        &env,
+        &[
+            "work",
+            "create",
+            "--id",
+            "adj-changed",
+            "--title",
+            "Changed adjudication",
+        ],
+    );
+    let recommendation = add_recommendation(&env, "adj-changed", "adj-changed-recommendation.json");
+    let body = write_adjudication(
+        &env,
+        "adj-changed",
+        &recommendation,
+        2,
+        "adj-changed-adjudication.json",
+    );
+    let changed = result(
+        &env,
+        &[
+            "work",
+            "adjudicate",
+            "--id",
+            "adj-changed",
+            "--expected-revision",
+            "1",
+            "--description",
+            "accepted wording",
+            "--dispositions-file",
+            body.to_str().expect("UTF-8 adjudication path"),
+        ],
+    );
+    assert_eq!(changed["work"]["revision"], json!(2));
+    assert_eq!(changed["note"]["revision"], json!(2));
+
+    let (code, moved) = env.forged(&[
+        "work",
+        "adjudicate",
+        "--id",
+        "adj-changed",
+        "--expected-revision",
+        "1",
+        "--description",
+        "different wording",
+        "--dispositions-file",
+        body.to_str().expect("UTF-8 adjudication path"),
+    ]);
+    assert_ne!(code, 0, "moved revision accepted: {moved}");
+    assert_eq!(moved["error"]["code"], json!("BEADS_CONTENTION"));
+
+    result(
+        &env,
+        &[
+            "work",
+            "create",
+            "--id",
+            "adj-epic",
+            "--title",
+            "Adjudicated epic",
+            "--kind",
+            "epic",
+        ],
+    );
+    result(
+        &env,
+        &[
+            "work",
+            "create",
+            "--id",
+            "adj-epic-child",
+            "--title",
+            "Adjudicated epic child",
+        ],
+    );
+    result(
+        &env,
+        &[
+            "work",
+            "link",
+            "--from",
+            "adj-epic-child",
+            "--to",
+            "adj-epic",
+            "--kind",
+            "parent-child",
+        ],
+    );
+    let recommendation =
+        add_recommendation(&env, "adj-epic-child", "adj-epic-child-recommendation.json");
+    let body = write_adjudication(
+        &env,
+        "adj-epic-child",
+        &recommendation,
+        1,
+        "adj-epic-child-adjudication.json",
+    );
+    result(
+        &env,
+        &[
+            "work",
+            "adjudicate",
+            "--id",
+            "adj-epic-child",
+            "--expected-revision",
+            "1",
+            "--dispositions-file",
+            body.to_str().expect("UTF-8 adjudication path"),
+        ],
+    );
+    let epic = result(&env, &["work", "show", "--id", "adj-epic"]);
+    assert_eq!(epic["lifecycle"]["stage"], json!("adjudicated"));
+}
+
+#[test]
+fn work_adjudicate_and_park_refusals_carry_recovery_verbs() {
+    let env = TestEnv::new("forged-work-lifecycle-remedies");
+    assert_eq!(env.forged(&["init"]).0, 0);
+    for id in ["adj-held", "park-held"] {
+        result(&env, &["work", "create", "--id", id, "--title", id]);
+    }
+    result(
+        &env,
+        &[
+            "work",
+            "create",
+            "--id",
+            "park-running-epic",
+            "--title",
+            "Running epic",
+            "--kind",
+            "epic",
+        ],
+    );
+    let recommendation = add_recommendation(&env, "adj-held", "adj-held-recommendation.json");
+    let body = write_adjudication(
+        &env,
+        "adj-held",
+        &recommendation,
+        1,
+        "adj-held-adjudication.json",
+    );
+    let ledger = env.ledger();
+    ledger
+        .claim_specific_work("adj-held", "holder", 300)
+        .expect("claim adjudication fixture");
+    ledger
+        .claim_specific_work("park-held", "holder", 300)
+        .expect("claim parking fixture");
+    ledger
+        .authorize_desired_work(
+            forged_ledger::DesiredSubjectKind::Epic,
+            "park-running-epic",
+            0,
+        )
+        .expect("authorize running epic fixture");
+    ledger.close().expect("close fixture ledger");
+
+    let (code, held) = env.forged(&[
+        "work",
+        "adjudicate",
+        "--id",
+        "adj-held",
+        "--expected-revision",
+        "1",
+        "--dispositions-file",
+        body.to_str().expect("UTF-8 adjudication path"),
+    ]);
+    assert_ne!(code, 0, "held adjudication accepted: {held}");
+    assert_eq!(held["error"]["detail"]["verb"], json!("run status"));
+
+    let (code, held) = env.forged(&[
+        "work",
+        "park",
+        "--id",
+        "park-held",
+        "--reason",
+        "cannot park custody",
+    ]);
+    assert_ne!(code, 0, "held park accepted: {held}");
+    assert_eq!(held["error"]["detail"]["verb"], json!("run stop"));
+
+    let (code, running_epic) = env.forged(&[
+        "work",
+        "park",
+        "--id",
+        "park-running-epic",
+        "--reason",
+        "cannot hide an executing epic",
+    ]);
+    assert_ne!(code, 0, "running epic parked: {running_epic}");
+    assert!(running_epic["error"]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("running epic controller")));
+    assert_eq!(running_epic["error"]["detail"]["verb"], json!("epic pause"));
+    let shown = result(&env, &["work", "show", "--id", "park-running-epic"]);
+    assert_eq!(shown["work"]["status"], json!("open"));
+
+    result(
+        &env,
+        &[
+            "work",
+            "create",
+            "--id",
+            "adj-closed",
+            "--title",
+            "Closed adjudication",
+        ],
+    );
+    let recommendation = add_recommendation(&env, "adj-closed", "adj-closed-recommendation.json");
+    let body = write_adjudication(
+        &env,
+        "adj-closed",
+        &recommendation,
+        1,
+        "adj-closed-adjudication.json",
+    );
+    result(
+        &env,
+        &[
+            "work",
+            "close",
+            "--id",
+            "adj-closed",
+            "--reason",
+            "fixture complete",
+        ],
+    );
+    let (code, closed) = env.forged(&[
+        "work",
+        "adjudicate",
+        "--id",
+        "adj-closed",
+        "--expected-revision",
+        "1",
+        "--dispositions-file",
+        body.to_str().expect("UTF-8 adjudication path"),
+    ]);
+    assert_ne!(code, 0, "closed adjudication accepted: {closed}");
+    assert_eq!(closed["error"]["detail"]["verb"], json!("work reopen"));
+}
+
+#[test]
+fn parking_blocked_beads_stubs_hides_every_rail_and_resume_records_decision() {
+    let env = TestEnv::new("forged-work-park-blocked-fixture");
+    assert_eq!(env.forged(&["init"]).0, 0);
+    let repository = env.repos.repo.to_string_lossy().into_owned();
+    let ids = ["beads-alpha", "beads-beta", "beads-gamma"];
+    for id in ids {
+        result(
+            &env,
+            &[
+                "work",
+                "create",
+                "--id",
+                id,
+                "--title",
+                id,
+                "--status",
+                "blocked",
+                "--repository",
+                &repository,
+            ],
+        );
+        let parked = result(
+            &env,
+            &[
+                "work",
+                "park",
+                "--id",
+                id,
+                "--reason",
+                "park this planning stub",
+            ],
+        );
+        assert_eq!(parked["work"]["status"], json!("deferred"));
+        assert_eq!(parked["work"]["revision"], json!(1));
+    }
+
+    let ready = result(&env, &["work", "ready", "--repo", &repository]);
+    assert_eq!(ready["ready"], json!([]));
+    let attention = result(&env, &["attention", "list", "--repo", &repository]);
+    assert!(attention["groups"]
+        .as_array()
+        .expect("attention groups")
+        .iter()
+        .flat_map(|group| group["items"].as_array().into_iter().flatten())
+        .all(|item| !ids.contains(&item["id"].as_str().unwrap_or_default())));
+    let next = result(&env, &["next", "--repo", &repository]);
+    assert_eq!(next["hidden"]["parked"], json!(ids.len()));
+    assert!(next["sections"]
+        .as_object()
+        .expect("next sections")
+        .values()
+        .flat_map(|rows| rows.as_array().into_iter().flatten())
+        .all(|row| !ids.contains(&row["id"].as_str().unwrap_or_default())));
+
+    let shown = result(&env, &["work", "show", "--id", ids[0]]);
+    assert_eq!(shown["lifecycle"]["stage"], json!("parked"));
+    let explained = result(&env, &["explain", "--id", ids[0]]);
+    assert_eq!(explained["lifecycle"]["stage"], json!("parked"));
+    assert_eq!(explained["how"]["verdict"], json!("parked"));
+
+    let (code, refused) = env.forged(&["work", "reopen", "--id", ids[0]]);
+    assert_ne!(code, 0, "parked work reopened without a reason: {refused}");
+    assert_eq!(refused["error"]["detail"]["verb"], json!("work reopen"));
+    let resumed = result(
+        &env,
+        &[
+            "work",
+            "reopen",
+            "--id",
+            ids[0],
+            "--reason",
+            "resume the selected stub",
+        ],
+    );
+    assert_eq!(resumed["work"]["status"], json!("open"));
+    assert_eq!(resumed["work"]["revision"], json!(1));
+    let decisions = result(
+        &env,
+        &["work", "note", "list", "--id", ids[0], "--kind", "decision"],
+    );
+    let choices = decisions["notes"]
+        .as_array()
+        .expect("decision notes")
+        .iter()
+        .map(|note| {
+            serde_json::from_str::<Value>(note["bodyJson"].as_str().expect("decision body"))
+                .expect("decision JSON")["choice"]
+                .as_str()
+                .expect("decision choice")
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(choices, vec!["park", "resume"]);
+}
+
+#[test]
+fn run_start_refuses_parked_work_with_the_reopen_reason_remedy() {
+    let env = TestEnv::new("forged-run-start-parked-remedy");
+    assert_eq!(env.forged(&["init"]).0, 0);
+    let repository = env.repos.repo.to_string_lossy().into_owned();
+    result(
+        &env,
+        &[
+            "work",
+            "create",
+            "--id",
+            "parked-start",
+            "--title",
+            "Parked start",
+            "--description",
+            "A complete parked slice",
+            "--acceptance",
+            "The slice remains parked",
+            "--repository",
+            &repository,
+        ],
+    );
+    result(
+        &env,
+        &[
+            "work",
+            "park",
+            "--id",
+            "parked-start",
+            "--reason",
+            "defer this slice",
+        ],
+    );
+
+    let (code, refused) = env.forged(&[
+        "run",
+        "start",
+        "--work",
+        "parked-start",
+        "--repo",
+        &repository,
+        "--base-ref",
+        "main",
+    ]);
+    assert_ne!(code, 0, "parked work started: {refused}");
+    assert_eq!(
+        refused["error"]["detail"]["schema"],
+        json!("forged.remedy/1")
+    );
+    assert_eq!(refused["error"]["detail"]["verb"], json!("work reopen"));
+    assert_eq!(
+        refused["error"]["detail"]["args"],
+        json!({"id": "parked-start", "reason": null})
+    );
+}
+
+#[test]
+fn lifecycle_notes_round_trip_their_closed_v1_contracts() {
+    let env = TestEnv::new("forged-lifecycle-note-v1");
+    assert_eq!(env.forged(&["init"]).0, 0);
+    result(
+        &env,
+        &[
+            "work",
+            "create",
+            "--id",
+            "lifecycle-work",
+            "--title",
+            "Lifecycle work",
+        ],
+    );
+    let body_path = env.root.join("lifecycle-note.json");
+    let body_file = body_path.to_str().expect("UTF-8 body path");
+    let cases = [
+        (
+            "adjudication",
+            "forged.adjudication/1",
+            json!({
+                "schema": "forged.adjudication/1",
+                "revision": 1,
+                "workItem": "lifecycle-work",
+                "critiquedRevision": 1,
+                "recommendationNoteId": "note-recommendation",
+                "resultingRevision": 1,
+                "dispositions": [
+                    {
+                        "ref": {"noteId": "note-recommendation", "index": 0},
+                        "disposition": "adapt",
+                        "reason": "narrow the proposed change"
+                    },
+                    {
+                        "ref": {"noteId": "note-recommendation", "cruxId": "CRUX-1"},
+                        "disposition": "accept",
+                        "reason": "the operator chose option A"
+                    }
+                ],
+                "cruxes": [{
+                    "id": "CRUX-1",
+                    "choice": "option-a",
+                    "rationale": "it preserves the ledger boundary"
+                }],
+                "adjudicatedAt": "2026-09-03T12:00:00Z",
+                "actor": "operator"
+            }),
+        ),
+        (
+            "decision",
+            "forged.decision/1",
+            json!({
+                "schema": "forged.decision/1",
+                "revision": 1,
+                "kind": "approval",
+                "subject": {"kind": "work", "id": "lifecycle-work"},
+                "choice": "dispatch",
+                "rationale": "the exact execution tuple is approved",
+                "actor": "operator",
+                "at": "2026-09-03T12:01:00Z",
+                "costMicrousdAtDecision": 1200,
+                "approval": {
+                    "repository": "/tmp/lifecycle-work",
+                    "baseRef": "main",
+                    "profile": "default",
+                    "roster": "default",
+                    "observedRevision": 1
+                }
+            }),
+        ),
+        (
+            "retro",
+            "forged.retro/1",
+            json!({
+                "schema": "forged.retro/1",
+                "revision": 1,
+                "epic": "ore-epic",
+                "worked": [{"item": "bounded work", "evidenceIds": ["note-1"]}],
+                "cost": [
+                    {"item": "known", "evidenceIds": ["usage-1"], "microusd": 1200},
+                    {"item": "unknown", "evidenceIds": [], "microusd": null}
+                ],
+                "ranked": [{"rank": 1, "item": "keep", "evidenceIds": ["note-1"]}],
+                "at": "2026-09-03T12:02:00Z",
+                "actor": "lead-agent"
+            }),
+        ),
+    ];
+
+    for (kind, schema, body) in cases {
+        std::fs::write(
+            &body_path,
+            serde_json::to_vec_pretty(&body).expect("serialize lifecycle note"),
+        )
+        .expect("write lifecycle note");
+        let added = result(
+            &env,
+            &[
+                "work",
+                "note",
+                "add",
+                "--id",
+                "lifecycle-work",
+                "--kind",
+                kind,
+                "--schema",
+                schema,
+                "--body-file",
+                body_file,
+            ],
+        );
+        assert_eq!(added["note"]["kind"], json!(kind));
+        assert_eq!(added["note"]["schema"], json!(schema));
+        assert_eq!(added["note"]["revision"], json!(1));
+        let canonical = String::from_utf8(canonical_json_bytes(&body).expect("canonical body"))
+            .expect("UTF-8 canonical body");
+        assert_eq!(added["note"]["bodyJson"], json!(canonical));
+
+        let listed = result(
+            &env,
+            &[
+                "work",
+                "note",
+                "list",
+                "--id",
+                "lifecycle-work",
+                "--kind",
+                kind,
+            ],
+        );
+        assert_eq!(listed["totals"], json!({"shown": 1, "total": 1}));
+        assert_eq!(listed["notes"][0], added["note"]);
+    }
+
+    let shown = result(&env, &["work", "show", "--id", "lifecycle-work"]);
+    assert_eq!(shown["notesCount"], json!(3));
+    assert_eq!(
+        shown["noteCounts"],
+        json!({"adjudication": 1, "decision": 1, "retro": 1})
+    );
+}
+
+#[test]
+fn lifecycle_note_refusals_name_numeric_and_captured_revision_fields() {
+    let env = TestEnv::new("forged-lifecycle-note-refusals");
+    assert_eq!(env.forged(&["init"]).0, 0);
+    result(
+        &env,
+        &[
+            "work",
+            "create",
+            "--id",
+            "lifecycle-refusal",
+            "--title",
+            "Lifecycle refusal",
+        ],
+    );
+    let body = env.root.join("lifecycle-refusal.json");
+    let body_path = body.to_str().expect("UTF-8 body path");
+
+    std::fs::write(
+        &body,
+        r#"{"schema":"forged.retro/1","epic":"ore-epic","worked":[],"cost":[],"ranked":[{"rank":1.5,"item":"bad","evidenceIds":[]}],"at":"2026-09-03T12:00:00Z","actor":"operator"}"#,
+    )
+    .expect("write non-integer retro");
+    let (code, malformed) = env.forged(&[
+        "work",
+        "note",
+        "add",
+        "--id",
+        "lifecycle-refusal",
+        "--kind",
+        "retro",
+        "--body-file",
+        body_path,
+    ]);
+    assert_ne!(code, 0, "non-integer rank was accepted: {malformed}");
+    assert!(
+        malformed["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("ranked[0].rank")),
+        "numeric refusal names its field: {malformed}"
+    );
+
+    std::fs::write(
+        &body,
+        r#"{"schema":"forged.decision/1","revision":2,"kind":"park","subject":{"kind":"work","id":"lifecycle-refusal"},"choice":"park","rationale":"wait","actor":"operator","at":"2026-09-03T12:00:00Z"}"#,
+    )
+    .expect("write stale revision decision");
+    let (code, stale) = env.forged(&[
+        "work",
+        "note",
+        "add",
+        "--id",
+        "lifecycle-refusal",
+        "--kind",
+        "decision",
+        "--body-file",
+        body_path,
+    ]);
+    assert_ne!(code, 0, "stale revision was accepted: {stale}");
+    assert!(
+        stale["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("field revision")),
+        "revision refusal names its field: {stale}"
+    );
+}
+
+#[test]
 fn typed_work_note_refusals_name_schema_and_first_field() {
     let env = TestEnv::new("forged-typed-note-refusals");
     assert_eq!(env.forged(&["init"]).0, 0);
@@ -907,38 +1637,18 @@ fn typed_work_note_refusals_name_schema_and_first_field() {
     let body = env.root.join("typed-note.json");
     let body_path = body.to_str().expect("UTF-8 body path");
 
-    let cases = [
-        (
-            "recommendation",
-            json!({
-                "schema": "forged.spec-recommendations/1",
-                "repository": "/tmp/typed-note-work",
-                "reviewedAt": "2026-08-29T12:00:00Z",
-                "recommendations": [],
-                "cruxes": []
-            }),
-            "forged.spec-recommendations/1",
-            "workItem",
-        ),
-        (
-            "approval",
-            json!({
-                "schema": "forged.execution-approval/1",
-                "subjectKind": "slice",
-                "workItemId": "typed-note-work",
-                "observedRevision": "1",
-                "repository": "/tmp/typed-note-work",
-                "baseRef": "main",
-                "profile": "default",
-                "roster": "default",
-                "action": "run-start-submit",
-                "approvedAt": "2026-08-29T12:00:00Z",
-                "actor": "operator"
-            }),
-            "forged.execution-approval/1",
-            "basis",
-        ),
-    ];
+    let cases = [(
+        "recommendation",
+        json!({
+            "schema": "forged.spec-recommendations/1",
+            "repository": "/tmp/typed-note-work",
+            "reviewedAt": "2026-08-29T12:00:00Z",
+            "recommendations": [],
+            "cruxes": []
+        }),
+        "forged.spec-recommendations/1",
+        "workItem",
+    )];
     for (kind, payload, schema, field) in cases {
         std::fs::write(
             &body,
@@ -996,42 +1706,6 @@ fn typed_work_note_refusals_name_schema_and_first_field() {
         message.contains("forged.spec-recommendations/1"),
         "{message}"
     );
-
-    let legacy_approval = json!({
-        "schema": "forged-execution-approval/1",
-        "subjectKind": "slice",
-        "workItemId": "typed-note-work",
-        "observedRevision": "1",
-        "repository": "/tmp/typed-note-work",
-        "baseRef": "main",
-        "profile": "default",
-        "roster": "default",
-        "action": "run-start-submit",
-        "approvedAt": "2026-08-29T12:00:00Z",
-        "actor": "operator",
-        "basis": "approved tuple"
-    });
-    std::fs::write(
-        &body,
-        serde_json::to_vec(&legacy_approval).expect("serialize legacy approval"),
-    )
-    .expect("write legacy approval");
-    let (code, legacy) = env.forged(&[
-        "work",
-        "note",
-        "add",
-        "--id",
-        "typed-note-work",
-        "--kind",
-        "approval",
-        "--body-file",
-        body_path,
-    ]);
-    assert_ne!(code, 0, "legacy approval schema was accepted: {legacy}");
-    let message = legacy["error"]["message"].as_str().unwrap_or_default();
-    assert!(message.contains("forged-execution-approval/1"), "{message}");
-    assert!(message.contains("forged.execution-approval/1"), "{message}");
-    assert!(message.contains("schema"), "{message}");
 }
 
 #[test]
