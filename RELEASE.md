@@ -16,29 +16,21 @@ Forge follows semantic versioning while it is pre-1.0:
 The historical TypeScript `v0.4.0` tag is reserved. Never reuse, delete, or
 move a release tag.
 
-## Beads compatibility gate
+## Beads import compatibility
 
-Forge does not pin or manage the Beads binary on an operator host. A candidate
-must clear the `bd >=1.2.1` version floor and the required epic, heartbeat,
-reclaim, merge-slot, schema, and lease-behavior probes. Version order alone is
-not compatibility evidence.
+The ledger owns work items, dependencies, readiness, leases, and runtime
+coordination. `bd` is only the one-shot legacy import source; normal users do
+not install it to run Forge.
 
-Forge `v0.5.0` carries a temporary compatibility exception for the exact
-upstream `v1.2.1` Linux amd64 artifact. Release CI binds that artifact to
-SHA-256
-`48aecf42ffdefa6470298d8022deeb762e30c8729dc0a4bdda93888c0b0354e2`,
-requires the binary to report version `1.2.1` and commit
-`634cbbc4bc580fa5124f63fdf65d137a46d5b4ff`, and then uses it for every
-genuine Beads integration test. Upstream classifies `v1.2.1` as a prerelease
-and replaced it with rollback release `v1.2.2`; `v1.2.2` intentionally omits
-the heartbeat and reclaim capabilities Forge requires.
-
-This exception does not make Forge install or manage Beads on an operator
-host. It records the dependency risk accepted for `v0.5.0` while keeping every
-capability, doctor, schema, and lease-behavior probe fail-closed. A later Forge
-release must remove or deliberately update the pin only after its candidate
-Beads binary clears the same probes. Any probe failure blocks both pull-request
-validation and publication.
+Release preflight provisions the pinned Linux amd64 `bd` v1.2.1 artifact,
+checks its `list` and `show` commands, and runs the byte-fidelity
+`cargo test -p forged --test work_import -- --nocapture` with
+`FORGED_TEST_BD` and `FORGED_REQUIRE_BD=1`. The version `1.2.1`, commit
+`634cbbc4bc580fa5124f63fdf65d137a46d5b4ff`, and SHA-256
+`48aecf42ffdefa6470298d8022deeb762e30c8729dc0a4bdda93888c0b0354e2` are the
+source of truth in `.github/actions/provision-beads/action.yml`. Without
+`FORGED_REQUIRE_BD=1`, an absent binary skips this one test; a supplied
+incompatible binary fails.
 
 ## Prepare the release pull request
 
@@ -50,7 +42,8 @@ validation and publication.
 3. Move the user-visible entries from `Unreleased` into
    `## [X.Y.Z] - YYYY-MM-DD` in `CHANGELOG.md`, then leave an empty
    `Unreleased` section and update the comparison links at the bottom.
-4. Run the complete local gates:
+4. Run the complete local gates with the pinned import fixture available as
+   `BD_BIN` or on `PATH`. This is release qualification, not a runtime dependency:
 
 ```sh
 BD_REQUEST="${BD_BIN:-bd}"
@@ -73,8 +66,8 @@ git diff --check
 6. Open the release pull request and let its checks pass: `ci-ok` (the
    aggregate of `rust.yml`'s `lint`, `test`, and `failpoints` jobs) and
    `preflight` (`release.yml`'s cheap version/CHANGELOG/plugin-parity and
-   pinned-Beads probe, which runs on every PR touching release-relevant
-   paths). Only the operator merges it to `main`.
+   pinned one-shot import probe, which runs on every PR touching
+   release-relevant paths). Only the operator merges it to `main`.
 
 Use a conventional commit such as `chore(release): prepare v0.5.0`.
 
@@ -105,10 +98,10 @@ git push origin v0.5.0
 
 Pushing the tag is what starts the release workflow. `preflight` re-validates
 the version and CHANGELOG heading, re-checks plugin parity, re-provisions the
-pinned Beads probe, asserts the pushed tag matches the workspace version, and
-requires a successful `rust.yml` push run for the tagged commit — the Linux
-suite ran on that exact SHA when it landed on `main`, and publication trusts
-that run instead of repeating it. The macOS `test-macos` and
+pinned one-shot import probe, asserts the pushed tag matches the workspace
+version, and requires a successful `rust.yml` push run for the tagged commit —
+the Linux suite ran on that exact SHA when it landed on `main`, and publication
+trusts that run instead of repeating it. The macOS `test-macos` and
 `failpoints-macos` legs and the four-target `package` matrix then run in
 parallel, and `release` runs last once all of them succeed:
 it refuses a tag whose commit is not reachable from `origin/main`, refuses a
@@ -184,12 +177,12 @@ curl -fsSL https://github.com/tcashel/forge/releases/latest/download/uninstall.s
 Run this uninstall command twice; the second invocation must succeed without
 changing anything outside the selected prefix.
 
-Provision an upstream-supported `bd` separately through `PATH` or `BD_BIN`; it
-must clear Forge's version floor and capability probes, and the Forge installer
-does not install it. Run `forged init`, inspect every required `forged doctor`
-probe, and validate the intended profile and roster. Register the installed
-plugin explicitly in a fresh Claude Code, Codex, or Pi session and confirm the
-harness discovers it. See the
+If qualifying migration from an existing Beads store, provide `bd` explicitly
+through `PATH` or `BD_BIN`; Forge does not install it or use it for runtime
+coordination. Run `forged init`, inspect every required `forged doctor` probe,
+and validate the intended profile and roster. Register the installed plugin
+explicitly in a fresh Claude Code, Codex, or Pi session and confirm the harness
+discovers it. See the
 [plugin installation guide](plugins/forged/README.md#install-and-register) for
 the exact registration commands.
 

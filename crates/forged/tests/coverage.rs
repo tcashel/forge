@@ -326,7 +326,7 @@ fn parked_run_decisions_have_one_should_and_terminal_cancellation_has_none() {
             RunOutcome::AcceptedRisk,
             "run stop",
         ),
-        ("coverage-blocked", RunOutcome::Blocked, "work update"),
+        ("coverage-blocked", RunOutcome::Blocked, "run retry"),
         (
             "coverage-input-required",
             RunOutcome::InputRequired,
@@ -339,11 +339,14 @@ fn parked_run_decisions_have_one_should_and_terminal_cancellation_has_none() {
         let should = should_actions(&status);
         assert_eq!(should.len(), 1, "{run}: {status}");
         assert_eq!(should[0]["verb"], json!(expected), "{run}: {status}");
-        assert!(status["run"]["nextActions"]
-            .as_array()
-            .expect("actions")
-            .iter()
-            .any(|action| action["verb"] == json!("run retry") && action["class"] == json!("can")));
+        if outcome != RunOutcome::Blocked {
+            assert!(status["run"]["nextActions"]
+                .as_array()
+                .expect("actions")
+                .iter()
+                .any(|action| action["verb"] == json!("run retry")
+                    && action["class"] == json!("can")));
+        }
     }
 
     fabricate_run(&env, "coverage-cancelled");

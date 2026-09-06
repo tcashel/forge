@@ -505,7 +505,7 @@ pub(crate) async fn run_start_with_definition(
         })
         .await
     };
-    match existing {
+    let terminal_replay = match existing {
         Ok(Some(row))
             if row.state == OperationState::Terminal && row.request_sha256 == legacy_hash =>
         {
@@ -523,9 +523,10 @@ pub(crate) async fn run_start_with_definition(
             )
             .await;
         }
-        Ok(_) => {}
+        Ok(Some(row)) => row.state == OperationState::Terminal,
+        Ok(None) => false,
         Err(error) => return err_response(&req.idempotency_key, &error),
-    }
+    };
     req.params.insert(
         "packageSha256".to_owned(),
         Value::String(compiled.package_sha256.clone()),
@@ -535,7 +536,30 @@ pub(crate) async fn run_start_with_definition(
         Ok(None) => {}
         Err(error) => return err_response(&req.idempotency_key, &error),
     }
-    let params = req.params.clone();
+    let mut params = req.params.clone();
+    if !terminal_replay {
+        let repo = match param_str(&params, "repo") {
+            Ok(repo) => repo,
+            Err(error) => return err_response(&req.idempotency_key, &error),
+        };
+        let base = match validated_run_base(
+            repo,
+            params.get("baseRef").and_then(Value::as_str),
+            compiled.package.protocol_ref.name == "slice",
+        )
+        .await
+        {
+            Ok(base) => base,
+            Err(error) => {
+                let mut args = params.clone();
+                args.remove("packageSha256");
+                args.insert("baseRef".to_owned(), Value::Null);
+                return dispatch_remedy(&req.idempotency_key, error, "run start", json!(args),
+                    "repair origin access if needed, then select an existing origin branch and pass --base-ref before starting");
+            }
+        };
+        params.insert("baseRef".to_owned(), json!(base));
+    }
     fenced(ctx, "run_start", EffectClass::SafeRetry, req, None, {
         move |operation_id| async move {
             create_run_from_definition(
@@ -843,8 +867,11 @@ pub async fn run_dispatch(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
         Err(error) => return err_response(&req.idempotency_key, &error),
     };
     let base_ref = match param_opt_str_strict(&req.params, "baseRef") {
-        Ok(Some(base)) if !base.trim().is_empty() => Some(base.to_owned()),
-        Ok(Some(_)) | Ok(None) => None,
+        Ok(_) => req
+            .params
+            .get("baseRef")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
         Err(error) => return err_response(&req.idempotency_key, &error),
     };
     let run_name = match param_opt_str_strict(&req.params, "runId") {
@@ -1068,6 +1095,14 @@ pub async fn run_dispatch(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
         Err(error) => return err_response(&req.idempotency_key, &error),
     }
 
+    let validated_base = match validated_run_base(&repository, base_ref.as_deref(), true).await {
+        Ok(base) => base,
+        Err(error) => return dispatch_remedy(&req.idempotency_key, error, "run dispatch",
+            json!({"id": work_id, "repo": repository, "baseRef": Value::Null,
+                "basis": basis, "approvedBy": approved_by, "override": override_reason,
+                "profile": profile, "roster": roster, "runId": run_name}),
+            "repair origin access if needed, then select an existing origin branch and pass --base-ref before dispatching"),
+    };
     let submit_guard = match super::handoff::acquire_run_submit(ctx, run_id.as_str()).await {
         Ok(guard) => guard,
         Err(error) => return err_response(&req.idempotency_key, &error),
@@ -1075,7 +1110,7 @@ pub async fn run_dispatch(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
     let mut start_params = req.params.clone();
     start_params.insert("bead".to_owned(), json!(work_id));
     start_params.insert("repo".to_owned(), json!(repository));
-    start_params.insert("baseRef".to_owned(), json!(base_ref));
+    start_params.insert("baseRef".to_owned(), json!(validated_base));
     start_params.remove("spec");
     let request_for_effect = req.clone();
     let work_for_effect = work_id.clone();
@@ -1240,6 +1275,31 @@ struct RunDispatchSeal {
     submission: Value,
 }
 
+/// Admission is read-only and precedes the operation fence. Canonical bytes
+/// enter only the effect parameters, never the request hash; replay stays
+/// offline. Runtime continuations already carry canonical branch names.
+async fn validated_run_base(
+    repo: &str,
+    requested: Option<&str>,
+    normalize: bool,
+) -> Result<String, Failure> {
+    let base = match requested {
+        Some(raw) if normalize => super::epic::normalize_base_ref(raw)
+            .ok_or_else(|| Failure::invalid("baseRef must name a nonempty branch on origin"))?
+            .to_owned(),
+        Some(canonical) => canonical.to_owned(),
+        None => default_branch_of(repo).await,
+    };
+    forged_git::remote_branch_sha(Path::new(repo), &base)
+        .await
+        .map_err(|error| {
+            Failure::invalid(format!(
+                "baseRef {base:?} must name a branch that exists on origin: {error}"
+            ))
+        })?;
+    Ok(base)
+}
+
 async fn create_run_from_definition(
     ctx: &Ctx,
     params: &serde_json::Map<String, Value>,
@@ -1331,7 +1391,7 @@ async fn create_run_from_definition(
             super::spec::SpecSource::Work(work.clone())
         }
     };
-    let base_ref = match param_opt_str(params, "baseRef") {
+    let base_ref = match params.get("baseRef").and_then(Value::as_str) {
         Some(base) => base.to_owned(),
         None => default_branch_of(&repo).await,
     };
@@ -2118,6 +2178,45 @@ pub async fn run_retry(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespon
         Ok(config) => config,
         Err(error) => return err_response(&req.idempotency_key, &Failure::invalid(error)),
     };
+    // Omitted model choices inherit the source's named topology and roster,
+    // while repository policy is refreshed. Keep inference out of the request
+    // hash so existing retries replay identically, including offline recovery.
+    let source_package = if profile.is_none() || roster.is_none() {
+        let source_id = source_id.clone();
+        match on_ledger(&ctx.ledger, move |ledger| {
+            ledger.get_run_definition(&source_id)
+        })
+        .await
+        {
+            Ok(Some(definition)) => {
+                match serde_json::from_str::<ExecutionPackageV1>(&definition.package_json) {
+                    Ok(package) => Some(package),
+                    Err(error) => {
+                        return err_response(
+                            &req.idempotency_key,
+                            &Failure::internal(format!(
+                                "stored source execution package is invalid: {error}"
+                            )),
+                        )
+                    }
+                }
+            }
+            Ok(None) => None,
+            Err(error) => return err_response(&req.idempotency_key, &error),
+        }
+    } else {
+        None
+    };
+    let profile = profile.or_else(|| {
+        source_package
+            .as_ref()
+            .map(|package| package.profile_ref.name.clone())
+    });
+    let roster = roster.or_else(|| {
+        source_package
+            .as_ref()
+            .map(|package| package.roster_ref.name.clone())
+    });
     let compiled = match config.compile_definition(profile.as_deref(), roster.as_deref()) {
         Ok(compiled) => compiled,
         Err(errors) => {
@@ -2715,6 +2814,7 @@ fn run_status_gate_state(view: &forged_proto::RunView) -> Option<&'static str> {
 pub(crate) fn run_projection_actions(
     run: &forged_ledger::RunRow,
     delivery_pr: Option<u64>,
+    work_status: Option<&str>,
 ) -> Vec<forged_types::OperationActionV1> {
     if run.state == RunState::Active {
         return vec![action(
@@ -2755,7 +2855,25 @@ pub(crate) fn run_projection_actions(
                 retry_action(&run.run_id, retry_reason(run)),
             ];
         }
-        Some(forged_ledger::RunOutcome::Blocked | forged_ledger::RunOutcome::InputRequired) => {
+        Some(forged_ledger::RunOutcome::Blocked) => {
+            return vec![match work_status {
+                Some("blocked") => classified_action(
+                    "work reopen",
+                    json!({"id": run.work_id}),
+                    super::attention::policy(forged_types::AttentionCondition::Blocked)
+                        .2
+                        .text,
+                    forged_types::ActionClass::Should,
+                ),
+                Some("closed" | "deferred") => action(
+                    "work show",
+                    json!({"id": run.work_id}),
+                    "inspect the deliberately closed or parked work before resuming it",
+                ),
+                _ => stopped_run_retry_action(run),
+            }];
+        }
+        Some(forged_ledger::RunOutcome::InputRequired) => {
             return vec![
                 classified_action(
                     "work update",
@@ -3138,7 +3256,7 @@ pub async fn run_status(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
                 "deadlineKills": deadline_kills,
                 "progress": progress,
                 "mail": mail,
-                "nextActions": run_projection_actions(&view.run, delivery_pr),
+                "nextActions": run_projection_actions(&view.run, delivery_pr, claim_health.get("status").and_then(Value::as_str)),
                 "nextAction": match protocol_terminal {
                     Some(terminal) if view.accepted_risk.is_none() => json!({"stop": terminal}),
                     _ => match &action {

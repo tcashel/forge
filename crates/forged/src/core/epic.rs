@@ -1398,7 +1398,7 @@ async fn recover_applied_epic_abandon(
 /// downstream construction (`git fetch origin <base>`,
 /// `refs/remotes/origin/<base>`, the PR base), so the remote prefix is
 /// stripped rather than frozen.
-fn normalize_base_ref(requested: &str) -> Option<&str> {
+pub(super) fn normalize_base_ref(requested: &str) -> Option<&str> {
     let bare = requested.strip_prefix("origin/").unwrap_or(requested);
     (!bare.is_empty()).then_some(bare)
 }

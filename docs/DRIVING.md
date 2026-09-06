@@ -96,6 +96,10 @@ The lifecycle is a total order at every boundary, including stub promotions.
 `run dispatch` refuses below `adjudicated` and records an explicit override
 reason when the operator insists.
 
+New runs validate the base branch on origin before admission. `origin/main`
+is accepted as `main`; a missing branch is refused before a run is created.
+Replaying a successful admission does not require origin to remain reachable.
+
 ## Act — the decision verbs
 
 Every decision on `next` names its verbs. The full table is in
@@ -112,6 +116,8 @@ forged run stop --run <run> --outcome landed --pr <n> --sha <full-sha>
 
 `retry` mints a successor run on the same work item from its current
 revision with a fresh package; it never un-settles the source.
+Omitted profile and roster choices retain the source's names; explicit
+overrides still apply, and policy is compiled from current repository settings.
 
 With `--because world-changed` (the default), it can reuse a completed
 implementation only when the machine stopped at its first push, before any
@@ -122,13 +128,24 @@ fresh review; it never inherits their verdicts. Changed or missing evidence
 prevents reuse, as do `--fresh`, `spec-amended`, and `rebase`. An implementation
 seat then continues from preserved commits when available.
 
+A protocol-blocked gate failure before review can also reuse implementation
+after the environment is repaired. Reopen blocked work, then retry with
+`world-changed`. Only gate commands may differ from the original execution
+contract; the recorded implementation, specification, base, and clean source
+and successor heads must still agree. Any intervening fix must have completed
+without changing source. The successor runs fresh gates and reviews, retaining
+the source failure and linking to its original implementation attempt. Missing
+proof falls back to implementation; `next` and `explain` name the applicable
+reopen or retry action.
+
 `supersede` is for when the spec must be replaced by a new item.
 `adjudicate-settlement` is the destructive door for a run the normal
 fence cannot settle; it refuses everything the fence can.
 
 ## Act — the repair verbs
 
-Refusals carry `error.detail.remedy`. Run the remedy, not a guess.
+Structured refusals carry `forged.remedy/1` in `error.detail`. Use its verb and
+arguments, filling any required null fields before retrying.
 
 | Refusal | Meaning | Remedy |
 | --- | --- | --- |

@@ -286,7 +286,7 @@ fn source_backed_attention_cannot_substitute_for_domain_resolution() {
             "verb": "work reopen",
             "args": {"id": "bead-attention-blocked"},
             "reason": blocked["recommendedAction"]["text"],
-            "class": "repair",
+            "class": "should",
         }]),
         "the closed recommendation mapping publishes one domain verb"
     );
@@ -321,10 +321,15 @@ fn source_backed_attention_cannot_substitute_for_domain_resolution() {
     let id = remedy["args"]["id"].as_str().expect("remedy work id");
     let (code, reopened) = env.forged(&["work", "reopen", "--id", id]);
     assert_eq!(code, 0, "advertised work reopen succeeds: {reopened}");
-    assert!(
-        attention(&overview(&env), "attention-blocked", "blocked").is_none(),
-        "the advertised domain transition clears the condition"
+    let value = overview(&env);
+    let blocked = attention(&value, "attention-blocked", "blocked")
+        .expect("reopening work does not resume its terminal run");
+    assert_eq!(blocked["nextActions"][0]["verb"], json!("run retry"));
+    assert_eq!(
+        blocked["nextActions"][0]["args"]["because"],
+        json!("world-changed")
     );
+    assert_eq!(blocked["nextActions"][0]["class"], json!("should"));
 }
 
 #[test]
@@ -1519,7 +1524,7 @@ fn exact_replay_survives_authoritative_source_clearance() {
 /// The shared attention_list fixture: two quarantined runs (one decision
 /// group with two items, `att-b` older than `att-a` — append order and
 /// alphabetical order deliberately DISAGREE so the oldest-first assertions
-/// cannot pass on an id sort) and one blocked run (one symptom group).
+/// cannot pass on an id sort) and one blocked run (another decision group).
 fn seed_attention_list_fixture(env: &TestEnv) {
     env.forged(&["init"]);
     fabricate_run(env, "att-a");
@@ -1602,7 +1607,7 @@ fn attention_list_groups_decisions_first_and_serves_complete_rail_items() {
     assert_eq!(groups[0]["condition"], json!("quarantined"));
     assert_eq!(groups[0]["classification"], json!("decision"));
     assert_eq!(groups[1]["condition"], json!("blocked"));
-    assert_eq!(groups[1]["classification"], json!("symptom"));
+    assert_eq!(groups[1]["classification"], json!("decision"));
     let quarantined = &groups[0];
     assert_eq!(quarantined["total"], json!(2));
     assert_eq!(quarantined["shown"], json!(2));
@@ -1618,8 +1623,8 @@ fn attention_list_groups_decisions_first_and_serves_complete_rail_items() {
             "open": 3,
             "acknowledged": 0,
             "resolved": 0,
-            "decisions": 2,
-            "symptoms": 1,
+            "decisions": 3,
+            "symptoms": 0,
             "shown": 3,
             "total": 3,
         })
@@ -1666,7 +1671,7 @@ fn attention_list_serves_the_plan_only_blocked_work_exactly_as_the_rail() {
 
     let listed = attention_list(&env, &[]);
     let blocked = group(&listed, "blocked");
-    assert_eq!(blocked["classification"], json!("symptom"));
+    assert_eq!(blocked["classification"], json!("decision"));
     assert_eq!(blocked["total"], json!(1));
     assert_eq!(
         blocked["items"][0], rail,
@@ -1786,8 +1791,8 @@ fn attention_list_state_scopes_reconcile_with_custody_truth() {
             "open": 1,
             "acknowledged": 1,
             "resolved": 1,
-            "decisions": 2,
-            "symptoms": 1,
+            "decisions": 3,
+            "symptoms": 0,
             "shown": 3,
             "total": 3,
         })
@@ -1806,7 +1811,7 @@ fn attention_list_state_scopes_reconcile_with_custody_truth() {
     assert_eq!(quarantined["totals"]["total"], json!(2));
     assert_eq!(quarantined["totals"]["symptoms"], json!(0));
     let symptoms = attention_list(&env, &["--state", "all", "--classification", "symptom"]);
-    assert_eq!(symptoms["totals"]["total"], json!(1));
+    assert_eq!(symptoms["totals"]["total"], json!(0));
     assert_eq!(symptoms["totals"]["decisions"], json!(0));
 }
 
