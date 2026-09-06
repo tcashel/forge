@@ -2178,7 +2178,7 @@ pub async fn run_retry(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespon
         Ok(config) => config,
         Err(error) => return err_response(&req.idempotency_key, &Failure::invalid(error)),
     };
-    // Omitted model choices inherit the source's named topology and roster,
+    // Omitted model choices inherit the source's named topology and active roster,
     // while repository policy is refreshed. Keep inference out of the request
     // hash so existing retries replay identically, including offline recovery.
     let source_package = if profile.is_none() || roster.is_none() {
@@ -2212,7 +2212,27 @@ pub async fn run_retry(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespon
             .as_ref()
             .map(|package| package.profile_ref.name.clone())
     });
-    let roster = roster.or_else(|| {
+    let active_source_roster = if roster.is_none() {
+        let source_id = source_id.clone();
+        match on_ledger(&ctx.ledger, move |ledger| {
+            ledger
+                .latest_roster_revision(&source_id)?
+                .map(|revision| {
+                    serde_json::from_str::<forged_types::RosterRef>(&revision.roster_ref_json)
+                        .map(|reference| reference.name)
+                        .map_err(forged_ledger::LedgerError::from)
+                })
+                .transpose()
+        })
+        .await
+        {
+            Ok(name) => name,
+            Err(error) => return err_response(&req.idempotency_key, &error),
+        }
+    } else {
+        None
+    };
+    let roster = roster.or(active_source_roster).or_else(|| {
         source_package
             .as_ref()
             .map(|package| package.roster_ref.name.clone())

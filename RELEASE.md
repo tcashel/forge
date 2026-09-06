@@ -55,7 +55,7 @@ test -x "$FORGED_TEST_BD"
 export CARGO_PROFILE_DEV_DEBUG=line-tables-only
 export CARGO_PROFILE_TEST_DEBUG=line-tables-only
 bash scripts/validate-plugin.sh
-bash scripts/test-install.sh
+env -u BD_BIN bash scripts/test-install.sh
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo build --workspace --locked

@@ -1051,8 +1051,16 @@ fn run_retry_preserves_three_local_only_commits_and_projects_the_start_point() {
 }
 
 #[test]
-fn run_retry_inherits_named_source_models_unless_explicitly_overridden() {
-    for mode in ["inherit", "override", "removed"] {
+fn run_retry_inherits_active_source_models_unless_explicitly_overridden() {
+    for mode in [
+        "inherit",
+        "override",
+        "removed",
+        "revised",
+        "revised-original-removed",
+        "revised-active-removed",
+        "revised-override",
+    ] {
         let env = TestEnv::new("forged-retry-model-inheritance");
         env.add_uniform_roster("source-models", "claude", "opus");
         assert_eq!(env.forged(&["init"]).0, 0);
@@ -1074,6 +1082,34 @@ fn run_retry_inherits_named_source_models_unless_explicitly_overridden() {
             "source-models",
         ]);
         assert_eq!(code, 0, "{started}");
+        let config_path = env.anvil.join("config.json");
+        let mut config: Value =
+            serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        config["rosters"]["other-models"] = config["rosters"]["default"].clone();
+        config["rosters"]["other-models"]["name"] = json!("other-models");
+        config["rosters"]["revised-models"] = config["rosters"]["default"].clone();
+        config["rosters"]["revised-models"]["name"] = json!("revised-models");
+        config["default_profile"] = json!("standard");
+        config["default_roster"] = json!("other-models");
+        std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+        if mode.starts_with("revised") {
+            let (code, revised) = env.forged(&[
+                "run",
+                "revise-roster",
+                "--run",
+                "model-source",
+                "--roster",
+                "revised-models",
+                "--reason",
+                "use replacement source models",
+            ]);
+            assert_eq!(code, 0, "{mode}: {revised}");
+            assert_eq!(revised["result"]["revision"], json!(2));
+            assert_eq!(
+                revised["result"]["roster_ref"]["name"],
+                json!("revised-models")
+            );
+        }
         let ledger = env.ledger();
         ledger
             .settle_run(
@@ -1086,32 +1122,35 @@ fn run_retry_inherits_named_source_models_unless_explicitly_overridden() {
             )
             .unwrap();
         ledger.close().unwrap();
-        let config_path = env.anvil.join("config.json");
-        let mut config: Value =
-            serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
-        config["rosters"]["other-models"] = config["rosters"]["default"].clone();
-        config["rosters"]["other-models"]["name"] = json!("other-models");
-        config["default_profile"] = json!("standard");
-        config["default_roster"] = json!("other-models");
-        if mode == "removed" {
-            config["rosters"]
-                .as_object_mut()
-                .unwrap()
-                .remove("source-models");
+        if matches!(
+            mode,
+            "removed" | "revised-original-removed" | "revised-active-removed"
+        ) {
+            config["rosters"].as_object_mut().unwrap().remove(
+                if mode == "revised-active-removed" {
+                    "revised-models"
+                } else {
+                    "source-models"
+                },
+            );
         }
-        std::fs::write(config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+        std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
         let mut args = vec!["run", "retry", "--id", "model-source", "--fresh"];
-        if mode == "override" {
+        if matches!(mode, "override" | "revised-override") {
             args.extend(["--profile", "standard", "--roster", "other-models"]);
         }
         let (code, retry) = env.forged(&args);
         let ledger = env.ledger();
-        if mode == "removed" {
+        if matches!(mode, "removed" | "revised-active-removed") {
             assert_ne!(code, 0, "missing named source must not fall back: {retry}");
             assert!(retry["error"]["message"]
                 .as_str()
                 .unwrap()
-                .contains("source-models"));
+                .contains(if mode == "removed" {
+                    "source-models"
+                } else {
+                    "revised-models"
+                }));
             assert_eq!(ledger.list_runs().unwrap().len(), 1);
         } else {
             assert_eq!(code, 0, "{retry}");
@@ -1120,15 +1159,30 @@ fn run_retry_inherits_named_source_models_unless_explicitly_overridden() {
                 .expect("returned successor id");
             let definition = ledger.get_run_definition(successor).unwrap().unwrap();
             let package: Value = serde_json::from_str(&definition.package_json).unwrap();
-            let (profile, roster) = if mode == "inherit" {
-                ("lean", "source-models")
-            } else {
-                ("standard", "other-models")
+            let (profile, roster) = match mode {
+                "inherit" => ("lean", "source-models"),
+                "revised" | "revised-original-removed" => ("lean", "revised-models"),
+                _ => ("standard", "other-models"),
             };
-            assert_eq!(package["profileRef"]["name"], json!(profile));
-            assert_eq!(package["rosterRef"]["name"], json!(roster));
+            assert_eq!(package["profileRef"]["name"], json!(profile), "{mode}");
+            assert_eq!(package["rosterRef"]["name"], json!(roster), "{mode}");
         }
         ledger.close().unwrap();
+        if mode == "revised-original-removed" {
+            config["rosters"]
+                .as_object_mut()
+                .unwrap()
+                .remove("revised-models");
+            std::fs::write(config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+            git(&env.repos.repo, &["remote", "remove", "origin"]);
+            let (code, replayed) = env.forged(&args);
+            assert_eq!(
+                code, 0,
+                "replay needs neither roster nor origin: {replayed}"
+            );
+            assert_eq!(replayed["reused"], json!(true));
+            assert_eq!(replayed["result"]["runId"], retry["result"]["runId"]);
+        }
     }
 }
 
