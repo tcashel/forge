@@ -644,4 +644,81 @@ fn unattributed_usage_preserves_tokens_cost_provenance_and_text_visibility() {
         );
     }
     assert!(!text.contains("unattributed attempts without usage"));
+    assert_eq!(report["pricing"]["currentRateCard"], raw["pricing"]);
+
+    let path = fixture.env.anvil.join("config.json");
+    let mut config: Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("scratch config"))
+            .expect("fixture config JSON");
+    config["pricing"] = json!({
+        "source":"fixture-updated-card", "rates_as_of":"2030-06-01",
+        "long_context_threshold":272000, "tools":{"web_search_per_1k":25.5},
+        "models":{"mismatched-imputed":{"context_window":272000,
+            "short":{"input":1000.0,"cached_input":2000.0,"cache_write":3000.0,"output":4000.0}}},
+    });
+    std::fs::write(
+        &path,
+        serde_json::to_vec_pretty(&config).expect("config JSON"),
+    )
+    .expect("change only scratch pricing configuration");
+
+    let after = fixture.report(&["--models", "--run", "unattributed"]);
+    let raw_after = fixture.report(&["--run", "unattributed"]);
+    assert_eq!(after["schema"], json!("forged.model-usage/1"));
+    assert_eq!(after["groups"], report["groups"]);
+    assert_eq!(after["unattributedUsage"], report["unattributedUsage"]);
+    assert_eq!(after["unattributedUsage"]["knownUsd"], json!(3.75));
+    assert_eq!(after["unattributedUsage"]["imputedRows"], json!(1));
+    assert_eq!(raw_after["rows"], raw["rows"]);
+    assert_eq!(after["pricing"]["currentRateCard"], raw_after["pricing"]);
+    assert_ne!(
+        after["pricing"]["currentRateCard"],
+        report["pricing"]["currentRateCard"]
+    );
+    assert_eq!(
+        after["pricing"]["currentRateCard"],
+        json!({
+            "source":"fixture-updated-card", "ratesAsOf":"2030-06-01", "webSearchPer1k":25.5,
+        })
+    );
+    for report in [&report, &after] {
+        assert_eq!(
+            report["pricing"].get("historicalRateCard"),
+            Some(&Value::Null)
+        );
+        let note = report["pricing"]["note"]
+            .as_str()
+            .expect("pricing provenance note");
+        for phrase in [
+            "Historical imputation source and rate-card metadata",
+            "were not captured",
+            "context only",
+            "recorded costs were not repriced",
+        ] {
+            assert!(note.contains(phrase), "missing {phrase:?}: {note}");
+        }
+    }
+    let output = fixture
+        .env
+        .forged_cmd(&["--text", "usage", "--models", "--run", "unattributed"])
+        .output()
+        .expect("text pricing report");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout).expect("UTF-8 pricing report");
+    for line in [
+        "current pricing source: fixture-updated-card",
+        "current rates as of: 2030-06-01",
+        "current web search USD per 1k: 25.5",
+        "Historical rate card: unknown; its source and date were not recorded.",
+        "Current rate card is context only; recorded costs were not repriced.",
+    ] {
+        assert!(
+            text.lines().any(|actual| actual == line),
+            "missing {line:?}: {text}"
+        );
+    }
 }

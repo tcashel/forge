@@ -555,6 +555,26 @@ fn render_model_usage(result: &Value, now: &str) -> String {
     ] {
         push_field(&mut lines, label, result.pointer(pointer));
     }
+    if result.get("pricing").is_some() {
+        for (label, pointer) in [
+            ("current pricing source", "/pricing/currentRateCard/source"),
+            ("current rates as of", "/pricing/currentRateCard/ratesAsOf"),
+            (
+                "current web search USD per 1k",
+                "/pricing/currentRateCard/webSearchPer1k",
+            ),
+        ] {
+            push_field(&mut lines, label, result.pointer(pointer));
+        }
+        push_line(
+            &mut lines,
+            "Historical rate card: unknown; its source and date were not recorded.".to_owned(),
+        );
+        push_line(
+            &mut lines,
+            "Current rate card is context only; recorded costs were not repriced.".to_owned(),
+        );
+    }
     if result
         .pointer("/attribution/unattributedUsageRows")
         .and_then(Value::as_u64)

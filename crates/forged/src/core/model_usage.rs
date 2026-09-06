@@ -132,7 +132,13 @@ pub(super) async fn report(
         move |ledger| ledger.model_usage_snapshot(repository.as_deref(), run.as_deref())
     })
     .await?;
-    project(snapshot, repository, run, limit as usize)
+    let mut result = project(snapshot, repository, run, limit as usize)?;
+    result["pricing"] = json!({
+        "currentRateCard": super::ops::pricing_json(&ctx.config),
+        "historicalRateCard": null,
+        "note": "Historical imputation source and rate-card metadata were not captured. The current rate card is configuration context only; recorded costs were not repriced.",
+    });
+    Ok(result)
 }
 
 fn project(
