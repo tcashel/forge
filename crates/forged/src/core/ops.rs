@@ -419,7 +419,13 @@ pub(super) fn run_start_failure_response(
 /// `--repo` and `--base-ref` arguments. The spec comes from the work;
 /// `--spec <path>` is the deprecated file route, honored for one release.
 pub async fn run_start(ctx: &Ctx, req: &mut OperationRequest) -> OperationResponse {
-    let compiled = match ctx.config.compile_definition(
+    let config = match param_str(&req.params, "repo")
+        .and_then(|repo| ctx.config.for_repository(repo).map_err(Failure::invalid))
+    {
+        Ok(config) => config,
+        Err(error) => return err_response(&derive_key("run_start", None, None, None), &error),
+    };
+    let compiled = match config.compile_definition(
         param_opt_str(&req.params, "profile"),
         param_opt_str(&req.params, "roster"),
     ) {
@@ -894,10 +900,11 @@ pub async fn run_dispatch(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
             )
         }
     };
-    let compiled = match ctx
-        .config
-        .compile_definition(profile.as_deref(), roster.as_deref())
-    {
+    let config = match ctx.config.for_repository(&repository) {
+        Ok(config) => config,
+        Err(error) => return err_response(&req.idempotency_key, &Failure::invalid(error)),
+    };
+    let compiled = match config.compile_definition(profile.as_deref(), roster.as_deref()) {
         Ok(compiled) => compiled,
         Err(errors) => {
             return err_response(
@@ -2107,10 +2114,11 @@ pub async fn run_retry(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespon
             }
         }
     };
-    let compiled = match ctx
-        .config
-        .compile_definition(profile.as_deref(), roster.as_deref())
-    {
+    let config = match ctx.config.for_repository(&source.repo) {
+        Ok(config) => config,
+        Err(error) => return err_response(&req.idempotency_key, &Failure::invalid(error)),
+    };
+    let compiled = match config.compile_definition(profile.as_deref(), roster.as_deref()) {
         Ok(compiled) => compiled,
         Err(errors) => {
             return err_response(
@@ -3194,12 +3202,37 @@ pub async fn definition_validate(ctx: &Ctx, req: &OperationRequest) -> Operation
     read_only("definition_validate", req, || async {
         let profile = param_opt_str(&req.params, "profile");
         let roster = param_opt_str(&req.params, "roster");
-        match ctx.config.compile_definition(profile, roster) {
+        let repository = param_opt_str(&req.params, "repo")
+            .map(|repo| {
+                forged_types::normalize_repository_path(repo)
+                    .ok_or_else(|| Failure::invalid("repo must be an absolute repository path"))
+            })
+            .transpose()?;
+        let config = match repository.as_deref() {
+            Some(repo) => ctx.config.for_repository(repo).map_err(Failure::invalid)?,
+            None => ctx.config.clone(),
+        };
+        if repository.is_none() {
+            let errors = config.validate_repositories();
+            if !errors.is_empty() {
+                return Ok(json!({"valid": false, "errors": errors}));
+            }
+        }
+        match config.compile_definition(profile, roster) {
             Ok(compiled) => {
                 let package = compiled.package;
+                let candidates = package.roster.roles.iter().map(|(role, choices)| {
+                    (role.as_str(), choices.iter().map(|choice| json!({
+                        "provider": choice.provider,
+                        "model": choice.model,
+                        "effort": choice.effort,
+                        "sandbox": choice.sandbox,
+                    })).collect::<Vec<_>>())
+                }).collect::<std::collections::BTreeMap<_, _>>();
                 Ok(json!({
                     "valid": true,
                     "errors": [],
+                    "repository": repository,
                     "protocolRef": package.protocol_ref,
                     "profileRef": package.profile_ref,
                     "rosterRef": package.roster_ref,
@@ -3207,6 +3240,7 @@ pub async fn definition_validate(ctx: &Ctx, req: &OperationRequest) -> Operation
                     "profileSha256": package.profile_sha256,
                     "rosterSha256": package.roster_sha256,
                     "roles": package.roster.roles.keys().map(|role| role.as_str()).collect::<Vec<_>>(),
+                    "candidates": candidates,
                     "seats": package.profile.seats,
                     "policy": package.policy,
                 }))
@@ -3337,7 +3371,32 @@ pub async fn run_revise_policy(ctx: &Ctx, req: &mut OperationRequest) -> Operati
         },
         None => package.policy,
     };
-    let current = match ctx.config.execution_policy() {
+    let repository = {
+        let run_for_lookup = run_id.clone();
+        match on_ledger(&ctx.ledger, move |ledger| {
+            ledger.get_run(&run_for_lookup).map(|run| run.repo)
+        })
+        .await
+        {
+            Ok(repository) => repository,
+            Err(error) => {
+                return err_response(
+                    &derive_key("run_revise_policy", Some(&run_id), None, None),
+                    &error,
+                )
+            }
+        }
+    };
+    let config = match ctx.config.for_repository(&repository) {
+        Ok(config) => config,
+        Err(error) => {
+            return err_response(
+                &derive_key("run_revise_policy", Some(&run_id), None, None),
+                &Failure::invalid(error),
+            )
+        }
+    };
+    let current = match config.execution_policy() {
         Ok(value) => value,
         Err(errors) => {
             return err_response(
@@ -4283,12 +4342,40 @@ pub(crate) fn pricing_json(config: &crate::config::ForgedConfig) -> Value {
 /// counted in `rowsMissingCost`.
 pub async fn usage_report(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
     read_only("usage_report", req, || async {
+        let repository = match req.params.get("repo") {
+            None | Some(Value::Null) => None,
+            _ => Some(
+                forged_types::normalize_repository_path(
+                    param_opt_str_strict(&req.params, "repo")?.unwrap_or_default(),
+                )
+                .ok_or_else(|| {
+                    Failure::invalid("usage repo must be an absolute repository path")
+                })?,
+            ),
+        };
+        let models = match req.params.get("models") {
+            None | Some(Value::Null) => false,
+            Some(Value::Bool(value)) => *value,
+            Some(_) => return Err(Failure::invalid("usage models must be a boolean")),
+        };
+        if models {
+            return super::model_usage::report(ctx, req, repository).await;
+        }
+        if req
+            .params
+            .get("limit")
+            .is_some_and(|value| !value.is_null())
+        {
+            return Err(Failure::invalid("usage limit requires models"));
+        }
         let run_ids: Vec<String> = match param_opt_str(&req.params, "run") {
-            Some(run) => vec![run.to_owned()],
-            None => on_ledger(&ctx.ledger, |l| l.list_runs())
+            Some(run) if repository.is_none() => vec![run.to_owned()],
+            requested => on_ledger(&ctx.ledger, |l| l.list_runs())
                 .await?
                 .into_iter()
-                .map(|r| r.run_id)
+                .filter(|run| requested.is_none_or(|id| run.run_id == id))
+                .filter(|run| repository.as_deref().is_none_or(|repo| run.repo == repo))
+                .map(|run| run.run_id)
                 .collect(),
         };
         let mut totals = forged_ledger::UsageTotals {

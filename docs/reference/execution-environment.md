@@ -4,6 +4,23 @@ How forged runs gate commands and what environment its child processes
 see. These are runtime contracts, not decisions under debate; the source
 files named below are the authority when this page and the code disagree.
 
+## Repository settings
+
+The operator's `config.yaml` supplies global defaults. Its `repositories` map
+can override `gate_commands`, `seat_commands`, `seat_env`, `default_profile`,
+and `default_roster` for each original repository path. Omitted fields inherit;
+supplied lists and environment maps replace the whole value. Paths normalize
+lexically without resolving symlinks. No configuration file is added to a target
+repository. See the [configuration skill](../../plugins/forged/skills/configure/SKILL.md)
+for the authoring shape.
+
+`forged definition validate --repo /absolute/repository` previews the effective
+checks and role candidates. Explicit profile/roster arguments take precedence.
+New starts and explicit run retries resolve these settings; existing packets
+and frontier-created epic children retain their frozen definitions. Policy
+revisions use the original repository and change policy, never cognition.
+`seat_env` affects providers; gate-specific variables belong in the gate command.
+
 ## Gate execution contract
 
 Source: `crates/forged-gate/src/runner.rs`.

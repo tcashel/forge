@@ -1900,7 +1900,10 @@ impl ForgedServer {
     }
 
     /// The read-only usage summary.
-    #[tool(name = "usage_report", description = "Summarize recorded usage.")]
+    #[tool(
+        name = "usage_report",
+        description = "Summarize recorded usage. Optional repo scopes one repository; models:true compares recorded attempts by role and requested model/effort, with missing evidence visible. Model groups default to 5; limit accepts 1-100."
+    )]
     pub async fn usage_report(&self, args: Parameters<LeadReadArgs>) -> CallToolResult {
         self.call_lead_read("usage_report", args.0).await
     }

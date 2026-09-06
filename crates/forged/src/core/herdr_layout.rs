@@ -1066,6 +1066,7 @@ mod tests {
             rosters: BTreeMap::new(),
             default_profile: "standard".to_owned(),
             default_roster: "default".to_owned(),
+            repositories: Default::default(),
             gate_commands: Vec::new(),
             stage_budget_s: HashMap::new(),
             transport_retry_budget: 3,

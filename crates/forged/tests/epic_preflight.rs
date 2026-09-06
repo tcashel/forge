@@ -27,12 +27,36 @@ fn preflight_previews_exactly_what_start_freezes_and_creates_nothing() {
     env.seed_epic("epic-pf", &[("child-pf", &env.spec, true)]);
     assert_eq!(env.forged(&["init"]).0, 0);
     let repo = env.repos.repo.to_string_lossy().into_owned();
+    env.add_uniform_roster("repository-roster", "codex", "gpt-5.6-sol");
+    let config_path = env.anvil.join("config.json");
+    let mut config: Value =
+        serde_json::from_str(&std::fs::read_to_string(&config_path).expect("read config"))
+            .expect("config JSON");
+    config["default_profile"] = json!("high");
+    config["repositories"] = json!({
+        (repo.clone()): {
+            "default_profile": "lean",
+            "default_roster": "repository-roster",
+            "gate_commands": ["echo repository-gate"],
+            "seat_commands": ["echo repository-seat"],
+            "seat_env": {"PROJECT_CHECK": "repository"},
+        },
+    });
+    std::fs::write(
+        &config_path,
+        serde_json::to_string_pretty(&config).expect("serialize config"),
+    )
+    .expect("write repository config");
 
     let (code, preflight) =
         env.forged(&["epic", "preflight", "--epic", "epic-pf", "--repo", &repo]);
     assert_eq!(code, 0, "{preflight}");
     let result = preflight["result"].clone();
     assert_eq!(result["ok"], json!(true), "{preflight}");
+    assert!(check(&result, "definition")["detail"]
+        .as_str()
+        .expect("definition detail")
+        .starts_with("profile lean / roster repository-roster "));
     assert_eq!(result["identities"]["assuranceStage"], json!("none"));
     assert_eq!(
         result["identities"]["integrationBranch"],
@@ -54,6 +78,21 @@ fn preflight_previews_exactly_what_start_freezes_and_creates_nothing() {
         "epic", "start", "--epic", "epic-pf", "--repo", &repo, "--spec", &spec,
     ]);
     assert_eq!(code, 0, "{started}");
+    let package = &started["result"]["executionPackage"];
+    assert_eq!(package["profileRef"]["name"], json!("lean"));
+    assert_eq!(package["rosterRef"]["name"], json!("repository-roster"));
+    assert_eq!(
+        package["policy"]["gateCommands"],
+        json!(["echo repository-gate"])
+    );
+    assert_eq!(
+        package["policy"]["seatCommands"],
+        json!(["echo repository-seat"])
+    );
+    assert_eq!(
+        package["policy"]["seatEnv"],
+        json!({"PROJECT_CHECK": "repository"})
+    );
     assert_eq!(
         started["result"]["integrationBranch"],
         result["identities"]["integrationBranch"]
@@ -66,6 +105,63 @@ fn preflight_previews_exactly_what_start_freezes_and_creates_nothing() {
         started["result"]["children"][0]["id"],
         result["identities"]["children"][0]["id"]
     );
+}
+
+#[test]
+fn explicit_epic_selectors_override_repository_defaults() {
+    let env = TestEnv::new("forged-epic-explicit-selectors");
+    env.seed_epic("epic-explicit", &[("child-explicit", &env.spec, true)]);
+    assert_eq!(env.forged(&["init"]).0, 0);
+    env.add_uniform_roster("repository-roster", "codex", "gpt-5.6-sol");
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let config_path = env.anvil.join("config.json");
+    let mut config: Value =
+        serde_json::from_str(&std::fs::read_to_string(&config_path).expect("read config"))
+            .expect("config JSON");
+    config["repositories"] = json!({
+        (repo.clone()): {
+            "default_profile": "high",
+            "default_roster": "repository-roster",
+            "gate_commands": ["echo repository-gate"],
+        },
+    });
+    std::fs::write(
+        config_path,
+        serde_json::to_string_pretty(&config).expect("serialize config"),
+    )
+    .expect("write repository config");
+
+    for verb in ["preflight", "start"] {
+        let (code, response) = env.forged(&[
+            "epic",
+            verb,
+            "--epic",
+            "epic-explicit",
+            "--repo",
+            &repo,
+            "--profile",
+            "lean",
+            "--roster",
+            "default",
+        ]);
+        assert_eq!(code, 0, "{verb}: {response}");
+        if verb == "preflight" {
+            assert_eq!(response["result"]["ok"], json!(true), "{response}");
+            assert!(check(&response["result"], "definition")["detail"]
+                .as_str()
+                .expect("definition detail")
+                .starts_with("profile lean / roster default "));
+            assert_nothing_durable(&env, "epic-explicit");
+        } else {
+            let package = &response["result"]["executionPackage"];
+            assert_eq!(package["profileRef"]["name"], json!("lean"));
+            assert_eq!(package["rosterRef"]["name"], json!("default"));
+            assert_eq!(
+                package["policy"]["gateCommands"],
+                json!(["echo repository-gate"])
+            );
+        }
+    }
 }
 
 #[test]

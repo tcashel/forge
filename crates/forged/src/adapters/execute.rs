@@ -2378,6 +2378,7 @@ async fn run_attempt(
                 .as_ref()
                 .and_then(|identity| identity.layout_id.as_deref()),
             attach_hint: attach_hint.as_deref(),
+            provider_hints: &packet.provider_hints,
         },
     )
     .await
@@ -3681,6 +3682,7 @@ mod settle_tests {
             rosters: BTreeMap::new(),
             default_profile: "standard".to_owned(),
             default_roster: "default".to_owned(),
+            repositories: Default::default(),
             gate_commands: Vec::new(),
             stage_budget_s: HashMap::new(),
             transport_retry_budget: 3,
@@ -3891,6 +3893,77 @@ mod settle_tests {
 
     async fn claimed_fixture(root: &Path, socket: &Path) -> ClaimedFixture {
         claimed_fixture_with_budget(root, socket, 600).await
+    }
+
+    #[tokio::test]
+    async fn session_started_records_runtime_selection_without_environment() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let socket = root.path().join("herdr.sock");
+        let _seen = start_mock_herdr(&socket, MockBehavior::Normal);
+        let mut fixture = claimed_fixture(root.path(), &socket).await;
+        fixture.packet.provider_hints.model = "claude-runtime".to_owned();
+        fixture.packet.provider_hints.effort = Some("high".to_owned());
+        fixture.packet.provider_hints.env.insert(
+            "FORGED_TEST_PRIVATE_ENV".to_owned(),
+            "fixture-private-value".to_owned(),
+        );
+        let stored = fixture
+            .ledger
+            .get_packet(&fixture.packet_id)
+            .expect("stored packet");
+        let stored = forged_proto::stored_packet(&stored).expect("stored packet");
+        assert_eq!(stored.provider_hints.model, "claude-test");
+        assert_eq!(stored.provider_hints.effort, None);
+
+        let attempt_dirs = PacketDirs::new(&fixture.packet_dir, fixture.attempt_id);
+        tokio::spawn(play_provider(
+            attempt_dirs.attempt_path(),
+            attempt_dirs.status(),
+            claude_capture(&fixture.packet_id),
+        ));
+        let outcome = run_attempt(
+            &fixture.ctx,
+            &fixture.ports,
+            &fixture.exec,
+            &fixture.packet,
+            &fixture.resolved,
+            fixture.attempt_id,
+            &fixture.claim_token,
+        )
+        .await
+        .expect("the attempt settles");
+        assert!(matches!(outcome, PacketOutcome::Landed(_)));
+
+        let events = fixture
+            .ledger
+            .list_events(Some(RUN_ID), 0, 1_000)
+            .expect("events");
+        let started = events
+            .iter()
+            .find(|event| event.kind == "forged.session.started")
+            .expect("session-start event");
+        let payload: Value = serde_json::from_str(&started.payload_json).expect("event JSON");
+        assert_eq!(
+            payload["selection"],
+            json!({"provider": "claude", "model": "claude-runtime", "effort": "high"})
+        );
+        assert!(!started.payload_json.contains("FORGED_TEST_PRIVATE_ENV"));
+        assert!(!started.payload_json.contains("fixture-private-value"));
+        assert_eq!(payload["schemaVersion"], 2);
+        assert_eq!(payload["attemptId"], fixture.attempt_id);
+        assert_eq!(payload["packetId"], fixture.packet_id);
+        assert_eq!(payload["host"], "herdr");
+        assert_eq!(payload["sessionId"], PANE_ID);
+        assert!(
+            crate::core::sessions::stored_attach_hint_for_test(
+                &fixture.ctx,
+                RUN_ID,
+                fixture.attempt_id,
+            )
+            .await
+            .is_some(),
+            "the existing session reader accepts the enriched payload"
+        );
     }
 
     #[tokio::test]

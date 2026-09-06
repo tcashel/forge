@@ -459,6 +459,8 @@ pub(crate) async fn migrate_legacy_epics(ctx: &Ctx) -> Result<usize, Failure> {
             ),
             None => (
                 ctx.config
+                    .for_repository(&string(&event, "repo")?)
+                    .map_err(Failure::invalid)?
                     .compile_definition(Some(&profile), Some(&roster))
                     .map_err(|errors| {
                         Failure::invalid(format!(
@@ -1537,6 +1539,8 @@ pub async fn epic_start(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespo
                 }
                 let compiled = ctx
                     .config
+                    .for_repository(&repo)
+                    .map_err(Failure::invalid)?
                     .compile_definition(
                         param_opt_str(&params, "profile"),
                         param_opt_str(&params, "roster"),
@@ -2461,7 +2465,11 @@ pub async fn epic_preflight(ctx: &Ctx, req: &OperationRequest) -> OperationRespo
             Err(error) => record_check(&mut checks, "children", Err(error)),
         }
 
-        let compiled = match ctx.config.compile_definition(
+        let config = match repo.as_deref() {
+            Some(repo) => ctx.config.for_repository(repo).map_err(Failure::invalid)?,
+            None => ctx.config.clone(),
+        };
+        let compiled = match config.compile_definition(
             param_opt_str(&req.params, "profile"),
             param_opt_str(&req.params, "roster"),
         ) {
@@ -2818,7 +2826,16 @@ pub async fn epic_revise_policy(ctx: &Ctx, req: &mut OperationRequest) -> Operat
             )
         }
     };
-    let current = match ctx.config.execution_policy() {
+    let config = match ctx.config.for_repository(&view.config.repo) {
+        Ok(config) => config,
+        Err(error) => {
+            return err_response(
+                &derive_key("epic_revise_policy", Some(&epic), None, None),
+                &Failure::invalid(error),
+            )
+        }
+    };
+    let current = match config.execution_policy() {
         Ok(value) => value,
         Err(errors) => {
             return err_response(

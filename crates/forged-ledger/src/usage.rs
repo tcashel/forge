@@ -6,10 +6,34 @@ use std::collections::BTreeMap;
 use forged_types::ErrorCode;
 use rusqlite::Connection;
 
+use crate::admission::{reservation_row, RESERVATION_COLUMNS};
+use crate::attempts::{attempt_row, ATTEMPT_COLUMNS};
 use crate::error::{internal, refused, LedgerError};
+use crate::events::event_row;
 use crate::ledger::Ledger;
+use crate::packets::{packet_row, PACKET_COLUMNS};
+use crate::runs::{run_row, RUN_COLUMNS};
 use crate::time::now_iso;
-use crate::types::{NewUsage, UsageRecord, UsageTotals};
+use crate::types::{
+    AdmissionReservationRow, AttemptRow, EventRow, NewUsage, PacketRow, RunRow, UsageRecord,
+    UsageTotals,
+};
+
+/// All retained model-usage evidence in one SQLite snapshot. Missing usage
+/// and selection evidence stays absent rather than being reconstructed from
+/// the current configuration or work-item metadata.
+#[derive(Debug)]
+pub struct ModelUsageSnapshot {
+    pub runs: Vec<RunRow>,
+    pub packets: Vec<PacketRow>,
+    /// All scoped attempts, ordered by id, including attempts with no usage.
+    /// Packet-local repeat ordinals can therefore be counted across all time.
+    pub attempts: Vec<AttemptRow>,
+    pub usage: Vec<UsageRecord>,
+    pub session_started_events: Vec<EventRow>,
+    /// Attempt-owned reservations, including released historical selections.
+    pub admission_reservations: Vec<AdmissionReservationRow>,
+}
 
 pub(crate) fn usage_record_row(row: &rusqlite::Row<'_>) -> Result<UsageRecord, rusqlite::Error> {
     let input: i64 = row.get(5)?;
@@ -206,6 +230,106 @@ pub(crate) fn latest_missing_usage_per_run_tx(
 }
 
 impl Ledger {
+    /// Read all-time model-usage evidence in one deferred transaction.
+    ///
+    /// Both optional scopes apply together; repository equality uses the
+    /// frozen `runs.repo` value. Six set queries cover every source without
+    /// one query per run, packet, or attempt. Only `forged.session.started`
+    /// events are included; projection and historical-unknown handling stay
+    /// with the caller.
+    pub fn model_usage_snapshot(
+        &self,
+        repository: Option<&str>,
+        run: Option<&str>,
+    ) -> Result<ModelUsageSnapshot, LedgerError> {
+        let repository = repository.map(str::to_owned);
+        let run = run.map(str::to_owned);
+        self.submit(move |conn| {
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)?;
+            let scope = "SELECT run_id FROM runs \
+                         WHERE (?1 IS NULL OR repo = ?1) \
+                           AND (?2 IS NULL OR run_id = ?2)";
+            let packet_scope = format!("SELECT packet_id FROM packets WHERE run_id IN ({scope})");
+            let attempt_scope = format!(
+                "SELECT CAST(attempt_id AS TEXT) FROM attempts \
+                 WHERE packet_id IN ({packet_scope})"
+            );
+
+            let runs = {
+                let mut statement = tx.prepare(&format!(
+                    "SELECT {RUN_COLUMNS} FROM runs WHERE run_id IN ({scope}) \
+                     ORDER BY created_at, rowid"
+                ))?;
+                let rows = statement
+                    .query_map(rusqlite::params![repository, run], run_row)?
+                    .collect::<Result<Vec<_>, _>>()?;
+                rows
+            };
+            let packets = {
+                let mut statement = tx.prepare(&format!(
+                    "SELECT {PACKET_COLUMNS} FROM packets WHERE run_id IN ({scope}) \
+                     ORDER BY created_at, rowid"
+                ))?;
+                let rows = statement
+                    .query_map(rusqlite::params![repository, run], packet_row)?
+                    .collect::<Result<Vec<_>, _>>()?;
+                rows
+            };
+            let attempts = {
+                let mut statement = tx.prepare(&format!(
+                    "SELECT {ATTEMPT_COLUMNS} FROM attempts \
+                     WHERE packet_id IN ({packet_scope}) ORDER BY attempt_id"
+                ))?;
+                let rows = statement
+                    .query_map(rusqlite::params![repository, run], attempt_row)?
+                    .collect::<Result<Vec<_>, _>>()?;
+                rows
+            };
+            let usage = {
+                let mut statement = tx.prepare(&format!(
+                    "SELECT {USAGE_COLUMNS} FROM usage WHERE run_id IN ({scope}) \
+                     ORDER BY usage_id"
+                ))?;
+                let rows = statement
+                    .query_map(rusqlite::params![repository, run], usage_row)?
+                    .collect::<Result<Vec<_>, _>>()?;
+                rows
+            };
+            let session_started_events = {
+                let mut statement = tx.prepare(&format!(
+                    "SELECT event_id, ts, run_id, kind, payload_json FROM events \
+                     WHERE kind = 'forged.session.started' AND run_id IN ({scope}) \
+                     ORDER BY event_id"
+                ))?;
+                let rows = statement
+                    .query_map(rusqlite::params![repository, run], event_row)?
+                    .collect::<Result<Vec<_>, _>>()?;
+                rows
+            };
+            let admission_reservations = {
+                let mut statement = tx.prepare(&format!(
+                    "SELECT {RESERVATION_COLUMNS} FROM admission_reservations \
+                     WHERE owner_kind = 'attempt' AND owner_id IN ({attempt_scope}) \
+                     ORDER BY reservation_id"
+                ))?;
+                let rows = statement
+                    .query_map(rusqlite::params![repository, run], reservation_row)?
+                    .collect::<Result<Vec<_>, _>>()?;
+                rows
+            };
+
+            tx.commit()?;
+            Ok(ModelUsageSnapshot {
+                runs,
+                packets,
+                attempts,
+                usage,
+                session_started_events,
+                admission_reservations,
+            })
+        })
+    }
+
     /// Record one usage row, keyed by
     /// `(run_id, packet_id, attempt_id, provider, model)`.
     ///

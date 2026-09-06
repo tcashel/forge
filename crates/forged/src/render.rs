@@ -479,6 +479,9 @@ fn render_epic_status(result: &Value, now: &str) -> String {
 }
 
 fn render_usage(result: &Value, now: &str) -> String {
+    if result.get("schema").and_then(Value::as_str) == Some("forged.model-usage/1") {
+        return render_model_usage(result, now);
+    }
     const ROW_LIMIT: usize = 10;
     let mut lines = Vec::new();
     render_header(&mut lines, "USAGE", now);
@@ -525,6 +528,137 @@ fn render_usage(result: &Value, now: &str) -> String {
             &mut lines,
             format!("  … {} more usage row(s) not shown", rows.len() - ROW_LIMIT),
         );
+    }
+    lines.join("\n")
+}
+
+fn render_model_usage(result: &Value, now: &str) -> String {
+    let mut lines = Vec::new();
+    render_header(&mut lines, "MODEL USAGE", now);
+    for (label, pointer) in [
+        ("repository", "/scope/repository"),
+        ("run", "/scope/run"),
+        ("observed from", "/observed/from"),
+        ("observed through", "/observed/to"),
+        (
+            "unknown model attempts",
+            "/attribution/unknownModelAttempts",
+        ),
+        (
+            "unknown effort attempts",
+            "/attribution/unknownEffortAttempts",
+        ),
+        (
+            "unattributed usage rows",
+            "/attribution/unattributedUsageRows",
+        ),
+    ] {
+        push_field(&mut lines, label, result.pointer(pointer));
+    }
+    if let Some(groups) = result.get("groups").and_then(Value::as_array) {
+        for row in groups {
+            for key in ["repository", "role", "provider", "model", "effort"] {
+                push_field(&mut lines, &format!("  {key}"), row.get(key));
+            }
+            for fields in [
+                vec![
+                    ("attempts", "/attempts"),
+                    ("completed", "/completed"),
+                    ("failed", "/failed"),
+                    ("in progress", "/inProgress"),
+                ],
+                vec![
+                    ("transport failures", "/transportFailures"),
+                    ("reclaimed", "/reclaimed"),
+                    ("stopped", "/stopped"),
+                ],
+                vec![
+                    ("packet repeats", "/repeatAttempts"),
+                    ("remediation", "/remediationAttempts"),
+                ],
+                vec![
+                    ("selection: launch", "/launchSelectionAttempts"),
+                    ("admission", "/admissionSelectionAttempts"),
+                    ("usage", "/usageModelAttempts"),
+                ],
+                vec![
+                    ("usage: multiple models", "/multipleUsageModelAttempts"),
+                    ("selection mismatch", "/usageModelMismatchAttempts"),
+                ],
+                vec![
+                    ("USD known", "/cost/knownUsd"),
+                    ("unpriced rows", "/cost/rowsMissingCost"),
+                    ("no usage attempts", "/cost/attemptsWithoutUsage"),
+                ],
+                vec![
+                    ("pricing: billed", "/cost/billedRows"),
+                    ("imputed", "/cost/imputedRows"),
+                    ("other/unknown", "/cost/otherPricingRows"),
+                ],
+                vec![
+                    ("tokens: uncached input", "/tokens/input"),
+                    ("output", "/tokens/output"),
+                ],
+                vec![
+                    ("tokens: cache read", "/tokens/cacheRead"),
+                    ("cache write", "/tokens/cacheWrite"),
+                ],
+                vec![
+                    ("duration seconds", "/duration/totalSeconds"),
+                    ("samples", "/duration/samples"),
+                    ("missing", "/duration/missing"),
+                ],
+                vec![
+                    ("reviews: approve", "/reviewVerdicts/approve"),
+                    ("changes", "/reviewVerdicts/requestChanges"),
+                    ("block", "/reviewVerdicts/block"),
+                    ("unknown", "/reviewVerdicts/unknown"),
+                ],
+            ] {
+                let mut line = String::from("  ");
+                for (label, pointer) in fields {
+                    let field = format!(
+                        "{label} {}",
+                        scalar(row.pointer(pointer).unwrap_or(&Value::Null))
+                    );
+                    if line.chars().count() + field.chars().count() + 2 > WIDTH {
+                        push_line(&mut lines, line);
+                        line = String::from("  ");
+                    }
+                    if line.len() > 2 {
+                        line.push_str("; ");
+                    }
+                    line.push_str(&field);
+                }
+                push_line(&mut lines, line);
+            }
+        }
+    }
+    push_field(
+        &mut lines,
+        "groups shown",
+        result.pointer("/coverage/shown"),
+    );
+    push_field(
+        &mut lines,
+        "groups total",
+        result.pointer("/coverage/total"),
+    );
+    push_field(
+        &mut lines,
+        "truncated",
+        result.pointer("/coverage/truncated"),
+    );
+    for note in [
+        "Evidence: each attempt is counted once; selection provenance is counted.",
+        "Effort is requested, not proof it was honored; provider-default = omitted.",
+        "Completed means protocol completion, not accepted quality.",
+        "Costs include every usage model per attempt; imputed USD is not a bill.",
+        "Missing usage is not free execution. Duration includes preparation.",
+        "In progress means recorded state, not proof the process is alive.",
+        "These observations do not establish causal model quality.",
+    ] {
+        push_line(&mut lines, note.to_owned());
     }
     lines.join("\n")
 }
@@ -725,6 +859,59 @@ mod tests {
             result: Some(result),
             error: None,
         }
+    }
+
+    #[test]
+    fn model_usage_keeps_selection_and_cost_unknowns_visible() {
+        let rendered = response(
+            "usage_report",
+            &ok(json!({
+                "schema": "forged.model-usage/1",
+                "capturedAt": "2026-09-05T12:00:00Z",
+                "scope": {"repository": format!("/{}", "repository".repeat(12))},
+                "groups": [{
+                    "repository": format!("/{}", "repository".repeat(12)),
+                    "role": "implementation", "provider": "codex",
+                    "model": "recorded-runtime-model", "effort": "high",
+                    "attempts": 2, "completed": 1, "failed": 1, "inProgress": 0,
+                    "transportFailures": 1, "reclaimed": 0, "stopped": 0,
+                    "repeatAttempts": 1, "remediationAttempts": 0,
+                    "launchSelectionAttempts": 2, "admissionSelectionAttempts": 0,
+                    "usageModelAttempts": 0, "multipleUsageModelAttempts": 1,
+                    "usageModelMismatchAttempts": 1,
+                    "cost": {"knownUsd": 1.25, "rowsMissingCost": 2,
+                        "attemptsWithoutUsage": 1, "billedRows": 1,
+                        "imputedRows": 0, "otherPricingRows": 2},
+                    "tokens": {"input": 100, "output": 20, "cacheRead": 300, "cacheWrite": 40},
+                    "duration": {"totalSeconds": 1.2, "samples": 2, "missing": 0},
+                    "reviewVerdicts": {"approve": 0, "requestChanges": 1, "block": 0, "unknown": 1}
+                }],
+                "coverage": {"shown": 1, "total": 2, "truncated": true}
+            })),
+            false,
+        )
+        .unwrap();
+        for evidence in [
+            "model: recorded-runtime-model",
+            "effort: high",
+            "in progress 0",
+            "USD known 1.25",
+            "unpriced rows 2",
+            "no usage attempts 1",
+            "pricing: billed 1; imputed 0; other/unknown 2",
+            "cache read 300",
+            "cache write 40",
+            "reviews: approve 0; changes 1; block 0; unknown 1",
+            "not accepted quality",
+            "not proof the process is alive",
+            "truncated: true",
+        ] {
+            assert!(
+                rendered.contains(evidence),
+                "missing {evidence}: {rendered}"
+            );
+        }
+        assert!(rendered.lines().all(|line| line.chars().count() <= WIDTH));
     }
 
     #[test]

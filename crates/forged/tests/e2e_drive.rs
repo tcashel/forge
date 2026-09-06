@@ -282,6 +282,21 @@ fn rolling_epic_assures_the_exact_draft_pr_head_before_completion() {
         started["result"]["assurancePackage"]["protocolRef"]["name"],
         json!("epic-assurance")
     );
+    let config_path = env.anvil.join("config.json");
+    let mut config: Value =
+        serde_json::from_str(&std::fs::read_to_string(&config_path).expect("read config"))
+            .expect("config JSON");
+    config["repositories"] = json!({
+        (repo.clone()): {
+            "gate_commands": ["false"],
+            "default_profile": "lean",
+        },
+    });
+    std::fs::write(
+        config_path,
+        serde_json::to_string_pretty(&config).expect("serialize config"),
+    )
+    .expect("change repository defaults after assurance freeze");
     env.authorize_epic("epic-assurance");
 
     let (code, integration) = env.reconcile_epic("epic-assurance");
@@ -327,6 +342,17 @@ fn rolling_epic_assures_the_exact_draft_pr_head_before_completion() {
     assert!(
         terminal["result"]["stopped"]["assurance"].is_object(),
         "assurance did not converge: {terminal}"
+    );
+    let ledger = env.ledger();
+    let definition = ledger
+        .get_run_definition("epic-assurance-epic-assurance")
+        .expect("assurance definition query")
+        .expect("assurance definition");
+    ledger.close().expect("close ledger");
+    assert_eq!(
+        serde_json::from_str::<Value>(&definition.package_json).expect("assurance package"),
+        started["result"]["assurancePackage"],
+        "assurance keeps its root-frozen package after repository defaults change"
     );
     let evidence = &terminal["result"]["stopped"]["assurance"]["evidence"];
     assert_eq!(evidence["disposition"], json!("approved-clean"));
@@ -907,6 +933,22 @@ fn rolling_planning_package_remains_frozen_across_epic_roster_revisions() {
         "retry within the frozen planning contract",
     ]);
     assert_eq!(code, 0, "resolve first planning cycle: {resolved}");
+    let config_path = env.anvil.join("config.json");
+    let mut config: Value =
+        serde_json::from_str(&std::fs::read_to_string(&config_path).expect("read config"))
+            .expect("config JSON");
+    config["repositories"] = json!({
+        (env.repos.repo.to_string_lossy().into_owned()): {
+            "gate_commands": ["false"],
+            "default_profile": "lean",
+            "default_roster": "all-codex",
+        },
+    });
+    std::fs::write(
+        config_path,
+        serde_json::to_string_pretty(&config).expect("serialize config"),
+    )
+    .expect("change repository defaults after planning freeze");
     let (code, revised) = env.forged(&[
         "epic",
         "revise-roster",
@@ -3003,11 +3045,17 @@ fn roster_revision_resets_transport_fallback_to_its_first_candidate() {
 #[test]
 fn policy_revision_repairs_the_next_boundary_without_mutating_a_live_packet() {
     let env = TestEnv::new("forged-policy-revision-boundary");
+    env.add_uniform_roster("project-models", "codex", "gpt-5.6-sol");
+    let repo = env.repos.repo.to_string_lossy().into_owned();
     let config_path = env.anvil.join("config.json");
     let mut config: Value =
         serde_json::from_str(&std::fs::read_to_string(&config_path).expect("read initial config"))
             .expect("initial config JSON");
-    config["gate_commands"] = json!(["false"]);
+    config["gate_commands"] = json!(["exit 17"]);
+    config["repositories"] = json!({repo.clone(): {
+        "gate_commands": ["false"],
+        "seat_env": {"PROJECT_CHECK": "before"},
+    }});
     config["transport_retry_budget"] = json!(1);
     std::fs::write(
         &config_path,
@@ -3017,7 +3065,6 @@ fn policy_revision_repairs_the_next_boundary_without_mutating_a_live_packet() {
 
     assert_eq!(env.forged(&["init"]).0, 0);
     env.seed_frontier("bead-policy-boundary");
-    let repo = env.repos.repo.to_string_lossy().into_owned();
     let spec = env.spec.to_string_lossy().into_owned();
     let (code, started) = env.forged(&[
         "run",
@@ -3085,7 +3132,13 @@ fn policy_revision_repairs_the_next_boundary_without_mutating_a_live_packet() {
     let mut current: Value =
         serde_json::from_str(&std::fs::read_to_string(&config_path).expect("read current config"))
             .expect("current config JSON");
-    current["gate_commands"] = json!(["true"]);
+    current["gate_commands"] = json!(["exit 18"]);
+    current["repositories"][&repo] = json!({
+        "gate_commands": ["true"],
+        "seat_env": {"PROJECT_CHECK": "after"},
+        "default_profile": "high",
+        "default_roster": "project-models",
+    });
     current["stage_budget_s"] = json!({
         "implement": 42,
         "reviewclaude": 43,
@@ -3133,6 +3186,10 @@ fn policy_revision_repairs_the_next_boundary_without_mutating_a_live_packet() {
         serde_json::from_str(&effective_row.policy_json).expect("effective policy");
     assert_eq!(effective.gate_commands, ["true"]);
     assert_eq!(
+        effective.seat_env.get("PROJECT_CHECK").map(String::as_str),
+        Some("after")
+    );
+    assert_eq!(
         effective.stage_budget_s[&forged_types::Stage::Implement],
         42
     );
@@ -3143,6 +3200,12 @@ fn policy_revision_repairs_the_next_boundary_without_mutating_a_live_packet() {
     );
     assert_eq!(effective.host_policy, frozen_package.policy.host_policy);
     assert_eq!(effective.herdr_socket, frozen_package.policy.herdr_socket);
+    let roster_revision = ledger
+        .latest_roster_revision("bead-policy-boundary")
+        .expect("roster revision")
+        .expect("initial roster revision");
+    assert_eq!(roster_revision.revision, 1);
+    assert_eq!(roster_revision.roster_sha256, frozen_package.roster_sha256);
     assert_eq!(
         ledger
             .get_run_definition("bead-policy-boundary")
@@ -3311,8 +3374,16 @@ fn epic_policy_revision_batches_unmerged_children_behind_one_event() {
     let mut config: Value =
         serde_json::from_str(&std::fs::read_to_string(&config_path).expect("read config"))
             .expect("config JSON");
-    config["gate_commands"] = json!(["echo revised-policy"]);
+    config["gate_commands"] = json!(["echo global-policy"]);
     config["transport_retry_budget"] = json!(9);
+    config["seat_env"] = json!({"GLOBAL_CHECK": "global"});
+    config["repositories"] = json!({
+        (repo.clone()): {
+            "gate_commands": ["echo revised-policy"],
+            "seat_commands": ["echo revised-seat"],
+            "seat_env": {"PROJECT_CHECK": "revised"},
+        },
+    });
     std::fs::write(
         &config_path,
         serde_json::to_string_pretty(&config).expect("serialize revised config"),
@@ -3352,6 +3423,11 @@ fn epic_policy_revision_batches_unmerged_children_behind_one_event() {
     let active_policy: forged_types::ExecutionPolicyV1 =
         serde_json::from_str(&active.policy_json).expect("active policy");
     assert_eq!(active_policy.gate_commands, ["echo revised-policy"]);
+    assert_eq!(active_policy.seat_commands, ["echo revised-seat"]);
+    assert_eq!(
+        active_policy.seat_env,
+        std::collections::BTreeMap::from([("PROJECT_CHECK".to_owned(), "revised".to_owned())])
+    );
     assert_eq!(active_policy.transport_retry_budget, 9);
     assert_eq!(
         ledger
@@ -4259,6 +4335,22 @@ fn pre_snapshot_epic_start_gets_one_package_event_and_remains_driveable() {
         .expect("restore pre-upgrade migration state");
     drop(connection);
 
+    let config_path = env.anvil.join("config.json");
+    let mut config: Value =
+        serde_json::from_str(&std::fs::read_to_string(&config_path).expect("read config"))
+            .expect("config JSON");
+    config["repositories"] = json!({
+        (repo.clone()): {
+            "gate_commands": ["echo repository-migration"],
+            "default_profile": "lean",
+        },
+    });
+    std::fs::write(
+        &config_path,
+        serde_json::to_string_pretty(&config).expect("serialize config"),
+    )
+    .expect("configure the repository before the legacy freeze");
+
     let (code, migrated) = env.forged(&["epic", "status", "--epic", "legacy-package-epic"]);
     assert_eq!(code, 0, "legacy epic status migrates: {migrated}");
     assert_eq!(
@@ -4269,11 +4361,8 @@ fn pre_snapshot_epic_start_gets_one_package_event_and_remains_driveable() {
 
     // Once frozen, later config changes do not affect either projection or
     // child creation from the epic package.
-    let config_path = env.anvil.join("config.json");
-    let mut config: Value =
-        serde_json::from_str(&std::fs::read_to_string(&config_path).expect("read config"))
-            .expect("config JSON");
     config["gate_commands"] = json!(["false"]);
+    config["repositories"][&repo]["gate_commands"] = json!(["false"]);
     std::fs::write(
         &config_path,
         serde_json::to_string_pretty(&config).expect("serialize config"),
@@ -4291,7 +4380,14 @@ fn pre_snapshot_epic_start_gets_one_package_event_and_remains_driveable() {
     ledger.close().expect("close ledger");
     let child_package: forged_types::ExecutionPackageV1 =
         serde_json::from_str(&child_definition.package_json).expect("child package");
-    assert_eq!(child_package.policy.gate_commands, ["true"]);
+    assert_eq!(
+        child_package.policy.gate_commands,
+        ["echo repository-migration"]
+    );
+    assert_eq!(
+        child_package.profile_ref.name, "standard",
+        "the legacy profile name stays explicit at the upgrade boundary"
+    );
 
     let connection = rusqlite::Connection::open(&db).expect("inspect epic migration");
     let migrations: i64 = connection
@@ -4315,16 +4411,33 @@ fn pre_snapshot_epic_start_gets_one_package_event_and_remains_driveable() {
     assert_eq!(migration["source"], json!("upgrade-config"));
     assert_eq!(
         migration["executionPackage"]["policy"]["gateCommands"],
-        json!(["true"])
+        json!(["echo repository-migration"])
     );
 }
 
 #[test]
 fn run_uses_its_frozen_roster_after_the_authoring_config_changes() {
     let env = TestEnv::new("forged-frozen-roster");
+    env.add_uniform_roster("project-models", "claude", "opus");
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let config_path = env.anvil.join("config.json");
+    let mut config: Value =
+        serde_json::from_str(&std::fs::read_to_string(&config_path).expect("read config"))
+            .expect("config json");
+    config["gate_commands"] = json!(["false"]);
+    config["repositories"] = json!({repo.clone(): {
+        "gate_commands": ["true"],
+        "seat_env": {"PROJECT_CHECK": "frozen"},
+        "default_profile": "lean",
+        "default_roster": "project-models",
+    }});
+    std::fs::write(
+        &config_path,
+        serde_json::to_string_pretty(&config).expect("serialize config"),
+    )
+    .expect("write repository config");
     assert_eq!(env.forged(&["init"]).0, 0);
     env.seed_frontier("bead-frozen");
-    let repo = env.repos.repo.to_string_lossy().into_owned();
     let spec = env.spec.to_string_lossy().into_owned();
     let (code, started) = env.forged(&[
         "run",
@@ -4340,8 +4453,11 @@ fn run_uses_its_frozen_roster_after_the_authoring_config_changes() {
     ]);
     assert_eq!(code, 0, "start: {started}");
     env.authorize_run("bead-frozen");
-    assert_eq!(started["result"]["profile_ref"]["name"], json!("standard"));
-    assert_eq!(started["result"]["roster_ref"]["name"], json!("default"));
+    assert_eq!(started["result"]["profile_ref"]["name"], json!("lean"));
+    assert_eq!(
+        started["result"]["roster_ref"]["name"],
+        json!("project-models")
+    );
     let original_digest = started["result"]["package_sha256"]
         .as_str()
         .expect("package digest")
@@ -4349,11 +4465,14 @@ fn run_uses_its_frozen_roster_after_the_authoring_config_changes() {
 
     // Make the live authoring roster unusable. A projection that consulted
     // config again would fail before the implement packet could run.
-    let config_path = env.anvil.join("config.json");
-    let mut config: Value =
-        serde_json::from_str(&std::fs::read_to_string(&config_path).expect("read config"))
-            .expect("config json");
-    config["roster"]["implement"]["provider"] = json!("unavailable-provider");
+    config["rosters"]["project-models"]["roles"]["implementation"][0]["provider"] =
+        json!("unavailable-provider");
+    config["repositories"][&repo] = json!({
+        "gate_commands": ["false"],
+        "seat_env": {"PROJECT_CHECK": "changed"},
+        "default_profile": "missing-profile",
+        "default_roster": "missing-roster",
+    });
     config["gate_commands"] = json!(["false"]);
     config["stage_budget_s"]["implement"] = json!(1);
     config["transport_retry_budget"] = json!(0);
@@ -4385,6 +4504,10 @@ fn run_uses_its_frozen_roster_after_the_authoring_config_changes() {
     assert_eq!(
         status["result"]["run"]["definition"]["policy"]["transportRetryBudget"],
         json!(3)
+    );
+    assert_eq!(
+        status["result"]["run"]["definition"]["policy"]["seatEnv"]["PROJECT_CHECK"],
+        json!("frozen")
     );
 }
 

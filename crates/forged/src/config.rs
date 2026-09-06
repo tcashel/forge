@@ -52,6 +52,8 @@ pub struct ForgedConfig {
     pub rosters: BTreeMap<String, RosterDefinitionV1>,
     pub default_profile: String,
     pub default_roster: String,
+    /// Operator-owned overrides keyed by normalized original repository path.
+    pub repositories: BTreeMap<String, RepositoryOverrides>,
     pub gate_commands: Vec<String>,
     pub stage_budget_s: HashMap<Stage, u64>,
     pub transport_retry_budget: u32,
@@ -176,6 +178,23 @@ const fn default_epic_fanout() -> u32 {
 
 pub use forged_types::HostPolicyV1 as HostPolicy;
 
+/// Omitted fields inherit global defaults; supplied collections replace them,
+/// including empty collections. Profile and roster names share global catalogs.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepositoryOverrides {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_commands: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seat_commands: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seat_env: Option<BTreeMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_roster: Option<String>,
+}
+
 /// On-disk authoring shape. Definition values themselves deny unknown fields.
 /// Unknown top-level `_comment_*` keys from v0 JSON are intentionally ignored.
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -184,6 +203,8 @@ struct ConfigFile {
     default_profile: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     default_roster: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    repositories: Option<BTreeMap<String, RepositoryOverrides>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     profiles: Option<BTreeMap<String, ProfileDefinitionV1>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -486,6 +507,60 @@ fn resolve_bd_path(
 }
 
 impl ForgedConfig {
+    /// Select by the original repository's lexical identity, never cwd or a
+    /// run worktree. No filesystem lookup is needed; symlink aliases remain
+    /// distinct, just as they do in stored run identities.
+    pub fn for_repository(&self, repository: &str) -> Result<Self, String> {
+        let repository = forged_types::normalize_repository_path(repository).ok_or_else(|| {
+            format!("repository must be an absolute path that does not escape its root, got {repository:?}")
+        })?;
+        let mut resolved = self.clone();
+        if let Some(overrides) = self.repositories.get(&repository) {
+            if let Some(commands) = &overrides.gate_commands {
+                resolved.gate_commands = commands.clone();
+            }
+            if let Some(commands) = &overrides.seat_commands {
+                resolved.seat_commands = commands.clone();
+            }
+            if let Some(env) = &overrides.seat_env {
+                resolved.seat_env = env.clone();
+            }
+            if let Some(profile) = &overrides.default_profile {
+                resolved.default_profile = profile.clone();
+            }
+            if let Some(roster) = &overrides.default_roster {
+                resolved.default_roster = roster.clone();
+            }
+        }
+        Ok(resolved)
+    }
+
+    /// Check all repository defaults at the authoring boundary. Loading or
+    /// projecting an existing run must not depend on mutable roster validity.
+    pub fn validate_repositories(&self) -> Vec<DefinitionError> {
+        let mut errors = Vec::new();
+        for repository in self.repositories.keys() {
+            match self.for_repository(repository) {
+                Ok(config) => {
+                    if let Err(repository_errors) = config.compile_definition(None, None) {
+                        errors.extend(repository_errors.into_iter().map(|error| DefinitionError {
+                            path: format!(
+                                "$.repositories[{repository:?}]{}",
+                                error.path.trim_start_matches('$')
+                            ),
+                            message: error.message,
+                        }));
+                    }
+                }
+                Err(message) => errors.push(DefinitionError {
+                    path: format!("$.repositories[{repository:?}]"),
+                    message,
+                }),
+            }
+        }
+        errors
+    }
+
     /// Resolve and validate the non-cognitive policy frozen into every new
     /// package. Upgrade code uses the same boundary to snapshot policy for
     /// packages written before policy became part of the schema.
@@ -587,7 +662,18 @@ impl ForgedConfig {
             .into_iter()
             .map(|(provider, config)| (provider, config.transport_patterns))
             .collect();
-        Ok(ForgedConfig {
+        let mut repositories = BTreeMap::new();
+        for (path, overrides) in file.repositories.unwrap_or_default() {
+            let normalized = forged_types::normalize_repository_path(&path).ok_or_else(|| {
+                format!("repositories key must be an absolute path that does not escape its root, got {path:?}")
+            })?;
+            if repositories.insert(normalized.clone(), overrides).is_some() {
+                return Err(format!(
+                    "repositories contains more than one key for normalized path {normalized:?}"
+                ));
+            }
+        }
+        let config = ForgedConfig {
             runs_root: anvil_home.join("runs"),
             db_path: anvil_home.join("state.db"),
             config_path,
@@ -601,6 +687,7 @@ impl ForgedConfig {
                 .default_profile
                 .unwrap_or_else(|| "standard".to_owned()),
             default_roster: file.default_roster.unwrap_or_else(|| "default".to_owned()),
+            repositories,
             gate_commands: file.gate_commands.unwrap_or_else(default_gate_commands),
             stage_budget_s: resolve_stage_budget_s(file.stage_budget_s),
             transport_retry_budget: file
@@ -627,7 +714,8 @@ impl ForgedConfig {
                 .unwrap_or_else(crate::pricing::default_rate_card),
             admission,
             anvil_home,
-        })
+        };
+        Ok(config)
     }
 
     /// Re-resolve this snapshot's config, refreshing every file-derived
@@ -917,6 +1005,7 @@ impl ForgedConfig {
         let file = ConfigFile {
             default_profile: Some("standard".to_owned()),
             default_roster: Some("default".to_owned()),
+            repositories: (!self.repositories.is_empty()).then(|| self.repositories.clone()),
             profiles: Some(default_profiles()),
             rosters: Some(default_rosters()),
             roster: None,
@@ -1445,6 +1534,7 @@ pub(crate) fn scratch_config(anvil_home: &std::path::Path) -> ForgedConfig {
         rosters: default_rosters(),
         default_profile: "standard".to_owned(),
         default_roster: "default".to_owned(),
+        repositories: Default::default(),
         gate_commands: default_gate_commands(),
         stage_budget_s: default_stage_budget_s(),
         transport_retry_budget: DEFAULT_TRANSPORT_RETRY_BUDGET,
@@ -1483,6 +1573,7 @@ mod tests {
             rosters: default_rosters(),
             default_profile: "standard".to_owned(),
             default_roster: "default".to_owned(),
+            repositories: Default::default(),
             gate_commands: default_gate_commands(),
             stage_budget_s: default_stage_budget_s(),
             transport_retry_budget: DEFAULT_TRANSPORT_RETRY_BUDGET,
@@ -2588,6 +2679,170 @@ mod tests {
         std::fs::write(&path, "default_profile: [broken").expect("break config");
         let error = snapshot.refreshed().expect_err("malformed gate");
         assert!(error.contains("does not parse"), "{error}");
+    }
+
+    #[test]
+    fn repository_overrides_replace_selected_fields_and_explicit_refs_win() {
+        let mut cfg = config();
+        cfg.gate_commands = vec!["global-gate".to_owned()];
+        cfg.seat_commands = vec!["global-seat".to_owned()];
+        cfg.seat_env = BTreeMap::from([("GLOBAL_ONLY".to_owned(), "1".to_owned())]);
+        let mut roster = cfg.rosters["default"].clone();
+        roster.name = "project-models".to_owned();
+        cfg.rosters.insert(roster.name.clone(), roster);
+        cfg.repositories.insert(
+            "/projects/app".to_owned(),
+            RepositoryOverrides {
+                gate_commands: Some(vec!["project-gate".to_owned()]),
+                seat_commands: Some(vec!["project-seat".to_owned()]),
+                seat_env: Some(BTreeMap::from([(
+                    "PROJECT_ONLY".to_owned(),
+                    "1".to_owned(),
+                )])),
+                default_profile: Some("lean".to_owned()),
+                default_roster: Some("project-models".to_owned()),
+            },
+        );
+        let selected = cfg.for_repository("/projects/./app/").expect("select");
+        let compiled = selected.compile_definition(None, None).expect("compile");
+        assert_eq!(compiled.package.profile_ref.name, "lean");
+        assert_eq!(compiled.package.roster_ref.name, "project-models");
+        assert_eq!(compiled.package.policy.gate_commands, ["project-gate"]);
+        assert_eq!(compiled.package.policy.seat_commands, ["project-seat"]);
+        assert_eq!(compiled.package.policy.seat_env.len(), 1);
+        assert!(compiled
+            .package
+            .policy
+            .seat_env
+            .contains_key("PROJECT_ONLY"));
+        let explicit = selected
+            .compile_definition(Some("standard"), Some("default"))
+            .expect("explicit refs");
+        assert_eq!(explicit.package.profile_ref.name, "standard");
+        assert_eq!(explicit.package.roster_ref.name, "default");
+        assert_eq!(explicit.package.policy, compiled.package.policy);
+        let unmatched = cfg
+            .for_repository("/projects/other")
+            .expect("global fallback");
+        assert_eq!(unmatched.gate_commands, ["global-gate"]);
+        assert_eq!(unmatched.seat_commands, ["global-seat"]);
+        assert!(unmatched.seat_env.contains_key("GLOBAL_ONLY"));
+        assert_eq!(unmatched.default_profile, "standard");
+        assert!(cfg.validate_repositories().is_empty());
+        assert!(cfg.for_repository("relative/repo").is_err());
+    }
+
+    #[test]
+    fn empty_repository_collections_clear_inherited_values() {
+        let mut cfg = config();
+        cfg.seat_commands = vec!["global-seat".to_owned()];
+        cfg.seat_env = BTreeMap::from([("GLOBAL_ONLY".to_owned(), "1".to_owned())]);
+        cfg.repositories.insert(
+            "/projects/app".to_owned(),
+            RepositoryOverrides {
+                gate_commands: Some(Vec::new()),
+                seat_commands: Some(Vec::new()),
+                seat_env: Some(BTreeMap::new()),
+                ..RepositoryOverrides::default()
+            },
+        );
+        let selected = cfg.for_repository("/projects/app").expect("select");
+        assert!(selected.gate_commands.is_empty());
+        assert!(selected.seat_commands.is_empty());
+        assert!(selected.seat_env.is_empty());
+        assert_eq!(selected.default_profile, cfg.default_profile);
+        assert_eq!(selected.default_roster, cfg.default_roster);
+    }
+
+    #[test]
+    fn repository_keys_normalize_without_filesystem_lookup_and_reject_ambiguity() {
+        let dir = tempfile::tempdir().expect("scratch config");
+        let path = dir.path().join("config.yaml");
+        std::fs::write(
+            &path,
+            "repositories:\n  /unmounted/projects/../app/:\n    seat_commands: [project-check]\n",
+        )
+        .expect("write config");
+        let cfg = ForgedConfig::load_at(dir.path().to_owned(), path.clone(), None).expect("load");
+        assert!(cfg.repositories.contains_key("/unmounted/app"));
+        assert_eq!(
+            cfg.for_repository("/unmounted/app")
+                .expect("select")
+                .seat_commands,
+            ["project-check"]
+        );
+        let encoded = cfg.default_document().expect("serialize config");
+        let decoded: ConfigFile = serde_yaml::from_str(&encoded).expect("parse generated config");
+        assert!(decoded
+            .repositories
+            .expect("repository entries")
+            .contains_key("/unmounted/app"));
+        for (document, expected) in [
+            ("repositories:\n  relative/repo: {}\n", "absolute path"),
+            ("repositories:\n  /../../app: {}\n", "absolute path"),
+            (
+                "repositories:\n  /projects/app: {}\n  /projects/./app/: {}\n",
+                "more than one key",
+            ),
+            (
+                "repositories:\n  /projects/app:\n    seat_command: [typo]\n",
+                "unknown field",
+            ),
+        ] {
+            std::fs::write(&path, document).expect("write invalid config");
+            let error = ForgedConfig::load_at(dir.path().to_owned(), path.clone(), None)
+                .expect_err("invalid repository authoring");
+            assert!(error.contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn repository_authoring_validation_does_not_revalidate_frozen_packages() {
+        let mut cfg = config();
+        cfg.repositories.insert(
+            "/projects/app".to_owned(),
+            RepositoryOverrides {
+                gate_commands: Some(vec!["project-gate".to_owned()]),
+                ..RepositoryOverrides::default()
+            },
+        );
+        let original = cfg
+            .for_repository("/projects/app")
+            .expect("select")
+            .compile_definition(None, None)
+            .expect("freeze");
+        for overrides in [
+            RepositoryOverrides {
+                default_profile: Some("missing".to_owned()),
+                ..RepositoryOverrides::default()
+            },
+            RepositoryOverrides {
+                default_roster: Some("missing".to_owned()),
+                ..RepositoryOverrides::default()
+            },
+            RepositoryOverrides {
+                gate_commands: Some(vec![" ".to_owned()]),
+                ..RepositoryOverrides::default()
+            },
+        ] {
+            cfg.repositories
+                .insert("/projects/app".to_owned(), overrides);
+            let errors = cfg.validate_repositories();
+            assert!(!errors.is_empty());
+            assert!(errors
+                .iter()
+                .all(|error| error.path.starts_with("$.repositories[\"/projects/app\"]")));
+            assert!(
+                cfg.for_repository("/projects/app")
+                    .expect("select")
+                    .compile_definition(None, None)
+                    .is_err(),
+                "selected invalid override never falls back"
+            );
+            let recovered =
+                compile_frozen_package(original.package.clone()).expect("frozen recovery");
+            assert_eq!(recovered.package_sha256, original.package_sha256);
+        }
     }
 
     #[test]

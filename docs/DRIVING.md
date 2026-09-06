@@ -178,6 +178,10 @@ polling loop.
 
 ## Cost discipline
 
+- `forged usage --repo "$TARGET_REPO" --models` summarizes recorded attempts by
+  role, requested model, and effort. It retains failures without usage and
+  distinguishes billed from imputed cost. Use comparable repository work to
+  recommend roster changes; completion counts alone do not establish quality.
 - The roster is a budget dial. Read the current usage window before
   dispatching; move implementation and remediation seats to the
   provider with headroom; keep one cross-family reviewer.

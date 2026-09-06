@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 
 use forged_ledger::{EffectClass, RevokeScope};
-use forged_types::{OperationRequest, OperationResponse, WorkIdentitySubjectKind};
+use forged_types::{OperationRequest, OperationResponse, ProviderHints, WorkIdentitySubjectKind};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -42,6 +42,7 @@ pub(crate) struct SessionStarted<'a> {
     pub controller_generation: Option<u32>,
     pub layout_id: Option<&'a str>,
     pub attach_hint: Option<&'a str>,
+    pub provider_hints: &'a ProviderHints,
 }
 
 fn event_payload(row: &forged_ledger::EventRow) -> Option<Value> {
@@ -130,6 +131,11 @@ pub(crate) async fn record_session_started(
         "controllerGeneration": started.controller_generation,
         "layoutId": started.layout_id,
         "attachHint": started.attach_hint,
+        "selection": {
+            "provider": started.provider_hints.provider,
+            "model": started.provider_hints.model,
+            "effort": started.provider_hints.effort,
+        },
     });
     on_ledger(&ctx.ledger, move |ledger| {
         ledger.append_event_once(&run_id, SESSION_STARTED, payload)?;

@@ -785,6 +785,22 @@ fn run_retry_mints_and_submits_one_flat_successor_at_the_amended_revision() {
         .expect("settle source run");
     ledger.close().expect("close ledger");
 
+    let config_path = env.anvil.join("config.json");
+    let mut config: Value =
+        serde_json::from_str(&std::fs::read_to_string(&config_path).expect("read config"))
+            .expect("config JSON");
+    config["gate_commands"] = json!(["global-check"]);
+    config["repositories"] = json!({repo.clone(): {
+        "gate_commands": ["project-retry-check"],
+        "seat_commands": ["project-seat-check"],
+        "seat_env": {"PROJECT_CHECK": "retry"},
+        "default_profile": "lean",
+    }});
+    std::fs::write(
+        &config_path,
+        serde_json::to_string_pretty(&config).expect("serialize config"),
+    )
+    .expect("write repository config");
     env.set_work_field(
         run_id,
         "notes",
@@ -816,6 +832,24 @@ fn run_retry_mints_and_submits_one_flat_successor_at_the_amended_revision() {
         .get_run("retry-amended-r1")
         .expect("successor run exists");
     assert_eq!(successor.work_id, run_id);
+    let definition = ledger
+        .get_run_definition("retry-amended-r1")
+        .expect("successor definition")
+        .expect("stored definition");
+    let package: Value = serde_json::from_str(&definition.package_json).expect("successor package");
+    assert_eq!(package["profileRef"]["name"], json!("lean"));
+    assert_eq!(
+        package["policy"]["gateCommands"],
+        json!(["project-retry-check"])
+    );
+    assert_eq!(
+        package["policy"]["seatCommands"],
+        json!(["project-seat-check"])
+    );
+    assert_eq!(
+        package["policy"]["seatEnv"]["PROJECT_CHECK"],
+        json!("retry")
+    );
     let desired = ledger
         .get_desired_work(forged_ledger::DesiredSubjectKind::Run, "retry-amended-r1")
         .expect("desired read")
@@ -1061,6 +1095,23 @@ fn run_retry_requires_fresh_when_a_recorded_branch_cannot_be_resolved() {
 #[test]
 fn run_dispatch_is_one_fenced_approval_and_submission() {
     let env = TestEnv::new("forged-run-dispatch");
+    env.add_uniform_roster("project-models", "claude", "opus");
+    let config_path = env.anvil.join("config.json");
+    let mut config: Value =
+        serde_json::from_str(&std::fs::read_to_string(&config_path).expect("read config"))
+            .expect("config JSON");
+    config["repositories"] = json!({env.repos.repo.to_string_lossy().into_owned(): {
+        "gate_commands": ["project-gate"],
+        "seat_commands": ["project-seat"],
+        "seat_env": {"PROJECT_CHECK": "dispatch"},
+        "default_profile": "lean",
+        "default_roster": "project-models",
+    }});
+    std::fs::write(
+        &config_path,
+        serde_json::to_string_pretty(&config).expect("serialize config"),
+    )
+    .expect("write repository config");
     env.forged(&["init"]);
     let work_id = "dispatch-one-verb";
     env.seed_work_spec(
@@ -1147,6 +1198,19 @@ fn run_dispatch_is_one_fenced_approval_and_submission() {
     let ledger = env.ledger();
     let run = ledger.get_run(work_id).expect("run exists");
     assert_eq!(run.work_id, work_id);
+    let definition = ledger
+        .get_run_definition(work_id)
+        .expect("definition")
+        .expect("stored definition");
+    let package: Value = serde_json::from_str(&definition.package_json).expect("package JSON");
+    assert_eq!(package["profileRef"]["name"], json!("lean"));
+    assert_eq!(package["rosterRef"]["name"], json!("project-models"));
+    assert_eq!(package["policy"]["gateCommands"], json!(["project-gate"]));
+    assert_eq!(package["policy"]["seatCommands"], json!(["project-seat"]));
+    assert_eq!(
+        package["policy"]["seatEnv"]["PROJECT_CHECK"],
+        json!("dispatch")
+    );
     let desired = ledger
         .get_desired_work(forged_ledger::DesiredSubjectKind::Run, work_id)
         .expect("desired lookup")

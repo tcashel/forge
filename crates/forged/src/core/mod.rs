@@ -17,6 +17,7 @@ pub(crate) mod herdr_ownership;
 pub(crate) mod herdr_projection;
 mod history;
 pub(crate) mod lifecycle;
+mod model_usage;
 mod observe;
 mod ops;
 mod ore;

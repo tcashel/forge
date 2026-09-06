@@ -10,10 +10,12 @@ system as of v0.7.0.
 
 ## One paragraph
 
-Forge is a factory with a ledger at its heart. Work items (the ore)
-enter as complete specifications. One scheduler — the supervisor's ore
-pass — dispatches ready ore to seats (coding agents) working in isolated
-worktrees. A closed protocol assures each slice: gate, independent
+Forge supports a lead agent acting as the operator's software-engineering
+chief of staff. The operator brings a desired outcome or a precise technical
+specification; the lead preserves supplied decisions, resolves missing routine
+choices, and records a concise execution contract in the ledger. One scheduler
+— the supervisor's ore pass — dispatches ready work to seats (coding agents)
+in isolated worktrees. A closed protocol assures each slice: gate, independent
 review, bounded remediation, draft pull request. Landed slices merge
 into their group's integration branch; a group ends at one draft PR to
 the default branch that a human merges. Every request, effect, attempt,
@@ -69,8 +71,7 @@ names what breaks the crash-safety story if violated (see `CLAUDE.md`).
 
 ### L2 — Work
 
-- **Nouns:** work item (`kind`: task | bug | feature | story | spike |
-  chore | decision | milestone | epic), spec (`title`, `description`,
+- **Nouns:** work item (`kind`: task | epic), spec (`title`, `description`,
   `design`, `acceptanceCriteria`, `notes`), revision (append-only,
   CAS-guarded), edge (`parent-child` | `blocks` | `supersedes` |
   `related` | `discovered-from`), status (`open` | `blocked` |
@@ -90,8 +91,9 @@ names what breaks the crash-safety story if violated (see `CLAUDE.md`).
   release | supersede | revert | note add`; **(ADR-0036)** `work
   adjudicate` (spec revision plus typed dispositions in one fenced
   write, generalizing `promote`) and `work park`.
-- **Agent need:** the spec is the *sole* instruction a seat receives.
-  Anything a seat must know is in the four fields or it does not exist.
+- **Agent need:** the spec is the durable task contract. Record task
+  requirements in its fields so a seat needs no planning-session history;
+  repository instructions and the packet's authority still apply.
 
 ### L3 — Execution
 
