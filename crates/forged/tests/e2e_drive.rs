@@ -4026,7 +4026,8 @@ fn pre_policy_run_package_is_migrated_once_and_then_stays_frozen() {
     let env = TestEnv::new("forged-legacy-run-policy");
     assert_eq!(env.forged(&["init"]).0, 0);
     let repo = env.repos.repo.to_string_lossy().into_owned();
-    let other_repo = env.repos.origin.to_string_lossy().into_owned();
+    let other_repos = support::setup_repos(&env.root.join("other-project"), "main");
+    let other_repo = other_repos.repo.to_string_lossy().into_owned();
     let spec = env.spec.to_string_lossy().into_owned();
     for (run, repository) in [
         ("legacy-policy-run", repo.as_str()),

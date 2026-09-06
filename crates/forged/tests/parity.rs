@@ -284,7 +284,7 @@ fn all_manifest_tools_match_their_cli_counterparts() {
     fabricate_run(&env, "par-repository");
     let repository = env.repos.repo.to_string_lossy().into_owned();
     env.set_work_repository("bead-par-repository", &repository);
-    // The fixture work exists for repository projections only; park it so
+    // The fixture work exists for repository projections only; block it so
     // the claim_next parity leg still sees an empty ready frontier (the
     // ledger frontier is a query over open unassigned items).
     env.set_work_field("bead-par-repository", "status", "blocked");
@@ -1148,8 +1148,25 @@ fn all_manifest_tools_match_their_cli_counterparts() {
         normalized(tool.clone()),
         "operations_overview parity"
     );
-    assert_eq!(tool["result"]["attention"]["counts"]["symptoms"], json!(1));
-    assert_eq!(tool["result"]["attention"]["decisions"], json!([]));
+    assert_eq!(tool["result"]["attention"]["counts"]["symptoms"], json!(0));
+    assert_eq!(tool["result"]["attention"]["counts"]["decisions"], json!(1));
+    let decisions = tool["result"]["attention"]["decisions"]
+        .as_array()
+        .expect("visible decision rows");
+    assert_eq!(decisions.len(), 1);
+    let blocked = &decisions[0];
+    assert_eq!(blocked["subjectId"], json!("par-repository"));
+    assert_eq!(blocked["condition"], json!("blocked"));
+    assert_eq!(
+        blocked["nextActions"],
+        json!([{
+            "verb": "work reopen",
+            "args": {"id": "bead-par-repository"},
+            "reason": blocked["recommendedAction"]["text"],
+            "class": "should",
+        }]),
+        "blocked work remains actionable in the default decision rail"
+    );
     assert!(
         tool["result"]["attention"].get("symptoms").is_none(),
         "summary attention omits symptom rows unless requested: {tool}"
@@ -1158,11 +1175,10 @@ fn all_manifest_tools_match_their_cli_counterparts() {
         "operations_overview",
         envelope(json!({"repo": repository, "limit": 25, "symptoms": true})),
     );
-    assert!(
-        symptoms
-            .pointer("/result/attention/symptoms/0/nextActions")
-            .is_some_and(Value::is_array),
-        "requested symptom items retain nextActions: {symptoms}"
+    assert_eq!(symptoms["result"]["attention"]["symptoms"], json!([]));
+    assert_eq!(
+        symptoms["result"]["attention"]["decisions"], tool["result"]["attention"]["decisions"],
+        "requesting symptoms retains the same actionable decision rows"
     );
     let structured = mcp.call_tool_result(
         "operations_overview",

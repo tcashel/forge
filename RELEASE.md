@@ -43,20 +43,24 @@ incompatible binary fails.
    `## [X.Y.Z] - YYYY-MM-DD` in `CHANGELOG.md`, then leave an empty
    `Unreleased` section and update the comparison links at the bottom.
 4. Run the complete local gates with the pinned import fixture available as
-   `BD_BIN` or on `PATH`. This is release qualification, not a runtime dependency:
+   `BD_BIN` or on `PATH`. Match CI's reduced debug information and three test
+   slots: process fixtures hash executables and spawn additional controllers.
+   This is release qualification, not a runtime dependency:
 
 ```sh
 BD_REQUEST="${BD_BIN:-bd}"
 export FORGED_TEST_BD="$(command -v "$BD_REQUEST")"
 export FORGED_REQUIRE_BD=1
 test -x "$FORGED_TEST_BD"
+export CARGO_PROFILE_DEV_DEBUG=line-tables-only
+export CARGO_PROFILE_TEST_DEBUG=line-tables-only
 bash scripts/validate-plugin.sh
 bash scripts/test-install.sh
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo build --workspace --locked
-cargo nextest run --workspace
-cargo nextest run -p forged --features failpoints
+cargo nextest run --workspace --test-threads 3
+cargo nextest run -p forged --features failpoints --test-threads 3
 cargo run --quiet -p forged -- --version
 git diff --check
 ```
