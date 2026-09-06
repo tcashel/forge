@@ -4025,47 +4025,63 @@ fn failed_gate_repairs_before_review_without_expanding_standard_topology() {
 fn pre_policy_run_package_is_migrated_once_and_then_stays_frozen() {
     let env = TestEnv::new("forged-legacy-run-policy");
     assert_eq!(env.forged(&["init"]).0, 0);
-    env.seed_frontier("legacy-policy-run");
     let repo = env.repos.repo.to_string_lossy().into_owned();
+    let other_repo = env.repos.origin.to_string_lossy().into_owned();
     let spec = env.spec.to_string_lossy().into_owned();
-    let (code, started) = env.forged(&[
-        "run",
-        "start",
-        "--work",
-        "legacy-policy-run",
-        "--repo",
-        &repo,
-        "--spec",
-        &spec,
-        "--base-ref",
-        "main",
-    ]);
-    assert_eq!(code, 0, "start: {started}");
+    for (run, repository) in [
+        ("legacy-policy-run", repo.as_str()),
+        ("legacy-policy-other", other_repo.as_str()),
+        ("current-policy-run", repo.as_str()),
+    ] {
+        env.seed_frontier(run);
+        let (code, started) = env.forged(&[
+            "run",
+            "start",
+            "--work",
+            run,
+            "--repo",
+            repository,
+            "--spec",
+            &spec,
+            "--base-ref",
+            "main",
+        ]);
+        assert_eq!(code, 0, "start {run}: {started}");
+    }
     env.authorize_run("legacy-policy-run");
+    let original_current = env
+        .ledger()
+        .get_run_definition("current-policy-run")
+        .expect("current definition")
+        .expect("stored current definition")
+        .package_json;
 
     // Recreate the exact pre-policy durable shape: package JSON and its hash
     // both omit `policy`, with no migration overlay yet.
     let db = env.anvil.join("state.db");
     let connection = rusqlite::Connection::open(&db).expect("open legacy run fixture");
-    let package_json: String = connection
-        .query_row(
-            "SELECT package_json FROM run_definitions WHERE run_id = ?1",
-            ["legacy-policy-run"],
-            |row| row.get(0),
-        )
-        .expect("stored package");
-    let mut legacy_package: Value = serde_json::from_str(&package_json).expect("package JSON");
-    legacy_package
-        .as_object_mut()
-        .expect("package object")
-        .remove("policy");
-    let (legacy_json, legacy_sha256) = canonical_json_and_sha(&legacy_package);
-    connection
-        .execute(
+    for run in ["legacy-policy-run", "legacy-policy-other"] {
+        let package_json: String = connection
+            .query_row(
+                "SELECT package_json FROM run_definitions WHERE run_id = ?1",
+                [run],
+                |row| row.get(0),
+            )
+            .expect("stored package");
+        let mut legacy_package: Value = serde_json::from_str(&package_json).expect("package JSON");
+        legacy_package
+            .as_object_mut()
+            .expect("package object")
+            .remove("policy");
+        let (legacy_json, legacy_sha256) = canonical_json_and_sha(&legacy_package);
+        connection.execute(
             "UPDATE run_definitions SET package_json = ?1, package_sha256 = ?2 WHERE run_id = ?3",
-            rusqlite::params![legacy_json, legacy_sha256, "legacy-policy-run"],
-        )
-        .expect("install legacy package");
+            rusqlite::params![legacy_json, legacy_sha256, run],
+        ).expect("install legacy package");
+        connection
+            .execute("DELETE FROM policy_revisions WHERE run_id = ?1", [run])
+            .expect("pre-policy runs have no policy revisions");
+    }
     connection
         .execute(
             "DELETE FROM runtime_migrations WHERE name = 'forged.run.execution-policy/1'",
@@ -4074,6 +4090,57 @@ fn pre_policy_run_package_is_migrated_once_and_then_stays_frozen() {
         .expect("restore pre-upgrade migration state");
     drop(connection);
 
+    let config_path = env.anvil.join("config.json");
+    let mut config: Value =
+        serde_json::from_str(&std::fs::read_to_string(&config_path).expect("read config"))
+            .expect("config JSON");
+    config["gate_commands"] = json!(["false"]);
+    config["repositories"] = json!({
+        (repo.clone()): {
+            "gate_commands": [" "],
+            "seat_commands": ["check-project-a"],
+            "seat_env": {"PROJECT_CHECK": "project-a"},
+        },
+        (other_repo.clone()): {
+            "gate_commands": ["echo project-b"],
+            "seat_commands": ["check-project-b"],
+            "seat_env": {"PROJECT_CHECK": "project-b"},
+        },
+        "/unmounted/unrelated": {"gate_commands": [" "]},
+    });
+    std::fs::write(
+        &config_path,
+        serde_json::to_string_pretty(&config).expect("serialize config"),
+    )
+    .expect("configure repository policies before migration");
+    let (code, rejected) = env.forged(&["run", "status", "--run", "legacy-policy-run"]);
+    assert_eq!(
+        code, 1,
+        "invalid repository policy refuses migration: {rejected}"
+    );
+    let connection = rusqlite::Connection::open(&db).expect("inspect failed migration");
+    let overlays: i64 = connection
+        .query_row("SELECT COUNT(*) FROM run_package_migrations", [], |row| {
+            row.get(0)
+        })
+        .expect("overlay count after refusal");
+    let completed: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM runtime_migrations WHERE name = 'forged.run.execution-policy/1')",
+        [], |row| row.get(0),
+    ).expect("completion marker after refusal");
+    assert_eq!(
+        overlays, 0,
+        "a later candidate's refusal rolls back every overlay"
+    );
+    assert!(!completed, "a refused migration remains retryable");
+    drop(connection);
+
+    config["repositories"][&repo]["gate_commands"] = json!(["true"]);
+    std::fs::write(
+        &config_path,
+        serde_json::to_string_pretty(&config).expect("serialize config"),
+    )
+    .expect("correct repository policy");
     let (code, migrated) = env.forged(&["run", "status", "--run", "legacy-policy-run"]);
     assert_eq!(code, 0, "legacy status migrates: {migrated}");
     assert_eq!(
@@ -4084,13 +4151,43 @@ fn pre_policy_run_package_is_migrated_once_and_then_stays_frozen() {
         .as_str()
         .expect("migrated digest")
         .to_owned();
+    let ledger = env.ledger();
+    for (run, gate, seat, check) in [
+        ("legacy-policy-run", "true", "check-project-a", "project-a"),
+        (
+            "legacy-policy-other",
+            "echo project-b",
+            "check-project-b",
+            "project-b",
+        ),
+    ] {
+        let definition = ledger
+            .get_run_definition(run)
+            .expect("definition")
+            .expect("stored definition");
+        let package: Value =
+            serde_json::from_str(&definition.package_json).expect("migrated package");
+        assert_eq!(package["policy"]["gateCommands"], json!([gate]));
+        assert_eq!(package["policy"]["seatCommands"], json!([seat]));
+        assert_eq!(
+            package["policy"]["seatEnv"],
+            json!({"PROJECT_CHECK": check})
+        );
+    }
+    assert_eq!(
+        ledger
+            .get_run_definition("current-policy-run")
+            .expect("current definition")
+            .expect("stored current definition")
+            .package_json,
+        original_current,
+        "an existing policy must not be replaced by current repository defaults"
+    );
+    ledger.close().expect("close migration readback");
 
     // A later authoring change must not leak through the compatibility seam.
-    let config_path = env.anvil.join("config.json");
-    let mut config: Value =
-        serde_json::from_str(&std::fs::read_to_string(&config_path).expect("read config"))
-            .expect("config JSON");
-    config["gate_commands"] = json!(["false"]);
+    config["repositories"][&repo]["gate_commands"] = json!(["false"]);
+    config["repositories"][&repo]["seat_env"] = json!({"PROJECT_CHECK": "changed"});
     std::fs::write(
         &config_path,
         serde_json::to_string_pretty(&config).expect("serialize config"),

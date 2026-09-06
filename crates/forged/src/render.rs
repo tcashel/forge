@@ -555,6 +555,46 @@ fn render_model_usage(result: &Value, now: &str) -> String {
     ] {
         push_field(&mut lines, label, result.pointer(pointer));
     }
+    if result
+        .pointer("/attribution/unattributedUsageRows")
+        .and_then(Value::as_u64)
+        .is_some_and(|rows| rows > 0)
+    {
+        for (label, pointer) in [
+            ("unattributed known USD", "/unattributedUsage/knownUsd"),
+            (
+                "unattributed rows missing cost",
+                "/unattributedUsage/rowsMissingCost",
+            ),
+            ("unattributed billed rows", "/unattributedUsage/billedRows"),
+            (
+                "unattributed imputed rows",
+                "/unattributedUsage/imputedRows",
+            ),
+            (
+                "unattributed other pricing rows",
+                "/unattributedUsage/otherPricingRows",
+            ),
+            (
+                "unattributed uncached input tokens",
+                "/unattributedUsage/tokens/input",
+            ),
+            (
+                "unattributed output tokens",
+                "/unattributedUsage/tokens/output",
+            ),
+            (
+                "unattributed cache read tokens",
+                "/unattributedUsage/tokens/cacheRead",
+            ),
+            (
+                "unattributed cache write tokens",
+                "/unattributedUsage/tokens/cacheWrite",
+            ),
+        ] {
+            push_field(&mut lines, label, result.pointer(pointer));
+        }
+    }
     if let Some(groups) = result.get("groups").and_then(Value::as_array) {
         for row in groups {
             for key in ["repository", "role", "provider", "model", "effort"] {

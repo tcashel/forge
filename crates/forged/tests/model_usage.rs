@@ -512,3 +512,136 @@ fn repository_scope_uses_frozen_runs_and_group_output_is_bounded() {
         json!({"shown":0,"total":0,"truncated":false})
     );
 }
+
+#[test]
+fn unattributed_usage_preserves_tokens_cost_provenance_and_text_visibility() {
+    let fixture = Fixture::new("forged-model-usage-unattributed");
+    fixture.run("unattributed", &fixture.repository);
+    let implementation = fixture.packet("unattributed", false);
+    let review = fixture.packet("unattributed", true);
+    let attempt = fixture.attempt(&implementation, "completed", None, None);
+    fixture.usage(
+        &implementation,
+        attempt,
+        ("codex", "grouped-model"),
+        (10, 1, Some(2), Some(3)),
+        (Some(0.5), Some("billed")),
+    );
+    let before = fixture.report(&["--models", "--run", "unattributed"]);
+
+    for (packet, owner, model, tokens, cost, basis) in [
+        (
+            Some(implementation.as_str()),
+            None,
+            "unowned-billed",
+            (100, 10, Some(20), Some(5)),
+            Some(1.25),
+            Some("billed"),
+        ),
+        (
+            Some(review.as_str()),
+            Some(attempt),
+            "mismatched-imputed",
+            (200, 20, Some(30), Some(6)),
+            Some(2.5),
+            Some("imputed_api_rate"),
+        ),
+        (
+            None,
+            None,
+            "unowned-unpriced",
+            (300, 30, None, None),
+            None,
+            None,
+        ),
+    ] {
+        fixture
+            .conn
+            .execute(
+                "INSERT INTO usage \
+                 (run_id, packet_id, attempt_id, provider, model, input_tokens, output_tokens, \
+                  cache_read_tokens, cache_write_tokens, cost_usd, pricing_basis, ts) \
+                 VALUES ('unattributed',?1,?2,'codex',?3,?4,?5,?6,?7,?8,?9,?10)",
+                params![
+                    packet, owner, model, tokens.0, tokens.1, tokens.2, tokens.3, cost, basis, END
+                ],
+            )
+            .expect("unattributed usage fixture");
+    }
+
+    let report = fixture.report(&["--models", "--run", "unattributed"]);
+    assert_eq!(report["schema"], json!("forged.model-usage/1"));
+    assert_eq!(
+        report["groups"], before["groups"],
+        "missing or mismatched ownership must not change valid attempt evidence"
+    );
+    assert_eq!(report["attribution"]["unattributedUsageRows"], json!(3));
+    assert_eq!(
+        report["unattributedUsage"],
+        json!({
+            "knownUsd":3.75,"rowsMissingCost":1,"attemptsWithoutUsage":0,
+            "billedRows":1,"imputedRows":1,"otherPricingRows":1,
+            "tokens":{"input":600,"output":60,"cacheRead":50,"cacheWrite":11},
+        })
+    );
+    let grouped = &report["groups"][0];
+    let unattributed = &report["unattributedUsage"];
+    let raw = fixture.report(&["--run", "unattributed"]);
+    assert_eq!(raw["rows"].as_array().expect("all usage rows").len(), 4);
+    for (group_field, raw_field) in [
+        ("input", "inputTokens"),
+        ("output", "outputTokens"),
+        ("cacheRead", "cacheReadTokens"),
+        ("cacheWrite", "cacheWriteTokens"),
+    ] {
+        assert_eq!(
+            grouped["tokens"][group_field]
+                .as_u64()
+                .expect("group tokens")
+                + unattributed["tokens"][group_field]
+                    .as_u64()
+                    .expect("unattributed tokens"),
+            raw["totals"][raw_field].as_u64().expect("raw tokens"),
+            "{group_field} must be conserved without double attribution"
+        );
+    }
+    assert_eq!(
+        grouped["cost"]["knownUsd"].as_f64().expect("group cost")
+            + unattributed["knownUsd"]
+                .as_f64()
+                .expect("unattributed cost"),
+        raw["totals"]["costUsdKnown"].as_f64().expect("raw cost")
+    );
+    assert_eq!(raw["totals"]["costUsdKnown"], json!(4.25));
+    assert_eq!(raw["totals"]["rowsMissingCost"], json!(1));
+
+    let output = fixture
+        .env
+        .forged_cmd(&["--text", "usage", "--models", "--run", "unattributed"])
+        .output()
+        .expect("text usage report");
+    assert!(
+        output.status.success(),
+        "text report failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout).expect("UTF-8 text report");
+    for line in [
+        "unattributed usage rows: 3",
+        "unattributed known USD: 3.75",
+        "unattributed rows missing cost: 1",
+        "unattributed billed rows: 1",
+        "unattributed imputed rows: 1",
+        "unattributed other pricing rows: 1",
+        "unattributed uncached input tokens: 600",
+        "unattributed output tokens: 60",
+        "unattributed cache read tokens: 50",
+        "unattributed cache write tokens: 11",
+    ] {
+        assert!(
+            text.lines().any(|actual| actual == line),
+            "missing {line:?}: {text}"
+        );
+    }
+    assert!(!text.contains("unattributed attempts without usage"));
+}

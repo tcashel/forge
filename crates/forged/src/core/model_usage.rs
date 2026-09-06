@@ -48,6 +48,21 @@ struct Tokens {
     cache_read: u64,
     cache_write: u64,
 }
+impl Tokens {
+    fn add(&mut self, row: &UsageRecord) {
+        self.input += row.input_tokens;
+        self.output += row.output_tokens;
+        self.cache_read += row.cache_read_tokens.unwrap_or(0);
+        self.cache_write += row.cache_write_tokens.unwrap_or(0);
+    }
+}
+
+#[derive(Default, Serialize)]
+struct UnattributedUsage {
+    #[serde(flatten)]
+    cost: Cost,
+    tokens: Tokens,
+}
 #[derive(Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ReviewVerdicts {
@@ -142,7 +157,7 @@ fn project(
         .map(|row| (row.attempt_id, row))
         .collect::<BTreeMap<_, _>>();
     let mut usage = BTreeMap::<i64, Vec<&UsageRecord>>::new();
-    let mut unmatched = Cost::default();
+    let mut unmatched = UnattributedUsage::default();
     let mut unattributed_usage_rows = 0;
     for row in &snapshot.usage {
         let owner = row.attempt_id.and_then(|id| attempts.get(&id).copied());
@@ -155,7 +170,8 @@ fn project(
             usage.entry(attempt.attempt_id).or_default().push(row);
         } else {
             unattributed_usage_rows += 1;
-            unmatched.add(row);
+            unmatched.cost.add(row);
+            unmatched.tokens.add(row);
         }
     }
     let mut selections = BTreeMap::new();
@@ -332,10 +348,7 @@ fn project(
         metrics.cost.attempts_without_usage += u64::from(rows.is_empty());
         for row in rows {
             metrics.cost.add(row);
-            metrics.tokens.input += row.input_tokens;
-            metrics.tokens.output += row.output_tokens;
-            metrics.tokens.cache_read += row.cache_read_tokens.unwrap_or(0);
-            metrics.tokens.cache_write += row.cache_write_tokens.unwrap_or(0);
+            metrics.tokens.add(row);
         }
     }
     let from = snapshot.attempts.iter().map(|row| &row.started_at).min();

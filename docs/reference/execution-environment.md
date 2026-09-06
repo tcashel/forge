@@ -19,6 +19,9 @@ checks and role candidates. Explicit profile/roster arguments take precedence.
 New starts and explicit run retries resolve these settings; existing packets
 and frontier-created epic children retain their frozen definitions. Policy
 revisions use the original repository and change policy, never cognition.
+When a legacy definition has no stored policy, its first upgrade freezes the
+policy for its stored repository. Existing policies and migration overlays stay
+unchanged.
 `seat_env` affects providers; gate-specific variables belong in the gate command.
 
 ## Gate execution contract
