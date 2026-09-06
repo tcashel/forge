@@ -4425,10 +4425,11 @@ fn run_uses_its_frozen_roster_after_the_authoring_config_changes() {
         serde_json::from_str(&std::fs::read_to_string(&config_path).expect("read config"))
             .expect("config json");
     config["gate_commands"] = json!(["false"]);
+    config["default_profile"] = json!("lean");
     config["repositories"] = json!({repo.clone(): {
         "gate_commands": ["true"],
         "seat_env": {"PROJECT_CHECK": "frozen"},
-        "default_profile": "lean",
+        "default_profile": "standard",
         "default_roster": "project-models",
     }});
     std::fs::write(
@@ -4453,7 +4454,7 @@ fn run_uses_its_frozen_roster_after_the_authoring_config_changes() {
     ]);
     assert_eq!(code, 0, "start: {started}");
     env.authorize_run("bead-frozen");
-    assert_eq!(started["result"]["profile_ref"]["name"], json!("lean"));
+    assert_eq!(started["result"]["profile_ref"]["name"], json!("standard"));
     assert_eq!(
         started["result"]["roster_ref"]["name"],
         json!("project-models")
@@ -4484,7 +4485,10 @@ fn run_uses_its_frozen_roster_after_the_authoring_config_changes() {
 
     let (code, driven) = env.forged(&["run", "drive", "--run", "bead-frozen"]);
     assert_eq!(code, 0, "drive must use the stored roster: {driven}");
-    assert!(driven["result"]["terminal"]["done"].is_object());
+    assert!(
+        driven["result"]["terminal"]["done"].is_object(),
+        "drive must finish with the frozen repair budget: {driven}"
+    );
 
     let (code, status) = env.forged(&["run", "status", "--run", "bead-frozen"]);
     assert_eq!(code, 0, "status: {status}");
