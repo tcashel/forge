@@ -17,6 +17,7 @@ pub(crate) mod herdr_ownership;
 pub(crate) mod herdr_projection;
 mod history;
 pub(crate) mod lifecycle;
+mod model_usage;
 mod observe;
 mod ops;
 mod ore;
@@ -79,14 +80,30 @@ pub(crate) async fn await_controller_authorization_from_env(ctx: &Ctx) -> Result
 /// epics: once it returns, their projections consume only complete packages.
 /// Definition-less v0 runs retain their older compatibility projection.
 pub async fn migrate_legacy_state(ctx: &Ctx) -> Result<(), Failure> {
-    let policy = ctx.config.execution_policy().map_err(|errors| {
+    ctx.config.execution_policy().map_err(|errors| {
         Failure::invalid(format!(
             "execution policy is invalid: {}",
             serde_json::to_string(&errors).unwrap_or_default()
         ))
     })?;
+    let config = ctx.config.clone();
     on_ledger(&ctx.ledger, move |ledger| {
-        ledger.migrate_legacy_execution_packages(policy)
+        ledger.migrate_legacy_execution_packages(move |repository| {
+            config
+                .for_repository(repository)
+                .map_err(|message| LedgerError::Refused {
+                    code: ErrorCode::InvalidRequest,
+                    message,
+                })?
+                .execution_policy()
+                .map_err(|errors| LedgerError::Refused {
+                    code: ErrorCode::InvalidRequest,
+                    message: format!(
+                        "execution policy is invalid for repository {repository:?}: {}",
+                        serde_json::to_string(&errors).unwrap_or_default()
+                    ),
+                })
+        })
     })
     .await?;
     epic::migrate_legacy_epics(ctx).await?;

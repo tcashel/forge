@@ -75,6 +75,9 @@ fn normalized(mut envelope: Value) -> Value {
     if envelope["result"]["schema"] == json!("forged.work-history/1") {
         envelope["result"]["asOf"] = json!("<sampled>");
     }
+    if envelope["result"]["schema"] == json!("forged.model-usage/1") {
+        envelope["result"]["capturedAt"] = json!("<sampled>");
+    }
     if envelope["result"]["schema"] == json!("forged.provider-session-inventory/1") {
         envelope["result"]["asOf"] = json!("<sampled>");
     }
@@ -114,6 +117,83 @@ fn normalized(mut envelope: Value) -> Value {
         }
     }
     envelope
+}
+
+#[test]
+fn repository_configuration_and_model_evidence_have_cli_mcp_parity() {
+    let env = TestEnv::new("forged-repository-evidence-parity");
+    let config_path = env.anvil.join("config.json");
+    let mut config: Value =
+        serde_json::from_str(&std::fs::read_to_string(&config_path).expect("config"))
+            .expect("JSON");
+    config["repositories"] = json!({"/work/example": {
+        "default_profile": "lean",
+        "gate_commands": ["make check"],
+        "seat_commands": ["make lint"],
+        "seat_env": {"CHECK_MODE": "offline"}
+    }});
+    std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+    let mut mcp = McpClient::new(&env, Some("lead"));
+
+    let cli = env
+        .forged(&["definition", "validate", "--repo", "/work/./example/"])
+        .1;
+    let tool = mcp.call_tool("definition_validate", json!({"repo": "/work/./example/"}));
+    assert_eq!(cli, tool);
+    assert_eq!(tool["result"]["repository"], "/work/example");
+    assert_eq!(tool["result"]["profileRef"]["name"], "lean");
+    assert_eq!(
+        tool["result"]["policy"]["gateCommands"],
+        json!(["make check"])
+    );
+    assert_eq!(tool["result"]["policy"]["seatEnv"]["CHECK_MODE"], "offline");
+    assert_eq!(
+        tool["result"]["candidates"]["implementation"][0]["model"],
+        "opus"
+    );
+    let explicit = env
+        .forged(&[
+            "definition",
+            "validate",
+            "--repo",
+            "/work/example",
+            "--profile",
+            "standard",
+        ])
+        .1;
+    assert_eq!(explicit["result"]["profileRef"]["name"], "standard");
+    assert_eq!(explicit["result"]["policy"], tool["result"]["policy"]);
+
+    for models in [false, true] {
+        let mut args = vec!["usage", "--repo", "/work/example"];
+        let mut params = json!({"repo": "/work/example"});
+        if models {
+            args.extend(["--models", "--limit", "1"]);
+            params["models"] = json!(true);
+            params["limit"] = json!(1);
+        }
+        let cli = env.forged(&args).1;
+        let tool = mcp.call_tool("usage_report", params);
+        assert_eq!(normalized(cli), normalized(tool.clone()));
+        assert_eq!(tool["ok"], true);
+        if models {
+            assert_eq!(tool["result"]["schema"], "forged.model-usage/1");
+            assert_eq!(tool["result"]["coverage"]["total"], 0);
+        }
+    }
+
+    for command in ["definition_validate", "usage_report"] {
+        let tool = mcp.call_tool(command, json!({"repo": "relative/path"}));
+        assert_eq!(tool["ok"], false, "{command}: {tool}");
+        assert_eq!(tool["error"]["code"], "INVALID_REQUEST");
+    }
+    let cli = env.forged(&["usage", "--models", "--limit", "1"]).1;
+    let tool = mcp.call_tool("usage_report", json!({"models": true, "limit": 1}));
+    assert_eq!(
+        cli["ok"], true,
+        "omitted repository must keep portfolio scope: {cli}"
+    );
+    assert_eq!(normalized(cli), normalized(tool));
 }
 
 fn assert_subject_parity(cli: &Value, tool: &Value, context: &str) {

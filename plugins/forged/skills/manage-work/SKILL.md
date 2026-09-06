@@ -12,6 +12,11 @@ Boundary: the lead owns conversation, research, planning, critique,
 adjudication, and operator judgment. Forged owns attempts, controllers, gates,
 and evidence after explicit dispatch. Apps are optional views, never authority.
 
+Preserve a supplied technical specification and research only its gaps. For a
+desired outcome, resolve routine engineering choices and prepare the smallest
+executable contract. The lead handles the ledger and lifecycle; the operator
+need not translate the request into Forge terminology.
+
 ## Route one fixture case
 
 `intent-fixtures.json` and `portfolio-control-fixtures.json` are the routing
@@ -41,8 +46,9 @@ Delegate `plan` and `revise` to `../plan/SKILL.md`, `configure` to
 `../configure/SKILL.md`, `critique` to `../critique/SKILL.md`, `adjudicate` to
 `../adjudicate/SKILL.md`, `execute-slice` to `../dispatch/SKILL.md`, and
 `execute-epic` to `../run-epic/SKILL.md`. Exploration persists nothing. Plan
-wording approval never implies execution. Mixed requests complete the
-least-authorized intent first.
+wording approval never implies execution. Mixed requests complete prerequisites
+and continue through every explicitly authorized intent without another prompt
+for the same authority.
 
 ### Portfolio and control routes
 

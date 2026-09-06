@@ -663,6 +663,9 @@ pub enum DefinitionCmd {
 /// `definition validate` flags.
 #[derive(Debug, Args)]
 pub struct DefinitionValidateArgs {
+    /// Resolve defaults and checks for this repository; omit for global defaults.
+    #[arg(long)]
+    pub repo: Option<String>,
     /// Named assurance profile; defaults from config.
     #[arg(long)]
     pub profile: Option<String>,
@@ -1202,6 +1205,15 @@ pub struct UsageArgs {
     /// Scope to one run.
     #[arg(long)]
     pub run: Option<String>,
+    /// Scope recorded usage to this repository.
+    #[arg(long)]
+    pub repo: Option<String>,
+    /// Compare recorded attempts by repository, role, model, and effort.
+    #[arg(long)]
+    pub models: bool,
+    /// Maximum model groups to show (1-100, default 5); requires --models.
+    #[arg(long, requires = "models", value_parser = clap::value_parser!(u32).range(1..=100))]
+    pub limit: Option<u32>,
     /// Cover every run.
     #[arg(long)]
     pub all: bool,
@@ -2459,7 +2471,7 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
                 request(
                     a.idempotency_key,
                     None,
-                    json!({"profile": a.profile, "roster": a.roster}),
+                    json!({"profile": a.profile, "roster": a.roster, "repo": a.repo}),
                 ),
             ),
         },
@@ -2964,7 +2976,7 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
                 request(
                     a.idempotency_key,
                     a.run.clone(),
-                    json!({"run": a.run, "all": a.all}),
+                    json!({"run": a.run, "all": a.all, "repo": a.repo, "models": a.models, "limit": a.limit}),
                 ),
             ),
         },

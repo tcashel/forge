@@ -55,9 +55,9 @@ Any unchecked question makes the work item blocked. When adjudicated, move the
 answer into the normative field it changes and remove the checkbox. Keep only a
 short dated decision note when the history is useful.
 
-Critique and execution-approval records also live in `notes` on current main
-because there is no separate ledger commentary operation. Preserve those
-fenced records during later spec updates.
+Critique and approval evidence lives in typed ledger notes, accessed through
+`work note list` and the lifecycle operations. Keep normative task requirements
+in the spec fields; do not copy the commentary history into them.
 
 ## Repository metadata
 

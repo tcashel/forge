@@ -51,7 +51,6 @@ recommendation and CRUX:
 ```json
 {
   "schema": "forged.adjudication/1",
-  "revision": 1,
   "workItem": "<ore-id>",
   "critiquedRevision": 4,
   "recommendationNoteId": "<note-id>",

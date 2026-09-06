@@ -18,7 +18,8 @@ owned by Forged.
 
 - The authoring config is `$ANVIL_HOME/config.yaml` (default
   `~/.anvil/config.yaml`; `FORGED_CONFIG` overrides; `.json` is accepted).
-- This skill edits profiles, rosters, defaults, and pricing in that file only.
+- This skill edits profiles, rosters, defaults, repository overrides, and pricing
+  in that file only.
   It never touches `state.db`, target repositories, provider credentials, or
   the service manifest.
 - Changing cognition for already-running work uses the typed
@@ -60,18 +61,49 @@ do not name models. The defaults are `lean`, `standard`, and `high`; most
 operators keep them and choose one at dispatch.
 
 **Rosters** map semantic roles to ordered provider candidates. This is where
-model, reasoning effort, and budget live. `default_profile` and
+model and reasoning effort live. `default_profile` and
 `default_roster` apply when dispatch names nothing.
+
+The `repositories` map uses canonical absolute checkout paths. Its only
+overrides are `default_profile`, `default_roster`, `gate_commands`,
+`seat_commands`, and `seat_env`; named profiles and rosters remain shared.
+Explicit dispatch profile/roster flags win, then repository defaults, then
+global defaults. Omitted values inherit; commands and environment replace the
+whole value, so `[]` and `{}` clear it. Matching normalizes `.` and `..` but
+does not resolve symlinks; use the same repository path as the work record.
+For example:
+
+```yaml
+repositories:
+  /absolute/path/to/repository:
+    default_profile: standard
+    default_roster: default
+    gate_commands: [make check]
+    seat_commands: [make lint]
+    seat_env: {CI: "1"}
+```
+
+Preview a repository change before and after editing with
+`forged definition validate --repo "$TARGET_REPO"`. Runs freeze the resolved
+values; supported revisions resolve against the run's original repository.
+
+Choose models and effort from demonstrated quality and total cost on comparable
+repository work. `forged usage --repo "$TARGET_REPO" --models` provides recorded
+evidence, not a ranking or proof that a model caused an outcome. Keep an effective
+baseline until a cheaper candidate meets the same quality bar. Reuse suitable
+named rosters; do not create rosters or add prices without configuration authority.
+The report shows five groups by default; `--limit` widens to at most 100 and
+coverage states what was omitted. Missing historical effort stays unknown.
 
 | Role | Sandbox | What it needs |
 | --- | --- | --- |
-| `implementation` | workspaceWrite | Strong coding capability; it writes the change and consumes most tokens. |
-| `remediation` | workspaceWrite | Same tier or one step down; it applies findings, not a redesign. |
-| `review.primary` | readOnly | Strong reasoning at high effort. |
+| `implementation` | workspaceWrite | Coding capability proven on comparable work. |
+| `remediation` | workspaceWrite | Capability to repair the reported failures within scope. |
+| `review.primary` | readOnly | Independent reasoning suited to the repository's risks. |
 | `review.secondary` | readOnly | A different provider family from primary. |
-| `review.tertiary` | readOnly | A third high-assurance perspective. |
-| `synthesis` | readOnly | Strong reasoning for low-volume conflict adjudication. |
-| `assessment` | readOnly | Fast, inexpensive rolling-epic judgment between waves. |
+| `review.tertiary` | readOnly | An additional perspective when the selected assurance needs it. |
+| `synthesis` | readOnly | Judgment to resolve conflicting findings. |
+| `assessment` | readOnly | Rolling-epic planning judgment between waves. |
 
 `forged definition validate` proves shape: every profile role has candidates,
 identifiers are printable, and sandbox agrees with capabilities. Rolling-epic
@@ -102,8 +134,8 @@ rosters:
 
 `effort` is optional and provider-specific:
 
-- **codex** — passed as `model_reasoning_effort`; use `xhigh` for review and
-  synthesis, lower tiers for cheap seats.
+- **codex** — passed as `model_reasoning_effort`; select it using the task and
+  evidence above.
 - **pi** — passed as `--thinking`; allowed values are
   `off|minimal|low|medium|high|xhigh|max`.
 - **claude** — the adapter passes no effort flag; omit it.
@@ -160,11 +192,12 @@ forged definition validate
 forged doctor
 ```
 
-Report resolved defaults, every role's selected candidate with a short reason,
-whether the built-in or a custom rate card applies, and every unpriced model.
-State that new starts pick up every change. Already-started work changes only
-through an explicit supported revision: roster revisions for cognition, or
-policy revisions for gate commands, stage budgets, and transport-retry budget.
+Report resolved defaults, each role's candidates and rationale, the rate card,
+and unpriced models. Standalone starts and explicit `run retry` use current
+authoring settings. Packet retries keep their frozen definition; frontier-created
+epic children inherit the parent's active frozen definition. Roster revisions
+change cognition. Policy revisions change gates and budgets, never the selected
+profile or roster.
 
 ## Never
 

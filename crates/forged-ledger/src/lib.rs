@@ -80,6 +80,7 @@ pub use types::{
     RunStartPoint, RunState, SlotOutcome, SpecFence, UsageRecord, UsageTotals,
     WorkSettlementRetryRow,
 };
+pub use usage::ModelUsageSnapshot;
 pub use work::{
     ImportedWorkItem, NewWorkItem, NewWorkNote, WorkDepKind, WorkDepRow, WorkDependencyStatus,
     WorkImportReport, WorkItemFilters, WorkItemSnapshot, WorkKind, WorkLifecycleSnapshot,

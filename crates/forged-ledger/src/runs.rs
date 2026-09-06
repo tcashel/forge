@@ -384,25 +384,23 @@ pub(crate) fn require_run(conn: &Connection, run_id: &str) -> Result<(), LedgerE
 }
 
 impl Ledger {
-    /// Freeze the supplied policy into every definition written before policy
-    /// joined the execution-package schema.
+    /// Freeze a policy selected by each run's stored repository into definitions
+    /// written before policy joined the execution-package schema.
     ///
     /// Original definition rows remain untouched. Each legacy row receives at
     /// most one append-only overlay, and readers project that overlay as the
     /// effective package. The whole upgrade is one immediate transaction, so
     /// a crash exposes either all overlays or none of them.
-    pub fn migrate_legacy_execution_packages(
+    /// The selector must be pure: it runs on the ledger actor inside that
+    /// transaction, and is never called for already-frozen definitions.
+    pub fn migrate_legacy_execution_packages<F>(
         &self,
-        policy: ExecutionPolicyV1,
-    ) -> Result<usize, LedgerError> {
+        policy_for_repository: F,
+    ) -> Result<usize, LedgerError>
+    where
+        F: Fn(&str) -> Result<ExecutionPolicyV1, LedgerError> + Send + 'static,
+    {
         self.submit(move |conn| {
-            let policy_errors = policy.validate();
-            if !policy_errors.is_empty() {
-                return Err(refused(
-                    ErrorCode::InvalidRequest,
-                    format!("execution policy is invalid: {policy_errors:?}"),
-                ));
-            }
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let completed: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM runtime_migrations WHERE name = ?1)",
@@ -415,8 +413,8 @@ impl Ledger {
             }
             let candidates = {
                 let mut statement = tx.prepare(
-                    "SELECT d.run_id, d.package_sha256, d.package_json \
-                     FROM run_definitions d \
+                    "SELECT d.run_id, d.package_sha256, d.package_json, r.repo \
+                     FROM run_definitions d JOIN runs r ON r.run_id = d.run_id \
                      LEFT JOIN run_package_migrations m ON m.run_id = d.run_id \
                      WHERE m.run_id IS NULL ORDER BY d.run_id",
                 )?;
@@ -426,13 +424,14 @@ impl Ledger {
                             row.get::<_, String>(0)?,
                             row.get::<_, String>(1)?,
                             row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
                         ))
                     })?
                     .collect::<Result<Vec<_>, _>>()?;
                 rows
             };
             let mut migrated = 0;
-            for (run_id, previous_package_sha256, package_json) in candidates {
+            for (run_id, previous_package_sha256, package_json, repository) in candidates {
                 let mut value: serde_json::Value = serde_json::from_str(&package_json)?;
                 if value.get("policy").is_some() {
                     continue;
@@ -442,6 +441,16 @@ impl Ledger {
                     return Err(refused(
                         ErrorCode::Internal,
                         format!("legacy execution package digest mismatch for run {run_id:?}"),
+                    ));
+                }
+                let policy = policy_for_repository(&repository)?;
+                let policy_errors = policy.validate();
+                if !policy_errors.is_empty() {
+                    return Err(refused(
+                        ErrorCode::InvalidRequest,
+                        format!(
+                            "execution policy is invalid for run {run_id:?}: {policy_errors:?}"
+                        ),
                     ));
                 }
                 let object = value.as_object_mut().ok_or_else(|| {

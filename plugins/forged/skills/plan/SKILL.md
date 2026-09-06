@@ -1,6 +1,6 @@
 ---
 name: plan
-description: "Turn an approved idea or plan into one ledger-native ore work-item specification, or an epic with reviewable child slices, without writing spec files into a repository. Use when the operator asks to plan work with Forged or invokes /forged:plan."
+description: "Turn a supplied specification or desired outcome into one ledger-native work item, or an epic with reviewable child slices, without writing spec files into a repository. Use when the operator asks to plan work with Forged or invokes /forged:plan."
 ---
 
 # /forged:plan
@@ -14,8 +14,11 @@ a specification, hook, setting, or work store into the target repository.
 
 ## Author the native record
 
-The ledger record is the specification. Resolve one canonical absolute
-`metadata.repository`, then fill every field:
+The ledger record is the execution contract. Preserve supplied requirements
+and decisions; inspect only what is needed to verify them and fill gaps. For an
+outcome-only request, resolve routine engineering choices within delegated
+scope. Both inputs produce the same concise fields, with detail proportional
+to the work. Resolve one canonical absolute `metadata.repository`:
 
 | Field | Contract |
 | --- | --- |
@@ -25,11 +28,13 @@ The ledger record is the specification. Resolve one canonical absolute
 | `acceptanceCriteria` | observable outcomes and exact gates |
 | `notes` | agent instructions, decisions, and unresolved `- [ ]` questions |
 
-Read `research.md`, `schema.md`, `epic.md`, and `checklist.md`. Inspect the
-repository read-only. Prefer one reviewable task; use an epic only when real
-dependencies or independent waves require it. Fully specify the first wave and
-make later work honest blocked stubs. The lead resolves routine engineering
-choices and asks the operator only about product scope or external authority.
+Use `schema.md` and `checklist.md` to check the contract; read `research.md`
+when discovery is needed and `epic.md` only when considering an epic. Inspect
+the relevant repository evidence read-only. Prefer one reviewable task; use an
+epic only when real dependencies or independent waves require it. Fully specify
+the first wave and make later work honest blocked stubs. The lead resolves
+routine engineering choices and asks the operator only about product scope or
+external authority.
 
 Prepare the four Markdown bodies outside the repository. Reject a draft that
 is missing, unreadable, non-UTF-8, or empty. Each file flag conflicts with its corresponding inline flag.
@@ -78,17 +83,17 @@ independent.
 
 ## Readback
 
-The complete repository frontier is bounded at 500 and returns full native
-records without skill-side pagination:
+Read the authored record and the next action:
 
 ```bash
-forged work ready --repo "$TARGET_REPO" --all --full
-forged explain --id "$WORK_ID"
+forged work show --id "$WORK_ID"
 forged next --repo "$TARGET_REPO"
 ```
 
 Verify repository identity, fields, questions, status, and edges from the
-readback. Report ids grouped by wave, ready records, and exact blockers.
+readback. Use `forged work ready --repo "$TARGET_REPO" --all --full` only when planning
+depends on the complete frontier. Report the work id and any exact blocker;
+group by wave only for an epic.
 
 ## Never
 

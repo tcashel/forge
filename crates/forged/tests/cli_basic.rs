@@ -81,7 +81,7 @@ fn help_lists_every_command_and_subcommand_flags() {
         "run start --help must not expose the retired --bead flag"
     );
     let definition = help_text(&env, &["definition", "validate", "--help"]);
-    for flag in ["--profile", "--roster", "--idempotency-key"] {
+    for flag in ["--repo", "--profile", "--roster", "--idempotency-key"] {
         assert!(
             definition.contains(flag),
             "definition validate --help must document {flag}"
@@ -141,6 +141,9 @@ fn help_lists_every_command_and_subcommand_flags() {
     }
     let usage = help_text(&env, &["usage", "--help"]);
     assert!(usage.contains("ingest"), "usage --help must list ingest");
+    for flag in ["--repo", "--models", "--limit"] {
+        assert!(usage.contains(flag), "usage --help must document {flag}");
+    }
     let work = help_text(&env, &["work", "--help"]);
     assert!(work.contains("list"), "work --help must list list");
     let events = help_text(&env, &["events", "--help"]);
