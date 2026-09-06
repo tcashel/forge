@@ -4,6 +4,33 @@ This file records user-visible changes to Forge.
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-09-06
+
+### Added
+
+- Configure repository-specific gates, seat checks, environment, default profile,
+  and default roster in the operator config. Omitted settings inherit global
+  defaults; supplied lists and maps replace them. Explicit run arguments take
+  precedence, and existing runs retain their frozen execution settings.
+- Preview effective repository settings with `definition validate --repo` before
+  dispatch, including each role's provider, model, and requested reasoning effort.
+- Compare recorded model outcomes with `usage --repo --models`: bounded groups
+  show attempts, repeat attempts, review verdicts, tokens, duration, and cost provenance
+  by repository, role, provider, model, and requested effort. Missing historical
+  attribution remains unknown; unmatched usage retains its tokens and costs.
+  Current pricing metadata is labeled separately from unknown historical rates.
+
+### Changed
+
+- Planning skills preserve supplied technical decisions and fill consequential
+  gaps when the operator starts with an outcome. The lead keeps lifecycle
+  bookkeeping internal and reuses the repository's execution defaults.
+
+### Fixed
+
+- Legacy runs without a frozen policy inherit their stored repository's settings
+  during migration, while existing policy packages and overlays remain unchanged.
+
 ## [0.8.1] - 2026-09-05
 
 ### Fixed
@@ -542,7 +569,8 @@ historical TypeScript `v0.4.0` product has been replaced and is unsupported.
 - Refuses non-normalized or root-equivalent install prefixes before touching a
   live path.
 
-[Unreleased]: https://github.com/tcashel/forge/compare/v0.8.1...HEAD
+[Unreleased]: https://github.com/tcashel/forge/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/tcashel/forge/compare/v0.8.1...v0.9.0
 [0.8.1]: https://github.com/tcashel/forge/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/tcashel/forge/compare/v0.7.2...v0.8.0
 [0.7.2]: https://github.com/tcashel/forge/compare/v0.7.1...v0.7.2
