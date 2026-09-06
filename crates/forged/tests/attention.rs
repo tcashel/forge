@@ -255,81 +255,118 @@ fn attention_is_identical_across_surfaces_and_controls_are_occurrence_fenced() {
 
 #[test]
 fn source_backed_attention_cannot_substitute_for_domain_resolution() {
-    let env = TestEnv::new("forged-attention-domain-boundary");
-    env.forged(&["init"]);
-    env.set_work_field("bead-attention-blocked", "status", "blocked");
-    fabricate_run(&env, "attention-blocked");
-    let ledger = env.ledger();
-    ledger
-        .settle_run(
+    for outcome in [
+        forged_ledger::RunOutcome::Blocked,
+        forged_ledger::RunOutcome::Cancelled,
+        forged_ledger::RunOutcome::InputRequired,
+    ] {
+        let env = TestEnv::new("forged-attention-domain-boundary");
+        env.forged(&["init"]);
+        env.set_work_field("bead-attention-blocked", "status", "blocked");
+        fabricate_run(&env, "attention-blocked");
+        let ledger = env.ledger();
+        ledger
+            .settle_run(
+                "attention-blocked",
+                outcome,
+                "operator decision required".to_owned(),
+                None,
+                None,
+                None,
+            )
+            .expect("settle blocked");
+        ledger.close().expect("close ledger");
+        let value = overview(&env);
+        let blocked = value["attention"]
+            .as_array()
+            .and_then(|items| {
+                items
+                    .iter()
+                    .find(|item| item["condition"] == json!("blocked"))
+            })
+            .expect("blocked attention");
+        assert_eq!(
+            blocked["nextActions"],
+            json!([{
+                "verb": "work reopen",
+                "args": {"id": "bead-attention-blocked"},
+                "reason": blocked["recommendedAction"]["text"],
+                "class": "should",
+            }]),
+            "the closed recommendation mapping publishes one domain verb"
+        );
+        let (code, status) = env.forged(&["run", "status", "--run", "attention-blocked"]);
+        assert_eq!(code, 0, "{status}");
+        assert_eq!(
+            status["result"]["run"]["nextActions"],
+            blocked["nextActions"]
+        );
+        let (code, explained) = env.forged(&["explain", "--id", "attention-blocked"]);
+        assert_eq!(code, 0, "{explained}");
+        assert_eq!(explained["result"]["next"][0]["verb"], json!("work reopen"));
+        let (_, refused) = env.forged(&[
+            "attention",
+            "resolve",
+            "--subject",
             "attention-blocked",
-            forged_ledger::RunOutcome::Blocked,
-            "operator decision required".to_owned(),
-            None,
-            None,
-            None,
-        )
-        .expect("settle blocked");
-    ledger.close().expect("close ledger");
-    let value = overview(&env);
-    let blocked = value["attention"]
-        .as_array()
-        .and_then(|items| {
-            items
-                .iter()
-                .find(|item| item["condition"] == json!("blocked"))
-        })
-        .expect("blocked attention");
-    assert_eq!(
-        blocked["nextActions"],
-        json!([{
-            "verb": "work reopen",
-            "args": {"id": "bead-attention-blocked"},
-            "reason": blocked["recommendedAction"]["text"],
-            "class": "should",
-        }]),
-        "the closed recommendation mapping publishes one domain verb"
-    );
-    let (_, refused) = env.forged(&[
-        "attention",
-        "resolve",
-        "--subject",
-        "attention-blocked",
-        "--attention-id",
-        blocked["attentionId"].as_str().expect("attention id"),
-        "--occurrence-id",
-        blocked["occurrenceId"].as_str().expect("occurrence id"),
-        "--actor",
-        "operator",
-        "--disposition",
-        "fixed",
-        "--note",
-        "this must not bypass run settlement",
-    ]);
-    assert_eq!(refused["ok"], json!(false), "{refused}");
-    assert_eq!(refused["error"]["code"], json!("INVALID_REQUEST"));
-    let remedy = &refused["error"]["detail"];
-    assert_eq!(remedy["schema"], json!("forged.remedy/1"), "{refused}");
-    assert_eq!(remedy["verb"], json!("work reopen"), "{refused}");
-    assert_eq!(remedy["args"], json!({"id": "bead-attention-blocked"}));
-    assert_eq!(
-        remedy["reason"], blocked["recommendedAction"]["text"],
-        "the remedy preserves the stored recommendation text"
-    );
-    assert_eq!(overview(&env)["attentionTotal"], json!(1));
+            "--attention-id",
+            blocked["attentionId"].as_str().expect("attention id"),
+            "--occurrence-id",
+            blocked["occurrenceId"].as_str().expect("occurrence id"),
+            "--actor",
+            "operator",
+            "--disposition",
+            "fixed",
+            "--note",
+            "this must not bypass run settlement",
+        ]);
+        assert_eq!(refused["ok"], json!(false), "{refused}");
+        assert_eq!(refused["error"]["code"], json!("INVALID_REQUEST"));
+        let remedy = &refused["error"]["detail"];
+        assert_eq!(remedy["schema"], json!("forged.remedy/1"), "{refused}");
+        assert_eq!(remedy["verb"], json!("work reopen"), "{refused}");
+        assert_eq!(remedy["args"], json!({"id": "bead-attention-blocked"}));
+        assert_eq!(
+            remedy["reason"], blocked["recommendedAction"]["text"],
+            "the remedy preserves the stored recommendation text"
+        );
+        assert_eq!(
+            overview(&env)["attentionTotal"],
+            json!(if outcome == forged_ledger::RunOutcome::InputRequired {
+                2
+            } else {
+                1
+            })
+        );
 
-    let id = remedy["args"]["id"].as_str().expect("remedy work id");
-    let (code, reopened) = env.forged(&["work", "reopen", "--id", id]);
-    assert_eq!(code, 0, "advertised work reopen succeeds: {reopened}");
-    let value = overview(&env);
-    let blocked = attention(&value, "attention-blocked", "blocked")
-        .expect("reopening work does not resume its terminal run");
-    assert_eq!(blocked["nextActions"][0]["verb"], json!("run retry"));
-    assert_eq!(
-        blocked["nextActions"][0]["args"]["because"],
-        json!("world-changed")
-    );
-    assert_eq!(blocked["nextActions"][0]["class"], json!("should"));
+        let id = remedy["args"]["id"].as_str().expect("remedy work id");
+        let (code, reopened) = env.forged(&["work", "reopen", "--id", id]);
+        assert_eq!(code, 0, "advertised work reopen succeeds: {reopened}");
+        let value = overview(&env);
+        if outcome == forged_ledger::RunOutcome::Blocked {
+            let blocked = attention(&value, "attention-blocked", "blocked")
+                .expect("reopening work does not resume its terminal run");
+            assert_eq!(blocked["nextActions"][0]["verb"], json!("run retry"));
+            assert_eq!(
+                blocked["nextActions"][0]["args"]["because"],
+                json!("world-changed")
+            );
+            assert_eq!(blocked["nextActions"][0]["class"], json!("should"));
+        } else {
+            assert!(attention(&value, "attention-blocked", "blocked").is_none());
+            let (code, status) = env.forged(&["run", "status", "--run", "attention-blocked"]);
+            assert_eq!(code, 0, "{status}");
+            let expected = if outcome == forged_ledger::RunOutcome::InputRequired {
+                "work update"
+            } else {
+                "run retry"
+            };
+            assert_eq!(
+                status["result"]["run"]["nextActions"][0]["verb"],
+                json!(expected)
+            );
+        }
+    }
 }
 
 #[test]

@@ -2857,6 +2857,16 @@ pub(crate) fn run_projection_actions(
             format!("inspect successor run {successor}"),
         )];
     }
+    if work_status == Some("blocked") {
+        return vec![classified_action(
+            "work reopen",
+            json!({"id": run.work_id}),
+            super::attention::policy(forged_types::AttentionCondition::Blocked)
+                .2
+                .text,
+            forged_types::ActionClass::Should,
+        )];
+    }
     match run.terminal_outcome {
         Some(forged_ledger::RunOutcome::Clean | forged_ledger::RunOutcome::AcceptedRisk) => {
             return vec![
@@ -2877,14 +2887,6 @@ pub(crate) fn run_projection_actions(
         }
         Some(forged_ledger::RunOutcome::Blocked) => {
             return vec![match work_status {
-                Some("blocked") => classified_action(
-                    "work reopen",
-                    json!({"id": run.work_id}),
-                    super::attention::policy(forged_types::AttentionCondition::Blocked)
-                        .2
-                        .text,
-                    forged_types::ActionClass::Should,
-                ),
                 Some("closed" | "deferred") => action(
                     "work show",
                     json!({"id": run.work_id}),
