@@ -223,6 +223,58 @@ fn a_stopped_run_uses_its_health_and_retry_first_action() {
 }
 
 #[test]
+fn parked_and_closed_runs_and_attempts_do_not_advertise_retry() {
+    let env = TestEnv::new("forged-explain-held-recovery");
+    assert_eq!(env.forged(&["init"]).0, 0);
+    let run = "explain-held-run";
+    let work = "bead-explain-held-run";
+    env.seed_work_spec(
+        work,
+        "Keep deliberately held work idle.",
+        "- no retry recommendation",
+    );
+    fabricate_run(&env, run);
+    let attempt_id = seed_live_attempt(&env, run);
+    let ledger = env.ledger();
+    // The fixture has no provider process; settle its synthetic attempt
+    // through the same fenced state sequence before stopping the run.
+    ledger
+        .revoke_attempt(attempt_id, "fixture stopped")
+        .unwrap();
+    ledger.mark_stopped(attempt_id).unwrap();
+    ledger
+        .settle_run(
+            run,
+            forged_ledger::RunOutcome::Blocked,
+            "gate stopped".to_owned(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+    ledger.close().unwrap();
+    for status in ["deferred", "closed"] {
+        env.set_work_field(work, "status", status);
+        let (code, status_response) = env.forged(&["run", "status", "--run", run]);
+        assert_eq!(code, 0, "{status_response}");
+        let expected = &result(&status_response)["run"]["nextActions"][0];
+        assert_eq!(expected["verb"], json!("work show"));
+        for id in [run.to_owned(), attempt_id.to_string()] {
+            let (code, explained) = env.forged(&["explain", "--id", &id]);
+            assert_eq!(code, 0, "{explained}");
+            let actions = result(&explained)["next"].as_array().unwrap();
+            assert!(actions.contains(expected), "{status} {id}: {explained}");
+            assert!(
+                actions
+                    .iter()
+                    .all(|action| action["verb"] != json!("run retry")),
+                "{status} {id}: {explained}"
+            );
+        }
+    }
+}
+
+#[test]
 fn multiple_run_decisions_keep_one_should_and_order_it_first() {
     let env = TestEnv::new("forged-explain-run-decision-ranking");
     assert_eq!(env.forged(&["init"]).0, 0);

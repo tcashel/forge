@@ -10,8 +10,8 @@ use forged_types::AttentionCondition;
 
 pub const SUBJECT_TOTAL: usize = 120;
 pub const ATTENTION_TOTAL: usize = 64;
-pub const BLOCKED_SYMPTOM_TOTAL: usize = 47;
-pub const DECISION_TOTAL: usize = 10;
+pub const BLOCKED_DECISION_TOTAL: usize = 47;
+pub const DECISION_TOTAL: usize = BLOCKED_DECISION_TOTAL + 10;
 pub const RUNNING_TOTAL: usize = 2;
 pub const RECENT_LANDED_TOTAL: usize = 3;
 
@@ -123,17 +123,17 @@ pub fn operator_store_fixture() -> OperatorStoreFixture {
     }
 
     let mut attention = Vec::with_capacity(ATTENTION_TOTAL);
-    for subject in subjects.iter().skip(5).take(BLOCKED_SYMPTOM_TOTAL) {
+    for subject in subjects.iter().skip(5).take(BLOCKED_DECISION_TOTAL) {
         attention.push(FixtureAttention {
             subject_id: subject.id.clone(),
             condition: AttentionCondition::Blocked,
-            decision: false,
+            decision: true,
             decision_context: None,
         });
     }
     for (subject, case) in subjects
         .iter()
-        .skip(5 + BLOCKED_SYMPTOM_TOTAL)
+        .skip(5 + BLOCKED_DECISION_TOTAL)
         .zip(COVERAGE_CONDITIONS.iter().chain(EXEMPT_CONDITIONS.iter()))
     {
         attention.push(FixtureAttention {
@@ -143,19 +143,15 @@ pub fn operator_store_fixture() -> OperatorStoreFixture {
             decision_context: Some(case.context),
         });
     }
-    for (subject, condition) in subjects
-        .iter()
-        .skip(5 + BLOCKED_SYMPTOM_TOTAL + DECISION_TOTAL)
-        .zip([
-            AttentionCondition::ControllerDead,
-            AttentionCondition::FailedGate,
-            AttentionCondition::ProviderDegraded,
-            AttentionCondition::AdmissionDeferred,
-            AttentionCondition::WorkSettlementPending,
-            AttentionCondition::AckOverdue,
-            AttentionCondition::SlowStage,
-        ])
-    {
+    for (subject, condition) in subjects.iter().skip(5 + DECISION_TOTAL).zip([
+        AttentionCondition::ControllerDead,
+        AttentionCondition::FailedGate,
+        AttentionCondition::ProviderDegraded,
+        AttentionCondition::AdmissionDeferred,
+        AttentionCondition::WorkSettlementPending,
+        AttentionCondition::AckOverdue,
+        AttentionCondition::SlowStage,
+    ]) {
         attention.push(FixtureAttention {
             subject_id: subject.id.clone(),
             condition,

@@ -709,7 +709,8 @@ fn advance_assurance_rounds(
         if !op_settled(view, gate, u32::from(round)) {
             return NextAction::RunMachine(gate);
         }
-        let gate_passed = gate_passed_for_round(view, round);
+        let gate_result = gate_result_for_round(view, round);
+        let gate_passed = gate_result == Some(true);
         if gate_passed {
             if (publish_pr || round > 0) && !op_settled(view, MachineStage::Push, u32::from(round))
             {
@@ -770,7 +771,23 @@ fn advance_assurance_rounds(
         if let Some(amendment) = fixed.amendment {
             return amendment_stop(amendment);
         }
-        if fixed.semantic_failure {
+        // A completed no-op can describe an environment repair. Before any
+        // review, let the already-budgeted gate decide whether it worked;
+        // missing/failed results and rejected review fixes still stop here.
+        let recheck_noop = gate_result == Some(false)
+            && review_rounds == 0
+            && !fixes.is_empty()
+            && fixes.iter().all(|seat| {
+                adaptive_packet(view, seat, round).is_some_and(|packet| {
+                    matches!(
+                        packet_state(view, packet),
+                        LegState::Completed {
+                            outcome: Some(Outcome::Fix { .. })
+                        }
+                    )
+                })
+            });
+        if fixed.semantic_failure && !recheck_noop {
             return NextAction::Stop(Terminal::RemediationFailed {
                 round: round.saturating_add(1),
                 final_verdict: reviewed.produced,
@@ -953,7 +970,7 @@ fn seats_for(profile: &ProfileDefinitionV1, purpose: SeatPurpose) -> Vec<&SeatDe
         .collect()
 }
 
-fn gate_passed_for_round(view: &RunView, round: u8) -> bool {
+fn gate_result_for_round(view: &RunView, round: u8) -> Option<bool> {
     let (phase, seq) = if round == 0 {
         (crate::events::GatePhase::Gate, 0)
     } else {
@@ -971,7 +988,6 @@ fn gate_passed_for_round(view: &RunView, round: u8) -> bool {
             } if *event_phase == phase && *event_seq == seq => Some(*passed),
             _ => None,
         })
-        == Some(true)
 }
 
 #[derive(Debug)]

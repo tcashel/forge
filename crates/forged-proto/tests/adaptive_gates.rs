@@ -243,6 +243,12 @@ fn settle_machine(view: &mut forged_proto::RunView, step: MachineStage, round: u
 
 #[test]
 fn failed_gate_repairs_before_push_pr_or_review_without_escalating() {
+    for applied in [true, false] {
+        assert_gate_repairs_before_review(applied);
+    }
+}
+
+fn assert_gate_repairs_before_review(applied: bool) {
     let mut view = after_initial_gate("slice-gate-repair", false);
     let profile = &mut view.execution_package.as_mut().unwrap().profile;
     profile.escalate_on = vec![forged_types::EscalationTrigger::GateFailure];
@@ -257,7 +263,7 @@ fn failed_gate_repairs_before_push_pr_or_review_without_escalating() {
         &mut view,
         &fix,
         Outcome::Fix {
-            applied: true,
+            applied,
             summary: "repaired gate".to_owned(),
         },
     );
@@ -356,6 +362,12 @@ fn persisted_approval_against_failed_gate_cannot_complete_clean() {
 
 #[test]
 fn every_failed_gate_consumes_the_same_bounded_repair_budget() {
+    for applied in [true, false] {
+        assert_failed_gates_consume_budget(applied);
+    }
+}
+
+fn assert_failed_gates_consume_budget(applied: bool) {
     let mut view = after_initial_gate("slice-budget", false);
     view.execution_package
         .as_mut()
@@ -370,7 +382,7 @@ fn every_failed_gate_consumes_the_same_bounded_repair_budget() {
             &mut view,
             &fix,
             Outcome::Fix {
-                applied: true,
+                applied,
                 summary: "attempted repair".to_owned(),
             },
         );
@@ -384,6 +396,64 @@ fn every_failed_gate_consumes_the_same_bounded_repair_budget() {
             ..
         })
     ));
+}
+
+#[test]
+fn noop_recovery_requires_completed_fix_evidence_and_no_prior_review() {
+    for scenario in ["review", "missing-result", "failed-result", "amendment"] {
+        let mut view = after_initial_gate("slice-noop-refusal", scenario == "review");
+        if scenario == "review" {
+            settle_machine(&mut view, MachineStage::Push, 0, true);
+            settle_machine(&mut view, MachineStage::DraftPr, 0, true);
+            let intent = one_intent(advance(&view));
+            complete(
+                &mut view,
+                &intent,
+                review(Verdict::RequestChanges, Vec::new()),
+            );
+        }
+        let fix = one_intent(advance(&view));
+        complete(
+            &mut view,
+            &fix,
+            Outcome::Fix {
+                applied: false,
+                summary: "no source change".to_owned(),
+            },
+        );
+        let attempt = view
+            .terminal_attempts
+            .get_mut(fix.packet_id.as_ref().unwrap())
+            .unwrap()
+            .last_mut()
+            .unwrap();
+        match scenario {
+            "missing-result" => attempt.outcome = None,
+            "failed-result" => {
+                attempt.state = AttemptState::Failed;
+                attempt.outcome = None;
+                attempt.fail_note = Some("semantic: repair failed".to_owned());
+            }
+            "amendment" => {
+                attempt.outcome = Some(Outcome::SpecAmendment {
+                    amendment: forged_types::SpecAmendment {
+                        summary: "scope decision".to_owned(),
+                        evidence: "target no longer exists".to_owned(),
+                        proposed_change: "choose a replacement".to_owned(),
+                    },
+                })
+            }
+            _ => {}
+        }
+        assert!(
+            matches!(
+                advance(&view),
+                NextAction::Stop(Terminal::RemediationFailed { .. })
+                    | NextAction::Stop(Terminal::SpecAmendmentProposed { .. })
+            ),
+            "{scenario}"
+        );
+    }
 }
 
 #[test]

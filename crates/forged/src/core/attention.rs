@@ -312,15 +312,22 @@ pub(crate) fn recommendation_actions(
     });
     match recommendation.code {
         Action::ResolveBlocker => {
-            let Some(work_id) = work_id else {
-                return Vec::new();
-            };
-            vec![classified_action(
-                "work reopen",
-                json!({"id": work_id}),
-                &recommendation.text,
-                forged_types::ActionClass::Repair,
-            )]
+            if let Some(run) = retryable {
+                return super::ops::run_projection_actions(
+                    run,
+                    None,
+                    Some(if work_id.is_some() { "blocked" } else { "open" }),
+                );
+            }
+            if let Some(work_id) = work_id {
+                return vec![classified_action(
+                    "work reopen",
+                    json!({"id": work_id}),
+                    &recommendation.text,
+                    forged_types::ActionClass::Should,
+                )];
+            }
+            Vec::new()
         }
         Action::ProvideInput => match subject_kind {
             AttentionSubjectKind::Epic => vec![classified_action(
@@ -533,6 +540,7 @@ pub(crate) fn recommendation_actions(
                 super::ops::run_projection_actions(
                     run,
                     evidence.and_then(|value| value.get("pr")).and_then(Value::as_u64),
+                    None,
                 )
             }),
         // These decision codes have no honesty-tested in-surface domain verb.
@@ -871,7 +879,13 @@ fn collect_domain_sources(input: &ProjectionInput<'_>) -> Result<Vec<RawAttentio
                     .and_then(Value::as_str)
                     .and_then(|work_id| work_by_id.get(work_id))
                     .map(|issue| issue.status.as_str());
-                if live_status.is_some_and(|status| status != "blocked") {
+                if live_status.is_some_and(|status| matches!(status, "closed" | "deferred"))
+                    || input
+                        .runs
+                        .iter()
+                        .any(|run| run.run_id == *id && run.superseded_by.is_some())
+                    || exhausted_run_has_successor(input, id)
+                {
                     continue;
                 }
                 let reason = entry.get("stopReason").and_then(Value::as_str);
@@ -2304,7 +2318,8 @@ pub(crate) enum AttentionClass {
 pub(crate) fn classification(condition: AttentionCondition) -> AttentionClass {
     use AttentionCondition as Condition;
     match condition {
-        Condition::InputRequired
+        Condition::Blocked
+        | Condition::InputRequired
         | Condition::MergeApproval
         | Condition::Quarantined
         | Condition::MissingCost
@@ -2314,8 +2329,7 @@ pub(crate) fn classification(condition: AttentionCondition) -> AttentionClass {
         | Condition::AmbiguousEffect
         | Condition::RestartBudgetExhausted
         | Condition::MissingEvidence => AttentionClass::Decision,
-        Condition::Blocked
-        | Condition::WorkSettlementPending
+        Condition::WorkSettlementPending
         | Condition::Revoking
         | Condition::ControllerDead
         | Condition::FailedGate
@@ -3366,6 +3380,7 @@ mod tests {
     fn classification_pins_the_exact_decision_and_symptom_sets() {
         use AttentionCondition as Condition;
         let decisions = [
+            Condition::Blocked,
             Condition::InputRequired,
             Condition::MergeApproval,
             Condition::Quarantined,
@@ -3377,7 +3392,6 @@ mod tests {
             Condition::MissingEvidence,
         ];
         let symptoms = [
-            Condition::Blocked,
             Condition::WorkSettlementPending,
             Condition::Revoking,
             Condition::ControllerDead,
@@ -3385,8 +3399,8 @@ mod tests {
             Condition::ProviderDegraded,
             Condition::AdmissionDeferred,
         ];
-        assert_eq!(decisions.len(), 9);
-        assert_eq!(symptoms.len(), 7);
+        assert_eq!(decisions.len(), 10);
+        assert_eq!(symptoms.len(), 6);
         for condition in decisions {
             assert_eq!(
                 classification(condition),

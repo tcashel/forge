@@ -636,16 +636,23 @@ fn run_status_classes_each_terminal_outcome_by_relevance() {
                 assert_eq!(should[0]["verb"], json!("run stop"));
                 assert_eq!(should[0]["args"]["outcome"], json!("landed"));
             }
-            forged_ledger::RunOutcome::Blocked | forged_ledger::RunOutcome::InputRequired => {
+            forged_ledger::RunOutcome::Blocked => {
+                assert_eq!(should.len(), 1, "{status}");
+                assert_eq!(should[0]["verb"], json!("run retry"));
+                assert_eq!(should[0]["args"]["because"], json!("world-changed"));
+            }
+            forged_ledger::RunOutcome::InputRequired => {
                 assert_eq!(should.len(), 1, "{status}");
                 assert_eq!(should[0]["verb"], json!("work update"));
             }
             forged_ledger::RunOutcome::Cancelled => assert!(should.is_empty(), "{status}"),
             _ => unreachable!("fixture outcomes are closed above"),
         }
-        assert!(actions.iter().any(|action| {
-            action["verb"] == json!("run retry") && action["class"] == json!("can")
-        }));
+        if outcome != forged_ledger::RunOutcome::Blocked {
+            assert!(actions.iter().any(|action| {
+                action["verb"] == json!("run retry") && action["class"] == json!("can")
+            }));
+        }
         if matches!(
             outcome,
             forged_ledger::RunOutcome::Clean | forged_ledger::RunOutcome::AcceptedRisk
@@ -837,7 +844,11 @@ fn run_retry_mints_and_submits_one_flat_successor_at_the_amended_revision() {
         .expect("successor definition")
         .expect("stored definition");
     let package: Value = serde_json::from_str(&definition.package_json).expect("successor package");
-    assert_eq!(package["profileRef"]["name"], json!("lean"));
+    assert_eq!(started["result"]["profile_ref"]["name"], json!("standard"));
+    assert_eq!(
+        package["profileRef"], started["result"]["profile_ref"],
+        "retry retains the source profile while refreshing repository check policy"
+    );
     assert_eq!(
         package["policy"]["gateCommands"],
         json!(["project-retry-check"])
@@ -1037,6 +1048,142 @@ fn run_retry_preserves_three_local_only_commits_and_projects_the_start_point() {
         .trim(),
         "3"
     );
+}
+
+#[test]
+fn run_retry_inherits_active_source_models_unless_explicitly_overridden() {
+    for mode in [
+        "inherit",
+        "override",
+        "removed",
+        "revised",
+        "revised-original-removed",
+        "revised-active-removed",
+        "revised-override",
+    ] {
+        let env = TestEnv::new("forged-retry-model-inheritance");
+        env.add_uniform_roster("source-models", "claude", "opus");
+        assert_eq!(env.forged(&["init"]).0, 0);
+        env.seed_work_spec(
+            "model-source",
+            "Preserve retry model choices.",
+            "- inherit or override",
+        );
+        let (code, started) = env.forged(&[
+            "run",
+            "start",
+            "--work",
+            "model-source",
+            "--repo",
+            env.repos.repo.to_str().unwrap(),
+            "--profile",
+            "lean",
+            "--roster",
+            "source-models",
+        ]);
+        assert_eq!(code, 0, "{started}");
+        let config_path = env.anvil.join("config.json");
+        let mut config: Value =
+            serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        config["rosters"]["other-models"] = config["rosters"]["default"].clone();
+        config["rosters"]["other-models"]["name"] = json!("other-models");
+        config["rosters"]["revised-models"] = config["rosters"]["default"].clone();
+        config["rosters"]["revised-models"]["name"] = json!("revised-models");
+        config["default_profile"] = json!("standard");
+        config["default_roster"] = json!("other-models");
+        std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+        if mode.starts_with("revised") {
+            let (code, revised) = env.forged(&[
+                "run",
+                "revise-roster",
+                "--run",
+                "model-source",
+                "--roster",
+                "revised-models",
+                "--reason",
+                "use replacement source models",
+            ]);
+            assert_eq!(code, 0, "{mode}: {revised}");
+            assert_eq!(revised["result"]["revision"], json!(2));
+            assert_eq!(
+                revised["result"]["roster_ref"]["name"],
+                json!("revised-models")
+            );
+        }
+        let ledger = env.ledger();
+        ledger
+            .settle_run(
+                "model-source",
+                forged_ledger::RunOutcome::Blocked,
+                "repair the environment".to_owned(),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        ledger.close().unwrap();
+        if matches!(
+            mode,
+            "removed" | "revised-original-removed" | "revised-active-removed"
+        ) {
+            config["rosters"].as_object_mut().unwrap().remove(
+                if mode == "revised-active-removed" {
+                    "revised-models"
+                } else {
+                    "source-models"
+                },
+            );
+        }
+        std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+        let mut args = vec!["run", "retry", "--id", "model-source", "--fresh"];
+        if matches!(mode, "override" | "revised-override") {
+            args.extend(["--profile", "standard", "--roster", "other-models"]);
+        }
+        let (code, retry) = env.forged(&args);
+        let ledger = env.ledger();
+        if matches!(mode, "removed" | "revised-active-removed") {
+            assert_ne!(code, 0, "missing named source must not fall back: {retry}");
+            assert!(retry["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains(if mode == "removed" {
+                    "source-models"
+                } else {
+                    "revised-models"
+                }));
+            assert_eq!(ledger.list_runs().unwrap().len(), 1);
+        } else {
+            assert_eq!(code, 0, "{retry}");
+            let successor = retry["result"]["runId"]
+                .as_str()
+                .expect("returned successor id");
+            let definition = ledger.get_run_definition(successor).unwrap().unwrap();
+            let package: Value = serde_json::from_str(&definition.package_json).unwrap();
+            let (profile, roster) = match mode {
+                "inherit" => ("lean", "source-models"),
+                "revised" | "revised-original-removed" => ("lean", "revised-models"),
+                _ => ("standard", "other-models"),
+            };
+            assert_eq!(package["profileRef"]["name"], json!(profile), "{mode}");
+            assert_eq!(package["rosterRef"]["name"], json!(roster), "{mode}");
+        }
+        ledger.close().unwrap();
+        if mode == "revised-original-removed" {
+            config["rosters"]
+                .as_object_mut()
+                .unwrap()
+                .remove("revised-models");
+            std::fs::write(config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+            git(&env.repos.repo, &["remote", "remove", "origin"]);
+            let (code, replayed) = env.forged(&args);
+            assert_eq!(
+                code, 0,
+                "replay needs neither roster nor origin: {replayed}"
+            );
+            assert_eq!(replayed["reused"], json!(true));
+            assert_eq!(replayed["result"]["runId"], retry["result"]["runId"]);
+        }
+    }
 }
 
 #[test]
@@ -1262,6 +1409,208 @@ fn run_dispatch_is_one_fenced_approval_and_submission() {
     ]);
     assert_ne!(code, 0, "duplicate dispatch must refuse: {duplicate}");
     assert_eq!(duplicate["error"]["detail"]["verb"], json!("run status"));
+}
+
+#[test]
+fn ordinary_run_bases_are_canonical_and_successful_replays_stay_offline() {
+    for dispatch in [false, true] {
+        for base in ["main", "release/2026", "origin/topic"] {
+            let env = TestEnv::new("forged-ordinary-base-replay");
+            assert_eq!(env.forged(&["init"]).0, 0);
+            env.seed_work_spec(
+                "base-replay",
+                "Validate the selected base.",
+                "- preserve the base",
+            );
+            if base != "main" {
+                git(&env.repos.origin, &["branch", base]);
+            }
+            if base == "origin/topic" {
+                git(
+                    &env.repos.origin,
+                    &["commit", "--allow-empty", "-m", "different topic base"],
+                );
+                git(&env.repos.origin, &["branch", "topic"]);
+                assert_ne!(
+                    git(&env.repos.origin, &["rev-parse", base]),
+                    git(&env.repos.origin, &["rev-parse", "topic"])
+                );
+            }
+            let prefixed = format!("origin/{base}");
+            let repo = env.repos.repo.to_str().unwrap();
+            let args = if dispatch {
+                vec![
+                    "run",
+                    "dispatch",
+                    "--id",
+                    "base-replay",
+                    "--basis",
+                    "base fixture",
+                    "--override",
+                    "base admission fixture",
+                    "--base-ref",
+                    &prefixed,
+                ]
+            } else {
+                vec![
+                    "run",
+                    "start",
+                    "--work",
+                    "base-replay",
+                    "--repo",
+                    repo,
+                    "--base-ref",
+                    &prefixed,
+                ]
+            };
+            let (code, started) = env.forged(&args);
+            assert_eq!(code, 0, "{args:?}: {started}");
+            let ledger = env.ledger();
+            assert_eq!(ledger.get_run("base-replay").unwrap().base_ref, base);
+            if dispatch {
+                let notes = ledger.list_work_notes("base-replay", None, 100).unwrap();
+                let approval = notes
+                    .notes
+                    .iter()
+                    .filter_map(|note| serde_json::from_str::<Value>(&note.body_json).ok())
+                    .find(|note| note["kind"] == json!("approval"))
+                    .unwrap();
+                assert_eq!(approval["approval"]["baseRef"], json!(base));
+            }
+            ledger.close().unwrap();
+            if base == "origin/topic" {
+                let ledger = env.ledger();
+                ledger
+                    .settle_run(
+                        "base-replay",
+                        forged_ledger::RunOutcome::Blocked,
+                        "retry a canonical base".to_owned(),
+                        None,
+                        None,
+                        None,
+                    )
+                    .unwrap();
+                ledger.close().unwrap();
+                let (code, retry) = env.forged(&["run", "retry", "--id", "base-replay", "--fresh"]);
+                assert_eq!(code, 0, "{retry}");
+                let successor = retry["result"]["runId"]
+                    .as_str()
+                    .expect("returned successor id");
+                let ledger = env.ledger();
+                assert_eq!(ledger.get_run(successor).unwrap().base_ref, base);
+                ledger.close().unwrap();
+            }
+            git(
+                &env.repos.repo,
+                &[
+                    "remote",
+                    "set-url",
+                    "origin",
+                    env.root.join("unavailable-origin").to_str().unwrap(),
+                ],
+            );
+            let (code, replay) = env.forged(&args);
+            assert_eq!(code, 0, "offline replay: {replay}");
+            assert_eq!(replay["reused"], json!(true));
+            assert_eq!(replay["result"], started["result"]);
+        }
+    }
+}
+
+#[test]
+fn invalid_ordinary_run_bases_leave_no_execution_or_approval() {
+    for dispatch in [false, true] {
+        for base in ["", "origin/", "missing-branch", "bad..branch"] {
+            let env = TestEnv::new("forged-ordinary-base-refusal");
+            assert_eq!(env.forged(&["init"]).0, 0);
+            env.seed_work_spec(
+                "bad-base",
+                "Refuse an invalid base.",
+                "- no execution effects",
+            );
+            let repo = env.repos.repo.to_str().unwrap();
+            let args = if dispatch {
+                vec![
+                    "run",
+                    "dispatch",
+                    "--id",
+                    "bad-base",
+                    "--basis",
+                    "base fixture",
+                    "--override",
+                    "base admission fixture",
+                    "--base-ref",
+                    base,
+                ]
+            } else {
+                vec![
+                    "run",
+                    "start",
+                    "--work",
+                    "bad-base",
+                    "--repo",
+                    repo,
+                    "--base-ref",
+                    base,
+                ]
+            };
+            let ledger = env.ledger();
+            let event_count = ledger.list_events(None, 0, 4096).unwrap().len();
+            ledger.close().unwrap();
+            let (code, refused) = env.forged(&args);
+            assert_ne!(code, 0, "{args:?}: {refused}");
+            assert!(refused["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("baseRef"));
+            let remedy = &refused["error"]["detail"];
+            assert_eq!(remedy["schema"], json!("forged.remedy/1"));
+            assert_eq!(
+                remedy["verb"],
+                json!(if dispatch {
+                    "run dispatch"
+                } else {
+                    "run start"
+                })
+            );
+            assert_eq!(
+                remedy["args"]["baseRef"],
+                Value::Null,
+                "a correction must not guess a branch"
+            );
+            assert!(remedy["reason"].as_str().unwrap().contains("--base-ref"));
+            let ledger = env.ledger();
+            assert_eq!(
+                ledger.list_events(None, 0, 4096).unwrap().len(),
+                event_count,
+                "invalid admission must not enter the operation fence"
+            );
+            assert!(ledger.list_runs().unwrap().is_empty());
+            assert!(ledger.list_desired_work().unwrap().is_empty());
+            assert!(ledger
+                .list_work_notes("bad-base", None, 100)
+                .unwrap()
+                .notes
+                .is_empty());
+            ledger.close().unwrap();
+            let mut correction = remedy["args"].clone();
+            correction["baseRef"] = json!("main");
+            let mut mcp = McpClient::new(&env, None);
+            let corrected = mcp.call_tool(
+                if dispatch {
+                    "run_dispatch"
+                } else {
+                    "run_start"
+                },
+                correction,
+            );
+            assert_eq!(
+                corrected["ok"],
+                json!(true),
+                "advertised correction: {corrected}"
+            );
+        }
+    }
 }
 
 #[test]

@@ -4,6 +4,23 @@ This file records user-visible changes to Forge.
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-09-06
+
+### Changed
+
+- Normalize and validate newly supplied ordinary base references while
+  preserving canonical retries and offline replay.
+- Preserve unchanged implementation for conservative `world-changed` retries
+  after a pre-review gate stop when only gate commands changed; rerun fresh
+  gates and reviews.
+- Keep blocked decisions and actions consistent across recovery paths. Omitted
+  retry model profiles and rosters inherit the source names; explicit overrides
+  remain supported.
+
+### Fixed
+
+- Allow completed no-op gate repair to rerun the bounded gate before review.
+
 ## [0.9.0] - 2026-09-06
 
 ### Added
@@ -569,7 +586,8 @@ historical TypeScript `v0.4.0` product has been replaced and is unsupported.
 - Refuses non-normalized or root-equivalent install prefixes before touching a
   live path.
 
-[Unreleased]: https://github.com/tcashel/forge/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/tcashel/forge/compare/v0.9.1...HEAD
+[0.9.1]: https://github.com/tcashel/forge/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/tcashel/forge/compare/v0.8.1...v0.9.0
 [0.8.1]: https://github.com/tcashel/forge/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/tcashel/forge/compare/v0.7.2...v0.8.0

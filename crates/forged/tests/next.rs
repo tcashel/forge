@@ -15,8 +15,7 @@ use forged_types::{
 };
 use serde_json::{json, Value};
 use support::operator_store::{
-    operator_store_fixture, BLOCKED_SYMPTOM_TOTAL, DECISION_TOTAL, RECENT_LANDED_TOTAL,
-    RUNNING_TOTAL, SUBJECT_TOTAL,
+    operator_store_fixture, DECISION_TOTAL, RECENT_LANDED_TOTAL, RUNNING_TOTAL, SUBJECT_TOTAL,
 };
 use support::{fabricate_run, McpClient, TestEnv};
 
@@ -151,7 +150,7 @@ fn seed_operator_store(env: &TestEnv) {
                         None,
                         None,
                     )
-                    .expect("settle symptom fixture");
+                    .expect("settle blocked decision fixture");
             }
             52..=61 => {
                 ledger
@@ -200,7 +199,7 @@ fn seed_operator_store(env: &TestEnv) {
     }
     record_spend(env, &fixture.subjects[0].id, 1.25);
     record_spend(env, &fixture.subjects[2].id, 0.75);
-    record_spend(env, &fixture.subjects[52].id, 2.5);
+    record_spend(env, &fixture.subjects[5].id, 2.5);
 }
 
 #[test]
@@ -480,10 +479,10 @@ fn shared_operator_fixture_stays_under_the_default_four_kib_budget() {
         result["coverage"]["sections"]["landed"]["total"],
         json!(RECENT_LANDED_TOTAL)
     );
-    assert_eq!(result["hidden"]["symptoms"], json!(BLOCKED_SYMPTOM_TOTAL));
+    assert_eq!(result["hidden"]["symptoms"], json!(0));
     assert_eq!(decisions[0]["spendUsd"], json!(2.5));
     assert!(decisions[0]["should"].is_object());
-    assert_eq!(decisions[0]["canCount"], json!(1));
+    assert_eq!(decisions[0]["canCount"], json!(0));
     assert!(decisions.iter().all(|row| row.get("next").is_none()));
     let bytes = serde_json::to_vec(&response).expect("serialize production response");
     assert!(
@@ -502,20 +501,38 @@ fn shared_operator_fixture_stays_under_the_default_four_kib_budget() {
     let hidden_symptoms = with_symptoms["result"]["hidden"]["symptoms"]
         .as_u64()
         .unwrap() as usize;
-    assert_eq!(shown_symptoms + hidden_symptoms, BLOCKED_SYMPTOM_TOTAL);
+    assert_eq!(shown_symptoms + hidden_symptoms, 0);
 
     let (code, expanded) = env.forged(&["next", "--section", "decisions", "--limit", "30"]);
     assert_eq!(code, 0, "expanded decisions: {expanded}");
     let expanded_result = &expanded["result"];
     let expanded_decisions = expanded_result["sections"]["decisions"].as_array().unwrap();
-    assert_eq!(expanded_decisions.len(), DECISION_TOTAL);
+    assert_eq!(expanded_decisions.len(), DECISION_TOTAL.min(30));
     assert!(expanded_decisions.iter().all(|row| {
         row["next"]
             .as_array()
-            .is_some_and(|actions| actions.len() == 2)
+            .is_some_and(|actions| actions.len() == 1 && actions[0]["class"] == json!("should"))
     }));
     let running = expanded_result["sections"]["running"].as_array().unwrap();
     let landed = expanded_result["sections"]["landed"].as_array().unwrap();
+    assert!(
+        running.is_empty(),
+        "decisions consume the default shared row budget"
+    );
+    assert!(
+        landed.is_empty(),
+        "decisions consume the default shared row budget"
+    );
+    let (code, running_page) = env.forged(&["next", "--section", "running", "--limit", "2"]);
+    assert_eq!(code, 0, "{running_page}");
+    let (code, landed_page) = env.forged(&["next", "--section", "landed", "--limit", "3"]);
+    assert_eq!(code, 0, "{landed_page}");
+    let running = running_page["result"]["sections"]["running"]
+        .as_array()
+        .unwrap();
+    let landed = landed_page["result"]["sections"]["landed"]
+        .as_array()
+        .unwrap();
     assert_eq!(running.len(), RUNNING_TOTAL);
     assert_eq!(landed.len(), RECENT_LANDED_TOTAL);
     assert_eq!(running[0]["stage"], json!("implement"));
@@ -526,6 +543,136 @@ fn shared_operator_fixture_stays_under_the_default_four_kib_budget() {
     assert_eq!(landed[0]["pr"], json!(262));
     assert_eq!(landed[0]["health"], json!("terminal"));
     assert_eq!(landed[0]["spendUsd"], json!(0.75));
+}
+
+#[test]
+fn blocked_run_recovery_remains_visible_until_deliberately_parked_or_superseded() {
+    let env = TestEnv::new("forged-next-blocked-recovery");
+    assert_eq!(env.forged(&["init"]).0, 0);
+    let run = "gate-stopped";
+    let work = "bead-gate-stopped";
+    env.seed_work_spec(
+        work,
+        "Recover the failed gate.",
+        "- fresh checks and review",
+    );
+    fabricate_run(&env, run);
+    env.set_work_field(work, "status", "blocked");
+    let ledger = env.ledger();
+    ledger
+        .settle_run(
+            run,
+            RunOutcome::Blocked,
+            "pre-review gate repair failed".to_owned(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+    ledger.close().unwrap();
+    let repository = env.repos.repo.to_str().unwrap();
+    let recovery = |verb: &str| {
+        let (code, next) = env.forged(&["next", "--repo", repository]);
+        assert_eq!(code, 0, "{next}");
+        let row = next["result"]["sections"]["decisions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == json!(run))
+            .expect("stopped run stays in decisions");
+        assert_eq!(row["should"]["verb"], json!(verb));
+        let (code, status) = env.forged(&["run", "status", "--run", run]);
+        assert_eq!(code, 0, "{status}");
+        let status_action = &status["result"]["run"]["nextActions"][0];
+        assert_eq!(status_action["verb"], row["should"]["verb"]);
+        assert_eq!(status_action["args"], row["should"]["args"]);
+        assert_eq!(status_action["class"], json!("should"));
+        for id in [run, work] {
+            let (code, explain) = env.forged(&["explain", "--id", id]);
+            assert_eq!(code, 0, "{explain}");
+            assert_eq!(
+                explain["result"]["next"][0], *status_action,
+                "same full action for {id}"
+            );
+        }
+        if verb == "run retry" {
+            assert_eq!(row["should"]["args"]["because"], json!("world-changed"));
+        }
+    };
+    let hidden = || {
+        let (code, next) = env.forged(&["next", "--repo", repository]);
+        assert_eq!(code, 0, "{next}");
+        assert!(
+            next["result"]["sections"]["decisions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|row| row["id"] != json!(run)),
+            "{next}"
+        );
+    };
+    recovery("work reopen");
+    assert_eq!(env.forged(&["work", "reopen", "--id", work]).0, 0);
+    recovery("run retry");
+    assert_eq!(
+        env.forged(&[
+            "work",
+            "park",
+            "--id",
+            work,
+            "--reason",
+            "deliberately held"
+        ])
+        .0,
+        0
+    );
+    hidden();
+    assert_eq!(
+        env.forged(&[
+            "work",
+            "reopen",
+            "--id",
+            work,
+            "--reason",
+            "resume recovery"
+        ])
+        .0,
+        0
+    );
+    recovery("run retry");
+    assert_eq!(
+        env.forged(&[
+            "work",
+            "close",
+            "--id",
+            work,
+            "--reason",
+            "delivered elsewhere"
+        ])
+        .0,
+        0
+    );
+    hidden();
+    assert_eq!(env.forged(&["work", "reopen", "--id", work]).0, 0);
+    // This generic fixture has no recorded branch; fresh explicitly chooses
+    // ordinary execution rather than claiming reusable implementation proof.
+    let (code, retry) = env.forged(&[
+        "run",
+        "retry",
+        "--id",
+        run,
+        "--because",
+        "world-changed",
+        "--fresh",
+    ]);
+    assert_eq!(code, 0, "{retry}");
+    hidden();
+    let ledger = env.ledger();
+    assert_eq!(
+        ledger.get_run(run).unwrap().terminal_outcome,
+        Some(RunOutcome::Blocked)
+    );
+    ledger.close().unwrap();
 }
 
 #[test]

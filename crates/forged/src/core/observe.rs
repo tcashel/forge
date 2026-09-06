@@ -1326,12 +1326,7 @@ pub(crate) async fn explain_work_item(
     ) {
         if let Some(run) = latest.as_ref() {
             let delivery_pr = super::ops::run_delivery_pr(ctx, run).await?;
-            next = super::ops::run_projection_actions(run, delivery_pr);
-            next.extend(subject_attention_actions(
-                attention,
-                AttentionSubjectKind::Run,
-                &run.run_id,
-            ));
+            next = run_actions(ctx, run, delivery_pr, attention, Some(work.status.as_str())).await;
         }
     }
     let (next, _) = rank_subject_actions(next);
@@ -1388,6 +1383,45 @@ fn subject_attention_actions(
             }
         }
     }
+    actions
+}
+
+async fn run_actions(
+    ctx: &Ctx,
+    run: &forged_ledger::RunRow,
+    delivery_pr: Option<u64>,
+    attention: &[AttentionItemV1],
+    work_status: Option<&str>,
+) -> Vec<forged_types::OperationActionV1> {
+    // A blocked run's live work status decides between reopen and retry.
+    // Share the attention action used by next instead of assuming a spec edit.
+    let mut actions = attention
+        .iter()
+        .find(|item| {
+            item.subject_kind == AttentionSubjectKind::Run
+                && item.subject_id == run.run_id
+                && item.condition == forged_types::AttentionCondition::Blocked
+                && item.state == AttentionState::Open
+        })
+        .map(|item| item.next_actions.clone())
+        .unwrap_or_default();
+    if actions.is_empty() {
+        let live_work =
+            if work_status.is_none() && run.terminal_outcome == Some(RunOutcome::Blocked) {
+                super::workstore::show_issue(&ctx.ledger, &run.work_id)
+                    .await
+                    .ok()
+            } else {
+                None
+            };
+        let status = work_status.or_else(|| live_work.as_ref().map(|work| work.status.as_str()));
+        actions = super::ops::run_projection_actions(run, delivery_pr, status);
+    }
+    actions.extend(subject_attention_actions(
+        attention,
+        AttentionSubjectKind::Run,
+        &run.run_id,
+    ));
     actions
 }
 
@@ -1478,15 +1512,8 @@ pub(crate) async fn explain_run(
         .await?
         .map(|revision| revision.revision)
     };
-    // Lifecycle first: the run's own outcome names the one `should`; open
-    // decisions on the same subject merge into it or demote to `can`.
     let delivery_pr = super::ops::run_delivery_pr(ctx, run).await?;
-    let mut next = super::ops::run_projection_actions(run, delivery_pr);
-    next.extend(subject_attention_actions(
-        attention,
-        AttentionSubjectKind::Run,
-        &id,
-    ));
+    let next = run_actions(ctx, run, delivery_pr, attention, None).await;
     let (next, next_total) = rank_subject_actions(next);
     let next_coverage = next_coverage(next.len(), next_total);
     let lifecycle = projected_lifecycle(ctx, &observation.identity, attention).await?;
@@ -1612,7 +1639,7 @@ async fn explain_attempt(
     let mut how = explain_how(inputs);
     how["attempt"] = json!({"state": attempt.state.as_str(), "stage": stage});
     let delivery_pr = super::ops::run_delivery_pr(ctx, run).await?;
-    let next = super::ops::run_projection_actions(run, delivery_pr);
+    let (next, _) = rank_subject_actions(run_actions(ctx, run, delivery_pr, attention, None).await);
     let lifecycle = projected_lifecycle(ctx, &observation.identity, attention).await?;
     Ok(json!({
         "schema": "forged.explain/1",
