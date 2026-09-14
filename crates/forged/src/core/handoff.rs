@@ -1068,6 +1068,10 @@ fn controller_state(
 }
 
 pub(super) async fn status_for(record: &Value) -> Value {
+    with_binary_identity(controller_liveness(record).await)
+}
+
+async fn controller_liveness(record: &Value) -> Value {
     let pid_path = record
         .get("pidPath")
         .and_then(Value::as_str)
@@ -1114,23 +1118,27 @@ pub(super) async fn status_for(record: &Value) -> Value {
         object.insert("state".to_owned(), json!(state));
         object.insert("pid".to_owned(), json!(pid));
         object.insert("exitCode".to_owned(), json!(exit_code));
-        let current_binary = current_binary_identity().ok();
-        let mismatch = match (
-            record.pointer("/binary/sha256").and_then(Value::as_str),
-            current_binary
-                .as_ref()
-                .and_then(|value| value.get("sha256"))
-                .and_then(Value::as_str),
-        ) {
-            (Some(recorded), Some(current)) => Some(recorded != current),
-            _ => None,
-        };
-        object.insert(
-            "currentBinary".to_owned(),
-            current_binary.unwrap_or(Value::Null),
-        );
-        object.insert("binaryMismatch".to_owned(), json!(mismatch));
     }
+    status
+}
+
+fn with_binary_identity(mut status: Value) -> Value {
+    if !status.is_object() {
+        return status;
+    }
+    let current_binary = current_binary_identity().ok();
+    let mismatch = match (
+        status.pointer("/binary/sha256").and_then(Value::as_str),
+        current_binary
+            .as_ref()
+            .and_then(|value| value.get("sha256"))
+            .and_then(Value::as_str),
+    ) {
+        (Some(recorded), Some(current)) => Some(recorded != current),
+        _ => None,
+    };
+    status["currentBinary"] = current_binary.unwrap_or(Value::Null);
+    status["binaryMismatch"] = json!(mismatch);
     status
 }
 
@@ -1139,6 +1147,17 @@ pub(super) async fn status_for(record: &Value) -> Value {
 /// transaction; only the per-controller identity files and OS process table
 /// are consulted here.
 pub(super) async fn controller_status_from_snapshot(
+    ctx: &Ctx,
+    id: &str,
+    event_record: Option<Value>,
+    progress: Option<&forged_ledger::EventRow>,
+) -> Value {
+    with_binary_identity(controller_liveness_from_snapshot(ctx, id, event_record, progress).await)
+}
+
+/// The same controller identity/sentinel verification without hashing the
+/// current executable for upgrade diagnostics, which are unrelated to liveness.
+pub(super) async fn controller_liveness_from_snapshot(
     ctx: &Ctx,
     id: &str,
     event_record: Option<Value>,
@@ -1155,7 +1174,7 @@ pub(super) async fn controller_status_from_snapshot(
     let Some(record) = record else {
         return Value::Null;
     };
-    let mut status = status_for(&record).await;
+    let mut status = controller_liveness(&record).await;
     if let Some(object) = status.as_object_mut() {
         object.insert(
             "lastProgressAt".to_owned(),

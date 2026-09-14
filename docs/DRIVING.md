@@ -48,6 +48,11 @@ Sections, in fixed order, capped to one tool result:
 4. **landed** — recent deliveries with PR numbers;
 5. **hidden** — counts of symptoms and parked items not shown.
 
+Controller-owned machine stages appear in `running` with no provider seat only
+when process identity, controller generation, and operation admission agree.
+Incomplete verification marks coverage truncated; an active ledger row alone
+does not prove that work is running.
+
 Use `--symptoms` only when diagnosing hidden operational trouble. Use
 `--section <name> --limit <n>` to widen exactly one section; widening
 `decisions` also includes its full `next` alternatives. The ordinary read
@@ -119,6 +124,14 @@ revision with a fresh package; it never un-settles the source.
 Omitted profile and roster choices retain the source's names; explicit
 overrides still apply, and policy is compiled from current repository settings.
 
+Implementation and fix seats receive up to 4096 UTF-8 bytes of historical
+findings and recorded gate evidence from the immediate authorized predecessor
+in the same repository and work item. This context includes provenance and
+artifact references; it excludes raw logs and transcripts. Missing evidence is
+reported explicitly. The current spec, code, and check contract take precedence:
+recheck applicable findings, and require fresh successor gates and independent
+review. Historical passes and verdicts do not validate the successor.
+
 With `--because world-changed` (the default), it can reuse a completed
 implementation only when the machine stopped at its first push, before any
 PR request or manual settlement. The recorded gate head, requested push head,
@@ -182,6 +195,9 @@ Seats pull with `seat inbox`, explicitly `ack` required messages,
 publish replace-keyed `progress`, and send bounded `note` messages to the
 lead. `run status` and `next` project progress and unacknowledged mail, so the
 lead does not need a separate inbox or a remembered polling loop.
+Reviewers read their inbox on entry and immediately before returning a verdict,
+as well as before check batches and after extended blocking. These coordination
+writes do not grant permission to change source or GitHub state.
 
 ## Wait
 

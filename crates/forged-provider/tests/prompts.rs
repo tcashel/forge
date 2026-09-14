@@ -180,6 +180,63 @@ fn render_succeeds_for_all_three_stages() {
         .expect("review renders");
     assert!(review.contains("#41"));
     assert!(review.contains("specs/bead-1.md"));
+    let flattened_review = review.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(review.contains("Repository and GitHub access are READ-ONLY"));
+    let first_inbox = review
+        .find("As your first action, run")
+        .expect("review polls inbox at start");
+    let read_once = review.find("Read once:").expect("review has read phase");
+    assert!(first_inbox < read_once, "inbox poll precedes review reads");
+    let final_inbox = review
+        .find("Immediately before the final result block")
+        .expect("review polls inbox before result");
+    let result_block = review
+        .find("End your final message with the result block")
+        .expect("review has result block");
+    assert!(
+        final_inbox < result_block,
+        "final inbox poll precedes result"
+    );
+    assert_eq!(
+        review
+            .matches("seat inbox --attempt \"$FORGED_SEAT_ATTEMPT\"")
+            .count(),
+        2,
+        "review polls inbox at both required boundaries"
+    );
+    for invocation in [
+        "seat inbox --attempt \"$FORGED_SEAT_ATTEMPT\" --bodies",
+        "seat ack --attempt \"$FORGED_SEAT_ATTEMPT\" --message",
+        "seat progress --attempt \"$FORGED_SEAT_ATTEMPT\" --snapshot-file -",
+        "seat note --attempt \"$FORGED_SEAT_ATTEMPT\" --body-file -",
+    ] {
+        assert!(
+            flattened_review.contains(invocation),
+            "review prompt carries usable {invocation}: {review}"
+        );
+    }
+    assert!(flattened_review.contains("nextSince"));
+    assert!(flattened_review.contains("--since"));
+    assert!(flattened_review.contains("message-id"));
+    assert!(flattened_review.contains("baseRefOid"));
+    assert!(flattened_review.contains("PR_BASE_OID"));
+    assert!(flattened_review.contains("git cat-file -e \"$PR_BASE_OID^{commit}\""));
+    assert!(flattened_review
+        .contains("commits_ahead=\"$(git rev-list --count \"$PR_BASE_OID\"..HEAD)\""));
+    assert!(flattened_review.contains(
+        "{\"phase\":\"reviewing\",\"commitsAhead\":%s,\"seatChecks\":null,\"blockers\":[],\"etaMin\":null}"
+    ));
+    assert!(!flattened_review.contains("commitsAhead\":0"));
+    assert!(flattened_review.contains("do not publish an invented `commitsAhead`"));
+    assert!(flattened_review.contains("commitsAhead not measured"));
+    assert!(flattened_review.contains("progress snapshot was skipped"));
+    assert!(flattened_review.contains(
+        "security holes (injection, auth bypass, secrets exposure, or path traversal) even if unlikely"
+    ));
+    assert!(
+        flattened_review.contains("rerun a focused check only when a concrete risk justifies it")
+    );
+    assert!(flattened_review.contains("only writes permitted by this read-only seat"));
 
     let findings = vec![
         RenderedFinding {

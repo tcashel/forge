@@ -63,6 +63,9 @@ pub struct ExecutionContext {
     pub findings: Vec<forged_types::Finding>,
     /// Standing review evidence supplied to an adaptive synthesis seat.
     pub review_evidence: Vec<String>,
+    /// Bounded historical predecessor context, never current-run findings.
+    /// Contains typed findings and references, not raw logs or transcripts.
+    pub retry_evidence: Option<String>,
     /// Latest complete rolling-plan candidate, when this is `epic-plan/v1`.
     pub plan_candidate: Option<PlanCandidate>,
     /// Exact integrated-assurance evidence, only for `epic-assurance/v1`.
@@ -1628,6 +1631,13 @@ async fn run_attempt(
         if let Some(note) = relaunch_note(ctx, &run_id, &packet).await? {
             packet.field_notes.push(note);
         }
+        // The immediate predecessor can inform implementation or repair;
+        // it must not become the successor reviewer's verdict or findings.
+        if matches!(packet.stage, Stage::Implement | Stage::Fix) {
+            if let Some(evidence) = &exec.retry_evidence {
+                packet.field_notes.push(evidence.clone());
+            }
+        }
         // Renewal targets the lease that is actually held — renewal is
         // owner-only, and a renewal under a second, derived identity would
         // be refused and let the run's own lease lapse under it. Internal
@@ -3176,6 +3186,7 @@ mod tests {
             pr_number: Some(73),
             findings: Vec::new(),
             review_evidence: Vec::new(),
+            retry_evidence: None,
             plan_candidate: None,
             assurance_evidence: Some(AssuranceEvidence {
                 path: path.to_path_buf(),
@@ -3301,6 +3312,7 @@ mod tests {
             pr_number: None,
             findings: Vec::new(),
             review_evidence: vec!["review-1: request changes".to_owned()],
+            retry_evidence: None,
             plan_candidate: None,
             assurance_evidence: None,
             risk_context: "High consequence plan.".to_owned(),
@@ -3736,10 +3748,12 @@ mod settle_tests {
         packet_dir: PathBuf,
     }
 
-    async fn claimed_fixture_with_budget(
+    async fn claimed_fixture_for_stage(
         root: &Path,
         socket: &Path,
         budget_s: u64,
+        stage: Stage,
+        execution: Option<forged_types::SeatExecutionV1>,
     ) -> ClaimedFixture {
         std::fs::create_dir_all(root.join("beads")).expect("beads dir");
 
@@ -3801,6 +3815,7 @@ mod settle_tests {
             pr_number: None,
             findings: Vec::new(),
             review_evidence: Vec::new(),
+            retry_evidence: None,
             plan_candidate: None,
             assurance_evidence: None,
             risk_context: "routine".to_owned(),
@@ -3811,7 +3826,7 @@ mod settle_tests {
             termination_grace_s: 5,
         };
         let intent = PacketIntent {
-            stage: Stage::Implement,
+            stage,
             seq: 1,
             hints: forged_types::ProviderHints {
                 provider: "claude".to_owned(),
@@ -3820,7 +3835,7 @@ mod settle_tests {
                 sandbox: forged_types::Sandbox::WorkspaceWrite,
                 env: Default::default(),
             },
-            execution: None,
+            execution,
             packet_id: None,
         };
         let source = crate::core::spec::SpecSource::File(spec_path.to_string_lossy().into_owned());
@@ -3847,7 +3862,7 @@ mod settle_tests {
         let packet_id = ledger
             .open_packet(forged_ledger::NewPacket {
                 run_id: RUN_ID.to_owned(),
-                stage: Stage::Implement,
+                stage,
                 seq: 1,
                 spec_path: packet.spec.path.clone(),
                 spec_sha256: spec_sha.clone(),
@@ -3874,7 +3889,8 @@ mod settle_tests {
                 &reservation_id,
             )
             .expect("claim packet");
-        let packet_dir = ctx.config.packet_dir_key(RUN_ID, "implement", 1);
+        let (stage_key, seq) = packet_keys(&packet).expect("packet keys");
+        let packet_dir = ctx.config.packet_dir_key(RUN_ID, &stage_key, seq);
         std::fs::create_dir_all(&packet_dir).expect("packet dir");
 
         ClaimedFixture {
@@ -3891,8 +3907,85 @@ mod settle_tests {
         }
     }
 
+    async fn claimed_fixture_with_budget(
+        root: &Path,
+        socket: &Path,
+        budget_s: u64,
+    ) -> ClaimedFixture {
+        claimed_fixture_for_stage(root, socket, budget_s, Stage::Implement, None).await
+    }
+
     async fn claimed_fixture(root: &Path, socket: &Path) -> ClaimedFixture {
         claimed_fixture_with_budget(root, socket, 600).await
+    }
+
+    #[tokio::test]
+    async fn retry_context_reaches_only_implementation_and_fix_prompts() {
+        use forged_types::{RoleId, SeatExecutionV1, SeatId, SeatPurpose};
+
+        const RETRY_CONTEXT: &str = "Historical predecessor finding: verify the retry boundary.";
+        for (stage, purpose, receives_retry) in [
+            (Stage::Implement, None, true),
+            (Stage::Fix, None, true),
+            (Stage::ReviewClaude, None, false),
+            (Stage::ReviewCodex, None, false),
+            (Stage::ReviewClaude, Some(SeatPurpose::Synthesis), false),
+        ] {
+            for evidence in [None, Some(RETRY_CONTEXT.to_owned())] {
+                let root = tempfile::tempdir().expect("tempdir");
+                let socket = root.path().join("herdr.sock");
+                let execution = purpose.map(|purpose| SeatExecutionV1 {
+                    stage_id: stage_str(stage).to_owned(),
+                    seat_id: SeatId::new("synthesis").expect("seat"),
+                    role_id: RoleId::new("synthesis").expect("role"),
+                    purpose,
+                    round: 1,
+                });
+                let mut fixture =
+                    claimed_fixture_for_stage(root.path(), &socket, 600, stage, execution).await;
+                fixture.packet.field_notes = vec!["Current run work context.".to_owned()];
+                fixture.exec.review_evidence = vec!["Current run independent verdict.".to_owned()];
+                let templates = PromptTemplates::load().expect("templates");
+                let baseline = templates
+                    .render(
+                        PromptStage::for_stage(stage),
+                        &render_context(&fixture.exec, &fixture.packet, 1).expect("context"),
+                    )
+                    .expect("baseline prompt");
+                let expects_retry = receives_retry && evidence.is_some();
+                fixture.exec.retry_evidence = evidence;
+                // Stop after real prompt materialization, before any provider
+                // or host can start; the test needs no process or mock session.
+                fixture.packet.provider_hints.provider = "fixture-unavailable".to_owned();
+                let outcome = run_attempt(
+                    &fixture.ctx,
+                    &fixture.ports,
+                    &fixture.exec,
+                    &fixture.packet,
+                    &fixture.resolved,
+                    fixture.attempt_id,
+                    &fixture.claim_token,
+                )
+                .await
+                .expect("unavailable adapter settles");
+                assert!(matches!(outcome, PacketOutcome::Transport(ref note)
+                    if note.contains("provider adapter unavailable")));
+                let dirs = PacketDirs::new(&fixture.packet_dir, fixture.attempt_id);
+                let prompt = std::fs::read_to_string(dirs.prompt()).expect("materialized prompt");
+                if expects_retry {
+                    assert_eq!(prompt.matches(RETRY_CONTEXT).count(), 1, "{stage:?}");
+                    assert!(prompt.contains("Current run work context."));
+                } else {
+                    assert_eq!(prompt, baseline, "{stage:?} {purpose:?}");
+                }
+                assert!(fixture
+                    .ledger
+                    .list_events(Some(RUN_ID), 0, 1_000)
+                    .expect("events")
+                    .iter()
+                    .all(|event| event.kind != "forged.session.started"));
+            }
+        }
     }
 
     #[tokio::test]
