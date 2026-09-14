@@ -14,6 +14,7 @@ use serde_json::{json, Value};
 use support::{require_node, run_split_app_host_scenario, setup_repos, McpClient, TestEnv};
 
 const FIXED: &str = "2026-08-15T00:00:00.000000000Z";
+const HISTORY_TO: &str = "2026-08-16T00:00:00.000000000Z";
 
 struct ControlPlaneFixture {
     env: TestEnv,
@@ -608,11 +609,18 @@ fn modern_projections_and_all_five_apps_converge_on_real_envelopes() {
             "repository",
             "--repository",
             &repository,
+            "--from",
+            FIXED,
+            "--to",
+            HISTORY_TO,
         ])
         .1;
     let map_raw = mcp.call_tool_result(
         "work_map",
-        envelope(json!({"scope": "repository", "repository": repository})),
+        envelope(json!({
+            "scope": "repository", "repository": repository,
+            "from": FIXED, "to": HISTORY_TO,
+        })),
     );
     let map = assert_raw_parity(map_cli, &map_raw, "Work Map");
 

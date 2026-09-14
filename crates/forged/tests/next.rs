@@ -4,7 +4,9 @@
 mod support;
 
 use std::collections::BTreeMap;
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
 
 use forged_ledger::{
     NewPacket, NewUsage, NewWorkItem, NewWorkNote, RunOutcome, SpecFence, WorkDepKind, WorkKind,
@@ -452,6 +454,183 @@ fn default_cap_and_single_section_widening_are_explicit() {
         widened["result"]["coverage"]["sections"]["ready"],
         json!({"shown": 33, "total": 35, "truncated": true})
     );
+}
+
+#[test]
+fn next_shows_only_verified_controller_owned_machine_stages() {
+    // A private inert process group exercises the production identity probe;
+    // no provider is started, and panic cleanup only signals our own child.
+    struct Controller(Child);
+    impl Drop for Controller {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut controller = Controller(
+        Command::new("sleep")
+            .arg("120")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .expect("spawn inert controller"),
+    );
+    let pid = controller.0.id();
+    let identity = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "lstart="])
+        .output()
+        .expect("read controller identity");
+    assert!(identity.status.success());
+    let lstart = String::from_utf8(identity.stdout)
+        .unwrap()
+        .trim()
+        .to_owned();
+    assert!(!lstart.is_empty());
+
+    for mode in [
+        "live",
+        "unknown",
+        "missing-controller",
+        "wrong-run",
+        "wrong-scope",
+        "wrong-generation",
+        "wrong-operation-generation",
+        "missing-admission",
+        "missing-stage",
+        "nonmachine",
+        "terminal",
+        "dead",
+    ] {
+        let env = TestEnv::new("forged-next-machine-stage");
+        assert_eq!(env.forged(&["init"]).0, 0);
+        let run = "machine-stage";
+        fabricate_run(&env, run);
+        let repository = env.repos.repo.to_string_lossy().into_owned();
+        env.set_work_repository("bead-machine-stage", &repository);
+        let ledger = env.ledger();
+        ledger
+            .authorize_desired_work(forged_ledger::DesiredSubjectKind::Run, run, 1)
+            .expect("authorize fixture controller");
+        if mode == "terminal" {
+            ledger
+                .settle_run(
+                    run,
+                    RunOutcome::Cancelled,
+                    "fixture stopped".to_owned(),
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap();
+        }
+        if mode != "missing-stage" {
+            let stage = if mode == "nonmachine" {
+                "inspect"
+            } else {
+                "gate"
+            };
+            let request = forged_types::OperationRequest {
+                schema_version: 1,
+                idempotency_key: format!("{run}/{stage}/0"),
+                run_id: Some(run.to_owned()),
+                params: serde_json::Map::new(),
+            };
+            if matches!(mode, "missing-admission" | "terminal") {
+                ledger
+                    .begin_operation(stage, &request, forged_ledger::EffectClass::SafeRetry, None)
+                    .unwrap();
+            } else {
+                ledger
+                    .begin_controller_operation(
+                        stage,
+                        &request,
+                        forged_ledger::EffectClass::SafeRetry,
+                        if mode == "wrong-operation-generation" {
+                            2
+                        } else {
+                            1
+                        },
+                    )
+                    .unwrap();
+            }
+        }
+        if mode != "missing-controller" {
+            ledger.append_event(Some(run), "forged.controller.started", json!({
+                "schemaVersion": 2,
+                "scope": if mode == "wrong-scope" { "epic" } else { "run" },
+                "id": if mode == "wrong-run" { "another-run" } else { run },
+                "generation": if mode == "wrong-generation" { 2 } else { 1 },
+                "driver": {
+                    "pid": pid,
+                    "lstart": if mode == "unknown" { "different process identity" } else { &lstart },
+                },
+            })).unwrap();
+        }
+        assert!(ledger.list_live_attempts(Some(run)).unwrap().is_empty());
+        ledger.close().unwrap();
+        if mode == "dead" {
+            controller.0.kill().unwrap();
+            controller.0.wait().unwrap();
+        }
+        let (code, response) = env.forged(&["next", "--repo", &repository]);
+        assert_eq!(code, 0, "{mode}: {response}");
+        let result = &response["result"];
+        let running = result["sections"]["running"].as_array().unwrap();
+        assert_eq!(
+            running.len(),
+            usize::from(mode == "live"),
+            "{mode}: {response}"
+        );
+        assert_eq!(
+            result["coverage"]["sections"]["running"]["total"],
+            json!(running.len())
+        );
+        let incomplete = matches!(
+            mode,
+            "unknown"
+                | "missing-controller"
+                | "wrong-run"
+                | "wrong-scope"
+                | "wrong-generation"
+                | "wrong-operation-generation"
+                | "missing-admission"
+        );
+        assert_eq!(
+            result["coverage"]["sections"]["running"]["truncated"],
+            json!(incomplete),
+            "{mode}: {response}"
+        );
+        assert_eq!(
+            result["coverage"]["truncated"],
+            json!(incomplete),
+            "{mode}: {response}"
+        );
+        if mode == "live" {
+            assert_eq!(running[0]["id"], json!(run));
+            assert_eq!(running[0]["stage"], json!("gate"));
+            assert_eq!(running[0]["state"], json!("gate"));
+            assert_eq!(running[0]["seat"], Value::Null);
+            assert_eq!(running[0]["health"], json!("running"));
+            assert_eq!(running[0]["should"], Value::Null);
+            assert!(running[0]["ageMin"].is_u64());
+            let other = env.root.join("another-repository");
+            let (code, outside) = env.forged(&["next", "--repo", other.to_str().unwrap()]);
+            assert_eq!(code, 0, "{outside}");
+            assert_eq!(
+                outside["result"]["coverage"]["sections"]["running"]["total"],
+                json!(0)
+            );
+            let (code, portfolio) = env.forged(&["next"]);
+            assert_eq!(code, 0, "{portfolio}");
+            assert_eq!(
+                portfolio["result"]["sections"]["running"][0]["stage"],
+                json!("gate")
+            );
+            assert!(serde_json::to_vec(&portfolio).unwrap().len() <= 4096);
+        }
+    }
 }
 
 #[test]

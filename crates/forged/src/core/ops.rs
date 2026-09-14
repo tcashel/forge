@@ -7099,6 +7099,109 @@ fn next_attention_row(
     Ok(row)
 }
 
+/// Machine effects have no provider seat. Reuse the inventory's operation
+/// and controller records, but verify the controller before calling them live.
+async fn enrich_next_machine_entries(
+    ctx: &Ctx,
+    snapshot: &InventorySnapshot,
+    entries: &mut [Value],
+) -> Result<bool, Failure> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(PROBE_TIMEOUT_S);
+    let mut verified_all = true;
+    let mut probes = 0;
+    for entry in entries {
+        if entry.get("state").and_then(Value::as_str) != Some("active")
+            || entry
+                .get("outcome")
+                .is_some_and(|outcome| !outcome.is_null())
+            || entry.get("liveSeats").and_then(Value::as_u64).unwrap_or(0) > 0
+            || next_entry_kind(entry) != "run"
+        {
+            continue;
+        }
+        let Some(id) = entry.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let mut operations = snapshot.inflight_operations.iter().filter(|operation| {
+            operation.run_id.as_deref() == Some(id)
+                && matches!(
+                    operation.name.as_str(),
+                    "resolve" | "gate" | "regate" | "push" | "draftpr"
+                )
+                && split_packet_key(&operation.idempotency_key)
+                    .is_ok_and(|(run, stage, _)| run == id && stage == operation.name)
+        });
+        let Some(operation) = operations.next() else {
+            continue;
+        };
+        // Ambiguous outstanding effects do not establish a current stage.
+        if operations.next().is_some() {
+            verified_all = false;
+            continue;
+        }
+        if probes == NEXT_MAX_LIMIT || tokio::time::Instant::now() >= deadline {
+            verified_all = false;
+            break;
+        }
+        probes += 1;
+        let controller = super::handoff::controller_liveness_from_snapshot(
+            ctx,
+            id,
+            entry
+                .pointer("/controller/record")
+                .filter(|record| !record.is_null())
+                .cloned(),
+            snapshot.latest_event.get(id),
+        );
+        let Ok(mut controller) = tokio::time::timeout_at(deadline, controller).await else {
+            verified_all = false;
+            break;
+        };
+        if !super::handoff::is_active(&controller) {
+            verified_all &= matches!(
+                controller.get("state").and_then(Value::as_str),
+                Some("exited" | "vanished")
+            );
+            continue;
+        }
+        let desired = snapshot.desired_work.iter().find(|desired| {
+            desired.subject_kind == forged_ledger::DesiredSubjectKind::Run
+                && desired.subject_id == id
+        });
+        let generation = controller
+            .get("generation")
+            .and_then(Value::as_u64)
+            .and_then(|generation| u32::try_from(generation).ok());
+        let Some(generation) = generation.filter(|generation| {
+            *generation > 0
+                && desired.is_some_and(|desired| desired.controller_generation == *generation)
+                && controller.get("id").and_then(Value::as_str) == Some(id)
+                && controller.get("scope").and_then(Value::as_str) == Some("run")
+        }) else {
+            verified_all = false;
+            continue;
+        };
+        let run_id = id.to_owned();
+        let uncontained = on_ledger(&ctx.ledger, move |ledger| {
+            ledger.uncontained_machine_operations(&run_id, Some(generation))
+        });
+        let Ok(uncontained) = tokio::time::timeout_at(deadline, uncontained).await else {
+            verified_all = false;
+            break;
+        };
+        if uncontained?.contains(&operation.operation_id) {
+            verified_all = false;
+            continue;
+        }
+        controller["verified"] = json!(true);
+        entry["controller"] = controller;
+        entry["currentStage"] = json!(operation.name);
+        entry["currentStageStartedAt"] = json!(operation.created_at);
+        entry["executionHealth"] = json!("running");
+    }
+    Ok(verified_all)
+}
+
 fn next_running_row(
     entry: &Value,
     snapshot: &InventorySnapshot,
@@ -7138,7 +7241,9 @@ fn next_running_row(
         state: stage.clone().map_or(Value::Null, Value::String),
         age_min: next_age_min(
             captured_at,
-            attempt.map(|attempt| attempt.started_at.as_str()),
+            attempt
+                .map(|attempt| attempt.started_at.as_str())
+                .or_else(|| entry.get("currentStageStartedAt").and_then(Value::as_str)),
         ),
         spend_usd: next_spend(entries, id, kind),
         actions: &actions,
@@ -7417,6 +7522,7 @@ pub async fn next(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
                         .is_some_and(|id| scope_ids.contains(id))
             });
         }
+        let machines_verified = enrich_next_machine_entries(ctx, &snapshot, &mut entries).await?;
         let scoped_ids = entries
             .iter()
             .filter_map(|entry| entry.get("id").and_then(Value::as_str))
@@ -7532,7 +7638,13 @@ pub async fn next(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
 
         let mut running = entries
             .iter()
-            .filter(|entry| entry.get("liveSeats").and_then(Value::as_u64).unwrap_or(0) > 0)
+            .filter(|entry| {
+                entry.get("liveSeats").and_then(Value::as_u64).unwrap_or(0) > 0
+                    || (entry.pointer("/controller/state").and_then(Value::as_str)
+                        == Some("running")
+                        && entry.pointer("/controller/verified").and_then(Value::as_bool)
+                            == Some(true))
+            })
             .map(|entry| next_running_row(entry, &snapshot, &entries, &captured_at, &lifecycles))
             .collect::<Result<Vec<_>, _>>()?;
         running.sort_by(|left, right| left["id"].as_str().cmp(&right["id"].as_str()));
@@ -7629,6 +7741,11 @@ pub async fn next(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
             "ready": next_coverage(ready_rows.len(), totals[2]),
             "landed": next_coverage(landed_rows.len(), totals[3]),
         });
+        // Totals count verified projected members. An incomplete controller
+        // probe must not masquerade as complete coverage of machine work.
+        if !machines_verified {
+            coverage_sections["running"]["truncated"] = json!(true);
+        }
         if include_symptoms {
             coverage_sections["symptoms"] = next_coverage(symptom_rows.len(), symptoms.len());
         }
@@ -7654,7 +7771,7 @@ pub async fn next(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
                 "limit": NEXT_DEFAULT_LIMIT,
                 "shown": shown,
                 "total": total,
-                "truncated": shown < total || ready_has_more || scope_plan_truncated,
+                "truncated": shown < total || ready_has_more || scope_plan_truncated || !machines_verified,
                 "sourceHealth": source_health,
                 "sections": coverage_sections,
             },

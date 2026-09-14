@@ -4,6 +4,22 @@ This file records user-visible changes to Forge.
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-09-14
+
+### Fixed
+
+- Restore reviewer inbox checks, acknowledgements, and progress updates for the
+  exact running attempt. Measure progress against the verified PR base commit
+  and rerun focused checks when a concrete risk warrants them.
+- Carry historical findings and recorded gate evidence from the immediate
+  authorized predecessor in the same repository and work item into implementation
+  and fix seats. Context is capped at 4096 UTF-8 bytes; the current contract takes
+  precedence, and the successor still requires fresh gates and independent review.
+- Show controller-owned machine stages in `next` only after verifying process
+  identity, controller generation, and operation admission, with no provider seat.
+  Keep binary hashing outside liveness checks and mark incomplete verification
+  as truncated coverage.
+
 ## [0.9.1] - 2026-09-06
 
 ### Changed
@@ -586,7 +602,8 @@ historical TypeScript `v0.4.0` product has been replaced and is unsupported.
 - Refuses non-normalized or root-equivalent install prefixes before touching a
   live path.
 
-[Unreleased]: https://github.com/tcashel/forge/compare/v0.9.1...HEAD
+[Unreleased]: https://github.com/tcashel/forge/compare/v0.9.2...HEAD
+[0.9.2]: https://github.com/tcashel/forge/compare/v0.9.1...v0.9.2
 [0.9.1]: https://github.com/tcashel/forge/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/tcashel/forge/compare/v0.8.1...v0.9.0
 [0.8.1]: https://github.com/tcashel/forge/compare/v0.8.0...v0.8.1

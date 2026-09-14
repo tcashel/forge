@@ -1504,6 +1504,7 @@ async fn execution_context(ctx: &Ctx, view: &RunView) -> Result<ExecutionContext
         pr_number: pr_number_of(view),
         findings,
         review_evidence: latest_review_evidence(view),
+        retry_evidence: super::retry_continuation::handoff(ctx, view).await,
         plan_candidate: latest_plan_candidate(view),
         assurance_evidence: assurance_evidence(ctx, view).await?,
         risk_context: active_profile
