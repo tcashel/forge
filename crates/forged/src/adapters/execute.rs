@@ -3438,12 +3438,13 @@ mod settle_tests {
     /// Every method the mock was asked for, in arrival order.
     type MethodLog = Arc<Mutex<Vec<String>>>;
 
-    #[derive(Clone, Copy)]
+    #[derive(Clone)]
     enum MockBehavior {
         Normal,
         RefuseClose,
         LoseSendResponse,
         DelayPreparePastDeadline,
+        CompleteProviderBeforeClose(Arc<tokio::sync::Notify>),
     }
 
     /// A protocol-19 Herdr exercising either a refused cleanup or the
@@ -3457,6 +3458,7 @@ mod settle_tests {
             while let Ok((stream, _)) = listener.accept().await {
                 let recorded = Arc::clone(&recorded);
                 let closed = Arc::clone(&closed);
+                let behavior = behavior.clone();
                 tokio::spawn(async move {
                     let (read_half, mut write_half) = stream.into_split();
                     let mut lines = BufReader::new(read_half).lines();
@@ -3520,6 +3522,10 @@ mod settle_tests {
                                     "code": "INTERNAL", "message": "close refused"}})
                             }
                             "pane.close" => {
+                                if let MockBehavior::CompleteProviderBeforeClose(done) = &behavior {
+                                    // Confirmed death must fence the mock's output writer too.
+                                    done.notified().await;
+                                }
                                 closed.store(true, Ordering::SeqCst);
                                 json!({"id": id, "result": {"type": "ok"}})
                             }
@@ -4382,17 +4388,29 @@ mod settle_tests {
     async fn terminal_output_observed_after_the_deadline_cannot_land() {
         let root = tempfile::tempdir().expect("tempdir");
         let socket = root.path().join("herdr.sock");
-        let seen = start_mock_herdr(&socket, MockBehavior::Normal);
+        let provider_done = Arc::new(tokio::sync::Notify::new());
+        let seen = start_mock_herdr(
+            &socket,
+            MockBehavior::CompleteProviderBeforeClose(Arc::clone(&provider_done)),
+        );
         let fixture = claimed_fixture_with_budget(root.path(), &socket, 1).await;
         let attempt_dirs = PacketDirs::new(&fixture.packet_dir, fixture.attempt_id);
-        tokio::spawn(play_provider_after(
-            attempt_dirs.attempt_path(),
-            attempt_dirs.status(),
-            claude_capture(&fixture.packet_id),
-            Duration::from_millis(1_100),
-            true,
-            true,
-        ));
+        let packet_dir = attempt_dirs.attempt_path();
+        let status_base = attempt_dirs.status();
+        let capture = claude_capture(&fixture.packet_id);
+        let expected_capture = capture.clone();
+        let provider = tokio::spawn(async move {
+            play_provider_after(
+                packet_dir,
+                status_base,
+                capture,
+                Duration::from_millis(1_100),
+                true,
+                true,
+            )
+            .await;
+            provider_done.notify_one();
+        });
 
         let outcome = run_attempt(
             &fixture.ctx,
@@ -4405,7 +4423,13 @@ mod settle_tests {
         )
         .await
         .expect("late terminal output settles as a timeout");
+        provider.await.expect("mock provider completed");
         assert!(matches!(outcome, PacketOutcome::Deadline(_)));
+        assert_eq!(
+            std::fs::read_to_string(attempt_dirs.stdout()).expect("finalized late capture"),
+            expected_capture,
+            "the landable late output must be captured without landing"
+        );
 
         let attempt = fixture
             .ledger
