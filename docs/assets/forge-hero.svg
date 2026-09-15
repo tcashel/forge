@@ -1,0 +1,211 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2400" height="800" viewBox="0 0 2400 800" role="img" aria-labelledby="title desc">
+  <title id="title">Autonomous industrial forge orchestration</title>
+  <desc id="desc">Molten work streams cross precise machinery and converge into a finished branching artifact on an anvil.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#080d11"/>
+      <stop offset=".46" stop-color="#11191e"/>
+      <stop offset="1" stop-color="#030608"/>
+    </linearGradient>
+    <radialGradient id="haze" cx="67%" cy="44%" r="55%">
+      <stop offset="0" stop-color="#466171" stop-opacity=".44"/>
+      <stop offset=".52" stop-color="#1b2930" stop-opacity=".20"/>
+      <stop offset="1" stop-color="#050708" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="steel" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#62717a"/>
+      <stop offset=".22" stop-color="#273239"/>
+      <stop offset=".58" stop-color="#10171b"/>
+      <stop offset=".82" stop-color="#3b4951"/>
+      <stop offset="1" stop-color="#0b1013"/>
+    </linearGradient>
+    <linearGradient id="steelEdge" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#a9bbc4"/>
+      <stop offset=".13" stop-color="#536671"/>
+      <stop offset=".5" stop-color="#222d33"/>
+      <stop offset="1" stop-color="#080d10"/>
+    </linearGradient>
+    <linearGradient id="molten" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#6f2505"/>
+      <stop offset=".18" stop-color="#ff7b10"/>
+      <stop offset=".53" stop-color="#ffd377"/>
+      <stop offset=".77" stop-color="#ff8a16"/>
+      <stop offset="1" stop-color="#9f3505"/>
+    </linearGradient>
+    <linearGradient id="artifact" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#fff0bf"/>
+      <stop offset=".18" stop-color="#ffbd4c"/>
+      <stop offset=".54" stop-color="#d95a0a"/>
+      <stop offset="1" stop-color="#51200a"/>
+    </linearGradient>
+    <linearGradient id="blue" x1="0" y1="0" x2="1" y2="0">
+      <stop stop-color="#5e849a" stop-opacity="0"/>
+      <stop offset=".5" stop-color="#94c0d3" stop-opacity=".8"/>
+      <stop offset="1" stop-color="#5e849a" stop-opacity="0"/>
+    </linearGradient>
+    <pattern id="grid" width="80" height="48" patternUnits="userSpaceOnUse" patternTransform="skewX(-18)">
+      <path d="M80 0H0V48" fill="none" stroke="#6b8795" stroke-opacity=".12" stroke-width="1"/>
+    </pattern>
+    <pattern id="micro" width="16" height="16" patternUnits="userSpaceOnUse">
+      <circle cx="2" cy="2" r=".8" fill="#91adba" fill-opacity=".18"/>
+    </pattern>
+    <filter id="glow" x="-80%" y="-180%" width="260%" height="460%">
+      <feGaussianBlur stdDeviation="14" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="softGlow" x="-50%" y="-80%" width="200%" height="260%">
+      <feGaussianBlur stdDeviation="28"/>
+    </filter>
+    <filter id="shadow" x="-30%" y="-40%" width="180%" height="220%">
+      <feDropShadow dx="0" dy="22" stdDeviation="20" flood-color="#000" flood-opacity=".85"/>
+    </filter>
+    <filter id="tinyGlow" x="-200%" y="-200%" width="500%" height="500%">
+      <feGaussianBlur stdDeviation="4" result="x"/><feMerge><feMergeNode in="x"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <clipPath id="floor"><path d="M0 560L2400 470V800H0Z"/></clipPath>
+  </defs>
+
+  <!-- atmosphere and architectural depth -->
+  <rect width="2400" height="800" fill="url(#bg)"/>
+  <rect width="2400" height="800" fill="url(#haze)"/>
+  <ellipse cx="1510" cy="315" rx="670" ry="330" fill="#6f8996" opacity=".10" filter="url(#softGlow)"/>
+  <path d="M0 140H2400M0 286H2400M0 438H2400" stroke="#9ab5c2" stroke-opacity=".025"/>
+  <path d="M1260 0V510M1540 0V500M1820 0V490M2100 0V480" stroke="#7d99a6" stroke-opacity=".035" stroke-width="2"/>
+  <g opacity=".22">
+    <path d="M1080 94H2260" stroke="url(#blue)"/>
+    <path d="M1250 114H2040" stroke="url(#blue)"/>
+    <circle cx="1320" cy="94" r="4" fill="#8cb6c7"/>
+    <circle cx="1610" cy="94" r="4" fill="#8cb6c7"/>
+    <circle cx="1920" cy="94" r="4" fill="#8cb6c7"/>
+  </g>
+
+  <!-- ledger floor -->
+  <g clip-path="url(#floor)">
+    <rect y="460" width="2400" height="340" fill="#06090b"/>
+    <rect x="0" y="460" width="2400" height="340" fill="url(#grid)"/>
+    <path d="M0 594L2400 504M0 672L2400 582M0 758L2400 668" stroke="#7594a3" stroke-opacity=".10"/>
+    <path d="M420 800L1160 470M980 800L1450 470M1510 800L1740 470M2040 800L2030 470" stroke="#7594a3" stroke-opacity=".09"/>
+  </g>
+  <ellipse cx="1610" cy="615" rx="740" ry="115" fill="#000" opacity=".7" filter="url(#softGlow)"/>
+  <ellipse cx="1940" cy="544" rx="360" ry="80" fill="#ff650d" opacity=".09" filter="url(#softGlow)"/>
+
+  <!-- fine orchestration graph, kept quiet behind the process -->
+  <g fill="none" stroke="#6f95a8" stroke-width="2" opacity=".31">
+    <path d="M85 620C330 620 372 678 600 678S832 634 1010 634"/>
+    <path d="M84 184C348 184 460 152 706 152S946 188 1100 188"/>
+    <path d="M1010 634C1140 634 1155 584 1250 584"/>
+    <path d="M1100 188C1180 188 1170 238 1248 238"/>
+  </g>
+  <g fill="#87aabd" opacity=".7">
+    <circle cx="85" cy="620" r="4"/><circle cx="600" cy="678" r="4"/><circle cx="1010" cy="634" r="4"/>
+    <circle cx="84" cy="184" r="4"/><circle cx="706" cy="152" r="4"/><circle cx="1100" cy="188" r="4"/>
+  </g>
+
+  <!-- converging agent streams -->
+  <g fill="none" stroke-linecap="round">
+    <path d="M-80 286C190 286 280 320 498 320S790 338 1012 356" stroke="#4e1b06" stroke-width="23" opacity=".7" filter="url(#softGlow)"/>
+    <path d="M-80 286C190 286 280 320 498 320S790 338 1012 356" stroke="url(#molten)" stroke-width="7" filter="url(#glow)"/>
+    <path d="M-60 384C210 384 294 368 510 368S802 370 1012 374" stroke="#542006" stroke-width="26" opacity=".75" filter="url(#softGlow)"/>
+    <path d="M-60 384C210 384 294 368 510 368S802 370 1012 374" stroke="url(#molten)" stroke-width="9" filter="url(#glow)"/>
+    <path d="M-100 486C180 486 292 414 502 414S786 396 1012 390" stroke="#461705" stroke-width="21" opacity=".7" filter="url(#softGlow)"/>
+    <path d="M-100 486C180 486 292 414 502 414S786 396 1012 390" stroke="url(#molten)" stroke-width="6" filter="url(#glow)"/>
+    <path d="M-50 550C218 550 326 456 532 456S814 418 1012 405" stroke="#361305" stroke-width="14" opacity=".72" filter="url(#softGlow)"/>
+    <path d="M-50 550C218 550 326 456 532 456S814 418 1012 405" stroke="url(#molten)" stroke-width="4" filter="url(#glow)"/>
+  </g>
+  <g fill="#ffd280" filter="url(#tinyGlow)">
+    <circle cx="218" cy="295" r="2.8"/><circle cx="390" cy="376" r="3"/><circle cx="686" cy="402" r="2.5"/><circle cx="842" cy="348" r="2.4"/>
+  </g>
+
+  <!-- first precision gate -->
+  <g filter="url(#shadow)">
+    <path d="M980 236L1138 213L1190 251V544L1148 574L982 557L946 525V270Z" fill="url(#steel)" stroke="#33434b" stroke-width="3"/>
+    <path d="M1008 284L1117 271L1140 289V488L1112 506L1008 495L988 478V305Z" fill="#030506" stroke="#51636d" stroke-opacity=".58" stroke-width="2"/>
+    <path d="M1012 346L1137 339V426L1010 419Z" fill="#130b06" stroke="#b75513" stroke-opacity=".7"/>
+    <path d="M1020 371L1133 369" stroke="#ff9b32" stroke-width="5" filter="url(#glow)"/>
+    <path d="M963 292L994 309V477L963 507" fill="none" stroke="#78909c" stroke-opacity=".43" stroke-width="4"/>
+    <rect x="1052" y="244" width="55" height="8" rx="4" fill="#6f8996" opacity=".62"/>
+    <circle cx="1093" cy="533" r="6" fill="#8fc0d3" filter="url(#tinyGlow)"/>
+  </g>
+
+  <!-- transfer conduit -->
+  <path d="M1138 383C1210 383 1223 386 1285 389" stroke="#542006" stroke-width="24" opacity=".7" filter="url(#softGlow)"/>
+  <path d="M1138 383C1210 383 1223 386 1285 389" stroke="url(#molten)" stroke-width="9" filter="url(#glow)"/>
+  <path d="M1160 449H1280" stroke="#7191a1" stroke-opacity=".42" stroke-width="2"/>
+  <circle cx="1200" cy="449" r="5" fill="#8db5c7"/><circle cx="1246" cy="449" r="5" fill="#8db5c7"/>
+
+  <!-- central autonomous press / assurance chamber -->
+  <g filter="url(#shadow)">
+    <path d="M1262 185L1547 157L1645 208V559L1584 606L1288 581L1238 540V231Z" fill="url(#steel)" stroke="#354851" stroke-width="3"/>
+    <path d="M1310 247L1519 227L1574 252V499L1536 527L1311 514L1285 491V274Z" fill="#050708" stroke="#4a606b" stroke-width="2"/>
+    <path d="M1371 175L1517 163L1542 177L1533 218L1366 232L1349 214Z" fill="url(#steelEdge)"/>
+    <path d="M1378 263L1504 252V337L1484 353L1398 358L1377 340Z" fill="#11181c" stroke="#526873"/>
+    <path d="M1404 278L1480 272V319L1402 324Z" fill="url(#micro)" stroke="#66828f" stroke-opacity=".5"/>
+    <path d="M1320 389L1546 379V443L1320 448Z" fill="#150c07" stroke="#a7470d" stroke-opacity=".65"/>
+    <path d="M1328 414L1538 406" stroke="url(#molten)" stroke-width="11" filter="url(#glow)"/>
+    <path d="M1263 258L1290 276V491L1263 519" fill="none" stroke="#77909c" stroke-opacity=".48" stroke-width="5"/>
+    <path d="M1580 244L1615 225V530L1581 551" fill="none" stroke="#182126" stroke-width="16"/>
+    <g fill="#99c7d8" filter="url(#tinyGlow)">
+      <circle cx="1322" cy="548" r="5"/><circle cx="1344" cy="550" r="5"/><circle cx="1366" cy="552" r="5"/>
+    </g>
+  </g>
+
+  <!-- overhead testing beam and checkpoints -->
+  <g opacity=".86">
+    <path d="M1195 138H1722L1792 178" fill="none" stroke="#26353d" stroke-width="14"/>
+    <path d="M1195 132H1719" stroke="#65808d" stroke-opacity=".55" stroke-width="2"/>
+    <path d="M1285 132V170M1420 132V158M1560 132V164M1698 132V205" stroke="#526c79" stroke-width="3"/>
+    <g fill="#83afc1" filter="url(#tinyGlow)">
+      <circle cx="1285" cy="132" r="5"/><circle cx="1420" cy="132" r="5"/><circle cx="1560" cy="132" r="5"/><circle cx="1698" cy="132" r="5"/>
+    </g>
+    <path d="M1308 110l9 9 17-21M1443 110l9 9 17-21M1583 110l9 9 17-21" fill="none" stroke="#8ab5c6" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" opacity=".82"/>
+  </g>
+
+  <!-- final channel -->
+  <path d="M1540 410C1648 410 1662 424 1751 423S1842 414 1914 414" stroke="#592207" stroke-width="31" opacity=".74" filter="url(#softGlow)"/>
+  <path d="M1540 410C1648 410 1662 424 1751 423S1842 414 1914 414" stroke="url(#molten)" stroke-width="12" filter="url(#glow)"/>
+  <path d="M1610 478C1700 478 1770 464 1865 464" fill="none" stroke="#7294a5" stroke-opacity=".38" stroke-width="2"/>
+  <g fill="#91bdcf"><circle cx="1640" cy="478" r="4"/><circle cx="1750" cy="470" r="4"/><circle cx="1858" cy="464" r="4"/></g>
+
+  <!-- shaping head -->
+  <g filter="url(#shadow)">
+    <path d="M1790 228L1950 212L2017 251V441L1976 475L1802 459L1768 429V260Z" fill="url(#steel)" stroke="#3c5059" stroke-width="3"/>
+    <path d="M1830 269L1942 260L1973 279V391L1948 414L1826 405L1808 389V288Z" fill="#050708" stroke="#526872"/>
+    <path d="M1846 315L1938 311L1955 324V367L1937 380L1844 376L1827 362V330Z" fill="#180d07"/>
+    <path d="M1838 347H1952" stroke="#ff9b31" stroke-width="8" filter="url(#glow)"/>
+    <circle cx="1967" cy="237" r="6" fill="#8dbbcf" filter="url(#tinyGlow)"/>
+  </g>
+
+  <!-- anvil -->
+  <g filter="url(#shadow)">
+    <path d="M1905 496L2217 481L2289 510L2229 542L2114 549L2089 587L2144 664L2085 695H1837L1784 666L1840 594L1831 554L1748 538L1698 512Z" fill="url(#steelEdge)" stroke="#455760" stroke-width="3"/>
+    <path d="M1702 511L2198 488L2270 509L2197 526L1807 537Z" fill="#52616a"/>
+    <path d="M1725 510L2197 492L2242 505L1800 524Z" fill="#9aa7ad" opacity=".38"/>
+    <path d="M1844 593H2113M1821 666H2130" stroke="#647783" stroke-opacity=".46" stroke-width="3"/>
+  </g>
+
+  <!-- immaculate forged branch / diff artifact -->
+  <g filter="url(#glow)" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M1887 478C1940 466 1988 453 2030 430V378" fill="none" stroke="#602308" stroke-width="32" opacity=".8"/>
+    <path d="M1887 478C1940 466 1988 453 2030 430V378" fill="none" stroke="url(#artifact)" stroke-width="14"/>
+    <path d="M2029 430C2073 420 2111 394 2133 358" fill="none" stroke="#70290a" stroke-width="25" opacity=".8"/>
+    <path d="M2029 430C2073 420 2111 394 2133 358" fill="none" stroke="url(#artifact)" stroke-width="11"/>
+    <path d="M2030 407C2070 390 2087 362 2086 330" fill="none" stroke="#722909" stroke-width="20" opacity=".8"/>
+    <path d="M2030 407C2070 390 2087 362 2086 330" fill="none" stroke="url(#artifact)" stroke-width="9"/>
+    <circle cx="2030" cy="378" r="13" fill="#ffe1a0" stroke="#ff951e" stroke-width="5"/>
+    <circle cx="2086" cy="330" r="12" fill="#ffd27b" stroke="#f17d12" stroke-width="5"/>
+    <circle cx="2133" cy="358" r="12" fill="#fff0bf" stroke="#ff951e" stroke-width="5"/>
+  </g>
+
+  <!-- restrained sparks and heat flecks -->
+  <g fill="#ffb84f" filter="url(#tinyGlow)">
+    <circle cx="1710" cy="391" r="3"/><circle cx="1760" cy="364" r="2"/><circle cx="1815" cy="442" r="2.5"/>
+    <circle cx="1964" cy="468" r="3"/><circle cx="2010" cy="501" r="2"/><circle cx="2078" cy="472" r="2.5"/>
+  </g>
+  <g stroke="#ff9a25" stroke-linecap="round" opacity=".74">
+    <path d="M1732 407l-18 13M1790 421l-21 23M1960 440l13-20M2045 482l18 16"/>
+  </g>
+
+  <!-- foreground vignette -->
+  <path d="M0 0H2400V800H0Z" fill="none" stroke="#000" stroke-width="52" opacity=".6"/>
+  <rect width="2400" height="800" fill="url(#haze)" opacity=".12"/>
+</svg>
