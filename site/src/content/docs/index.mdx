@@ -1,0 +1,83 @@
+---
+title: Forge
+description: Forge runs approved engineering work through coding agents, tests, and independent review to a draft pull request.
+tableOfContents: false
+---
+
+import { LinkButton } from '@astrojs/starlight/components';
+
+<p className="forge-eyebrow">Plan. Run. Review. Ship.</p>
+
+<p className="cw-lede">Turn an approved plan into a reviewed draft pull request, with coding agents that keep working after you leave the session.</p>
+
+<p className="cw-status">For experienced engineers using Claude Code, Codex, or Pi. Forge is under active development; the current release is <a href="https://github.com/tcashel/forge/releases/tag/v0.9.2">v0.9.2</a>.</p>
+
+<LinkButton href={`${import.meta.env.BASE_URL}getting-started/`} icon="right-arrow">
+  Get started
+</LinkButton>
+
+## A handoff with boundaries
+
+Describe the outcome to your lead agent. Review the plan and approve what it may
+change. Forge records that agreement and runs the work in isolated Git worktrees.
+You return to a draft pull request, or a concrete decision that needs your input.
+
+<ol className="forge-flow" aria-label="From plan to pull request">
+  <li><strong>Plan</strong><span>Agree on scope and acceptance criteria.</span></li>
+  <li><strong>Run</strong><span>Implement with your configured agents.</span></li>
+  <li><strong>Review</strong><span>Run checks, independent review, and bounded fixes.</span></li>
+  <li><strong>Deliver</strong><span>Inspect the draft PR. You own the final merge.</span></li>
+</ol>
+
+## Pick up where you left off
+
+Once setup is complete, open a lead-agent session in your repository:
+
+```text
+Plan this work as a rolling Forge epic. Critique it and bring me the
+decisions I need to approve.
+```
+
+After approving the work, ask the lead to run the epic. Submission returns
+immediately; Forge's local controllers continue the job. In a later session,
+inspect the recorded state:
+
+```sh
+# What needs attention in this repository?
+forged next --repo "$PWD"
+
+# Why is a particular work item in its current state?
+forged explain --id "$WORK_ID"
+```
+
+Here, `WORK_ID` is an existing work item's ID. The [epic guide](/forge/guides/run-an-epic/)
+walks through approval, submission, and delivery.
+
+## What Forge takes care of
+
+- **Durable coordination.** The work specification, execution attempts, review
+  results, and decisions survive the conversation that started them.
+- **Bounded execution.** Configured checks and independent reviewers assess the
+  changes. Fix rounds and budgets constrain how long agents keep trying.
+- **A clear stopping point.** Clean child work can be integrated into an epic
+  branch. Changes to approved scope and unresolved failures return for a decision;
+  the final draft PR is yours to merge.
+
+Use the [operating guide](/forge/guides/inspect-and-recover/) to inspect progress
+and resolve a stopped run, or read [how it works](/forge/how-it-works/) for the
+responsibilities of the lead agent, Forge, and execution agents.
+
+## Before you start
+
+Forge runs locally on macOS and GNU/Linux. Your machine must stay awake while
+controllers and agents run; the managed background supervisor is macOS-only.
+You need authenticated provider CLIs, GitHub access through `gh`, and working
+project checks. Your configured providers may incur usage charges.
+
+Agents run with your local user privileges. Forge's review process is not a
+sandbox, and a reviewed PR still needs your engineering judgment. Read the
+[prerequisites](/forge/getting-started/#prerequisites) and
+[security model](https://github.com/tcashel/forge/blob/main/SECURITY.md)
+before dispatching work.
+
+<p className="cw-signature">A project by <a href="https://cinderworks.ai">Cinderworks</a>. <a href="https://github.com/tcashel/forge">Source</a> · <a href="https://github.com/tcashel/forge/releases">Releases</a> · <a href="https://github.com/tcashel/forge/blob/main/LICENSE">License</a></p>

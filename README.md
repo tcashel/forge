@@ -145,6 +145,33 @@ then file, sized by lines and colored by coverage.
 
 ## Documentation
 
+The documentation site is maintained in [`site/src/content/docs/`](site/src/content/docs/).
+It introduces Forge, walks through setup and operating an epic, and links to the
+engineering references below.
+
+To edit and preview the site, use Node 24 and Bun 1.3.13:
+
+```sh
+cd site
+bun install --frozen-lockfile
+bun run dev
+# Verify the production output, including search:
+bun run build
+bun run preview --host 127.0.0.1
+```
+
+Open the printed local URL at `/forge/`. The production address is
+`https://tcashel.github.io/forge/` once Pages is enabled and the first deployment
+succeeds. [The docs workflow](.github/workflows/docs.yml) builds pull requests;
+pushes to `main` and manual runs on `main` deploy through the `github-pages`
+environment. First-time publication requires setting the repository's Pages
+source to **GitHub Actions**. The site has its own dependencies and does not
+build or install Forge. Only selected content under `site/` is published.
+
+The shared Cinderworks theme lives in `site/src/styles/cinderworks.css`; Forge
+adjustments live in `site/src/styles/forge.css`. The copied theme does not update
+automatically; reapply the GitHub Pages skill when a refresh is wanted.
+
 - [The system as a tower](docs/SYSTEM.md) — start here
 - [The one lifecycle](docs/LIFECYCLE.md)
 - [Driving Forge — the agent's runbook](docs/DRIVING.md)

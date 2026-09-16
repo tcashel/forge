@@ -1,0 +1,56 @@
+/* Project adjustments; keep the shared Cinderworks baseline unchanged. */
+.sl-markdown-content .forge-eyebrow {
+  color: var(--sl-color-accent-high);
+  font-size: 0.8rem;
+  font-weight: 650;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.sl-markdown-content .cw-lede {
+  font-size: clamp(1.2rem, 2.2vw, 1.5rem);
+  line-height: 1.55;
+  max-width: 42ch;
+}
+
+.sl-markdown-content .forge-flow {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 1.25rem;
+  list-style: none;
+  padding: 1.25rem 0;
+  border-block: 1px solid var(--sl-color-hairline-light);
+  counter-reset: forge-step;
+}
+
+.sl-markdown-content .forge-flow li {
+  margin: 0;
+  counter-increment: forge-step;
+}
+
+.forge-flow li::before {
+  content: '0' counter(forge-step);
+  display: block;
+  color: var(--sl-color-accent-high);
+  font-family: var(--sl-font-mono);
+  font-size: 0.75rem;
+  margin-bottom: 0.6rem;
+}
+
+.forge-flow strong,
+.forge-flow span {
+  display: block;
+}
+
+.forge-flow span {
+  color: var(--sl-color-gray-2);
+  font-size: 0.85rem;
+  line-height: 1.6;
+  margin-top: 0.4rem;
+}
+
+@media (max-width: 38rem) {
+  .sl-markdown-content .forge-flow {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
