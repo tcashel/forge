@@ -1,0 +1,75 @@
+/* Shared baseline. Load project-specific overrides in a separate file. */
+:root {
+  --sl-font: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --sl-font-mono: ui-monospace, "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  --sl-content-width: 48rem;
+  --sl-text-5xl: clamp(2.2rem, 4vw, 3.25rem);
+  --sl-color-accent-low: #38251a;
+  --sl-color-accent: #f0a568;
+  --sl-color-accent-high: #ffdab9;
+  --sl-color-white: #f7f4ef;
+  --sl-color-gray-1: #e5e0d8;
+  --sl-color-gray-2: #bcb6ae;
+  --sl-color-gray-3: #89837b;
+  --sl-color-gray-4: #57524c;
+  --sl-color-gray-5: #35312d;
+  --sl-color-gray-6: #211e1b;
+  --sl-color-black: #161412;
+}
+
+:root[data-theme="light"] {
+  --sl-color-accent-low: #fbe8d8;
+  --sl-color-accent: #995019;
+  --sl-color-accent-high: #582b0e;
+  --sl-color-white: #211b17;
+  --sl-color-gray-1: #352e28;
+  --sl-color-gray-2: #544c44;
+  --sl-color-gray-3: #71675d;
+  --sl-color-gray-4: #a89c90;
+  --sl-color-gray-5: #ded5ca;
+  --sl-color-gray-6: #f1ece5;
+  --sl-color-gray-7: #f8f4ee;
+  --sl-color-black: #fffcf8;
+}
+
+h1,
+.sl-markdown-content :is(h2, h3) {
+  font-weight: 650;
+  letter-spacing: -0.025em;
+  text-wrap: balance;
+}
+
+.sl-markdown-content {
+  line-height: 1.75;
+}
+
+.sl-markdown-content :is(h2, h3) {
+  line-height: 1.25;
+}
+
+.sl-markdown-content a:not([class]) {
+  text-underline-offset: 0.2em;
+}
+
+.sl-markdown-content img {
+  border-radius: 0.6rem;
+}
+
+.sl-markdown-content .cw-lede {
+  color: var(--sl-color-text);
+  font-size: 1.2rem;
+  line-height: 1.65;
+  max-width: 55ch;
+}
+
+.sl-markdown-content .cw-status {
+  color: var(--sl-color-gray-2);
+  font-size: 0.9rem;
+}
+
+.sl-markdown-content .cw-signature {
+  border-top: 1px solid var(--sl-color-hairline-light);
+  margin-top: 3rem;
+  padding-top: 1rem;
+  font-size: 0.875rem;
+}
