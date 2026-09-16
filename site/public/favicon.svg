@@ -1,4 +1,23 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
-  <rect width="64" height="64" rx="14" fill="#161412"/>
-  <path d="M35 8 16 35l16 21 16-21-8-11-7 12-7-1Z" fill="#f0a568"/>
+<svg viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Cinderworks app icon">
+  <defs>
+    <radialGradient id="ckAppBg" cx="0.32" cy="0.28" r="0.9">
+      <stop offset="0" stop-color="#2a2521"></stop><stop offset="1" stop-color="#131110"></stop>
+    </radialGradient>
+    <linearGradient id="ckAppBase" x1="16" y1="36" x2="34" y2="54" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#eab64a"></stop><stop offset="0.55" stop-color="#d35a2c"></stop><stop offset="1" stop-color="#7a1f14"></stop>
+    </linearGradient>
+    <linearGradient id="ckAppMid" x1="34" y1="27" x2="45" y2="38" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#f0c75a"></stop><stop offset="1" stop-color="#d35a2c"></stop>
+    </linearGradient>
+    <filter id="ckAppGlow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="3.5" result="b"></feGaussianBlur>
+      <feMerge><feMergeNode in="b"></feMergeNode><feMergeNode in="SourceGraphic"></feMergeNode></feMerge>
+    </filter>
+  </defs>
+  <rect x="2" y="2" width="60" height="60" rx="14" fill="url(#ckAppBg)"></rect>
+  <g filter="url(#ckAppGlow)">
+    <rect x="16" y="36" width="18" height="18" rx="4" fill="url(#ckAppBase)"></rect>
+    <rect x="35.5" y="26.5" width="10.5" height="10.5" rx="2.6" fill="url(#ckAppMid)"></rect>
+    <rect x="46.5" y="19" width="6.5" height="6.5" rx="1.8" fill="#eab64a"></rect>
+  </g>
 </svg>

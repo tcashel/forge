@@ -1,41 +1,71 @@
-/* Shared baseline. Load project-specific overrides in a separate file. */
+/* Matches AiChat/apps/web/app/assets/portfolio.css, checked 2026-09-16.
+ * Keep this copied preset local to each site; load project overrides afterward.
+ * Starlight uses data-theme, while the portfolio uses the .dark class.
+ */
 :root {
-  --sl-font: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --ck-bg: #07131c;
+  --ck-surface: #0b1b26;
+  --ck-elevated: #102530;
+  --ck-text: #e3edf2;
+  --ck-muted: #b2c6d1;
+  --ck-dim: #88a6b5;
+  --ck-accent: #7ee3d7;
+  --ck-accent-fg: #061b20;
+  --ck-border: #233945;
+  --ck-border-strong: #375867;
+  --ck-accent-line: #477a7a;
+  --ck-accent-soft: #122f34;
+
+  --sl-font: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   --sl-font-mono: ui-monospace, "SFMono-Regular", Consolas, "Liberation Mono", monospace;
-  --sl-content-width: 48rem;
+  --sl-content-width: 68ch;
   --sl-text-5xl: clamp(2.2rem, 4vw, 3.25rem);
-  --sl-color-accent-low: #38251a;
-  --sl-color-accent: #f0a568;
-  --sl-color-accent-high: #ffdab9;
-  --sl-color-white: #f7f4ef;
-  --sl-color-gray-1: #e5e0d8;
-  --sl-color-gray-2: #bcb6ae;
-  --sl-color-gray-3: #89837b;
-  --sl-color-gray-4: #57524c;
-  --sl-color-gray-5: #35312d;
-  --sl-color-gray-6: #211e1b;
-  --sl-color-black: #161412;
+  --sl-color-white: var(--ck-text);
+  --sl-color-gray-1: var(--ck-text);
+  --sl-color-gray-2: var(--ck-muted);
+  --sl-color-gray-3: var(--ck-dim);
+  --sl-color-gray-4: var(--ck-border-strong);
+  --sl-color-gray-5: var(--ck-border);
+  --sl-color-gray-6: var(--ck-surface);
+  --sl-color-gray-7: var(--ck-bg);
+  --sl-color-black: var(--ck-bg);
+  --sl-color-accent-low: var(--ck-accent-soft);
+  --sl-color-accent: var(--ck-accent);
+  --sl-color-accent-high: var(--ck-accent);
+  --sl-color-text: var(--ck-muted);
+  --sl-color-text-accent: var(--ck-accent);
+  --sl-color-text-invert: var(--ck-accent-fg);
+  --sl-color-bg: var(--ck-bg);
+  --sl-color-bg-nav: var(--ck-bg);
+  --sl-color-bg-sidebar: var(--ck-bg);
+  --sl-color-bg-inline-code: var(--ck-elevated);
+  --sl-color-bg-accent: var(--ck-accent);
+  --sl-color-hairline-light: var(--ck-border);
+  --sl-color-hairline: var(--ck-border);
+  --sl-color-hairline-shade: var(--ck-border);
 }
 
 :root[data-theme="light"] {
-  --sl-color-accent-low: #fbe8d8;
-  --sl-color-accent: #995019;
-  --sl-color-accent-high: #582b0e;
-  --sl-color-white: #211b17;
-  --sl-color-gray-1: #352e28;
-  --sl-color-gray-2: #544c44;
-  --sl-color-gray-3: #71675d;
-  --sl-color-gray-4: #a89c90;
-  --sl-color-gray-5: #ded5ca;
-  --sl-color-gray-6: #f1ece5;
-  --sl-color-gray-7: #f8f4ee;
-  --sl-color-black: #fffcf8;
+  --ck-bg: #edf3f6;
+  --ck-surface: #e5eef3;
+  --ck-elevated: #dce9ef;
+  --ck-text: #142a36;
+  --ck-muted: #425e6c;
+  --ck-dim: #536f7a;
+  --ck-accent: #176c68;
+  --ck-accent-fg: #f5fffe;
+  --ck-border: #c7d8e0;
+  --ck-border-strong: #a9c4cf;
+  --ck-accent-line: #89bcb8;
+  --ck-accent-soft: #deefec;
 }
 
 h1,
 .sl-markdown-content :is(h2, h3) {
-  font-weight: 650;
-  letter-spacing: -0.025em;
+  color: var(--ck-text);
+  font-family: Georgia, serif;
+  font-weight: 400;
+  letter-spacing: -0.035em;
   text-wrap: balance;
 }
 
@@ -47,28 +77,34 @@ h1,
   line-height: 1.25;
 }
 
+.site-title {
+  color: var(--ck-text);
+  font-weight: 500;
+  letter-spacing: -0.065em;
+}
+
+.sl-link-button,
+.sl-markdown-content img {
+  border-radius: 4px;
+}
+
 .sl-markdown-content a:not([class]) {
   text-underline-offset: 0.2em;
 }
 
-.sl-markdown-content img {
-  border-radius: 0.6rem;
-}
-
 .sl-markdown-content .cw-lede {
-  color: var(--sl-color-text);
   font-size: 1.2rem;
   line-height: 1.65;
   max-width: 55ch;
 }
 
 .sl-markdown-content .cw-status {
-  color: var(--sl-color-gray-2);
+  color: var(--ck-dim);
   font-size: 0.9rem;
 }
 
 .sl-markdown-content .cw-signature {
-  border-top: 1px solid var(--sl-color-hairline-light);
+  border-top: 1px solid var(--ck-border);
   margin-top: 3rem;
   padding-top: 1rem;
   font-size: 0.875rem;
