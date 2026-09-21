@@ -161,7 +161,7 @@ jobs:
         with:
           cache-save-if: 'false'
 
-      - uses: taiki-e/install-action@37f7c5781271959fb65b6b35224e28652ff2b63d # v2.87.0
+      - uses: taiki-e/install-action@4076c08d76dba979c11a7285295b0716c1d67908 # v2.87.15
         with:
           tool: cargo-nextest@0.9.143
 
@@ -184,7 +184,7 @@ jobs:
         with:
           cache-save-if: 'false'
 
-      - uses: taiki-e/install-action@37f7c5781271959fb65b6b35224e28652ff2b63d # v2.87.0
+      - uses: taiki-e/install-action@4076c08d76dba979c11a7285295b0716c1d67908 # v2.87.15
         with:
           tool: cargo-nextest@0.9.143
 
