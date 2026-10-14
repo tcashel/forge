@@ -46,7 +46,7 @@ jobs:
           # Matches release.yml: nothing here talks to git as us.
           persist-credentials: false
 
-      - uses: taiki-e/install-action@37f7c5781271959fb65b6b35224e28652ff2b63d # v2.87.0
+      - uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.27
         with:
           tool: cargo-deny@0.20.2
 
